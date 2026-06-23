@@ -15,15 +15,21 @@ export function loadConfig(): AppConfig {
   const projects = loadProjects();
 
   return {
-    discordToken: requiredEnv("DISCORD_TOKEN"),
-    discordClientId: requiredEnv("DISCORD_CLIENT_ID"),
-    discordGuildId: requiredEnv("DISCORD_GUILD_ID"),
+    ...loadDiscordConfig(),
     openaiApiKey: requiredEnv("OPENAI_API_KEY"),
     openaiModel: process.env.OPENAI_MODEL?.trim() || "gpt-5.5",
     allowedUserIds: csvSet(process.env.ALLOWED_USER_IDS),
     allowedRoleIds: csvSet(process.env.ALLOWED_ROLE_IDS),
     projects,
     scanner: DEFAULT_SCANNER
+  };
+}
+
+export function loadDiscordConfig(): Pick<AppConfig, "discordToken" | "discordClientId" | "discordGuildId"> {
+  return {
+    discordToken: requiredEnv("DISCORD_TOKEN"),
+    discordClientId: requiredEnv("DISCORD_CLIENT_ID"),
+    discordGuildId: requiredEnv("DISCORD_GUILD_ID")
   };
 }
 
