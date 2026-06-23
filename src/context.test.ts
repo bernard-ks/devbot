@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
+import { parseMentionRequest } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 
 const scanner = {
@@ -62,4 +63,34 @@ test("splitDiscordMessage keeps chunks inside the requested limit", () => {
   const chunks = splitDiscordMessage("a ".repeat(3000), 500);
   assert.ok(chunks.length > 1);
   assert.ok(chunks.every((chunk) => chunk.length <= 500));
+});
+
+test("mention status questions route to read-only answer mode", () => {
+  const request = parseMentionRequest("<@123> whats the current state of pullprice", "123", [
+    { name: "pullprice", root: "/tmp/pullprice" }
+  ]);
+
+  assert.equal(request.project.name, "pullprice");
+  assert.equal(request.text, "whats the current state of pullprice");
+  assert.equal(request.mode, "answer");
+});
+
+test("mention action verbs route to action mode", () => {
+  const request = parseMentionRequest("<@!123> project:pullprice include:src/* fix the failing tests", "123", [
+    { name: "pullprice", root: "/tmp/pullprice" }
+  ]);
+
+  assert.equal(request.project.name, "pullprice");
+  assert.deepEqual(request.includePatterns, ["src/*"]);
+  assert.equal(request.text, "fix the failing tests");
+  assert.equal(request.mode, "action");
+});
+
+test("mention mode override wins over inferred mode", () => {
+  const request = parseMentionRequest("<@123> mode:action whats the current state", "123", [
+    { name: "pullprice", root: "/tmp/pullprice" }
+  ]);
+
+  assert.equal(request.text, "whats the current state");
+  assert.equal(request.mode, "action");
 });
