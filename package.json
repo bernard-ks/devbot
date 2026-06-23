@@ -1,0 +1,27 @@
+{
+  "name": "devbot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A Discord bot that answers development questions with local project context through the OpenAI Responses API.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "commands:deploy": "tsx src/deploy-commands.ts",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "npm run build && node --test dist"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.7",
+    "openai": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
