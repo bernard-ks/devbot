@@ -22,5 +22,20 @@ export const commandDefinitions = [
         .setName("include")
         .setDescription("Optional comma-separated path patterns, e.g. src/*,README.md,*.json.")
         .setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("act")
+    .setDescription("Ask local Codex to perform a focused project task.")
+    .addStringOption((option) =>
+      option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+    )
+    .addStringOption((option) =>
+      option.setName("task").setDescription("The concrete change or command workflow to run.").setRequired(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("include")
+        .setDescription("Optional comma-separated path patterns, e.g. src/*,README.md,*.json.")
+        .setRequired(false)
     )
 ].map((command) => command.toJSON());

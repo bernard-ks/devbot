@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A Discord bot that answers development questions with local project context through the OpenAI Responses API.",
+  "description": "A Discord bot that answers and acts on development requests with local Codex project context.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "commands:deploy": "tsx src/deploy-commands.ts",
@@ -13,8 +13,7 @@
   },
   "dependencies": {
     "discord.js": "^14.16.3",
-    "dotenv": "^16.4.7",
-    "openai": "^5.0.1"
+    "dotenv": "^16.4.7"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

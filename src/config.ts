@@ -16,12 +16,31 @@ export function loadConfig(): AppConfig {
 
   return {
     ...loadDiscordConfig(),
-    openaiApiKey: requiredEnv("OPENAI_API_KEY"),
-    openaiModel: process.env.OPENAI_MODEL?.trim() || "gpt-5.5",
+    codex: loadCodexConfig(),
     allowedUserIds: csvSet(process.env.ALLOWED_USER_IDS),
     allowedRoleIds: csvSet(process.env.ALLOWED_ROLE_IDS),
     projects,
     scanner: DEFAULT_SCANNER
+  };
+}
+
+function loadCodexConfig() {
+  const sandbox = process.env.CODEX_SANDBOX?.trim() || "read-only";
+  if (!isCodexSandbox(sandbox)) {
+    throw new Error(`Invalid CODEX_SANDBOX: ${sandbox}`);
+  }
+
+  const actionSandbox = process.env.CODEX_ACTION_SANDBOX?.trim() || "workspace-write";
+  if (!isCodexSandbox(actionSandbox)) {
+    throw new Error(`Invalid CODEX_ACTION_SANDBOX: ${actionSandbox}`);
+  }
+
+  return {
+    bin: process.env.CODEX_BIN?.trim() || "/Applications/Codex.app/Contents/Resources/codex",
+    model: process.env.CODEX_MODEL?.trim() || undefined,
+    sandbox,
+    actionSandbox,
+    timeoutMs: Number(process.env.CODEX_TIMEOUT_MS || 180_000)
   };
 }
 
@@ -31,6 +50,10 @@ export function loadDiscordConfig(): Pick<AppConfig, "discordToken" | "discordCl
     discordClientId: requiredEnv("DISCORD_CLIENT_ID"),
     discordGuildId: requiredEnv("DISCORD_GUILD_ID")
   };
+}
+
+function isCodexSandbox(value: string): value is "read-only" | "workspace-write" | "danger-full-access" {
+  return value === "read-only" || value === "workspace-write" || value === "danger-full-access";
 }
 
 function loadProjects(): ProjectEntry[] {
