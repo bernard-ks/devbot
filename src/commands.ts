@@ -2,6 +2,7 @@ import { SlashCommandBuilder } from "discord.js";
 
 export const commandDefinitions = [
   new SlashCommandBuilder().setName("projects").setDescription("List configured local projects."),
+  new SlashCommandBuilder().setName("status").setDescription("Show Codex dev work currently in progress."),
   new SlashCommandBuilder()
     .setName("refresh")
     .setDescription("Refresh the indexed context for a project.")

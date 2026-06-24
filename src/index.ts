@@ -8,12 +8,14 @@ import type { AutocompleteInteraction, ChatInputCommandInteraction, Interaction,
 import { loadConfig } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
-import { parseMentionRequest } from "./mention.js";
+import { isWorkStatusQuestion, parseMentionRequest, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
+import { formatWorkStatus, WorkTracker } from "./work-status.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
 
 const config = loadConfig();
 const contextService = new ProjectContextService(config.scanner);
+const workTracker = new WorkTracker();
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
@@ -57,6 +59,12 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
+    const mentionText = stripBotMention(message.content, client.user.id);
+    if (isWorkStatusQuestion(mentionText)) {
+      await message.reply(formatWorkStatus(workTracker.snapshot()));
+      return;
+    }
+
     const request = parseMentionRequest(message.content, client.user.id, config.projects);
     if (!request.text) {
       await message.reply("Tell me what to do after the mention. Example: `@devbot fix the failing tests`");
@@ -65,12 +73,13 @@ client.on("messageCreate", async (message) => {
 
     await message.channel.sendTyping();
     const pending = await message.reply(`Working on \`${request.project.name}\`...`);
-    const answer = await runProjectRequest({
+    const { answer } = await runProjectRequest({
       appConfig: config,
       project: request.project,
       text: request.text,
       includePatterns: request.includePatterns,
-      mode: request.mode
+      mode: request.mode,
+      requester: message.author.tag
     });
 
     const chunks = splitDiscordMessage(answer);
@@ -96,6 +105,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     return;
   }
 
+  if (interaction.commandName === "status") {
+    await interaction.reply(formatWorkStatus(workTracker.snapshot()));
+    return;
+  }
+
   if (interaction.commandName === "refresh") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
@@ -109,8 +123,14 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     const question = interaction.options.getString("question", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
-    const context = await contextService.pack(project, question, includePatterns);
-    const answer = await runCodex(appConfig, question, context, "answer");
+    const { answer, context } = await runProjectRequest({
+      appConfig,
+      project,
+      text: question,
+      includePatterns,
+      mode: "answer",
+      requester: interaction.user.tag
+    });
 
     const header = [
       `Project: \`${project.name}\``,
@@ -134,12 +154,13 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     const task = interaction.options.getString("task", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
-    const answer = await runProjectRequest({
+    const { answer } = await runProjectRequest({
       appConfig,
       project,
       text: task,
       includePatterns,
-      mode: "action"
+      mode: "action",
+      requester: interaction.user.tag
     });
     const chunks = splitDiscordMessage(answer);
     await interaction.editReply(chunks[0] ?? "No answer generated.");
@@ -156,11 +177,29 @@ interface ProjectRequestOptions {
   text: string;
   includePatterns: string[];
   mode: CodexRequestMode;
+  requester: string;
 }
 
-async function runProjectRequest(options: ProjectRequestOptions): Promise<string> {
-  const context = await contextService.pack(options.project, options.text, options.includePatterns);
-  return runCodex(options.appConfig, options.text, context, options.mode);
+interface ProjectRequestResult {
+  answer: string;
+  context: PackedProjectContext;
+}
+
+async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
+  const work = workTracker.start({
+    mode: options.mode,
+    projectName: options.project.name,
+    requester: options.requester,
+    text: options.text
+  });
+
+  try {
+    const context = await contextService.pack(options.project, options.text, options.includePatterns);
+    const answer = await runCodex(options.appConfig, options.text, context, options.mode);
+    return { answer, context };
+  } finally {
+    workTracker.finish(work.id);
+  }
 }
 
 async function runCodex(

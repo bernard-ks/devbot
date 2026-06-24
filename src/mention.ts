@@ -10,7 +10,7 @@ export interface ParsedMentionRequest {
 }
 
 export function parseMentionRequest(content: string, botUserId: string, projects: ProjectEntry[]): ParsedMentionRequest {
-  let text = content.replace(new RegExp(`<@!?${botUserId}>`, "g"), "").trim();
+  let text = stripBotMention(content, botUserId);
   const projectMatch = text.match(/\bproject:([a-z0-9_-]+)\b/i);
   const includeMatch = text.match(/\binclude:([^\s]+)/i);
   const modeMatch = text.match(/\bmode:(ask|answer|act|action)\b/i);
@@ -31,6 +31,19 @@ export function parseMentionRequest(content: string, botUserId: string, projects
 
   const mode = modeMatch ? parseMentionMode(modeMatch[1] ?? "") : inferMentionMode(text);
   return { project, text, includePatterns, mode };
+}
+
+export function stripBotMention(content: string, botUserId: string): string {
+  return content.replace(new RegExp(`<@!?${botUserId}>`, "g"), "").trim();
+}
+
+export function isWorkStatusQuestion(text: string): boolean {
+  const normalized = text.toLowerCase().replace(/[?!.]/g, "").replace(/\s+/g, " ").trim();
+  return (
+    normalized === "status" ||
+    normalized === "wip" ||
+    /\b(work in progress|in progress|currently working|working on|current work|dev work|codex work)\b/.test(normalized)
+  );
 }
 
 function mustFindProject(projects: ProjectEntry[], name: string): ProjectEntry {

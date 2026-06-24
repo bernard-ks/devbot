@@ -4,8 +4,9 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
-import { parseMentionRequest } from "./mention.js";
+import { isWorkStatusQuestion, parseMentionRequest } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
+import { formatWorkStatus, WorkTracker } from "./work-status.js";
 
 const scanner = {
   maxIndexedFileBytes: 80_000,
@@ -93,4 +94,34 @@ test("mention mode override wins over inferred mode", () => {
 
   assert.equal(request.text, "whats the current state");
   assert.equal(request.mode, "action");
+});
+
+test("work status phrases are detected before Codex routing", () => {
+  assert.equal(isWorkStatusQuestion("what is currently in progress"), true);
+  assert.equal(isWorkStatusQuestion("current dev work?"), true);
+  assert.equal(isWorkStatusQuestion("wip"), true);
+  assert.equal(isWorkStatusQuestion("fix the failing tests"), false);
+});
+
+test("work status reports empty and active Codex work", () => {
+  const tracker = new WorkTracker();
+
+  assert.equal(formatWorkStatus(tracker.snapshot()), "No Codex dev work is currently in progress.");
+
+  const startedAt = new Date("2026-06-23T20:00:00.000Z");
+  const work = tracker.start({
+    mode: "action",
+    projectName: "pullprice",
+    requester: "Shadow.bk",
+    text: "run a repo health check"
+  });
+  work.startedAt = startedAt;
+
+  assert.equal(
+    formatWorkStatus(tracker.snapshot(), new Date("2026-06-23T20:01:05.000Z")),
+    "Codex dev work currently in progress: 1\n- `pullprice` action for Shadow.bk, running 1m 5s: run a repo health check"
+  );
+
+  tracker.finish(work.id);
+  assert.equal(formatWorkStatus(tracker.snapshot()), "No Codex dev work is currently in progress.");
 });
