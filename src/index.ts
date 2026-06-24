@@ -65,14 +65,19 @@ client.on("messageCreate", async (message) => {
     const statusRequest = parseStatusRequest(statusProjectRequest.text);
     if (statusRequest.isStatus) {
       await message.channel.sendTyping();
-      const response = await getStatusResponse({
-        appConfig: config,
-        question: statusRequest.question,
-        wantsImage: statusRequest.wantsImage,
-        requester: message.author.tag,
-        project: statusProjectRequest.project
-      });
-      await replyToMessageWithChunks(message, response);
+      console.log(`Status request from ${message.author.tag}: image=${statusRequest.wantsImage} question=${Boolean(statusRequest.question)}`);
+      const snapshot = await getStatusSnapshotResponse(config, statusRequest.wantsImage);
+      await replyToMessageWithChunks(message, snapshot);
+
+      if (statusRequest.question) {
+        const detail = await getDetailedStatusResponse({
+          appConfig: config,
+          question: statusRequest.question,
+          requester: message.author.tag,
+          project: statusProjectRequest.project
+        });
+        await replyToMessageWithChunks(message, detail);
+      }
       return;
     }
 
@@ -119,14 +124,19 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
   if (interaction.commandName === "status") {
     await interaction.deferReply();
     const projectName = interaction.options.getString("project");
-    const response = await getStatusResponse({
-      appConfig,
-      question: interaction.options.getString("question") ?? undefined,
-      wantsImage: interaction.options.getBoolean("image") ?? false,
-      requester: interaction.user.tag,
-      project: projectName ? mustFindProject(appConfig.projects, projectName) : undefined
-    });
-    await editInteractionWithChunks(interaction, response);
+    const question = interaction.options.getString("question") ?? undefined;
+    const snapshot = await getStatusSnapshotResponse(appConfig, interaction.options.getBoolean("image") ?? false);
+    await editInteractionWithChunks(interaction, snapshot);
+
+    if (question) {
+      const detail = await getDetailedStatusResponse({
+        appConfig,
+        question,
+        requester: interaction.user.tag,
+        project: projectName ? mustFindProject(appConfig.projects, projectName) : undefined
+      });
+      await followUpWithChunks(interaction, detail);
+    }
     return;
   }
 
@@ -232,8 +242,7 @@ interface StatusResponseOptions {
   appConfig: AppConfig;
   requester: string;
   project: ProjectEntry | undefined;
-  question: string | undefined;
-  wantsImage: boolean;
+  question: string;
 }
 
 interface BotResponse {
@@ -241,39 +250,39 @@ interface BotResponse {
   image?: Buffer;
 }
 
-async function getStatusResponse(options: StatusResponseOptions): Promise<BotResponse> {
-  const status = await getWorkStatusMessage(options.appConfig);
-  let content = status;
+async function getStatusSnapshotResponse(appConfig: AppConfig, wantsImage: boolean): Promise<BotResponse> {
+  const content = await getWorkStatusMessage(appConfig);
 
-  if (options.question) {
-    const project = options.project ?? defaultProject(options.appConfig.projects);
-    const detailPrompt = [
-      "Give a deeper development status update for the configured project.",
-      "Use the current work snapshot below as live context, then inspect the project read-only if needed.",
-      "Be concrete about what appears active, what output/state is visible, and what is unknown.",
-      "",
-      "Current work snapshot:",
-      status,
-      "",
-      "Status question:",
-      options.question
-    ].join("\n");
-    const { answer } = await runProjectRequest({
-      appConfig: options.appConfig,
-      project,
-      text: detailPrompt,
-      includePatterns: [],
-      mode: "answer",
-      requester: options.requester
-    });
-    content = [`Status snapshot:`, status, "", `Detailed update for \`${project.name}\`:`, answer].join("\n");
-  }
-
-  if (options.wantsImage) {
+  if (wantsImage) {
     return { content, image: await renderStatusImage(content) };
   }
 
   return { content };
+}
+
+async function getDetailedStatusResponse(options: StatusResponseOptions): Promise<BotResponse> {
+  const status = await getWorkStatusMessage(options.appConfig);
+  const project = options.project ?? defaultProject(options.appConfig.projects);
+  const detailPrompt = [
+    "Give a deeper development status update for the configured project.",
+    "Use the current work snapshot below as live context, then inspect the project read-only if needed.",
+    "Be concrete about what appears active, what output/state is visible, and what is unknown.",
+    "",
+    "Current work snapshot:",
+    status,
+    "",
+    "Status question:",
+    options.question
+  ].join("\n");
+  const { answer } = await runProjectRequest({
+    appConfig: options.appConfig,
+    project,
+    text: detailPrompt,
+    includePatterns: [],
+    mode: "answer",
+    requester: options.requester
+  });
+  return { content: [`Detailed update for \`${project.name}\`:`, answer].join("\n") };
 }
 
 async function replyToMessageWithChunks(message: Message, response: BotResponse): Promise<void> {
@@ -290,6 +299,16 @@ async function editInteractionWithChunks(interaction: ChatInputCommandInteractio
   const chunks = splitDiscordMessage(response.content);
   const files = response.image ? [new AttachmentBuilder(response.image, { name: "devbot-status.png" })] : [];
   await interaction.editReply({ content: chunks[0] ?? "No status generated.", files });
+
+  for (const chunk of chunks.slice(1)) {
+    await interaction.followUp(chunk);
+  }
+}
+
+async function followUpWithChunks(interaction: ChatInputCommandInteraction, response: BotResponse): Promise<void> {
+  const chunks = splitDiscordMessage(response.content);
+  const files = response.image ? [new AttachmentBuilder(response.image, { name: "devbot-status.png" })] : [];
+  await interaction.followUp({ content: chunks[0] ?? "No status generated.", files });
 
   for (const chunk of chunks.slice(1)) {
     await interaction.followUp(chunk);
