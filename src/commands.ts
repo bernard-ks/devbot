@@ -9,7 +9,10 @@ export const commandDefinitions = [
       option.setName("project").setDescription("Optional project for a deeper status question.").setRequired(false).setAutocomplete(true)
     )
     .addStringOption((option) =>
-      option.setName("question").setDescription("Optional deeper status question to answer with project context.").setRequired(false)
+      option
+        .setName("question")
+        .setDescription("Optional deeper status question; include a page or path to target screenshots.")
+        .setRequired(false)
     )
     .addBooleanOption((option) =>
       option.setName("image").setDescription("Attach a live screenshot of the project UI when available.").setRequired(false)

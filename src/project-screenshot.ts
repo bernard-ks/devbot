@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ProjectEntry } from "./types.js";
@@ -12,8 +13,15 @@ export interface ProjectScreenshot {
   url: string;
 }
 
-export async function captureProjectScreenshot(project: ProjectEntry): Promise<ProjectScreenshot | undefined> {
-  const urls = await findProjectWebUrls(project);
+export interface ProjectScreenshotOptions {
+  requestText?: string;
+}
+
+export async function captureProjectScreenshot(
+  project: ProjectEntry,
+  options: ProjectScreenshotOptions = {}
+): Promise<ProjectScreenshot | undefined> {
+  const urls = await findProjectWebUrls(project, options.requestText);
 
   for (const url of urls) {
     if (!(await canReach(url))) {
@@ -28,7 +36,7 @@ export async function captureProjectScreenshot(project: ProjectEntry): Promise<P
       const image = await page.screenshot({ type: "png", fullPage: false });
       return {
         image,
-        fileName: `${sanitizeFilePart(project.name)}-ui-screenshot.png`,
+        fileName: `${sanitizeFilePart(project.name)}-${sanitizeFilePart(new URL(url).pathname || "home")}-screenshot.png`,
         url
       };
     } finally {
@@ -39,10 +47,12 @@ export async function captureProjectScreenshot(project: ProjectEntry): Promise<P
   return undefined;
 }
 
-export async function findProjectWebUrls(project: ProjectEntry): Promise<string[]> {
+export async function findProjectWebUrls(project: ProjectEntry, requestText = ""): Promise<string[]> {
   const configured = configuredProjectUrls(project);
   const detected = await detectRunningProjectWebUrls(project);
-  return uniqueUrls([...configured, ...detected]);
+  const baseUrls = uniqueUrls([...configured, ...detected]);
+  const routePaths = await resolveRequestedRoutePaths(project, requestText);
+  return uniqueUrls(baseUrls.flatMap((url) => routePaths.map((routePath) => withPath(url, routePath))));
 }
 
 export function detectLocalWebUrlsFromPs(psOutput: string, project: ProjectEntry): string[] {
@@ -99,10 +109,111 @@ function configuredProjectUrls(project: ProjectEntry): string[] {
   return urls;
 }
 
+export async function resolveRequestedRoutePaths(project: ProjectEntry, requestText: string): Promise<string[]> {
+  const explicitUrl = requestText.match(/\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/[^\s]*)?/i)?.[0];
+  if (explicitUrl) {
+    return [new URL(normalizeLocalUrl(explicitUrl)).pathname || "/"];
+  }
+
+  const explicitPath = extractExplicitPath(requestText);
+  if (explicitPath) {
+    return [explicitPath, "/"];
+  }
+
+  const discoveredRoutes = await discoverStaticProjectRoutes(project);
+  const bestRoute = bestRouteForText(discoveredRoutes, requestText);
+  if (bestRoute) {
+    return [bestRoute, "/"];
+  }
+
+  return ["/"];
+}
+
+export async function discoverStaticProjectRoutes(project: ProjectEntry): Promise<string[]> {
+  const routeRoots = [
+    path.join(project.root, "PullPriceWeb", "web", "src", "app"),
+    path.join(project.root, "web", "src", "app"),
+    path.join(project.root, "src", "app")
+  ];
+  const routeSets = await Promise.all(routeRoots.map((routeRoot) => discoverNextAppRoutes(routeRoot)));
+  return uniqueRoutePaths(routeSets.flat());
+}
+
+export function bestRouteForText(routes: string[], requestText: string): string | undefined {
+  const normalizedText = normalizeForMatch(requestText);
+  if (!normalizedText) {
+    return undefined;
+  }
+
+  const homeWords = ["home", "main", "landing", "root"];
+  if (homeWords.some((word) => wordInText(normalizedText, word))) {
+    return routes.includes("/") ? "/" : undefined;
+  }
+
+  let best: { route: string; score: number } | undefined;
+  for (const route of routes.filter((candidate) => candidate !== "/")) {
+    const routeWords = route
+      .split("/")
+      .filter(Boolean)
+      .flatMap((segment) => segment.split(/[-_]/))
+      .map(normalizeForMatch)
+      .filter(Boolean);
+    const score = routeWords.reduce((total, word) => total + (wordInText(normalizedText, word) ? 4 : 0), 0);
+    const pagePhraseScore = routeWords.some((word) => normalizedText.includes(`${word} page`)) ? 3 : 0;
+    const fullRouteScore = normalizedText.includes(route.replaceAll("/", " ").trim()) ? 2 : 0;
+    const totalScore = score + pagePhraseScore + fullRouteScore;
+
+    if (totalScore > 0 && (!best || totalScore > best.score)) {
+      best = { route, score: totalScore };
+    }
+  }
+
+  return best?.route;
+}
+
+async function discoverNextAppRoutes(routeRoot: string): Promise<string[]> {
+  async function walk(directory: string, segments: string[]): Promise<string[]> {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    const routes: string[] = [];
+    const hasPage = entries.some((entry) => entry.isFile() && /^page\.(tsx|ts|jsx|js|mdx)$/.test(entry.name));
+    if (hasPage && !segments.some((segment) => segment.startsWith("[") || segment.startsWith("("))) {
+      routes.push(routePathFromSegments(segments));
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith("_") || entry.name === "api") {
+        continue;
+      }
+
+      const nextSegments = entry.name.startsWith("(") ? segments : [...segments, entry.name];
+      routes.push(...(await walk(path.join(directory, entry.name), nextSegments)));
+    }
+
+    return routes;
+  }
+
+  return walk(routeRoot, []);
+}
+
 function extractExplicitUrls(command: string): string[] {
   return [...command.matchAll(/\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/[^\s]*)?/gi)].map((match) =>
     normalizeLocalUrl(match[0] ?? "")
   );
+}
+
+function extractExplicitPath(text: string): string | undefined {
+  const match = text.match(/(?:^|\s)(\/[a-z0-9][a-z0-9/_-]*)(?:\s|$|[,.?!])/i);
+  if (!match?.[1]) {
+    return undefined;
+  }
+
+  return normalizeRoutePath(match[1]);
 }
 
 function detectKnownDevServerPort(command: string): number | undefined {
@@ -176,6 +287,35 @@ function normalizeLocalUrl(url: string): string {
 
 function uniqueUrls(urls: string[]): string[] {
   return [...new Set(urls.map((url) => normalizeLocalUrl(url.trim())).filter(Boolean))];
+}
+
+function uniqueRoutePaths(paths: string[]): string[] {
+  return [...new Set(paths.map(normalizeRoutePath))].sort((a, b) => a.localeCompare(b));
+}
+
+function withPath(baseUrl: string, routePath: string): string {
+  const url = new URL(normalizeLocalUrl(baseUrl));
+  url.pathname = normalizeRoutePath(routePath);
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/$/, url.pathname === "/" ? "/" : "");
+}
+
+function routePathFromSegments(segments: string[]): string {
+  return normalizeRoutePath(`/${segments.join("/")}`);
+}
+
+function normalizeRoutePath(routePath: string): string {
+  const cleaned = routePath.trim().replace(/\/+/g, "/").replace(/\/$/, "");
+  return cleaned && cleaned !== "/" ? cleaned : "/";
+}
+
+function normalizeForMatch(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function wordInText(text: string, word: string): boolean {
+  return new RegExp(`(?:^| )${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?: |$)`).test(text);
 }
 
 function sanitizeFilePart(value: string): string {

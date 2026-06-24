@@ -86,7 +86,7 @@ client.on("messageCreate", async (message) => {
     if (statusRequest.isStatus) {
       await message.channel.sendTyping();
       console.log(`Status request from ${message.author.tag}: image=${statusRequest.wantsImage} question=${Boolean(statusRequest.question)}`);
-      const snapshot = await getStatusSnapshotResponse(config, statusRequest.wantsImage, statusProjectRequest.project);
+      const snapshot = await getStatusSnapshotResponse(config, statusRequest.wantsImage, statusProjectRequest.project, statusRequest.question);
       await replyToMessageWithChunks(message, snapshot);
 
       if (statusRequest.question) {
@@ -146,7 +146,7 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     const projectName = interaction.options.getString("project");
     const question = interaction.options.getString("question") ?? undefined;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
-    const snapshot = await getStatusSnapshotResponse(appConfig, interaction.options.getBoolean("image") ?? false, project);
+    const snapshot = await getStatusSnapshotResponse(appConfig, interaction.options.getBoolean("image") ?? false, project, question);
     await editInteractionWithChunks(interaction, snapshot);
 
     if (question) {
@@ -275,13 +275,14 @@ interface BotResponse {
 async function getStatusSnapshotResponse(
   appConfig: AppConfig,
   wantsImage: boolean,
-  requestedProject?: ProjectEntry
+  requestedProject?: ProjectEntry,
+  requestText = ""
 ): Promise<BotResponse> {
   let content = await getWorkStatusMessage(appConfig);
 
   if (wantsImage) {
     const project = requestedProject ?? defaultProject(appConfig.projects);
-    const screenshot = await captureProjectScreenshot(project);
+    const screenshot = await captureProjectScreenshot(project, { requestText });
 
     if (screenshot) {
       content = `${content}\n\nAttached live UI screenshot for \`${project.name}\` from ${screenshot.url}.`;
