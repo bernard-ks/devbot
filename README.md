@@ -44,7 +44,7 @@ npm start
 ## Discord Commands
 
 - `/projects`: List configured projects.
-- `/status`: Show any Codex dev work currently running through this bot process.
+- `/status`: Show Codex dev work currently running through this bot process, plus local Codex sessions detected for configured project paths.
 - `/refresh project:<name>`: Rebuild the in-memory file index for a project.
 - `/ask project:<name> question:<text> include:<optional patterns>`: Ask the model a question with local project context.
 - `/act project:<name> task:<text> include:<optional patterns>`: Ask local Codex to perform a focused project task and return a fixed `Project / Request / Actions / Verification / Result` summary.
@@ -59,7 +59,7 @@ You can also mention the bot in a channel:
 
 If only one project is configured, mentions default to that project. If multiple projects are configured, include `project:<name>`.
 
-Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@devbot what's currently in progress` do not invoke Codex. They return the bot's active in-memory work tracker, or `No Codex dev work is currently in progress.` when idle.
+Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@devbot what's currently in progress` do not invoke Codex. They return the bot's active in-memory work tracker plus sanitized local Codex process matches for configured project paths, or `No Codex dev work is currently in progress.` when idle.
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 

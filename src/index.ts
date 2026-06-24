@@ -10,7 +10,7 @@ import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
 import { isWorkStatusQuestion, parseMentionRequest, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
-import { formatWorkStatus, WorkTracker } from "./work-status.js";
+import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
 
 const config = loadConfig();
@@ -61,7 +61,7 @@ client.on("messageCreate", async (message) => {
 
     const mentionText = stripBotMention(message.content, client.user.id);
     if (isWorkStatusQuestion(mentionText)) {
-      await message.reply(formatWorkStatus(workTracker.snapshot()));
+      await message.reply(await getWorkStatusMessage(config));
       return;
     }
 
@@ -106,7 +106,7 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
   }
 
   if (interaction.commandName === "status") {
-    await interaction.reply(formatWorkStatus(workTracker.snapshot()));
+    await interaction.reply(await getWorkStatusMessage(appConfig));
     return;
   }
 
@@ -200,6 +200,12 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
   } finally {
     workTracker.finish(work.id);
   }
+}
+
+async function getWorkStatusMessage(appConfig: AppConfig): Promise<string> {
+  const activeBotWork = workTracker.snapshot();
+  const externalCodexWork = await findExternalCodexWork(appConfig.projects);
+  return formatWorkStatus([...activeBotWork, ...externalCodexWork]);
 }
 
 async function runCodex(

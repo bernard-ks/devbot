@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { isWorkStatusQuestion, parseMentionRequest } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
-import { formatWorkStatus, WorkTracker } from "./work-status.js";
+import { formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
 
 const scanner = {
   maxIndexedFileBytes: 80_000,
@@ -119,9 +119,34 @@ test("work status reports empty and active Codex work", () => {
 
   assert.equal(
     formatWorkStatus(tracker.snapshot(), new Date("2026-06-23T20:01:05.000Z")),
-    "Codex dev work currently in progress: 1\n- `pullprice` action for Shadow.bk, running 1m 5s: run a repo health check"
+    "Codex dev work currently in progress: 1\n- `pullprice` action via bot for Shadow.bk, running 1m 5s: run a repo health check"
   );
 
   tracker.finish(work.id);
   assert.equal(formatWorkStatus(tracker.snapshot()), "No Codex dev work is currently in progress.");
+});
+
+test("external Codex process parser detects configured project sessions without leaking commands", () => {
+  const output = [
+    "42248 16:54 /Applications/Codex.app/Contents/Resources/cua_node/bin/node --experimental-vm-modules /tmp/kernel.js --session-id abc --working-dir /Users/bernard/Documents/PullPrice",
+    "59726 01:02 /Applications/Codex.app/Contents/Resources/codex exec --ephemeral --sandbox workspace-write --cd /Users/bernard/Documents/PullPrice --output-last-message /tmp/answer.txt long prompt text",
+    "59727 01:02 /Applications/Codex.app/Contents/Resources/codex exec --cd /Users/bernard/Documents/PullPrice --output-last-message /tmp/devbot-codex-abc/answer.txt bot-owned prompt",
+    "99999 00:01 rg PullPrice"
+  ].join("\n");
+
+  const work = parseExternalCodexWork(
+    output,
+    [{ name: "pullprice", root: "/Users/bernard/Documents/PullPrice" }],
+    new Date("2026-06-23T20:20:00.000Z")
+  );
+
+  assert.equal(work.length, 2);
+  assert.equal(work[0]?.projectName, "pullprice");
+  assert.equal(work[0]?.source, "local-codex");
+  assert.equal(work[0]?.mode, "session");
+  assert.equal(work[0]?.pid, 42248);
+  assert.equal(work[0]?.text, "local Codex app session");
+  assert.equal(work[1]?.mode, "action");
+  assert.equal(work[1]?.pid, 59726);
+  assert.equal(work.some((item) => item.text.includes("long prompt text")), false);
 });
