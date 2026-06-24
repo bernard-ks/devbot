@@ -9,6 +9,12 @@ export interface ParsedMentionRequest {
   mode: CodexRequestMode;
 }
 
+export interface ParsedStatusRequest {
+  isStatus: boolean;
+  question: string | undefined;
+  wantsImage: boolean;
+}
+
 export function parseMentionRequest(content: string, botUserId: string, projects: ProjectEntry[]): ParsedMentionRequest {
   let text = stripBotMention(content, botUserId);
   const projectMatch = text.match(/\bproject:([a-z0-9_-]+)\b/i);
@@ -38,11 +44,43 @@ export function stripBotMention(content: string, botUserId: string): string {
 }
 
 export function isWorkStatusQuestion(text: string): boolean {
+  return parseStatusRequest(text).isStatus;
+}
+
+export function parseStatusRequest(text: string): ParsedStatusRequest {
   const normalized = text.toLowerCase().replace(/[?!.]/g, "").replace(/\s+/g, " ").trim();
+  const isStatus =
+    normalized === "status" ||
+    normalized === "wip" ||
+    /\b(work in progress|in progress|currently working|working on|current work|dev work|codex work|what are you working on)\b/.test(normalized) ||
+    /\b(status|state)\s+(on|of|for|about)\b/.test(normalized);
+
+  if (!isStatus) {
+    return { isStatus: false, question: undefined, wantsImage: false };
+  }
+
+  const wantsImage = wantsStatusImage(text);
+  const question = isSimpleStatusRequest(normalized) ? undefined : text.trim();
+  return { isStatus: true, question, wantsImage };
+}
+
+function isSimpleStatusRequest(normalized: string): boolean {
   return (
     normalized === "status" ||
     normalized === "wip" ||
-    /\b(work in progress|in progress|currently working|working on|current work|dev work|codex work|what are you working on)\b/.test(normalized)
+    normalized === "what are you working on" ||
+    normalized === "what is currently in progress" ||
+    normalized === "whats currently in progress" ||
+    normalized === "what's currently in progress" ||
+    normalized === "current dev work"
+  );
+}
+
+function wantsStatusImage(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    /\b(snip|screenshot|screen shot|image|picture|pic)\b/.test(normalized) ||
+    /\b(send|attach|include|show)\b.*\b(output|snip|screenshot|image|picture|pic)\b/.test(normalized)
   );
 }
 

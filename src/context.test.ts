@@ -4,8 +4,9 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
-import { isWorkStatusQuestion, parseMentionRequest } from "./mention.js";
+import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
+import { renderStatusImage } from "./status-image.js";
 import { formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
 
 const scanner = {
@@ -104,6 +105,26 @@ test("work status phrases are detected before Codex routing", () => {
   assert.equal(isWorkStatusQuestion("fix the failing tests"), false);
 });
 
+test("status requests preserve detail questions and image intent", () => {
+  assert.deepEqual(parseStatusRequest("status"), {
+    isStatus: true,
+    question: undefined,
+    wantsImage: false
+  });
+
+  assert.deepEqual(parseStatusRequest("what's the status on the web build, send me a snip of the output"), {
+    isStatus: true,
+    question: "what's the status on the web build, send me a snip of the output",
+    wantsImage: true
+  });
+
+  assert.deepEqual(parseStatusRequest("fix the failing tests"), {
+    isStatus: false,
+    question: undefined,
+    wantsImage: false
+  });
+});
+
 test("work status reports empty and active Codex work", () => {
   const tracker = new WorkTracker();
 
@@ -125,6 +146,11 @@ test("work status reports empty and active Codex work", () => {
 
   tracker.finish(work.id);
   assert.equal(formatWorkStatus(tracker.snapshot()), "No Codex dev work is currently in progress.");
+});
+
+test("status image renderer returns a png", async () => {
+  const image = await renderStatusImage("Codex dev work currently in progress: 1\n- pullprice session");
+  assert.equal(image.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
 });
 
 test("external Codex process parser detects configured project sessions without leaking commands", () => {

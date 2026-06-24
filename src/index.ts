@@ -1,4 +1,5 @@
 import {
+  AttachmentBuilder,
   Client,
   GatewayIntentBits,
   GuildMember,
@@ -8,8 +9,9 @@ import type { AutocompleteInteraction, ChatInputCommandInteraction, Interaction,
 import { loadConfig } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
-import { isWorkStatusQuestion, parseMentionRequest, stripBotMention } from "./mention.js";
+import { parseMentionRequest, parseStatusRequest, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
+import { renderStatusImage } from "./status-image.js";
 import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
 
@@ -59,9 +61,18 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const mentionText = stripBotMention(message.content, client.user.id);
-    if (isWorkStatusQuestion(mentionText)) {
-      await message.reply(await getWorkStatusMessage(config));
+    const statusProjectRequest = parseOptionalProjectToken(stripBotMention(message.content, client.user.id), config.projects);
+    const statusRequest = parseStatusRequest(statusProjectRequest.text);
+    if (statusRequest.isStatus) {
+      await message.channel.sendTyping();
+      const response = await getStatusResponse({
+        appConfig: config,
+        question: statusRequest.question,
+        wantsImage: statusRequest.wantsImage,
+        requester: message.author.tag,
+        project: statusProjectRequest.project
+      });
+      await replyToMessageWithChunks(message, response);
       return;
     }
 
@@ -106,7 +117,16 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
   }
 
   if (interaction.commandName === "status") {
-    await interaction.reply(await getWorkStatusMessage(appConfig));
+    await interaction.deferReply();
+    const projectName = interaction.options.getString("project");
+    const response = await getStatusResponse({
+      appConfig,
+      question: interaction.options.getString("question") ?? undefined,
+      wantsImage: interaction.options.getBoolean("image") ?? false,
+      requester: interaction.user.tag,
+      project: projectName ? mustFindProject(appConfig.projects, projectName) : undefined
+    });
+    await editInteractionWithChunks(interaction, response);
     return;
   }
 
@@ -208,6 +228,74 @@ async function getWorkStatusMessage(appConfig: AppConfig): Promise<string> {
   return formatWorkStatus([...activeBotWork, ...externalCodexWork]);
 }
 
+interface StatusResponseOptions {
+  appConfig: AppConfig;
+  requester: string;
+  project: ProjectEntry | undefined;
+  question: string | undefined;
+  wantsImage: boolean;
+}
+
+interface BotResponse {
+  content: string;
+  image?: Buffer;
+}
+
+async function getStatusResponse(options: StatusResponseOptions): Promise<BotResponse> {
+  const status = await getWorkStatusMessage(options.appConfig);
+  let content = status;
+
+  if (options.question) {
+    const project = options.project ?? defaultProject(options.appConfig.projects);
+    const detailPrompt = [
+      "Give a deeper development status update for the configured project.",
+      "Use the current work snapshot below as live context, then inspect the project read-only if needed.",
+      "Be concrete about what appears active, what output/state is visible, and what is unknown.",
+      "",
+      "Current work snapshot:",
+      status,
+      "",
+      "Status question:",
+      options.question
+    ].join("\n");
+    const { answer } = await runProjectRequest({
+      appConfig: options.appConfig,
+      project,
+      text: detailPrompt,
+      includePatterns: [],
+      mode: "answer",
+      requester: options.requester
+    });
+    content = [`Status snapshot:`, status, "", `Detailed update for \`${project.name}\`:`, answer].join("\n");
+  }
+
+  if (options.wantsImage) {
+    return { content, image: await renderStatusImage(content) };
+  }
+
+  return { content };
+}
+
+async function replyToMessageWithChunks(message: Message, response: BotResponse): Promise<void> {
+  const chunks = splitDiscordMessage(response.content);
+  const files = response.image ? [new AttachmentBuilder(response.image, { name: "devbot-status.png" })] : [];
+  await message.reply({ content: chunks[0] ?? "No status generated.", files });
+
+  for (const chunk of chunks.slice(1)) {
+    await message.reply(chunk);
+  }
+}
+
+async function editInteractionWithChunks(interaction: ChatInputCommandInteraction, response: BotResponse): Promise<void> {
+  const chunks = splitDiscordMessage(response.content);
+  const files = response.image ? [new AttachmentBuilder(response.image, { name: "devbot-status.png" })] : [];
+  await interaction.editReply({ content: chunks[0] ?? "No status generated.", files });
+
+  for (const chunk of chunks.slice(1)) {
+    await interaction.followUp(chunk);
+  }
+}
+
 async function runCodex(
   appConfig: AppConfig,
   text: string,
@@ -240,6 +328,26 @@ function mustFindProject(projects: ProjectEntry[], name: string): ProjectEntry {
   }
 
   return project;
+}
+
+function parseOptionalProjectToken(text: string, projects: ProjectEntry[]): { text: string; project: ProjectEntry | undefined } {
+  const projectMatch = text.match(/\bproject:([a-z0-9_-]+)\b/i);
+  if (!projectMatch) {
+    return { text, project: undefined };
+  }
+
+  return {
+    text: text.replace(projectMatch[0], "").trim(),
+    project: mustFindProject(projects, projectMatch[1] ?? "")
+  };
+}
+
+function defaultProject(projects: ProjectEntry[]): ProjectEntry {
+  if (projects.length === 1 && projects[0]) {
+    return projects[0];
+  }
+
+  throw new Error("Multiple projects are configured. Add `project:<name>` to the request.");
 }
 
 function isAllowed(interaction: ChatInputCommandInteraction, appConfig: AppConfig): boolean {

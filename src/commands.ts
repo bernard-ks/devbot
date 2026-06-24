@@ -2,7 +2,18 @@ import { SlashCommandBuilder } from "discord.js";
 
 export const commandDefinitions = [
   new SlashCommandBuilder().setName("projects").setDescription("List configured local projects."),
-  new SlashCommandBuilder().setName("status").setDescription("Show Codex dev work currently in progress."),
+  new SlashCommandBuilder()
+    .setName("status")
+    .setDescription("Show Codex dev work currently in progress.")
+    .addStringOption((option) =>
+      option.setName("project").setDescription("Optional project for a deeper status question.").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((option) =>
+      option.setName("question").setDescription("Optional deeper status question to answer with project context.").setRequired(false)
+    )
+    .addBooleanOption((option) =>
+      option.setName("image").setDescription("Attach the status output as a PNG image.").setRequired(false)
+    ),
   new SlashCommandBuilder()
     .setName("refresh")
     .setDescription("Refresh the indexed context for a project.")
