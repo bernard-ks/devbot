@@ -52,7 +52,16 @@ client.on("interactionCreate", async (interaction) => {
 
 client.on("messageCreate", async (message) => {
   try {
-    if (message.author.bot || !client.user || !message.mentions.users.has(client.user.id)) {
+    if (message.author.bot || !client.user) {
+      return;
+    }
+
+    const botRoleMentionIds = getBotRoleMentionIds(message, client.user.username);
+    const mentionsBot =
+      message.mentions.users.has(client.user.id) ||
+      botRoleMentionIds.length > 0 ||
+      message.content.toLowerCase().includes(`@${client.user.username.toLowerCase()}`);
+    if (!mentionsBot) {
       return;
     }
 
@@ -61,8 +70,19 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const statusProjectRequest = parseOptionalProjectToken(stripBotMention(message.content, client.user.id), config.projects);
-    const statusRequest = parseStatusRequest(statusProjectRequest.text);
+    const mentionText = stripBotMention(message.content, client.user.id, botRoleMentionIds);
+    console.log(
+      `Mention from ${message.author.tag}: content=${JSON.stringify(truncateForLog(message.content))} text=${JSON.stringify(
+        truncateForLog(mentionText)
+      )}`
+    );
+
+    const statusProjectRequest = parseOptionalProjectToken(mentionText, config.projects);
+    const parsedStatusRequest = parseStatusRequest(statusProjectRequest.text);
+    const statusRequest = parsedStatusRequest.isStatus
+      ? parsedStatusRequest
+      : parseFallbackStatusRequest(statusProjectRequest.text);
+
     if (statusRequest.isStatus) {
       await message.channel.sendTyping();
       console.log(`Status request from ${message.author.tag}: image=${statusRequest.wantsImage} question=${Boolean(statusRequest.question)}`);
@@ -81,7 +101,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const request = parseMentionRequest(message.content, client.user.id, config.projects);
+    const request = parseMentionRequest(message.content, client.user.id, config.projects, botRoleMentionIds);
     if (!request.text) {
       await message.reply("Tell me what to do after the mention. Example: `@devbot fix the failing tests`");
       return;
@@ -367,6 +387,29 @@ function defaultProject(projects: ProjectEntry[]): ProjectEntry {
   }
 
   throw new Error("Multiple projects are configured. Add `project:<name>` to the request.");
+}
+
+function parseFallbackStatusRequest(text: string): { isStatus: boolean; question: string | undefined; wantsImage: boolean } {
+  const normalized = text.toLowerCase();
+  const isStatus = /\b(status|state|progress|wip|working|work|snip|screenshot|screen shot|output)\b/.test(normalized);
+  if (!isStatus) {
+    return { isStatus: false, question: undefined, wantsImage: false };
+  }
+
+  const wantsImage = /\b(snip|screenshot|screen shot|image|picture|pic|output)\b/.test(normalized);
+  return { isStatus: true, question: text.trim() || undefined, wantsImage };
+}
+
+function truncateForLog(value: string): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length > 220 ? `${compact.slice(0, 217)}...` : compact;
+}
+
+function getBotRoleMentionIds(message: Message, botUsername: string): string[] {
+  const normalizedBotName = botUsername.toLowerCase();
+  return message.mentions.roles
+    .filter((role) => role.name.toLowerCase() === normalizedBotName)
+    .map((role) => role.id);
 }
 
 function isAllowed(interaction: ChatInputCommandInteraction, appConfig: AppConfig): boolean {

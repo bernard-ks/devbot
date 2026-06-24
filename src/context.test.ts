@@ -97,6 +97,15 @@ test("mention mode override wins over inferred mode", () => {
   assert.equal(request.mode, "action");
 });
 
+test("role mentions can invoke the bot", () => {
+  const request = parseMentionRequest("<@&456> what's the status on the web build", "123", [{ name: "pullprice", root: "/tmp/pullprice" }], [
+    "456"
+  ]);
+
+  assert.equal(request.text, "what's the status on the web build");
+  assert.equal(request.mode, "answer");
+});
+
 test("work status phrases are detected before Codex routing", () => {
   assert.equal(isWorkStatusQuestion("what is currently in progress"), true);
   assert.equal(isWorkStatusQuestion("current dev work?"), true);

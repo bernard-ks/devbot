@@ -15,8 +15,13 @@ export interface ParsedStatusRequest {
   wantsImage: boolean;
 }
 
-export function parseMentionRequest(content: string, botUserId: string, projects: ProjectEntry[]): ParsedMentionRequest {
-  let text = stripBotMention(content, botUserId);
+export function parseMentionRequest(
+  content: string,
+  botUserId: string,
+  projects: ProjectEntry[],
+  botRoleIds: string[] = []
+): ParsedMentionRequest {
+  let text = stripBotMention(content, botUserId, botRoleIds);
   const projectMatch = text.match(/\bproject:([a-z0-9_-]+)\b/i);
   const includeMatch = text.match(/\binclude:([^\s]+)/i);
   const modeMatch = text.match(/\bmode:(ask|answer|act|action)\b/i);
@@ -39,8 +44,13 @@ export function parseMentionRequest(content: string, botUserId: string, projects
   return { project, text, includePatterns, mode };
 }
 
-export function stripBotMention(content: string, botUserId: string): string {
-  return content.replace(new RegExp(`<@!?${botUserId}>`, "g"), "").trim();
+export function stripBotMention(content: string, botUserId: string, botRoleIds: string[] = []): string {
+  let text = content.replace(new RegExp(`<@!?${botUserId}>`, "g"), "");
+  for (const roleId of botRoleIds) {
+    text = text.replace(new RegExp(`<@&${roleId}>`, "g"), "");
+  }
+
+  return text.trim();
 }
 
 export function isWorkStatusQuestion(text: string): boolean {
