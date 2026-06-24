@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
+import { detectLocalWebUrlsFromPs } from "./project-screenshot.js";
 import { renderStatusImage } from "./status-image.js";
 import { formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
 
@@ -160,6 +161,17 @@ test("work status reports empty and active Codex work", () => {
 test("status image renderer returns a png", async () => {
   const image = await renderStatusImage("Codex dev work currently in progress: 1\n- pullprice session");
   assert.equal(image.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+});
+
+test("project screenshot detection finds a running Next dev server for the project", () => {
+  const output = [
+    "node /Users/bernard/Documents/PullPrice/PullPriceWeb/web/node_modules/.bin/next dev -p 3001",
+    "node /Users/bernard/Documents/Other/web/node_modules/.bin/vite --port 5174"
+  ].join("\n");
+
+  assert.deepEqual(detectLocalWebUrlsFromPs(output, { name: "pullprice", root: "/Users/bernard/Documents/PullPrice" }), [
+    "http://127.0.0.1:3001"
+  ]);
 });
 
 test("external Codex process parser detects configured project sessions without leaking commands", () => {

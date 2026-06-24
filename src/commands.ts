@@ -12,7 +12,7 @@ export const commandDefinitions = [
       option.setName("question").setDescription("Optional deeper status question to answer with project context.").setRequired(false)
     )
     .addBooleanOption((option) =>
-      option.setName("image").setDescription("Attach the status output as a PNG image.").setRequired(false)
+      option.setName("image").setDescription("Attach a live screenshot of the project UI when available.").setRequired(false)
     ),
   new SlashCommandBuilder()
     .setName("refresh")

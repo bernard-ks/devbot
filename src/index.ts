@@ -11,7 +11,7 @@ import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
 import { parseMentionRequest, parseStatusRequest, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
-import { renderStatusImage } from "./status-image.js";
+import { captureProjectScreenshot } from "./project-screenshot.js";
 import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
 
@@ -86,7 +86,7 @@ client.on("messageCreate", async (message) => {
     if (statusRequest.isStatus) {
       await message.channel.sendTyping();
       console.log(`Status request from ${message.author.tag}: image=${statusRequest.wantsImage} question=${Boolean(statusRequest.question)}`);
-      const snapshot = await getStatusSnapshotResponse(config, statusRequest.wantsImage);
+      const snapshot = await getStatusSnapshotResponse(config, statusRequest.wantsImage, statusProjectRequest.project);
       await replyToMessageWithChunks(message, snapshot);
 
       if (statusRequest.question) {
@@ -145,7 +145,8 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     await interaction.deferReply();
     const projectName = interaction.options.getString("project");
     const question = interaction.options.getString("question") ?? undefined;
-    const snapshot = await getStatusSnapshotResponse(appConfig, interaction.options.getBoolean("image") ?? false);
+    const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+    const snapshot = await getStatusSnapshotResponse(appConfig, interaction.options.getBoolean("image") ?? false, project);
     await editInteractionWithChunks(interaction, snapshot);
 
     if (question) {
@@ -153,7 +154,7 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
         appConfig,
         question,
         requester: interaction.user.tag,
-        project: projectName ? mustFindProject(appConfig.projects, projectName) : undefined
+        project
       });
       await followUpWithChunks(interaction, detail);
     }
@@ -268,13 +269,26 @@ interface StatusResponseOptions {
 interface BotResponse {
   content: string;
   image?: Buffer;
+  imageName?: string;
 }
 
-async function getStatusSnapshotResponse(appConfig: AppConfig, wantsImage: boolean): Promise<BotResponse> {
-  const content = await getWorkStatusMessage(appConfig);
+async function getStatusSnapshotResponse(
+  appConfig: AppConfig,
+  wantsImage: boolean,
+  requestedProject?: ProjectEntry
+): Promise<BotResponse> {
+  let content = await getWorkStatusMessage(appConfig);
 
   if (wantsImage) {
-    return { content, image: await renderStatusImage(content) };
+    const project = requestedProject ?? defaultProject(appConfig.projects);
+    const screenshot = await captureProjectScreenshot(project);
+
+    if (screenshot) {
+      content = `${content}\n\nAttached live UI screenshot for \`${project.name}\` from ${screenshot.url}.`;
+      return { content, image: screenshot.image, imageName: screenshot.fileName };
+    }
+
+    content = `${content}\n\nI could not find a running local web UI to screenshot for \`${project.name}\`. Start the frontend dev server or set PROJECT_SCREENSHOT_URLS_JSON.`;
   }
 
   return { content };
@@ -307,7 +321,7 @@ async function getDetailedStatusResponse(options: StatusResponseOptions): Promis
 
 async function replyToMessageWithChunks(message: Message, response: BotResponse): Promise<void> {
   const chunks = splitDiscordMessage(response.content);
-  const files = response.image ? [new AttachmentBuilder(response.image, { name: "devbot-status.png" })] : [];
+  const files = attachmentFiles(response);
   await message.reply({ content: chunks[0] ?? "No status generated.", files });
 
   for (const chunk of chunks.slice(1)) {
@@ -317,7 +331,7 @@ async function replyToMessageWithChunks(message: Message, response: BotResponse)
 
 async function editInteractionWithChunks(interaction: ChatInputCommandInteraction, response: BotResponse): Promise<void> {
   const chunks = splitDiscordMessage(response.content);
-  const files = response.image ? [new AttachmentBuilder(response.image, { name: "devbot-status.png" })] : [];
+  const files = attachmentFiles(response);
   await interaction.editReply({ content: chunks[0] ?? "No status generated.", files });
 
   for (const chunk of chunks.slice(1)) {
@@ -327,12 +341,16 @@ async function editInteractionWithChunks(interaction: ChatInputCommandInteractio
 
 async function followUpWithChunks(interaction: ChatInputCommandInteraction, response: BotResponse): Promise<void> {
   const chunks = splitDiscordMessage(response.content);
-  const files = response.image ? [new AttachmentBuilder(response.image, { name: "devbot-status.png" })] : [];
+  const files = attachmentFiles(response);
   await interaction.followUp({ content: chunks[0] ?? "No status generated.", files });
 
   for (const chunk of chunks.slice(1)) {
     await interaction.followUp(chunk);
   }
+}
+
+function attachmentFiles(response: BotResponse): AttachmentBuilder[] {
+  return response.image ? [new AttachmentBuilder(response.image, { name: response.imageName ?? "devbot-screenshot.png" })] : [];
 }
 
 async function runCodex(
