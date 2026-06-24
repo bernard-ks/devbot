@@ -42,7 +42,7 @@ export function isWorkStatusQuestion(text: string): boolean {
   return (
     normalized === "status" ||
     normalized === "wip" ||
-    /\b(work in progress|in progress|currently working|working on|current work|dev work|codex work)\b/.test(normalized)
+    /\b(work in progress|in progress|currently working|working on|current work|dev work|codex work|what are you working on)\b/.test(normalized)
   );
 }
 

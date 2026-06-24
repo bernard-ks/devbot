@@ -99,6 +99,7 @@ test("mention mode override wins over inferred mode", () => {
 test("work status phrases are detected before Codex routing", () => {
   assert.equal(isWorkStatusQuestion("what is currently in progress"), true);
   assert.equal(isWorkStatusQuestion("current dev work?"), true);
+  assert.equal(isWorkStatusQuestion("what are you working on?"), true);
   assert.equal(isWorkStatusQuestion("wip"), true);
   assert.equal(isWorkStatusQuestion("fix the failing tests"), false);
 });
