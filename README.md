@@ -44,7 +44,7 @@ npm start
 ## Discord Commands
 
 - `/projects`: List configured projects.
-- `/status project:<optional> question:<optional> image:<optional>`: Show Codex dev work currently running through this bot process, plus local Codex sessions detected for configured project paths. Add a question for a deeper read-only status update, and set `image:true` to attach the output as a PNG.
+- `/status project:<optional> question:<optional> image:<optional>`: Show Codex dev work currently running through this bot process, plus local Codex sessions detected for configured project paths. Add a question for a deeper read-only status update, and set `image:true` to attach a live project UI screenshot when a local web app is detected.
 - `/refresh project:<name>`: Rebuild the in-memory file index for a project.
 - `/ask project:<name> question:<text> include:<optional patterns>`: Ask the model a question with local project context.
 - `/act project:<name> task:<text> include:<optional patterns>`: Ask local Codex to perform a focused project task and return a fixed `Project / Request / Actions / Verification / Result` summary.
@@ -55,12 +55,12 @@ You can also mention the bot in a channel:
 @devbot fix the failing test
 @devbot project:api include:src/* add logging around failed webhooks
 @devbot what's currently in progress
-@devbot what's the status on the web build, send me a snip of the output
+@devbot what's the status on the web build, send me a snip of the browse page
 ```
 
 If only one project is configured, mentions default to that project. If multiple projects are configured, include `project:<name>`.
 
-Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@devbot what's currently in progress` do not invoke Codex. They return the bot's active in-memory work tracker plus sanitized local Codex process matches for configured project paths, or `No Codex dev work is currently in progress.` when idle. If a status mention includes a deeper question, the bot runs a read-only Codex status update. If the message asks for a snip, screenshot, image, or picture, the bot attaches a PNG rendering of the status output.
+Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@devbot what's currently in progress` do not invoke Codex. They return the bot's active in-memory work tracker plus sanitized local Codex process matches for configured project paths, or `No Codex dev work is currently in progress.` when idle. If a status mention includes a deeper question, the bot runs a read-only Codex status update. If the message asks for a snip, screenshot, image, or picture, the bot tries to attach a live project UI screenshot. Page hints such as `browse page`, `watchlist`, or explicit paths like `/cards/op01-016` target matching local routes when available.
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
