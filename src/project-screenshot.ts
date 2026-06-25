@@ -6,15 +6,32 @@ import type { ProjectEntry } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_VIEWPORT = { width: 1440, height: 1000 };
+const VIEWPORTS = {
+  desktop: DEFAULT_VIEWPORT,
+  tablet: { width: 820, height: 1180 },
+  mobile: { width: 390, height: 844 }
+} as const;
 
 export interface ProjectScreenshot {
   image: Buffer;
   fileName: string;
   url: string;
+  metadata: ProjectScreenshotMetadata;
+}
+
+export interface ProjectScreenshotMetadata {
+  startUrl: string;
+  finalUrl: string;
+  viewport: keyof typeof VIEWPORTS;
+  capturedAt: string;
+  consoleErrors: string[];
+  failedRequests: string[];
+  badResponses: string[];
 }
 
 export interface ProjectScreenshotOptions {
   requestText?: string;
+  viewport?: keyof typeof VIEWPORTS;
 }
 
 export async function captureProjectScreenshot(
@@ -23,6 +40,8 @@ export async function captureProjectScreenshot(
 ): Promise<ProjectScreenshot | undefined> {
   const target = parseExplicitScreenshotTarget(options.requestText ?? "");
   const urls = target.url ? [target.url] : await findProjectWebUrls(project);
+  const viewportName = options.viewport ?? "desktop";
+  const viewport = VIEWPORTS[viewportName];
 
   for (const url of urls) {
     const startUrl = target.path ? withPath(url, target.path) : url;
@@ -33,7 +52,8 @@ export async function captureProjectScreenshot(
     const { chromium } = await import("playwright");
     const browser = await chromium.launch({ headless: true });
     try {
-      const page = await browser.newPage({ viewport: DEFAULT_VIEWPORT });
+      const page = await browser.newPage({ viewport });
+      const diagnostics = collectScreenshotDiagnostics(page);
       await page.goto(startUrl, { waitUntil: "networkidle", timeout: 20_000 });
       if (!target.path && !target.url) {
         await navigateByVisibleUi(page, options.requestText ?? "");
@@ -44,7 +64,16 @@ export async function captureProjectScreenshot(
       return {
         image,
         fileName: `${sanitizeFilePart(project.name)}-${sanitizeFilePart(new URL(finalUrl).pathname || "home")}-screenshot.png`,
-        url: finalUrl
+        url: finalUrl,
+        metadata: {
+          startUrl,
+          finalUrl,
+          viewport: viewportName,
+          capturedAt: new Date().toISOString(),
+          consoleErrors: diagnostics.consoleErrors,
+          failedRequests: diagnostics.failedRequests,
+          badResponses: diagnostics.badResponses
+        }
       };
     } finally {
       await browser.close();
@@ -89,6 +118,10 @@ async function detectRunningProjectWebUrls(project: ProjectEntry): Promise<strin
 
 function configuredProjectUrls(project: ProjectEntry): string[] {
   const urls: string[] = [];
+  if (project.metadata.frontendUrl) {
+    urls.push(project.metadata.frontendUrl);
+  }
+
   const directUrl = process.env.PROJECT_SCREENSHOT_URL?.trim();
   if (directUrl) {
     urls.push(directUrl);
@@ -110,6 +143,34 @@ function configuredProjectUrls(project: ProjectEntry): string[] {
   }
 
   return urls;
+}
+
+function collectScreenshotDiagnostics(page: Page): {
+  consoleErrors: string[];
+  failedRequests: string[];
+  badResponses: string[];
+} {
+  const consoleErrors: string[] = [];
+  const failedRequests: string[] = [];
+  const badResponses: string[] = [];
+
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(truncateDiagnostic(message.text()));
+    }
+  });
+
+  page.on("requestfailed", (request) => {
+    failedRequests.push(truncateDiagnostic(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? ""}`.trim()));
+  });
+
+  page.on("response", (response) => {
+    if (response.status() >= 400) {
+      badResponses.push(truncateDiagnostic(`${response.status()} ${response.url()}`));
+    }
+  });
+
+  return { consoleErrors, failedRequests, badResponses };
 }
 
 export interface NavigationCandidate {
@@ -326,6 +387,11 @@ function wordInText(text: string, word: string): boolean {
 
 function sanitizeFilePart(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "project";
+}
+
+function truncateDiagnostic(value: string): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length > 220 ? `${compact.slice(0, 217)}...` : compact;
 }
 
 const SCREENSHOT_STOP_WORDS = new Set([

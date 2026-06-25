@@ -11,8 +11,19 @@ import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
 import { parseMentionRequest, parseStatusRequest, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
-import { captureProjectScreenshot } from "./project-screenshot.js";
-import { formatTaskDetail, formatTaskList, TaskStore } from "./task-store.js";
+import { captureProjectScreenshot, type ProjectScreenshot } from "./project-screenshot.js";
+import { configuredCommandNames, formatProjectCommandResult, runConfiguredProjectCommand } from "./command-runner.js";
+import {
+  buildCapabilities,
+  createPeerEnvelope,
+  formatCapabilities,
+  formatPeerEnvelope,
+  formatPeerList,
+  parsePeerEnvelope,
+  PeerStore
+} from "./peer.js";
+import { createReviewPacket, evaluateMergeGates, formatMergeGateResult, formatReviewPacket, formatValidationResults, validateReview } from "./review.js";
+import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskStatus } from "./task-store.js";
 import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
 
@@ -20,12 +31,14 @@ const config = loadConfig();
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
+const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
 client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user?.tag ?? "unknown bot"}.`);
+  console.log(`Devbot identity: ${config.botIdentity.displayName} owned by ${config.botIdentity.owner}. Safe mode: ${config.safeMode ? "on" : "off"}.`);
   console.log(`Configured projects: ${config.projects.map((project) => project.name).join(", ")}`);
 });
 
@@ -54,7 +67,12 @@ client.on("interactionCreate", async (interaction) => {
 
 client.on("messageCreate", async (message) => {
   try {
-    if (message.author.bot || !client.user) {
+    if (!client.user) {
+      return;
+    }
+
+    if (message.author.bot) {
+      await maybeHandlePeerMessage(message, config);
       return;
     }
 
@@ -138,7 +156,7 @@ await client.login(config.discordToken);
 async function handleCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   if (interaction.commandName === "projects") {
     await interaction.reply({
-      content: appConfig.projects.map((project) => `- \`${project.name}\` -> \`${project.root}\``).join("\n"),
+      content: appConfig.projects.map(formatProjectSummary).join("\n"),
       flags: MessageFlags.Ephemeral
     });
     return;
@@ -168,15 +186,16 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     await interaction.deferReply();
     const projectName = interaction.options.getString("project");
     const target = interaction.options.getString("target", true);
+    const viewport = interaction.options.getString("viewport") as "desktop" | "tablet" | "mobile" | null;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : defaultProject(appConfig.projects);
-    const screenshot = await captureProjectScreenshot(project, { requestText: target });
+    const screenshot = await captureProjectScreenshot(project, { requestText: target, viewport: viewport ?? "desktop" });
     if (!screenshot) {
       await interaction.editReply(`I could not find a running local web UI to screenshot for \`${project.name}\`.`);
       return;
     }
 
     await editInteractionWithChunks(interaction, {
-      content: `Attached live UI screenshot for \`${project.name}\` from ${screenshot.url}.`,
+      content: formatScreenshotReply(project, screenshot),
       image: screenshot.image,
       imageName: screenshot.fileName
     });
@@ -185,6 +204,31 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
 
   if (interaction.commandName === "task") {
     await handleTaskCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "dashboard") {
+    await handleDashboardCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "run") {
+    await handleRunCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "review") {
+    await handleReviewCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "devbot") {
+    await handleDevbotCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "peer") {
+    await handlePeerCommand(interaction, appConfig);
     return;
   }
 
@@ -332,7 +376,7 @@ async function getStatusSnapshotResponse(
     const screenshot = await captureProjectScreenshot(project, { requestText });
 
     if (screenshot) {
-      content = `${content}\n\nAttached live UI screenshot for \`${project.name}\` from ${screenshot.url}.`;
+      content = `${content}\n\n${formatScreenshotReply(project, screenshot)}`;
       return { content, image: screenshot.image, imageName: screenshot.fileName };
     }
 
@@ -374,8 +418,8 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     await interaction.deferReply();
     const projectName = interaction.options.getString("project") ?? undefined;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
-    const status = interaction.options.getString("status") as "running" | "succeeded" | "failed" | null;
-    const filters: { limit: number; projectName?: string; status?: "running" | "succeeded" | "failed" } = {
+    const status = interaction.options.getString("status") as TaskStatus | null;
+    const filters: { limit: number; projectName?: string; status?: TaskStatus } = {
       limit: interaction.options.getInteger("limit") ?? 10
     };
     if (project?.name) {
@@ -390,11 +434,286 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     return;
   }
 
-  if (subcommand === "show") {
+  if (subcommand === "show" || subcommand === "status") {
     await interaction.deferReply();
     const id = interaction.options.getString("id", true);
     const task = await taskStore.get(id);
     await interaction.editReply(task ? formatTaskDetail(task) : `No saved task found for \`${id}\`.`);
+    return;
+  }
+
+  if (subcommand === "logs") {
+    await interaction.deferReply();
+    const id = interaction.options.getString("id", true);
+    const task = await taskStore.get(id);
+    await interaction.editReply(task ? formatTaskLogs(task) : `No saved task found for \`${id}\`.`);
+    return;
+  }
+
+  if (subcommand === "cancel") {
+    await interaction.deferReply();
+    const id = interaction.options.getString("id", true);
+    const task = await taskStore.cancel(id, `Canceled by ${interaction.user.tag}.`);
+    await interaction.editReply(task ? `Task \`${id}\` is now ${task.status}.` : `No saved task found for \`${id}\`.`);
+    return;
+  }
+
+  if (subcommand === "retry") {
+    await interaction.deferReply();
+    const id = interaction.options.getString("id", true);
+    const task = await taskStore.get(id);
+    if (!task) {
+      await interaction.editReply(`No saved task found for \`${id}\`.`);
+      return;
+    }
+
+    const project = mustFindProject(appConfig.projects, task.projectName);
+    const { answer, taskId } = await runProjectRequest({
+      appConfig,
+      project,
+      text: task.text,
+      includePatterns: task.includePatterns,
+      mode: task.mode === "action" ? "action" : "answer",
+      requester: interaction.user.tag,
+      source: `retry:${task.id}`
+    });
+    await editInteractionWithChunks(interaction, { content: `Retried \`${id}\` as \`${taskId}\`.\n\n${answer}` });
+    return;
+  }
+
+  if (subcommand === "stale") {
+    await interaction.deferReply();
+    const minutes = interaction.options.getInteger("minutes") ?? 30;
+    const projectName = interaction.options.getString("project") ?? undefined;
+    const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+    const running = await taskStore.listRecent({
+      status: "running",
+      limit: 25,
+      ...(project ? { projectName: project.name } : {})
+    });
+    const cutoff = Date.now() - minutes * 60_000;
+    const stale = running.filter((task) => new Date(task.startedAt).getTime() < cutoff);
+    await interaction.editReply(stale.length ? formatTaskList(stale) : `No running tasks older than ${minutes}m.`);
+  }
+}
+
+async function handleDashboardCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  await interaction.deferReply();
+  const projectName = interaction.options.getString("project") ?? undefined;
+  const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+  const projects = project ? [project] : appConfig.projects;
+  const status = await getWorkStatusMessage(appConfig);
+  const recentTasks = await taskStore.listRecent({ limit: 5, ...(project ? { projectName: project.name } : {}) });
+  const lines = [
+    `Devbot dashboard for ${project ? `\`${project.name}\`` : "configured projects"}`,
+    `Bot: \`${appConfig.botIdentity.displayName}\` owned by ${appConfig.botIdentity.owner}`,
+    `Safe mode: ${appConfig.safeMode ? "on" : "off"}`,
+    "",
+    "Projects:",
+    projects.map(formatProjectSummary).join("\n"),
+    "",
+    "Active work:",
+    status,
+    "",
+    "Recent tasks:",
+    formatTaskList(recentTasks)
+  ];
+
+  await editInteractionWithChunks(interaction, { content: lines.join("\n") });
+}
+
+async function handleRunCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  await interaction.deferReply();
+  if (appConfig.safeMode) {
+    await interaction.editReply("Safe mode is on, so configured project command runs are disabled.");
+    return;
+  }
+
+  const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+  const command = interaction.options.getString("command", true);
+  const result = await runConfiguredProjectCommand(project, command);
+  await editInteractionWithChunks(interaction, { content: formatProjectCommandResult(result) });
+}
+
+async function handleReviewCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const subcommand = interaction.options.getSubcommand();
+  const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+
+  if (subcommand === "packet") {
+    await interaction.deferReply();
+    const taskId = interaction.options.getString("task") ?? undefined;
+    const task = taskId ? await taskStore.get(taskId) : undefined;
+    const packet = await createReviewPacket(project, task);
+    await editInteractionWithChunks(interaction, { content: formatReviewPacket(packet) });
+    return;
+  }
+
+  if (appConfig.safeMode) {
+    await interaction.reply({ content: "Safe mode is on, so review validation commands are disabled.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferReply();
+  const commandNames = parseCommandNames(interaction.options.getString("commands"));
+  if (subcommand === "validate") {
+    const results = await validateReview(project, commandNames);
+    await editInteractionWithChunks(interaction, { content: formatValidationResults(project, results) });
+    return;
+  }
+
+  if (subcommand === "gates") {
+    const result = await evaluateMergeGates(project, commandNames);
+    await editInteractionWithChunks(interaction, { content: formatMergeGateResult(project, result) });
+  }
+}
+
+async function handleDevbotCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const subcommand = interaction.options.getSubcommand();
+  const capabilities = buildCapabilities(appConfig, client.user?.id);
+
+  if (subcommand === "capabilities") {
+    await interaction.reply({ content: formatCapabilities(capabilities), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (subcommand === "peers") {
+    await interaction.reply({ content: formatPeerList(await peerStore.list()), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (subcommand === "announce") {
+    await interaction.deferReply();
+    const envelope = createPeerEnvelope({
+      type: "devbot.peer.announce",
+      from: client.user?.id ?? "unknown",
+      owner: appConfig.botIdentity.owner,
+      capabilities
+    });
+    await sendPeerMessage(interaction, appConfig, formatPeerEnvelope(envelope));
+    await interaction.editReply("Announced devbot capabilities.");
+  }
+}
+
+async function handlePeerCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const subcommand = interaction.options.getSubcommand();
+  const peerBotId = parseBotId(interaction.options.getString("bot", true));
+  if (!appConfig.peerBotIds.has(peerBotId)) {
+    await interaction.reply({
+      content: `Peer <@${peerBotId}> is not allow-listed. Add it to PEER_BOT_IDS before sending peer requests.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+  const action = subcommand === "snip" ? "snip" : subcommand === "status" ? "status" : "capabilities";
+  const envelope = createPeerEnvelope({
+    type: "devbot.peer.request",
+    from: client.user?.id ?? "unknown",
+    owner: appConfig.botIdentity.owner,
+    action,
+    ...optionalPeerField("project", interaction.options.getString("project")),
+    ...optionalPeerField("target", interaction.options.getString("target"))
+  });
+
+  await sendPeerMessage(interaction, appConfig, `<@${peerBotId}>\n${formatPeerEnvelope(envelope)}`);
+  await interaction.editReply(`Sent ${action} request \`${envelope.requestId}\` to <@${peerBotId}>.`);
+}
+
+async function maybeHandlePeerMessage(message: Message, appConfig: AppConfig): Promise<void> {
+  if (!client.user || !appConfig.peerBotIds.has(message.author.id)) {
+    return;
+  }
+
+  const envelope = parsePeerEnvelope(message.content);
+  if (!envelope) {
+    return;
+  }
+
+  if (envelope.capabilities) {
+    await peerStore.upsert(message.author.id, envelope.capabilities);
+  }
+
+  if (envelope.type !== "devbot.peer.request") {
+    return;
+  }
+
+  if (!message.mentions.users.has(client.user.id)) {
+    return;
+  }
+
+  if (!envelope.action) {
+    return;
+  }
+
+  if (envelope.action === "capabilities") {
+    const capabilities = buildCapabilities(appConfig, client.user.id);
+    const result = createPeerEnvelope({
+      type: "devbot.peer.result",
+      requestId: envelope.requestId,
+      from: client.user.id,
+      owner: appConfig.botIdentity.owner,
+      action: envelope.action,
+      ok: true,
+      message: formatCapabilities(capabilities),
+      capabilities
+    });
+    await message.reply(formatPeerEnvelope(result));
+    return;
+  }
+
+  let project: ProjectEntry | undefined;
+  try {
+    project = envelope.project ? findProject(appConfig.projects, envelope.project) : defaultProject(appConfig.projects);
+  } catch {
+    project = undefined;
+  }
+  if (!project) {
+    const result = createPeerEnvelope({
+      type: "devbot.peer.result",
+      requestId: envelope.requestId,
+      from: client.user.id,
+      owner: appConfig.botIdentity.owner,
+      action: envelope.action,
+      ok: false,
+      message: `Unknown project: ${envelope.project}`
+    });
+    await message.reply(formatPeerEnvelope(result));
+    return;
+  }
+
+  if (envelope.action === "status") {
+    const status = await getStatusSnapshotResponse(appConfig, false, project, envelope.target ?? "");
+    const result = createPeerEnvelope({
+      type: "devbot.peer.result",
+      requestId: envelope.requestId,
+      from: client.user.id,
+      owner: appConfig.botIdentity.owner,
+      action: envelope.action,
+      project: project.name,
+      ok: true,
+      message: status.content
+    });
+    await message.reply(formatPeerEnvelope(result));
+    return;
+  }
+
+  if (envelope.action === "snip") {
+    const screenshot = await captureProjectScreenshot(project, { requestText: envelope.target ?? "" });
+    const result = createPeerEnvelope({
+      type: "devbot.peer.result",
+      requestId: envelope.requestId,
+      from: client.user.id,
+      owner: appConfig.botIdentity.owner,
+      action: envelope.action,
+      project: project.name,
+      ok: Boolean(screenshot),
+      message: screenshot ? formatScreenshotReply(project, screenshot) : `No running local web UI found for ${project.name}.`
+    });
+    await message.reply({
+      content: formatPeerEnvelope(result),
+      files: screenshot ? [new AttachmentBuilder(screenshot.image, { name: screenshot.fileName })] : []
+    });
   }
 }
 
@@ -432,6 +751,89 @@ function attachmentFiles(response: BotResponse): AttachmentBuilder[] {
   return response.image ? [new AttachmentBuilder(response.image, { name: response.imageName ?? "devbot-screenshot.png" })] : [];
 }
 
+function formatScreenshotReply(project: ProjectEntry, screenshot: ProjectScreenshot): string {
+  const diagnostics = screenshot.metadata;
+  const issueCount = diagnostics.consoleErrors.length + diagnostics.failedRequests.length + diagnostics.badResponses.length;
+  const lines = [
+    `Attached live UI screenshot for \`${project.name}\`.`,
+    `URL: ${diagnostics.finalUrl}`,
+    `Viewport: ${diagnostics.viewport}`,
+    `Captured: ${new Date(diagnostics.capturedAt).toLocaleString()}`,
+    `Diagnostics: ${issueCount === 0 ? "no console errors, failed requests, or bad responses captured." : `${issueCount} issue(s) captured.`}`
+  ];
+
+  if (issueCount > 0) {
+    lines.push(formatDiagnosticList("Console errors", diagnostics.consoleErrors));
+    lines.push(formatDiagnosticList("Failed requests", diagnostics.failedRequests));
+    lines.push(formatDiagnosticList("Bad HTTP responses", diagnostics.badResponses));
+  }
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function formatDiagnosticList(label: string, values: string[]): string {
+  if (values.length === 0) {
+    return "";
+  }
+
+  return `${label}:\n${values.slice(0, 5).map((value) => `- ${value}`).join("\n")}`;
+}
+
+function formatProjectSummary(project: ProjectEntry): string {
+  const commands = configuredCommandNames(project);
+  const details = [
+    `- \`${project.name}\` -> \`${project.root}\``,
+    project.metadata.frontendUrl ? `frontend: ${project.metadata.frontendUrl}` : undefined,
+    commands.length > 0 ? `commands: ${commands.map((command) => `\`${command}\``).join(", ")}` : undefined,
+    project.metadata.ownerBot ? `owner bot: ${project.metadata.ownerBot}` : undefined
+  ].filter(Boolean);
+
+  return details.join(" | ");
+}
+
+function parseCommandNames(value: string | null): string[] | undefined {
+  const parsed = parseIncludePatterns(value);
+  return parsed.length > 0 ? parsed.map((item) => item.toLowerCase()) : undefined;
+}
+
+function parseBotId(value: string): string {
+  return value.trim().replace(/[<@!>]/g, "");
+}
+
+async function sendPeerMessage(
+  interaction: ChatInputCommandInteraction,
+  appConfig: AppConfig,
+  content: string
+): Promise<void> {
+  if (appConfig.coordinationChannelId) {
+    const channel = await client.channels.fetch(appConfig.coordinationChannelId);
+    if (!channel?.isTextBased()) {
+      throw new Error(`Configured coordination channel ${appConfig.coordinationChannelId} is not text-based.`);
+    }
+    await sendToTextChannel(channel, content);
+    return;
+  }
+
+  const channel = interaction.channel;
+  if (!channel?.isTextBased()) {
+    throw new Error("This command must be used in a text channel or COORDINATION_CHANNEL_ID must be configured.");
+  }
+  await sendToTextChannel(channel, content);
+}
+
+async function sendToTextChannel(channel: unknown, content: string): Promise<void> {
+  const sendable = channel as { send?: (message: string) => Promise<unknown> };
+  if (!sendable.send) {
+    throw new Error("Target channel cannot send messages.");
+  }
+
+  await sendable.send(content);
+}
+
+function optionalPeerField(key: "project" | "target", value: string | null): Partial<Record<"project" | "target", string>> {
+  return value?.trim() ? { [key]: value.trim() } : {};
+}
+
 async function runCodex(
   appConfig: AppConfig,
   text: string,
@@ -457,13 +859,22 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, projects
 }
 
 function mustFindProject(projects: ProjectEntry[], name: string): ProjectEntry {
-  const normalized = name.trim().toLowerCase();
-  const project = projects.find((entry) => entry.name === normalized);
+  const project = findProject(projects, name);
   if (!project) {
     throw new Error(`Unknown project: ${name}`);
   }
 
   return project;
+}
+
+function findProject(projects: ProjectEntry[], name: string): ProjectEntry | undefined {
+  const normalized = name.trim().toLowerCase();
+  return projects.find(
+    (entry) =>
+      entry.name === normalized ||
+      entry.metadata.aliases.includes(normalized) ||
+      entry.metadata.canonicalName?.toLowerCase() === normalized
+  );
 }
 
 function parseOptionalProjectToken(text: string, projects: ProjectEntry[]): { text: string; project: ProjectEntry | undefined } {

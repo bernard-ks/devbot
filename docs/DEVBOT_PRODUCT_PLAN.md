@@ -200,24 +200,24 @@ MVP multi-bot flow:
 - Add task IDs and task history commands. Baseline implemented with `/task recent` and `/task show`.
 - Update README to reflect current screenshot behavior. Done for dynamic UI screenshots and `/snip`.
 - Add project metadata config support.
-- Add screenshot diagnostics: console errors and failed requests.
+- Add screenshot diagnostics: console errors, failed requests, bad HTTP responses, URL, viewport, and timestamp. Done.
 
 ### Phase 2: Review-Centered Workflow
 
-- Add branch/review packet creation mode for `/act`.
-- Add review status and verification commands.
-- Add review validation command that runs configured tests.
-- Add merge gate logic.
-- Add a handoff packet generator.
+- Add branch/review packet creation mode for `/act`. MVP implemented as `/review packet`, which can include a saved task ID and local git state.
+- Add review status and verification commands. MVP implemented with `/review validate`.
+- Add review validation command that runs configured tests. Done through project metadata commands.
+- Add merge gate logic. MVP implemented as `/review gates`; it checks clean working tree plus configured validation without merging.
+- Add a handoff packet generator. Done through `/review packet`.
 
 ### Phase 3: Multi-Bot Server MVP
 
-- Add bot identity and peer allowlist config.
-- Add `/devbot announce` and `/devbot peers`.
-- Add structured peer requests over Discord.
-- Support peer status and peer screenshot requests.
-- Support peer review validation requests.
-- Keep edits and merges human-confirmed.
+- Add bot identity and peer allowlist config. Done with `BOT_OWNER`, `BOT_DISPLAY_NAME`, and `PEER_BOT_IDS`.
+- Add `/devbot announce` and `/devbot peers`. Done.
+- Add structured peer requests over Discord. Done with JSON envelopes.
+- Support peer status and peer screenshot requests. Done for allow-listed peers.
+- Support peer review validation requests. Deferred; peer validation implies command execution on another machine and should be gated separately.
+- Keep edits and merges human-confirmed. Done by limiting peer MVP to read-only status/screenshot/capability requests.
 
 ### Phase 4: Team Workflow Automation
 
@@ -225,21 +225,21 @@ MVP multi-bot flow:
 - Add reviewer assignment.
 - Add verification/check summarization.
 - Add cross-bot handoff threads.
-- Add project dashboards in Discord.
-- Add automatic stale task reminders.
+- Add project dashboards in Discord. MVP implemented as `/dashboard`.
+- Add automatic stale task reminders. MVP implemented as `/task stale`; automatic timed reminders remain deferred to avoid surprise channel noise.
 
 ## Near-Term Backlog
 
 - Update README for live UI screenshot behavior. Done.
-- Add `docs/OPERATIONS.md` for setup, restart, and troubleshooting.
-- Add `.devbot/project.example.json`.
+- Add `docs/OPERATIONS.md` for setup, restart, and troubleshooting. Done.
+- Add `.devbot/project.example.json`. Done.
 - Add `/snip` as a dedicated command instead of overloading `/status image:true`. Done.
 - Add `/task` command group. Baseline done.
-- Add `/review` command group.
-- Add `BOT_OWNER`, `BOT_DISPLAY_NAME`, and `PEER_BOT_IDS` config.
-- Add a coordination channel ID config.
-- Add structured result envelopes for bot-to-bot messages.
-- Add tests for peer message parsing and permission enforcement.
+- Add `/review` command group. Done.
+- Add `BOT_OWNER`, `BOT_DISPLAY_NAME`, and `PEER_BOT_IDS` config. Done.
+- Add a coordination channel ID config. Done with `COORDINATION_CHANNEL_ID`.
+- Add structured result envelopes for bot-to-bot messages. Done.
+- Add tests for peer message parsing and permission enforcement. Peer parsing tests added; permission enforcement is handled by `PEER_BOT_IDS` and should get deeper integration tests when Discord handlers are split out.
 
 ## Open Questions
 

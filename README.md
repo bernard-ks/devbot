@@ -4,7 +4,7 @@ A local Discord bot that lets you ask development questions and request focused 
 
 It uses:
 
-- Discord slash commands for `/ask`, `/act`, `/status`, `/snip`, `/task`, `/projects`, and `/refresh`
+- Discord slash commands for `/ask`, `/act`, `/status`, `/snip`, `/task`, `/dashboard`, `/run`, `/review`, `/devbot`, `/peer`, `/projects`, and `/refresh`
 - `@devbot` mentions for action-style requests
 - the local Codex CLI for model answers
 - Local project scanning with default ignores for `.git`, `node_modules`, build output, lock artifacts, and secret-looking files
@@ -16,19 +16,20 @@ This does not require an OpenAI API key. Each request runs `codex exec` locally,
 1. Install Node.js 20 or newer.
 2. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, and `DISCORD_GUILD_ID`.
 3. Copy `config/projects.example.json` to `config/projects.json` and map project names to local paths.
-4. Install dependencies:
+4. Optionally copy `.devbot/project.example.json` into each target project at `<project>/.devbot/project.json` and customize URLs, aliases, and validation commands.
+5. Install dependencies:
 
    ```bash
    npm install
    ```
 
-5. Deploy slash commands to your test Discord server:
+6. Deploy slash commands to your test Discord server:
 
    ```bash
    npm run commands:deploy
    ```
 
-6. Start the bot:
+7. Start the bot:
 
    ```bash
    npm run dev
@@ -48,6 +49,21 @@ npm start
 - `/snip project:<optional> target:<text>`: Attach a live project UI screenshot by opening the running app and navigating visible UI controls from the target text. Explicit paths and local URLs are also supported.
 - `/task recent project:<optional> status:<optional> limit:<optional>`: List recent saved devbot tasks from local task history.
 - `/task show id:<task-id>`: Show one saved task with request, status, and result or error preview.
+- `/task status id:<task-id>`: Alias for showing one saved task.
+- `/task logs id:<task-id>`: Show the saved request, result preview, and error text.
+- `/task cancel id:<task-id>`: Mark a running saved task as canceled in local history.
+- `/task retry id:<task-id>`: Retry a saved task with the same project, mode, text, and include patterns.
+- `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
+- `/dashboard project:<optional>`: Show active work, recent tasks, project metadata, and configured commands.
+- `/run project:<name> command:<name>`: Run a configured command from `<project>/.devbot/project.json`, such as `test`, `build`, `lint`, `verify`, or a named preset.
+- `/review packet project:<name> task:<optional>`: Create a provider-neutral review handoff packet from git status, diff stat, last commit, and optional task context.
+- `/review validate project:<name> commands:<optional>`: Run configured validation commands.
+- `/review gates project:<name> commands:<optional>`: Check merge gates without merging: clean working tree plus validation pass.
+- `/devbot capabilities`: Show this bot's owner, safe mode, projects, and command capabilities.
+- `/devbot announce`: Post a structured capability announcement for peer devbots.
+- `/devbot peers`: List peer devbots that have announced themselves.
+- `/peer status bot:<id-or-mention> project:<optional>`: Ask an allow-listed peer bot for read-only status.
+- `/peer snip bot:<id-or-mention> target:<text> project:<optional>`: Ask an allow-listed peer bot for a live UI screenshot.
 - `/refresh project:<name>`: Rebuild the in-memory file index for a project.
 - `/ask project:<name> question:<text> include:<optional patterns>`: Ask the model a question with local project context.
 - `/act project:<name> task:<text> include:<optional patterns>`: Ask local Codex to perform a focused project task and return a fixed `Project / Request / Actions / Verification / Result` summary.
@@ -68,6 +84,35 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
 Task history is stored locally in `.devbot/tasks.json` by default. Set `DEVBOT_TASK_STORE` to use a different task-history file.
+
+## Project Metadata
+
+Each target project can define optional metadata at `<project>/.devbot/project.json`.
+
+```json
+{
+  "canonicalName": "pullprice",
+  "frontendUrl": "http://127.0.0.1:3000",
+  "defaultBranch": "main",
+  "aliases": ["web", "frontend"],
+  "commands": {
+    "test": ["npm test"],
+    "build": ["npm run build"],
+    "verify": ["npm run build && npm test"],
+    "presets": {
+      "quick-check": "npm run build"
+    }
+  }
+}
+```
+
+Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables `/run`, `/review validate`, and `/review gates`.
+
+## Peer Bots
+
+For multi-dev servers, each developer can run a separate bot application and add the other bot user IDs to `PEER_BOT_IDS`.
+
+Use `/devbot announce` to publish capabilities. Peer requests are sent as structured Discord messages and are limited to read-only capabilities in this MVP: capabilities, status, and screenshots. Peer-triggered edits, pushes, and merges are intentionally not enabled.
 
 ## Project Context Behavior
 

@@ -96,7 +96,12 @@ function wantsStatusImage(text: string): boolean {
 
 function mustFindProject(projects: ProjectEntry[], name: string): ProjectEntry {
   const normalized = name.trim().toLowerCase();
-  const project = projects.find((entry) => entry.name === normalized);
+  const project = projects.find(
+    (entry) =>
+      entry.name === normalized ||
+      entry.metadata.aliases.includes(normalized) ||
+      entry.metadata.canonicalName?.toLowerCase() === normalized
+  );
   if (!project) {
     throw new Error(`Unknown project: ${name}`);
   }

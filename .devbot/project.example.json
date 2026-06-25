@@ -1,0 +1,19 @@
+{
+  "canonicalName": "pullprice",
+  "repoUrl": "git@github.com:example/pullprice.git",
+  "defaultBranch": "main",
+  "frontendUrl": "http://127.0.0.1:3000",
+  "backendUrl": "http://127.0.0.1:8787",
+  "ownerBot": "shadow-devbot",
+  "aliases": ["web", "frontend"],
+  "commands": {
+    "test": ["npm test"],
+    "build": ["npm run build"],
+    "lint": ["npm run lint"],
+    "verify": ["npm run build && npm test"],
+    "presets": {
+      "web-build": "npm run build",
+      "quick-check": "npm run build"
+    }
+  }
+}

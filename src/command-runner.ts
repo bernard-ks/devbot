@@ -1,0 +1,105 @@
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+import type { ProjectEntry } from "./types.js";
+
+const execAsync = promisify(exec);
+const DEFAULT_TIMEOUT_MS = 180_000;
+
+export type ProjectCommandKind = "test" | "build" | "lint" | "verify";
+
+export interface ProjectCommandResult {
+  projectName: string;
+  kind: string;
+  command: string;
+  ok: boolean;
+  exitCode: number | undefined;
+  output: string;
+  startedAt: string;
+  finishedAt: string;
+}
+
+export function configuredCommandNames(project: ProjectEntry): string[] {
+  const builtIns = (["test", "build", "lint", "verify"] as ProjectCommandKind[]).filter(
+    (kind) => project.metadata.commands[kind].length > 0
+  );
+  return [...builtIns, ...Object.keys(project.metadata.commands.presets)].sort();
+}
+
+export function resolveProjectCommand(project: ProjectEntry, name: string): string | undefined {
+  const normalized = name.trim().toLowerCase();
+  if (isProjectCommandKind(normalized)) {
+    return project.metadata.commands[normalized][0];
+  }
+
+  return project.metadata.commands.presets[normalized];
+}
+
+export async function runConfiguredProjectCommand(
+  project: ProjectEntry,
+  name: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS
+): Promise<ProjectCommandResult> {
+  const command = resolveProjectCommand(project, name);
+  if (!command) {
+    throw new Error(
+      `No configured command named ${name} for ${project.name}. Add it to ${project.root}/.devbot/project.json.`
+    );
+  }
+
+  const startedAt = new Date().toISOString();
+  try {
+    const { stdout, stderr } = await execAsync(command, {
+      cwd: project.root,
+      timeout: timeoutMs,
+      maxBuffer: 2_000_000,
+      env: process.env
+    });
+    return {
+      projectName: project.name,
+      kind: name,
+      command,
+      ok: true,
+      exitCode: 0,
+      output: trimOutput(`${stdout}${stderr ? `\n${stderr}` : ""}`),
+      startedAt,
+      finishedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number };
+    return {
+      projectName: project.name,
+      kind: name,
+      command,
+      ok: false,
+      exitCode: typeof err.code === "number" ? err.code : undefined,
+      output: trimOutput(`${err.stdout ?? ""}${err.stderr ? `\n${err.stderr}` : ""}` || err.message),
+      startedAt,
+      finishedAt: new Date().toISOString()
+    };
+  }
+}
+
+export function formatProjectCommandResult(result: ProjectCommandResult): string {
+  const status = result.ok ? "passed" : "failed";
+  const exit = result.exitCode === undefined ? "" : `, exit ${result.exitCode}`;
+  return [
+    `\`${result.kind}\` ${status} for \`${result.projectName}\`${exit}.`,
+    `Command: \`${result.command}\``,
+    "",
+    "Output:",
+    codeBlock(result.output || "(no output)")
+  ].join("\n");
+}
+
+function isProjectCommandKind(value: string): value is ProjectCommandKind {
+  return value === "test" || value === "build" || value === "lint" || value === "verify";
+}
+
+function trimOutput(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.length <= 3_500 ? trimmed : `${trimmed.slice(-3_500)}\n[output truncated to last 3500 chars]`;
+}
+
+function codeBlock(value: string): string {
+  return `\`\`\`\n${value.replace(/```/g, "'''")}\n\`\`\``;
+}

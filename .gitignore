@@ -1,7 +1,8 @@
 node_modules/
 dist/
 .env
-.devbot/
+.devbot/*
+!.devbot/project.example.json
 config/projects.json
 .DS_Store
 coverage/

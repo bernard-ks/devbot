@@ -3,12 +3,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { configuredCommandNames, resolveProjectCommand } from "./command-runner.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
+import { createPeerEnvelope, formatPeerEnvelope, parsePeerEnvelope } from "./peer.js";
 import { bestNavigationCandidate, detectLocalWebUrlsFromPs, extractScreenshotKeywords } from "./project-screenshot.js";
 import { renderStatusImage } from "./status-image.js";
 import { TaskStore } from "./task-store.js";
+import type { ProjectEntry } from "./types.js";
 import { formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
 
 const scanner = {
@@ -17,6 +20,30 @@ const scanner = {
   maxPackedContextChars: 120_000,
   maxRankedFiles: 36
 };
+
+function project(name: string, root: string, overrides: Partial<ProjectEntry["metadata"]> = {}): ProjectEntry {
+  return {
+    name,
+    root,
+    metadata: {
+      canonicalName: undefined,
+      repoUrl: undefined,
+      defaultBranch: "main",
+      frontendUrl: undefined,
+      backendUrl: undefined,
+      ownerBot: undefined,
+      aliases: [],
+      commands: {
+        test: [],
+        build: [],
+        lint: [],
+        verify: [],
+        presets: {}
+      },
+      ...overrides
+    }
+  };
+}
 
 test("packs ranked text context while ignoring env and node_modules", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "project-context-bot-"));
@@ -28,7 +55,7 @@ test("packs ranked text context while ignoring env and node_modules", async () =
   await writeFile(path.join(root, "src", "server.ts"), "export function startServer() { return 'server'; }\n");
 
   const service = new ProjectContextService(scanner);
-  const context = await service.pack({ name: "demo", root }, "How does startServer work?");
+  const context = await service.pack(project("demo", root), "How does startServer work?");
 
   assert.match(context.packedText, /src\/server\.ts/);
   assert.doesNotMatch(context.packedText, /should-not-index/);
@@ -42,7 +69,7 @@ test("include patterns restrict packed files", async () => {
   await writeFile(path.join(root, "src", "bot.ts"), "Discord bot handler\n");
 
   const service = new ProjectContextService(scanner);
-  const context = await service.pack({ name: "demo", root }, "discord bot", ["src/*"]);
+  const context = await service.pack(project("demo", root), "discord bot", ["src/*"]);
 
   assert.equal(context.files.length, 1);
   assert.equal(context.files[0]?.relativePath, path.join("src", "bot.ts"));
@@ -53,7 +80,7 @@ test("redacts secret-looking values inside indexed files", async () => {
   await writeFile(path.join(root, "config.ts"), "const token = 'abcdabcdabcdabcdabcdabcd';\nconst name = 'ok';\n");
 
   const service = new ProjectContextService(scanner);
-  const context = await service.pack({ name: "demo", root }, "token");
+  const context = await service.pack(project("demo", root), "token");
 
   assert.match(context.packedText, /\[REDACTED\]/);
   assert.doesNotMatch(context.packedText, /abcdabcdabcdabcdabcdabcd/);
@@ -71,7 +98,7 @@ test("splitDiscordMessage keeps chunks inside the requested limit", () => {
 
 test("mention status questions route to read-only answer mode", () => {
   const request = parseMentionRequest("<@123> whats the current state of pullprice", "123", [
-    { name: "pullprice", root: "/tmp/pullprice" }
+    project("pullprice", "/tmp/pullprice")
   ]);
 
   assert.equal(request.project.name, "pullprice");
@@ -81,7 +108,7 @@ test("mention status questions route to read-only answer mode", () => {
 
 test("mention action verbs route to action mode", () => {
   const request = parseMentionRequest("<@!123> project:pullprice include:src/* fix the failing tests", "123", [
-    { name: "pullprice", root: "/tmp/pullprice" }
+    project("pullprice", "/tmp/pullprice")
   ]);
 
   assert.equal(request.project.name, "pullprice");
@@ -92,7 +119,7 @@ test("mention action verbs route to action mode", () => {
 
 test("mention mode override wins over inferred mode", () => {
   const request = parseMentionRequest("<@123> mode:action whats the current state", "123", [
-    { name: "pullprice", root: "/tmp/pullprice" }
+    project("pullprice", "/tmp/pullprice")
   ]);
 
   assert.equal(request.text, "whats the current state");
@@ -100,7 +127,7 @@ test("mention mode override wins over inferred mode", () => {
 });
 
 test("role mentions can invoke the bot", () => {
-  const request = parseMentionRequest("<@&456> what's the status on the web build", "123", [{ name: "pullprice", root: "/tmp/pullprice" }], [
+  const request = parseMentionRequest("<@&456> what's the status on the web build", "123", [project("pullprice", "/tmp/pullprice")], [
     "456"
   ]);
 
@@ -185,6 +212,63 @@ test("task store persists task lifecycle to disk", async () => {
   assert.equal(recent[0]?.id, task.id);
 });
 
+test("task store can mark running tasks as canceled", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-store-"));
+  const store = new TaskStore(path.join(root, "tasks.json"));
+  const task = await store.start({
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    text: "do work"
+  });
+
+  const canceled = await store.cancel(task.id, "stopped");
+  const saved = await store.get(task.id);
+
+  assert.equal(canceled?.status, "canceled");
+  assert.equal(saved?.status, "canceled");
+  assert.equal(saved?.error, "stopped");
+});
+
+test("project metadata exposes configured commands and presets", () => {
+  const demo = project("demo", "/tmp/demo", {
+    commands: {
+      test: ["npm test"],
+      build: ["npm run build"],
+      lint: [],
+      verify: ["npm run verify"],
+      presets: {
+        "quick-check": "npm run build"
+      }
+    }
+  });
+
+  assert.deepEqual(configuredCommandNames(demo), ["build", "quick-check", "test", "verify"]);
+  assert.equal(resolveProjectCommand(demo, "test"), "npm test");
+  assert.equal(resolveProjectCommand(demo, "quick-check"), "npm run build");
+  assert.equal(resolveProjectCommand(demo, "missing"), undefined);
+});
+
+test("peer envelopes round-trip through Discord-friendly fenced JSON", () => {
+  const envelope = createPeerEnvelope({
+    type: "devbot.peer.request",
+    from: "111",
+    owner: "shadow",
+    action: "snip",
+    project: "pullprice",
+    target: "browse page"
+  });
+
+  const parsed = parsePeerEnvelope(`<@222>\n${formatPeerEnvelope(envelope)}`);
+
+  assert.equal(parsed?.type, "devbot.peer.request");
+  assert.equal(parsed?.from, "111");
+  assert.equal(parsed?.action, "snip");
+  assert.equal(parsed?.project, "pullprice");
+  assert.equal(parsed?.target, "browse page");
+});
+
 test("status image renderer returns a png", async () => {
   const image = await renderStatusImage("Codex dev work currently in progress: 1\n- pullprice session");
   assert.equal(image.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
@@ -196,7 +280,7 @@ test("project screenshot detection finds a running Next dev server for the proje
     "node /Users/bernard/Documents/Other/web/node_modules/.bin/vite --port 5174"
   ].join("\n");
 
-  assert.deepEqual(detectLocalWebUrlsFromPs(output, { name: "pullprice", root: "/Users/bernard/Documents/PullPrice" }), [
+  assert.deepEqual(detectLocalWebUrlsFromPs(output, project("pullprice", "/Users/bernard/Documents/PullPrice")), [
     "http://127.0.0.1:3001"
   ]);
 });
@@ -228,7 +312,7 @@ test("external Codex process parser detects configured project sessions without 
 
   const work = parseExternalCodexWork(
     output,
-    [{ name: "pullprice", root: "/Users/bernard/Documents/PullPrice" }],
+    [project("pullprice", "/Users/bernard/Documents/PullPrice")],
     new Date("2026-06-23T20:20:00.000Z")
   );
 

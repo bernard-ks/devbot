@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 
-export type TaskStatus = "running" | "succeeded" | "failed";
+export type TaskStatus = "running" | "succeeded" | "failed" | "canceled";
 
 export interface TaskRecord {
   id: string;
@@ -86,6 +86,22 @@ export class TaskStore {
     });
   }
 
+  async cancel(id: string, reason = "Canceled by user request."): Promise<TaskRecord | undefined> {
+    let canceled: TaskRecord | undefined;
+    await this.update(id, (task, now) => {
+      if (task.status !== "running") {
+        canceled = task;
+        return;
+      }
+
+      task.status = "canceled";
+      task.error = reason;
+      task.finishedAt = now;
+      canceled = task;
+    });
+    return canceled;
+  }
+
   async get(id: string): Promise<TaskRecord | undefined> {
     const state = await this.load();
     return state.tasks.find((task) => task.id === id);
@@ -150,6 +166,20 @@ export function formatTaskList(tasks: TaskRecord[]): string {
       const finished = task.finishedAt ? `, finished ${formatTime(task.finishedAt)}` : "";
       return `- \`${task.id}\` ${task.status} ${task.mode} via ${task.source} on \`${task.projectName}\` for ${task.requester}${finished}: ${truncate(task.text, 90)}`;
     })
+    .join("\n");
+}
+
+export function formatTaskLogs(task: TaskRecord): string {
+  return [
+    `Task \`${task.id}\` logs`,
+    `Status: ${task.status}`,
+    "",
+    "Request:",
+    truncate(task.text, 1_500),
+    task.resultPreview ? ["", "Result:", truncate(task.resultPreview, 2_000)].join("\n") : undefined,
+    task.error ? ["", "Error:", truncate(task.error, 2_000)].join("\n") : undefined
+  ]
+    .filter((line) => line !== undefined)
     .join("\n");
 }
 
