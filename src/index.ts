@@ -12,12 +12,14 @@ import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.
 import { parseMentionRequest, parseStatusRequest, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { captureProjectScreenshot } from "./project-screenshot.js";
+import { formatTaskDetail, formatTaskList, TaskStore } from "./task-store.js";
 import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
 
 const config = loadConfig();
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
+const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
@@ -109,16 +111,17 @@ client.on("messageCreate", async (message) => {
 
     await message.channel.sendTyping();
     const pending = await message.reply(`Working on \`${request.project.name}\`...`);
-    const { answer } = await runProjectRequest({
+    const { answer, taskId } = await runProjectRequest({
       appConfig: config,
       project: request.project,
       text: request.text,
       includePatterns: request.includePatterns,
       mode: request.mode,
-      requester: message.author.tag
+      requester: message.author.tag,
+      source: "mention"
     });
 
-    const chunks = splitDiscordMessage(answer);
+    const chunks = splitDiscordMessage(`Task: \`${taskId}\`\n\n${answer}`);
     await pending.edit(chunks[0] ?? "No answer generated.");
 
     for (const chunk of chunks.slice(1)) {
@@ -161,6 +164,30 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     return;
   }
 
+  if (interaction.commandName === "snip") {
+    await interaction.deferReply();
+    const projectName = interaction.options.getString("project");
+    const target = interaction.options.getString("target", true);
+    const project = projectName ? mustFindProject(appConfig.projects, projectName) : defaultProject(appConfig.projects);
+    const screenshot = await captureProjectScreenshot(project, { requestText: target });
+    if (!screenshot) {
+      await interaction.editReply(`I could not find a running local web UI to screenshot for \`${project.name}\`.`);
+      return;
+    }
+
+    await editInteractionWithChunks(interaction, {
+      content: `Attached live UI screenshot for \`${project.name}\` from ${screenshot.url}.`,
+      image: screenshot.image,
+      imageName: screenshot.fileName
+    });
+    return;
+  }
+
+  if (interaction.commandName === "task") {
+    await handleTaskCommand(interaction, appConfig);
+    return;
+  }
+
   if (interaction.commandName === "refresh") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
@@ -174,17 +201,19 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     const question = interaction.options.getString("question", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
-    const { answer, context } = await runProjectRequest({
+    const { answer, context, taskId } = await runProjectRequest({
       appConfig,
       project,
       text: question,
       includePatterns,
       mode: "answer",
-      requester: interaction.user.tag
+      requester: interaction.user.tag,
+      source: "slash:ask"
     });
 
     const header = [
       `Project: \`${project.name}\``,
+      `Task: \`${taskId}\``,
       `Context files: ${context.files.length}`,
       includePatterns.length > 0 ? `Include: \`${includePatterns.join(", ")}\`` : undefined
     ]
@@ -205,15 +234,16 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     const task = interaction.options.getString("task", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
-    const { answer } = await runProjectRequest({
+    const { answer, taskId } = await runProjectRequest({
       appConfig,
       project,
       text: task,
       includePatterns,
       mode: "action",
-      requester: interaction.user.tag
+      requester: interaction.user.tag,
+      source: "slash:act"
     });
-    const chunks = splitDiscordMessage(answer);
+    const chunks = splitDiscordMessage(`Task: \`${taskId}\`\n\n${answer}`);
     await interaction.editReply(chunks[0] ?? "No answer generated.");
 
     for (const chunk of chunks.slice(1)) {
@@ -229,11 +259,13 @@ interface ProjectRequestOptions {
   includePatterns: string[];
   mode: CodexRequestMode;
   requester: string;
+  source: string;
 }
 
 interface ProjectRequestResult {
   answer: string;
   context: PackedProjectContext;
+  taskId: string;
 }
 
 async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
@@ -243,11 +275,26 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     requester: options.requester,
     text: options.text
   });
+  const task = await taskStore.start({
+    source: options.source,
+    mode: options.mode,
+    projectName: options.project.name,
+    requester: options.requester,
+    text: options.text,
+    includePatterns: options.includePatterns
+  });
 
   try {
     const context = await contextService.pack(options.project, options.text, options.includePatterns);
     const answer = await runCodex(options.appConfig, options.text, context, options.mode);
-    return { answer, context };
+    await taskStore.succeed(task.id, {
+      contextFileCount: context.files.length,
+      resultPreview: answer
+    });
+    return { answer, context, taskId: task.id };
+  } catch (error) {
+    await taskStore.fail(task.id, error);
+    throw error;
   } finally {
     workTracker.finish(work.id);
   }
@@ -315,9 +362,40 @@ async function getDetailedStatusResponse(options: StatusResponseOptions): Promis
     text: detailPrompt,
     includePatterns: [],
     mode: "answer",
-    requester: options.requester
+    requester: options.requester,
+    source: "status-detail"
   });
   return { content: [`Detailed update for \`${project.name}\`:`, answer].join("\n") };
+}
+
+async function handleTaskCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const subcommand = interaction.options.getSubcommand();
+  if (subcommand === "recent") {
+    await interaction.deferReply();
+    const projectName = interaction.options.getString("project") ?? undefined;
+    const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+    const status = interaction.options.getString("status") as "running" | "succeeded" | "failed" | null;
+    const filters: { limit: number; projectName?: string; status?: "running" | "succeeded" | "failed" } = {
+      limit: interaction.options.getInteger("limit") ?? 10
+    };
+    if (project?.name) {
+      filters.projectName = project.name;
+    }
+    if (status) {
+      filters.status = status;
+    }
+
+    const tasks = await taskStore.listRecent(filters);
+    await interaction.editReply(formatTaskList(tasks));
+    return;
+  }
+
+  if (subcommand === "show") {
+    await interaction.deferReply();
+    const id = interaction.options.getString("id", true);
+    const task = await taskStore.get(id);
+    await interaction.editReply(task ? formatTaskDetail(task) : `No saved task found for \`${id}\`.`);
+  }
 }
 
 async function replyToMessageWithChunks(message: Message, response: BotResponse): Promise<void> {

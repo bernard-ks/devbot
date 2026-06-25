@@ -8,6 +8,7 @@ import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from ".
 import { splitDiscordMessage } from "./messages.js";
 import { bestNavigationCandidate, detectLocalWebUrlsFromPs, extractScreenshotKeywords } from "./project-screenshot.js";
 import { renderStatusImage } from "./status-image.js";
+import { TaskStore } from "./task-store.js";
 import { formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
 
 const scanner = {
@@ -156,6 +157,32 @@ test("work status reports empty and active Codex work", () => {
 
   tracker.finish(work.id);
   assert.equal(formatWorkStatus(tracker.snapshot()), "No Codex dev work is currently in progress.");
+});
+
+test("task store persists task lifecycle to disk", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-store-"));
+  const stateFile = path.join(root, "tasks.json");
+  const store = new TaskStore(stateFile);
+  const task = await store.start({
+    source: "test",
+    mode: "answer",
+    projectName: "demo",
+    requester: "tester",
+    text: "inspect project state",
+    includePatterns: ["src/*"]
+  });
+
+  await store.succeed(task.id, { contextFileCount: 2, resultPreview: "done" });
+
+  const reloaded = new TaskStore(stateFile);
+  const saved = await reloaded.get(task.id);
+  const recent = await reloaded.listRecent({ projectName: "demo" });
+
+  assert.equal(saved?.status, "succeeded");
+  assert.equal(saved?.contextFileCount, 2);
+  assert.equal(saved?.resultPreview, "done");
+  assert.equal(saved?.includePatterns[0], "src/*");
+  assert.equal(recent[0]?.id, task.id);
 });
 
 test("status image renderer returns a png", async () => {

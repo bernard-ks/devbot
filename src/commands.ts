@@ -18,6 +18,46 @@ export const commandDefinitions = [
       option.setName("image").setDescription("Attach a live screenshot of the project UI when available.").setRequired(false)
     ),
   new SlashCommandBuilder()
+    .setName("snip")
+    .setDescription("Attach a live screenshot from a running local project UI.")
+    .addStringOption((option) =>
+      option.setName("target").setDescription("Natural-language UI target or exact path/URL.").setRequired(true)
+    )
+    .addStringOption((option) =>
+      option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("task")
+    .setDescription("Inspect saved devbot task history.")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("recent")
+        .setDescription("List recent saved tasks.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Filter by configured project name.").setRequired(false).setAutocomplete(true)
+        )
+        .addStringOption((option) =>
+          option
+            .setName("status")
+            .setDescription("Filter by task status.")
+            .setRequired(false)
+            .addChoices(
+              { name: "running", value: "running" },
+              { name: "succeeded", value: "succeeded" },
+              { name: "failed", value: "failed" }
+            )
+        )
+        .addIntegerOption((option) =>
+          option.setName("limit").setDescription("Number of tasks to show, 1-25.").setRequired(false).setMinValue(1).setMaxValue(25)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("show")
+        .setDescription("Show one saved task.")
+        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true))
+    ),
+  new SlashCommandBuilder()
     .setName("refresh")
     .setDescription("Refresh the indexed context for a project.")
     .addStringOption((option) =>

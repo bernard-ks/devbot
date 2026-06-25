@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .env
+.devbot/
 config/projects.json
 .DS_Store
 coverage/

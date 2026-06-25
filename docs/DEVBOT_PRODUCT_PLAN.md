@@ -196,9 +196,9 @@ MVP multi-bot flow:
 
 ### Phase 1: Stabilize Single-User Devbot
 
-- Add SQLite task persistence.
-- Add task IDs and task history commands.
-- Update README to reflect current screenshot behavior.
+- Add durable task persistence. Baseline implemented with local JSON storage; SQLite remains an optional backend upgrade if task history needs query-heavy reporting.
+- Add task IDs and task history commands. Baseline implemented with `/task recent` and `/task show`.
+- Update README to reflect current screenshot behavior. Done for dynamic UI screenshots and `/snip`.
 - Add project metadata config support.
 - Add screenshot diagnostics: console errors and failed requests.
 
@@ -230,11 +230,11 @@ MVP multi-bot flow:
 
 ## Near-Term Backlog
 
-- Update README for live UI screenshot behavior.
+- Update README for live UI screenshot behavior. Done.
 - Add `docs/OPERATIONS.md` for setup, restart, and troubleshooting.
 - Add `.devbot/project.example.json`.
-- Add `/snip` as a dedicated command instead of overloading `/status image:true`.
-- Add `/task` command group.
+- Add `/snip` as a dedicated command instead of overloading `/status image:true`. Done.
+- Add `/task` command group. Baseline done.
 - Add `/review` command group.
 - Add `BOT_OWNER`, `BOT_DISPLAY_NAME`, and `PEER_BOT_IDS` config.
 - Add a coordination channel ID config.
