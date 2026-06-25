@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
-import { bestRouteForText, detectLocalWebUrlsFromPs, resolveRequestedRoutePaths } from "./project-screenshot.js";
+import { bestNavigationCandidate, detectLocalWebUrlsFromPs, extractScreenshotKeywords } from "./project-screenshot.js";
 import { renderStatusImage } from "./status-image.js";
 import { formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
 
@@ -174,24 +174,21 @@ test("project screenshot detection finds a running Next dev server for the proje
   ]);
 });
 
-test("project screenshot route matching picks requested app pages", () => {
-  const routes = ["/", "/alerts", "/browse", "/sets", "/trending", "/watchlist"];
-
-  assert.equal(bestRouteForText(routes, "send me a ui snip of the browse page"), "/browse");
-  assert.equal(bestRouteForText(routes, "show the current watchlist view"), "/watchlist");
-  assert.equal(bestRouteForText(routes, "main page please"), "/");
+test("project screenshot keywords ignore generic screenshot wording", () => {
+  assert.deepEqual(extractScreenshotKeywords("send me a ui snip of the browse page"), ["browse"]);
+  assert.deepEqual(extractScreenshotKeywords("what's the current frontend status"), []);
 });
 
-test("project screenshot route resolver supports explicit paths and discovered routes", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "project-screenshot-routes-"));
-  await mkdir(path.join(root, "src", "app", "browse"), { recursive: true });
-  await mkdir(path.join(root, "src", "app", "cards", "[id]"), { recursive: true });
-  await writeFile(path.join(root, "src", "app", "page.tsx"), "export default function Page() { return null; }\n");
-  await writeFile(path.join(root, "src", "app", "browse", "page.tsx"), "export default function Page() { return null; }\n");
-  await writeFile(path.join(root, "src", "app", "cards", "[id]", "page.tsx"), "export default function Page() { return null; }\n");
+test("project screenshot navigation chooses visible UI by request text", () => {
+  const candidates = [
+    { index: 0, text: "Home", href: "http://127.0.0.1:3001/" },
+    { index: 1, text: "Browse cards", href: "http://127.0.0.1:3001/browse" },
+    { index: 2, text: "Watchlist", href: "http://127.0.0.1:3001/watchlist" }
+  ];
 
-  assert.deepEqual(await resolveRequestedRoutePaths({ name: "demo", root }, "snip the browse page"), ["/browse", "/"]);
-  assert.deepEqual(await resolveRequestedRoutePaths({ name: "demo", root }, "snip /cards/op01-016"), ["/cards/op01-016", "/"]);
+  assert.equal(bestNavigationCandidate(candidates, "send me a ui snip of the browse page")?.index, 1);
+  assert.equal(bestNavigationCandidate(candidates, "show the current watchlist view")?.index, 2);
+  assert.equal(bestNavigationCandidate(candidates, "send me a snip")?.index, undefined);
 });
 
 test("external Codex process parser detects configured project sessions without leaking commands", () => {

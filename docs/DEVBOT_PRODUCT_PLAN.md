@@ -6,7 +6,7 @@ Date: 2026-06-24
 
 Devbot is a local Discord interface for Codex-backed development work. Its current strength is that it can answer project questions, run focused local Codex tasks, report active Codex work, and attach live UI screenshots without requiring an OpenAI API key.
 
-The next product step is to make devbot useful for a small team, not just one developer. The most interesting direction is a Discord server with multiple developer-owned devbots that can discover each other, exchange status, request help, hand off work, and coordinate PR review and merge flows.
+The next product step is to make devbot useful for a small team, not just one developer. The most interesting direction is a Discord server with multiple developer-owned devbots that can discover each other, exchange status, request help, hand off work, and coordinate review and merge flows.
 
 ## Current Features
 
@@ -35,16 +35,16 @@ The next product step is to make devbot useful for a small team, not just one de
   - Reports sanitized process status without leaking command prompts.
 - UI screenshot support:
   - Detects running local web dev servers such as Next, Vite, React Scripts, Astro, and Nuxt.
-  - Discovers static Next app routes.
-  - Maps requests like "browse page" or "watchlist view" to matching routes.
-  - Supports explicit paths such as `/cards/op01-016`.
+  - Opens the running app and navigates through visible links/buttons based on request language.
+  - Handles requests like "browse page" or "watchlist view" without reading framework routes from disk.
+  - Supports explicit URLs and paths such as `/cards/op01-016` when the user wants an exact target.
 
 ## Current Constraints
 
 - Runtime state is in memory. Bot restarts lose active task history.
-- The bot has no durable concept of task ownership, handoff, PR state, or merge state.
+- The bot has no durable concept of task ownership, handoff, review state, or merge state.
 - The context scanner is text-only and does not understand repository structure beyond path/content ranking.
-- Screenshot targeting is currently route-based and static. It does not click through flows, log in, seed test data, or navigate dynamic states.
+- Screenshot targeting can click one visible matching UI control, but it does not yet plan multi-step flows, log in, seed test data, or navigate complex dynamic states.
 - Local Codex process detection is heuristic and depends on command-line shape.
 - Permissions are coarse: allow-listed users or roles can use broad bot capabilities.
 - There is no durable audit trail beyond Discord messages and local git history.
@@ -59,7 +59,7 @@ The next product step is to make devbot useful for a small team, not just one de
   - completed tasks
   - Discord message/thread IDs
   - project aliases
-  - PR links and merge state
+  - review links or branch references and merge state
   - screenshot URLs and capture metadata
 - Add task IDs to every `/act` and mention-triggered action.
 - Add `/task status <id>`, `/task cancel <id>`, `/task logs <id>`, and `/task retry <id>`.
@@ -76,20 +76,18 @@ The next product step is to make devbot useful for a small team, not just one de
   - backend URL
   - test commands
   - build commands
-  - route aliases
   - owner bot
 - Use package manager scripts and known framework files to infer common commands.
-- Cache route discovery and refresh it on file changes or `/refresh`.
 - Add project-specific command presets, for example `/run test`, `/run build`, `/run lint`.
 
 ### 3. Screenshot And UI Inspection
 
-- Extend screenshots from static route capture to workflow capture:
-  - route aliases: `browse`, `card detail`, `portfolio`, `login`
+- Extend screenshots from single-click dynamic navigation to workflow capture:
+  - natural language targets: `browse`, `card detail`, `portfolio`, `login`
   - scripted actions: click, search, filter, open modal
   - viewport options: desktop, tablet, mobile
   - authenticated storage state per project
-- Add `/snip project:<name> page:<alias-or-path> viewport:<desktop|mobile>`.
+- Add `/snip project:<name> target:<natural-language-or-path> viewport:<desktop|mobile>`.
 - Attach screenshot metadata in the Discord reply:
   - URL
   - viewport
@@ -98,26 +96,21 @@ The next product step is to make devbot useful for a small team, not just one de
   - failed network requests
 - Optionally attach a short Playwright trace for deeper debugging.
 
-### 4. PR And Merge Workflows
+### 4. Review And Merge Workflows
 
-- Add first-class GitHub integration through local `gh` or a GitHub app:
-  - `/pr create`
-  - `/pr status`
-  - `/pr review`
-  - `/pr checks`
-  - `/pr merge`
-- Make `/act` optionally produce a branch and draft PR instead of editing main directly.
+- Keep review/merge support provider-neutral instead of coupling devbot to one hosting provider or CLI.
+- Make `/act` optionally produce a branch and review packet instead of editing main directly.
 - Add merge gates:
   - clean working tree
   - tests pass
-  - no unresolved review comments
+  - no unresolved review comments when the configured review provider exposes them
   - approval from allowed users or peer bot
 - Add a "handoff packet" format:
   - task summary
   - changed files
   - verification commands
   - known risks
-  - PR URL
+  - review URL or branch reference when available
   - next requested action
 
 ### 5. Multi-Dev / Multi-Bot Coordination
@@ -158,13 +151,13 @@ Useful interactions:
   - "Tom Devbot, what are you working on?"
   - "Shadow Devbot, do you have PullPrice frontend running?"
 - Request a screenshot from the peer who owns the UI:
-  - "Shadow Devbot, send a snip of `/browse`."
+  - "Shadow Devbot, send a snip of the browse page."
 - Ask another bot to validate a branch:
   - "A5omic Devbot, pull PR 42 and run backend tests."
 - Handoff a task:
   - "Shadow Devbot, hand off PR 42 to Tom Devbot for review."
 - Merge with peer validation:
-  - author bot creates PR
+  - author bot creates a branch/review request
   - reviewer bot pulls branch and validates
   - owner approves merge
   - merge bot performs final merge and posts result
@@ -207,14 +200,13 @@ MVP multi-bot flow:
 - Add task IDs and task history commands.
 - Update README to reflect current screenshot behavior.
 - Add project metadata config support.
-- Add route alias config for screenshots.
 - Add screenshot diagnostics: console errors and failed requests.
 
-### Phase 2: PR-Centered Workflow
+### Phase 2: Review-Centered Workflow
 
-- Add branch/PR creation mode for `/act`.
-- Add PR status/checks commands.
-- Add PR validation command that runs configured tests.
+- Add branch/review packet creation mode for `/act`.
+- Add review status and verification commands.
+- Add review validation command that runs configured tests.
 - Add merge gate logic.
 - Add a handoff packet generator.
 
@@ -224,14 +216,14 @@ MVP multi-bot flow:
 - Add `/devbot announce` and `/devbot peers`.
 - Add structured peer requests over Discord.
 - Support peer status and peer screenshot requests.
-- Support peer PR validation requests.
+- Support peer review validation requests.
 - Keep edits and merges human-confirmed.
 
 ### Phase 4: Team Workflow Automation
 
 - Add durable task queues.
 - Add reviewer assignment.
-- Add CI/check summarization.
+- Add verification/check summarization.
 - Add cross-bot handoff threads.
 - Add project dashboards in Discord.
 - Add automatic stale task reminders.
@@ -241,10 +233,9 @@ MVP multi-bot flow:
 - Update README for live UI screenshot behavior.
 - Add `docs/OPERATIONS.md` for setup, restart, and troubleshooting.
 - Add `.devbot/project.example.json`.
-- Add `PROJECT_SCREENSHOT_ROUTES_JSON` for explicit route aliases.
 - Add `/snip` as a dedicated command instead of overloading `/status image:true`.
 - Add `/task` command group.
-- Add `/pr` command group.
+- Add `/review` command group.
 - Add `BOT_OWNER`, `BOT_DISPLAY_NAME`, and `PEER_BOT_IDS` config.
 - Add a coordination channel ID config.
 - Add structured result envelopes for bot-to-bot messages.
@@ -261,12 +252,12 @@ MVP multi-bot flow:
 
 ## Recommendation
 
-Build toward a peer-bot model, but do it in layers. First make devbot durable and PR-aware for one user. Then add peer discovery and read-only peer queries. Only after that should peer bots be allowed to request validation, pushes, or merges.
+Build toward a peer-bot model, but do it in layers. First make devbot durable and review-aware for one user. Then add peer discovery and read-only peer queries. Only after that should peer bots be allowed to request validation, pushes, or merges.
 
 The safest initial multi-dev experience is:
 
 1. Everyone runs their own devbot locally.
 2. Bots can announce capabilities and answer read-only status/screenshot requests.
-3. Bots can generate handoff packets for PRs.
+3. Bots can generate handoff packets for review requests.
 4. Peer validation is allowed with explicit human approval.
 5. Merges stay gated by tests, review state, and an explicit owner command.

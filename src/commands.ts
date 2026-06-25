@@ -11,7 +11,7 @@ export const commandDefinitions = [
     .addStringOption((option) =>
       option
         .setName("question")
-        .setDescription("Optional deeper status question; include a page or path to target screenshots.")
+        .setDescription("Optional deeper status question; describe the UI target for screenshots.")
         .setRequired(false)
     )
     .addBooleanOption((option) =>

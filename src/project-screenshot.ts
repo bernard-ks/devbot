@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import type { Page } from "playwright";
 import type { ProjectEntry } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -21,10 +21,12 @@ export async function captureProjectScreenshot(
   project: ProjectEntry,
   options: ProjectScreenshotOptions = {}
 ): Promise<ProjectScreenshot | undefined> {
-  const urls = await findProjectWebUrls(project, options.requestText);
+  const target = parseExplicitScreenshotTarget(options.requestText ?? "");
+  const urls = target.url ? [target.url] : await findProjectWebUrls(project);
 
   for (const url of urls) {
-    if (!(await canReach(url))) {
+    const startUrl = target.path ? withPath(url, target.path) : url;
+    if (!(await canReach(startUrl))) {
       continue;
     }
 
@@ -32,12 +34,17 @@ export async function captureProjectScreenshot(
     const browser = await chromium.launch({ headless: true });
     try {
       const page = await browser.newPage({ viewport: DEFAULT_VIEWPORT });
-      await page.goto(url, { waitUntil: "networkidle", timeout: 20_000 });
+      await page.goto(startUrl, { waitUntil: "networkidle", timeout: 20_000 });
+      if (!target.path && !target.url) {
+        await navigateByVisibleUi(page, options.requestText ?? "");
+      }
+
       const image = await page.screenshot({ type: "png", fullPage: false });
+      const finalUrl = page.url();
       return {
         image,
-        fileName: `${sanitizeFilePart(project.name)}-${sanitizeFilePart(new URL(url).pathname || "home")}-screenshot.png`,
-        url
+        fileName: `${sanitizeFilePart(project.name)}-${sanitizeFilePart(new URL(finalUrl).pathname || "home")}-screenshot.png`,
+        url: finalUrl
       };
     } finally {
       await browser.close();
@@ -47,12 +54,10 @@ export async function captureProjectScreenshot(
   return undefined;
 }
 
-export async function findProjectWebUrls(project: ProjectEntry, requestText = ""): Promise<string[]> {
+export async function findProjectWebUrls(project: ProjectEntry): Promise<string[]> {
   const configured = configuredProjectUrls(project);
   const detected = await detectRunningProjectWebUrls(project);
-  const baseUrls = uniqueUrls([...configured, ...detected]);
-  const routePaths = await resolveRequestedRoutePaths(project, requestText);
-  return uniqueUrls(baseUrls.flatMap((url) => routePaths.map((routePath) => withPath(url, routePath))));
+  return uniqueUrls([...configured, ...detected]);
 }
 
 export function detectLocalWebUrlsFromPs(psOutput: string, project: ProjectEntry): string[] {
@@ -63,8 +68,6 @@ export function detectLocalWebUrlsFromPs(psOutput: string, project: ProjectEntry
     if (!command.includes(root)) {
       continue;
     }
-
-    urls.push(...extractExplicitUrls(command));
 
     const port = detectKnownDevServerPort(command);
     if (port) {
@@ -109,102 +112,109 @@ function configuredProjectUrls(project: ProjectEntry): string[] {
   return urls;
 }
 
-export async function resolveRequestedRoutePaths(project: ProjectEntry, requestText: string): Promise<string[]> {
+export interface NavigationCandidate {
+  index: number;
+  text: string;
+  href: string;
+}
+
+export interface ScoredNavigationCandidate extends NavigationCandidate {
+  score: number;
+}
+
+export function extractScreenshotKeywords(requestText: string): string[] {
+  const normalized = requestText.toLowerCase().replace(/[^a-z0-9/_-]+/g, " ");
+  return uniqueWords(
+    normalized
+      .split(/\s+/)
+      .map((word) => word.trim().replace(/^\/+|\/+$/g, ""))
+      .filter((word) => word.length >= 3 && !SCREENSHOT_STOP_WORDS.has(word) && !word.includes("/"))
+  ).slice(0, 8);
+}
+
+export function bestNavigationCandidate(
+  candidates: NavigationCandidate[],
+  requestText: string
+): ScoredNavigationCandidate | undefined {
+  const keywords = extractScreenshotKeywords(requestText);
+  if (keywords.length === 0) {
+    return undefined;
+  }
+
+  let best: ScoredNavigationCandidate | undefined;
+  for (const candidate of candidates) {
+    const haystack = normalizeForMatch(`${candidate.text} ${candidate.href}`);
+    const score = keywords.reduce((total, keyword) => {
+      if (wordInText(haystack, keyword)) {
+        return total + 5;
+      }
+
+      if (haystack.includes(keyword)) {
+        return total + 2;
+      }
+
+      return total;
+    }, 0);
+
+    if (score > 0 && (!best || score > best.score)) {
+      best = { ...candidate, score };
+    }
+  }
+
+  return best && best.score >= 5 ? best : undefined;
+}
+
+async function navigateByVisibleUi(page: Page, requestText: string): Promise<void> {
+  const clickable = page.locator("a, button, [role='link'], [role='button']");
+  const candidates = await clickable.evaluateAll((elements) =>
+    elements
+      .map((element, index) => {
+        const rect = element.getBoundingClientRect();
+        const style = element.ownerDocument.defaultView?.getComputedStyle(element);
+        const href = element.getAttribute("href") ?? element.getAttribute("data-href") ?? "";
+        const text = [
+          element.textContent ?? "",
+          element.getAttribute("aria-label") ?? "",
+          element.getAttribute("title") ?? "",
+          href
+        ].join(" ");
+
+        return {
+          index,
+          text,
+          href,
+          visible: rect.width > 0 && rect.height > 0 && style?.visibility !== "hidden" && style?.display !== "none"
+        };
+      })
+      .filter((candidate) => candidate.visible)
+      .map(({ index, text, href }) => ({ index, text, href }))
+  );
+  const target = bestNavigationCandidate(candidates, requestText);
+  if (!target) {
+    return;
+  }
+
+  await clickable.nth(target.index).click({ timeout: 5_000 });
+  await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
+}
+
+interface ExplicitScreenshotTarget {
+  url?: string;
+  path?: string;
+}
+
+function parseExplicitScreenshotTarget(requestText: string): ExplicitScreenshotTarget {
   const explicitUrl = requestText.match(/\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/[^\s]*)?/i)?.[0];
   if (explicitUrl) {
-    return [new URL(normalizeLocalUrl(explicitUrl)).pathname || "/"];
+    return { url: normalizeLocalUrl(explicitUrl) };
   }
 
   const explicitPath = extractExplicitPath(requestText);
   if (explicitPath) {
-    return [explicitPath, "/"];
+    return { path: explicitPath };
   }
 
-  const discoveredRoutes = await discoverStaticProjectRoutes(project);
-  const bestRoute = bestRouteForText(discoveredRoutes, requestText);
-  if (bestRoute) {
-    return [bestRoute, "/"];
-  }
-
-  return ["/"];
-}
-
-export async function discoverStaticProjectRoutes(project: ProjectEntry): Promise<string[]> {
-  const routeRoots = [
-    path.join(project.root, "PullPriceWeb", "web", "src", "app"),
-    path.join(project.root, "web", "src", "app"),
-    path.join(project.root, "src", "app")
-  ];
-  const routeSets = await Promise.all(routeRoots.map((routeRoot) => discoverNextAppRoutes(routeRoot)));
-  return uniqueRoutePaths(routeSets.flat());
-}
-
-export function bestRouteForText(routes: string[], requestText: string): string | undefined {
-  const normalizedText = normalizeForMatch(requestText);
-  if (!normalizedText) {
-    return undefined;
-  }
-
-  const homeWords = ["home", "main", "landing", "root"];
-  if (homeWords.some((word) => wordInText(normalizedText, word))) {
-    return routes.includes("/") ? "/" : undefined;
-  }
-
-  let best: { route: string; score: number } | undefined;
-  for (const route of routes.filter((candidate) => candidate !== "/")) {
-    const routeWords = route
-      .split("/")
-      .filter(Boolean)
-      .flatMap((segment) => segment.split(/[-_]/))
-      .map(normalizeForMatch)
-      .filter(Boolean);
-    const score = routeWords.reduce((total, word) => total + (wordInText(normalizedText, word) ? 4 : 0), 0);
-    const pagePhraseScore = routeWords.some((word) => normalizedText.includes(`${word} page`)) ? 3 : 0;
-    const fullRouteScore = normalizedText.includes(route.replaceAll("/", " ").trim()) ? 2 : 0;
-    const totalScore = score + pagePhraseScore + fullRouteScore;
-
-    if (totalScore > 0 && (!best || totalScore > best.score)) {
-      best = { route, score: totalScore };
-    }
-  }
-
-  return best?.route;
-}
-
-async function discoverNextAppRoutes(routeRoot: string): Promise<string[]> {
-  async function walk(directory: string, segments: string[]): Promise<string[]> {
-    let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch {
-      return [];
-    }
-
-    const routes: string[] = [];
-    const hasPage = entries.some((entry) => entry.isFile() && /^page\.(tsx|ts|jsx|js|mdx)$/.test(entry.name));
-    if (hasPage && !segments.some((segment) => segment.startsWith("[") || segment.startsWith("("))) {
-      routes.push(routePathFromSegments(segments));
-    }
-
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.startsWith("_") || entry.name === "api") {
-        continue;
-      }
-
-      const nextSegments = entry.name.startsWith("(") ? segments : [...segments, entry.name];
-      routes.push(...(await walk(path.join(directory, entry.name), nextSegments)));
-    }
-
-    return routes;
-  }
-
-  return walk(routeRoot, []);
-}
-
-function extractExplicitUrls(command: string): string[] {
-  return [...command.matchAll(/\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/[^\s]*)?/gi)].map((match) =>
-    normalizeLocalUrl(match[0] ?? "")
-  );
+  return {};
 }
 
 function extractExplicitPath(text: string): string | undefined {
@@ -289,8 +299,8 @@ function uniqueUrls(urls: string[]): string[] {
   return [...new Set(urls.map((url) => normalizeLocalUrl(url.trim())).filter(Boolean))];
 }
 
-function uniqueRoutePaths(paths: string[]): string[] {
-  return [...new Set(paths.map(normalizeRoutePath))].sort((a, b) => a.localeCompare(b));
+function uniqueWords(words: string[]): string[] {
+  return [...new Set(words)];
 }
 
 function withPath(baseUrl: string, routePath: string): string {
@@ -299,10 +309,6 @@ function withPath(baseUrl: string, routePath: string): string {
   url.search = "";
   url.hash = "";
   return url.toString().replace(/\/$/, url.pathname === "/" ? "/" : "");
-}
-
-function routePathFromSegments(segments: string[]): string {
-  return normalizeRoutePath(`/${segments.join("/")}`);
 }
 
 function normalizeRoutePath(routePath: string): string {
@@ -321,3 +327,40 @@ function wordInText(text: string, word: string): boolean {
 function sanitizeFilePart(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "project";
 }
+
+const SCREENSHOT_STOP_WORDS = new Set([
+  "about",
+  "attach",
+  "can",
+  "current",
+  "cna",
+  "dev",
+  "front",
+  "frontend",
+  "give",
+  "image",
+  "main",
+  "need",
+  "output",
+  "page",
+  "pic",
+  "picture",
+  "please",
+  "project",
+  "projects",
+  "screen",
+  "screenshot",
+  "send",
+  "show",
+  "snip",
+  "state",
+  "status",
+  "the",
+  "this",
+  "view",
+  "want",
+  "what",
+  "whats",
+  "working",
+  "you"
+]);
