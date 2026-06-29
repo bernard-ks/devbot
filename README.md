@@ -106,7 +106,7 @@ Each target project can define optional metadata at `<project>/.devbot/project.j
 }
 ```
 
-Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables `/run`, `/review validate`, and `/review gates`.
+Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables write-capable work: `/act`, action-style mentions, `/task retry` for action tasks, `/run`, `/review validate`, and `/review gates`.
 
 ## Peer Bots
 

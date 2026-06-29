@@ -6,6 +6,7 @@ import {
   MessageFlags,
 } from "discord.js";
 import type { AutocompleteInteraction, ChatInputCommandInteraction, Interaction, Message } from "discord.js";
+import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
 import { loadConfig } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
@@ -23,6 +24,7 @@ import {
   PeerStore
 } from "./peer.js";
 import { createReviewPacket, evaluateMergeGates, formatMergeGateResult, formatReviewPacket, formatValidationResults, validateReview } from "./review.js";
+import { isWriteBlockedBySafeMode, safeModeActionMessage } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskStatus } from "./task-store.js";
 import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
@@ -32,6 +34,7 @@ const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
+const activeTaskControllers = new Map<string, AbortController>();
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
@@ -45,7 +48,7 @@ client.once("clientReady", async () => {
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isAutocomplete()) {
-      await handleAutocomplete(interaction, config.projects);
+      await handleAutocomplete(interaction, config);
       return;
     }
 
@@ -124,6 +127,11 @@ client.on("messageCreate", async (message) => {
     const request = parseMentionRequest(message.content, client.user.id, config.projects, botRoleMentionIds);
     if (!request.text) {
       await message.reply("Tell me what to do after the mention. Example: `@devbot fix the failing tests`");
+      return;
+    }
+
+    if (isWriteBlockedBySafeMode(config, request.mode)) {
+      await message.reply(safeModeActionMessage("action-style mentions"));
       return;
     }
 
@@ -275,6 +283,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
 
   if (interaction.commandName === "act") {
     await interaction.deferReply();
+    if (isWriteBlockedBySafeMode(appConfig, "action")) {
+      await interaction.editReply(safeModeActionMessage("/act"));
+      return;
+    }
+
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     const task = interaction.options.getString("task", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
@@ -313,6 +326,10 @@ interface ProjectRequestResult {
 }
 
 async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
+  if (isWriteBlockedBySafeMode(options.appConfig, options.mode)) {
+    throw new Error(safeModeActionMessage(options.source));
+  }
+
   const work = workTracker.start({
     mode: options.mode,
     projectName: options.project.name,
@@ -327,19 +344,26 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     text: options.text,
     includePatterns: options.includePatterns
   });
+  const controller = new AbortController();
+  activeTaskControllers.set(task.id, controller);
 
   try {
     const context = await contextService.pack(options.project, options.text, options.includePatterns);
-    const answer = await runCodex(options.appConfig, options.text, context, options.mode);
+    const answer = await runCodex(options.appConfig, options.text, context, options.mode, controller.signal);
     await taskStore.succeed(task.id, {
       contextFileCount: context.files.length,
       resultPreview: answer
     });
     return { answer, context, taskId: task.id };
   } catch (error) {
-    await taskStore.fail(task.id, error);
+    if (controller.signal.aborted) {
+      await taskStore.cancel(task.id, "Canceled by user request.");
+    } else {
+      await taskStore.fail(task.id, error);
+    }
     throw error;
   } finally {
+    activeTaskControllers.delete(task.id);
     workTracker.finish(work.id);
   }
 }
@@ -453,6 +477,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
   if (subcommand === "cancel") {
     await interaction.deferReply();
     const id = interaction.options.getString("id", true);
+    activeTaskControllers.get(id)?.abort();
     const task = await taskStore.cancel(id, `Canceled by ${interaction.user.tag}.`);
     await interaction.editReply(task ? `Task \`${id}\` is now ${task.status}.` : `No saved task found for \`${id}\`.`);
     return;
@@ -464,6 +489,11 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     const task = await taskStore.get(id);
     if (!task) {
       await interaction.editReply(`No saved task found for \`${id}\`.`);
+      return;
+    }
+
+    if (isWriteBlockedBySafeMode(appConfig, task.mode === "action" ? "action" : "answer")) {
+      await interaction.editReply(safeModeActionMessage("/task retry"));
       return;
     }
 
@@ -570,6 +600,11 @@ async function handleReviewCommand(interaction: ChatInputCommandInteraction, app
 async function handleDevbotCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   const subcommand = interaction.options.getSubcommand();
   const capabilities = buildCapabilities(appConfig, client.user?.id);
+
+  if (subcommand === "help") {
+    await interaction.reply({ content: formatDevbotHelp(appConfig), flags: MessageFlags.Ephemeral });
+    return;
+  }
 
   if (subcommand === "capabilities") {
     await interaction.reply({ content: formatCapabilities(capabilities), flags: MessageFlags.Ephemeral });
@@ -791,6 +826,26 @@ function formatProjectSummary(project: ProjectEntry): string {
   return details.join(" | ");
 }
 
+function formatDevbotHelp(appConfig: AppConfig): string {
+  return [
+    `Devbot help for \`${appConfig.botIdentity.displayName}\``,
+    `Safe mode: ${appConfig.safeMode ? "on" : "off"}`,
+    "",
+    "Common workflows:",
+    "- Check work: `/status` or `/dashboard`.",
+    "- Ask read-only questions: `/ask project:<name> question:<text>`.",
+    "- Capture UI: `/snip project:<name> target:<page or path>`.",
+    "- Inspect tasks: `/task recent`, `/task show`, `/task logs`, `/task retry`.",
+    "- Run configured validation: `/run project:<name> command:<preset>` or `/review validate`.",
+    "- Prepare handoff: `/review packet project:<name> task:<task-id>`.",
+    "- Coordinate peers: `/devbot announce`, `/devbot peers`, `/peer status`, `/peer snip`.",
+    "",
+    appConfig.safeMode
+      ? "Write-capable actions are disabled while safe mode is on: `/act`, action-style mentions, `/run`, and review validation."
+      : "Write-capable actions are enabled for allowed users: `/act`, action-style mentions, `/run`, and review validation."
+  ].join("\n");
+}
+
 function parseCommandNames(value: string | null): string[] | undefined {
   const parsed = parseIncludePatterns(value);
   return parsed.length > 0 ? parsed.map((item) => item.toLowerCase()) : undefined;
@@ -838,24 +893,51 @@ async function runCodex(
   appConfig: AppConfig,
   text: string,
   context: PackedProjectContext,
-  mode: CodexRequestMode
+  mode: CodexRequestMode,
+  signal?: AbortSignal
 ): Promise<string> {
   return answerWithProjectContext({
     codex: appConfig.codex,
     question: text,
     context,
-    mode
+    mode,
+    ...(signal ? { signal } : {})
   });
 }
 
-async function handleAutocomplete(interaction: AutocompleteInteraction, projects: ProjectEntry[]): Promise<void> {
-  const focused = interaction.options.getFocused().toLowerCase();
-  const choices = projects
-    .filter((project) => project.name.includes(focused))
-    .slice(0, 25)
-    .map((project) => ({ name: project.name, value: project.name }));
+async function handleAutocomplete(interaction: AutocompleteInteraction, appConfig: AppConfig): Promise<void> {
+  const focused = interaction.options.getFocused(true);
+  const value = String(focused.value ?? "");
 
-  await interaction.respond(choices);
+  if (focused.name === "project") {
+    await interaction.respond(projectChoices(appConfig.projects, value));
+    return;
+  }
+
+  if (focused.name === "command" || focused.name === "commands") {
+    const project = findProjectFromAutocomplete(interaction, appConfig.projects);
+    await interaction.respond(commandChoices(project, value));
+    return;
+  }
+
+  if (focused.name === "id" || focused.name === "task") {
+    const project = findProjectFromAutocomplete(interaction, appConfig.projects);
+    const tasks = await taskStore.listRecent({ limit: 25, ...(project ? { projectName: project.name } : {}) });
+    await interaction.respond(taskChoices(tasks, value));
+    return;
+  }
+
+  if (focused.name === "bot") {
+    await interaction.respond(peerChoices(await peerStore.list(), value));
+    return;
+  }
+
+  await interaction.respond([]);
+}
+
+function findProjectFromAutocomplete(interaction: AutocompleteInteraction, projects: ProjectEntry[]): ProjectEntry | undefined {
+  const projectName = interaction.options.getString("project");
+  return projectName ? findProject(projects, projectName) : undefined;
 }
 
 function mustFindProject(projects: ProjectEntry[], name: string): ProjectEntry {
