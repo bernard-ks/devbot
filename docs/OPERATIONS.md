@@ -77,7 +77,7 @@ Set this to disable configured command execution and review validation:
 DEVBOT_SAFE_MODE=true
 ```
 
-Safe mode still allows read-only status, ask, screenshots, task reads, and peer read-only coordination.
+Safe mode still allows read-only status, ask, screenshots, task reads, dashboards, and peer read-only coordination. It blocks `/act`, action-style mentions, `/task retry` for action tasks, `/run`, `/review validate`, and `/review gates`.
 
 ## Screenshot Troubleshooting
 

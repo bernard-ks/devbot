@@ -11,6 +11,7 @@ export interface AnswerOptions {
   question: string;
   context: PackedProjectContext;
   mode?: CodexRequestMode;
+  signal?: AbortSignal;
 }
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
@@ -36,7 +37,7 @@ export async function answerWithProjectContext(options: AnswerOptions): Promise<
       args.splice(1, 0, "--model", options.codex.model);
     }
 
-    await runCodex(options.codex.bin, args, options.codex.timeoutMs);
+    await runCodex(options.codex.bin, args, options.codex.timeoutMs, options.signal);
     const answer = (await readFile(outputFile, "utf8")).trim();
     return answer || "Codex did not produce a final text answer.";
   } finally {
@@ -90,20 +91,32 @@ function buildPrompt(context: PackedProjectContext, question: string, mode: Code
   ].join("\n");
 }
 
-function runCodex(bin: string, args: string[], timeoutMs: number): Promise<void> {
+function runCodex(bin: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
       env: process.env,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32"
     });
     let stdout = "";
     let stderr = "";
     let settled = false;
 
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
+      terminateChild(child.pid);
       finish(new Error(`Codex timed out after ${timeoutMs}ms.`));
     }, timeoutMs);
+    const abort = (): void => {
+      terminateChild(child.pid);
+      finish(new Error("Codex run was canceled."));
+    };
+
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+
+    signal?.addEventListener("abort", abort, { once: true });
 
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString("utf8");
@@ -128,6 +141,7 @@ function runCodex(bin: string, args: string[], timeoutMs: number): Promise<void>
 
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
       if (error) {
         reject(error);
         return;
@@ -136,6 +150,30 @@ function runCodex(bin: string, args: string[], timeoutMs: number): Promise<void>
       resolve();
     }
   });
+}
+
+function terminateChild(pid: number | undefined): void {
+  if (!pid) {
+    return;
+  }
+
+  try {
+    if (process.platform === "win32") {
+      process.kill(pid, "SIGTERM");
+      return;
+    }
+
+    process.kill(-pid, "SIGTERM");
+    setTimeout(() => {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // Process already exited.
+      }
+    }, 2_000).unref();
+  } catch {
+    // Process already exited.
+  }
 }
 
 function trimProcessOutput(output: string): string {

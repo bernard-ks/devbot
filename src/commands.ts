@@ -67,31 +67,31 @@ export const commandDefinitions = [
       subcommand
         .setName("show")
         .setDescription("Show one saved task.")
-        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true))
+        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
     )
     .addSubcommand((subcommand) =>
       subcommand
         .setName("status")
         .setDescription("Show the current state for one saved task.")
-        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true))
+        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
     )
     .addSubcommand((subcommand) =>
       subcommand
         .setName("logs")
         .setDescription("Show the saved request, result preview, and error for one task.")
-        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true))
+        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
     )
     .addSubcommand((subcommand) =>
       subcommand
         .setName("cancel")
         .setDescription("Mark a running saved task as canceled.")
-        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true))
+        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
     )
     .addSubcommand((subcommand) =>
       subcommand
         .setName("retry")
         .setDescription("Retry a saved task with the same project, mode, request, and include patterns.")
-        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true))
+        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
     )
     .addSubcommand((subcommand) =>
       subcommand
@@ -121,6 +121,7 @@ export const commandDefinitions = [
         .setName("command")
         .setDescription("Configured command name such as test, build, lint, verify, or a project preset.")
         .setRequired(true)
+        .setAutocomplete(true)
     ),
   new SlashCommandBuilder()
     .setName("review")
@@ -132,7 +133,7 @@ export const commandDefinitions = [
         .addStringOption((option) =>
           option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
         )
-        .addStringOption((option) => option.setName("task").setDescription("Optional saved task ID.").setRequired(false))
+        .addStringOption((option) => option.setName("task").setDescription("Optional saved task ID.").setRequired(false).setAutocomplete(true))
     )
     .addSubcommand((subcommand) =>
       subcommand
@@ -142,7 +143,7 @@ export const commandDefinitions = [
           option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
         )
         .addStringOption((option) =>
-          option.setName("commands").setDescription("Optional comma-separated configured commands.").setRequired(false)
+          option.setName("commands").setDescription("Optional comma-separated configured commands.").setRequired(false).setAutocomplete(true)
         )
     )
     .addSubcommand((subcommand) =>
@@ -153,12 +154,13 @@ export const commandDefinitions = [
           option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
         )
         .addStringOption((option) =>
-          option.setName("commands").setDescription("Optional comma-separated configured commands.").setRequired(false)
+          option.setName("commands").setDescription("Optional comma-separated configured commands.").setRequired(false).setAutocomplete(true)
         )
     ),
   new SlashCommandBuilder()
     .setName("devbot")
     .setDescription("Inspect or announce this bot's identity and capabilities.")
+    .addSubcommand((subcommand) => subcommand.setName("help").setDescription("Show common devbot workflows."))
     .addSubcommand((subcommand) => subcommand.setName("capabilities").setDescription("Show local bot capabilities."))
     .addSubcommand((subcommand) => subcommand.setName("peers").setDescription("List known peer devbots."))
     .addSubcommand((subcommand) =>
@@ -174,7 +176,7 @@ export const commandDefinitions = [
         .setName("status")
         .setDescription("Ask a peer bot for project status.")
         .addStringOption((option) =>
-          option.setName("bot").setDescription("Peer bot user ID or mention.").setRequired(true)
+          option.setName("bot").setDescription("Peer bot user ID or mention.").setRequired(true).setAutocomplete(true)
         )
         .addStringOption((option) => option.setName("project").setDescription("Project name on the peer.").setRequired(false))
     )
@@ -183,7 +185,7 @@ export const commandDefinitions = [
         .setName("snip")
         .setDescription("Ask a peer bot for a live UI screenshot.")
         .addStringOption((option) =>
-          option.setName("bot").setDescription("Peer bot user ID or mention.").setRequired(true)
+          option.setName("bot").setDescription("Peer bot user ID or mention.").setRequired(true).setAutocomplete(true)
         )
         .addStringOption((option) => option.setName("target").setDescription("Natural-language target or route.").setRequired(true))
         .addStringOption((option) => option.setName("project").setDescription("Project name on the peer.").setRequired(false))
@@ -193,7 +195,7 @@ export const commandDefinitions = [
         .setName("capabilities")
         .setDescription("Ask a peer bot to announce capabilities.")
         .addStringOption((option) =>
-          option.setName("bot").setDescription("Peer bot user ID or mention.").setRequired(true)
+          option.setName("bot").setDescription("Peer bot user ID or mention.").setRequired(true).setAutocomplete(true)
         )
     ),
   new SlashCommandBuilder()

@@ -3,12 +3,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
+import { commandDefinitions } from "./commands.js";
 import { configuredCommandNames, resolveProjectCommand } from "./command-runner.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { createPeerEnvelope, formatPeerEnvelope, parsePeerEnvelope } from "./peer.js";
 import { bestNavigationCandidate, detectLocalWebUrlsFromPs, extractScreenshotKeywords } from "./project-screenshot.js";
+import { isWriteBlockedBySafeMode, safeModeActionMessage } from "./safety.js";
 import { renderStatusImage } from "./status-image.js";
 import { TaskStore } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
@@ -248,6 +251,91 @@ test("project metadata exposes configured commands and presets", () => {
   assert.equal(resolveProjectCommand(demo, "test"), "npm test");
   assert.equal(resolveProjectCommand(demo, "quick-check"), "npm run build");
   assert.equal(resolveProjectCommand(demo, "missing"), undefined);
+});
+
+test("autocomplete helpers suggest projects commands tasks and peers", () => {
+  const demo = project("demo", "/tmp/demo", {
+    aliases: ["web"],
+    commands: {
+      test: ["npm test"],
+      build: ["npm run build"],
+      lint: [],
+      verify: [],
+      presets: {
+        "quick-check": "npm run build"
+      }
+    }
+  });
+  const task = {
+    id: "task-abc",
+    status: "running" as const,
+    source: "slash:act",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    text: "fix the build",
+    includePatterns: [],
+    startedAt: "2026-06-23T20:00:00.000Z",
+    updatedAt: "2026-06-23T20:00:00.000Z"
+  };
+
+  assert.deepEqual(projectChoices([demo], "we"), [{ name: "demo", value: "demo" }]);
+  assert.deepEqual(commandChoices(demo, "qui"), [{ name: "quick-check", value: "quick-check" }]);
+  assert.deepEqual(commandChoices(demo, "test, bu"), [{ name: "build", value: "test, build" }]);
+  assert.deepEqual(taskChoices([task], "abc"), [{ name: "task-abc | running action demo", value: "task-abc" }]);
+  assert.deepEqual(
+    peerChoices(
+      [
+        {
+          botId: "123",
+          owner: "shadow",
+          botName: "shadow-devbot",
+          projects: ["demo"],
+          commands: ["status"],
+          supportsScreenshots: true,
+          safeMode: false,
+          lastSeenAt: "2026-06-23T20:00:00.000Z"
+        }
+      ],
+      "shadow"
+    ),
+    [{ name: "shadow-devbot (shadow)", value: "123" }]
+  );
+});
+
+test("command schema exposes help and autocomplete for high-friction options", () => {
+  const commands = commandDefinitions as CommandJson[];
+  const devbot = commands.find((command) => command.name === "devbot");
+  assert.ok(devbot);
+  assert.ok(devbot.options?.some((option) => option.name === "help"));
+
+  const run = commands.find((command) => command.name === "run");
+  const runCommandOption = run?.options?.find((option) => option.name === "command");
+  assert.equal(runCommandOption?.autocomplete, true);
+
+  const task = commands.find((command) => command.name === "task");
+  const show = task?.options?.find((option) => option.name === "show");
+  const showId = show?.options?.find((option) => option.name === "id");
+  assert.equal(showId?.autocomplete, true);
+
+  const peer = commands.find((command) => command.name === "peer");
+  const status = peer?.options?.find((option) => option.name === "status");
+  const bot = status?.options?.find((option) => option.name === "bot");
+  assert.equal(bot?.autocomplete, true);
+});
+
+interface CommandJson {
+  name: string;
+  autocomplete?: boolean;
+  options?: CommandJson[];
+}
+
+test("safe mode blocks only write-capable Codex requests", () => {
+  assert.equal(isWriteBlockedBySafeMode({ safeMode: true }, "action"), true);
+  assert.equal(isWriteBlockedBySafeMode({ safeMode: true }, "answer"), false);
+  assert.equal(isWriteBlockedBySafeMode({ safeMode: false }, "action"), false);
+  assert.match(safeModeActionMessage("/act"), /cannot start write-capable Codex work/);
+  assert.match(safeModeActionMessage("/act"), /Read-only commands still work/);
 });
 
 test("peer envelopes round-trip through Discord-friendly fenced JSON", () => {
