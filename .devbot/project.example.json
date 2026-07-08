@@ -1,10 +1,10 @@
 {
-  "canonicalName": "pullprice",
-  "repoUrl": "git@github.com:example/pullprice.git",
+  "canonicalName": "webapp",
+  "repoUrl": "git@github.com:example/webapp.git",
   "defaultBranch": "main",
   "frontendUrl": "http://127.0.0.1:3000",
   "backendUrl": "http://127.0.0.1:8787",
-  "ownerBot": "shadow-devbot",
+  "ownerBot": "local-devbot",
   "aliases": ["web", "frontend"],
   "commands": {
     "test": ["npm test"],

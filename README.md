@@ -15,7 +15,7 @@ This does not require an OpenAI API key. Each request runs `codex exec` locally,
 
 1. Install Node.js 20 or newer.
 2. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, and `DISCORD_GUILD_ID`.
-3. Copy `config/projects.example.json` to `config/projects.json` and map project names to local paths.
+3. Copy `config/projects.example.json` to `config/projects.json` and map project names to env-backed local paths on the machine running devbot. For quick one-off setup, you can instead set `PROJECTS_JSON` in `.env`.
 4. Optionally copy `.devbot/project.example.json` into each target project at `<project>/.devbot/project.json` and customize URLs, aliases, and validation commands.
 5. Install dependencies:
 
@@ -83,7 +83,7 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Set `DEVBOT_TASK_STORE` to use a different task-history file.
+Task history is stored locally in `.devbot/tasks.json` by default. Peer registry state is stored in `.devbot/peers.json`. Set `DEVBOT_TASK_STORE` or `DEVBOT_PEER_STORE` to use different files; relative paths resolve from the devbot process working directory.
 
 ## Project Metadata
 
@@ -91,7 +91,7 @@ Each target project can define optional metadata at `<project>/.devbot/project.j
 
 ```json
 {
-  "canonicalName": "pullprice",
+  "canonicalName": "webapp",
   "frontendUrl": "http://127.0.0.1:3000",
   "defaultBranch": "main",
   "aliases": ["web", "frontend"],
@@ -131,6 +131,10 @@ Defaults are conservative:
 - Default ignored paths include `.git`, `node_modules`, `dist`, `build`, `coverage`, `.env`, private keys, logs, and common binary media files
 
 Tune these in `src/config.ts` if you need a larger or smaller context window.
+
+## License
+
+MIT. See `LICENSE`.
 
 ## Discord App Notes
 

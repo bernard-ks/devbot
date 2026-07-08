@@ -5,6 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
 import { commandDefinitions } from "./commands.js";
+import { expandEnvPlaceholders } from "./config.js";
 import { configuredCommandNames, resolveProjectCommand } from "./command-runner.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from "./mention.js";
@@ -93,6 +94,23 @@ test("parseIncludePatterns handles comma-separated values", () => {
   assert.deepEqual(parseIncludePatterns("src/*, README.md,,*.json"), ["src/*", "README.md", "*.json"]);
 });
 
+test("project path config can reference environment variables", () => {
+  process.env.DEVBOT_TEST_PROJECT_ROOT = "/tmp/example-project";
+
+  assert.equal(expandEnvPlaceholders("${DEVBOT_TEST_PROJECT_ROOT}/web", "test project"), "/tmp/example-project/web");
+
+  delete process.env.DEVBOT_TEST_PROJECT_ROOT;
+});
+
+test("project path config reports missing environment variables", () => {
+  delete process.env.DEVBOT_MISSING_PROJECT_ROOT;
+
+  assert.throws(
+    () => expandEnvPlaceholders("${DEVBOT_MISSING_PROJECT_ROOT}", "test project"),
+    /Missing environment variable DEVBOT_MISSING_PROJECT_ROOT/
+  );
+});
+
 test("splitDiscordMessage keeps chunks inside the requested limit", () => {
   const chunks = splitDiscordMessage("a ".repeat(3000), 500);
   assert.ok(chunks.length > 1);
@@ -100,21 +118,21 @@ test("splitDiscordMessage keeps chunks inside the requested limit", () => {
 });
 
 test("mention status questions route to read-only answer mode", () => {
-  const request = parseMentionRequest("<@123> whats the current state of pullprice", "123", [
-    project("pullprice", "/tmp/pullprice")
+  const request = parseMentionRequest("<@123> whats the current state of webapp", "123", [
+    project("webapp", "/tmp/webapp")
   ]);
 
-  assert.equal(request.project.name, "pullprice");
-  assert.equal(request.text, "whats the current state of pullprice");
+  assert.equal(request.project.name, "webapp");
+  assert.equal(request.text, "whats the current state of webapp");
   assert.equal(request.mode, "answer");
 });
 
 test("mention action verbs route to action mode", () => {
-  const request = parseMentionRequest("<@!123> project:pullprice include:src/* fix the failing tests", "123", [
-    project("pullprice", "/tmp/pullprice")
+  const request = parseMentionRequest("<@!123> project:webapp include:src/* fix the failing tests", "123", [
+    project("webapp", "/tmp/webapp")
   ]);
 
-  assert.equal(request.project.name, "pullprice");
+  assert.equal(request.project.name, "webapp");
   assert.deepEqual(request.includePatterns, ["src/*"]);
   assert.equal(request.text, "fix the failing tests");
   assert.equal(request.mode, "action");
@@ -122,7 +140,7 @@ test("mention action verbs route to action mode", () => {
 
 test("mention mode override wins over inferred mode", () => {
   const request = parseMentionRequest("<@123> mode:action whats the current state", "123", [
-    project("pullprice", "/tmp/pullprice")
+    project("webapp", "/tmp/webapp")
   ]);
 
   assert.equal(request.text, "whats the current state");
@@ -130,7 +148,7 @@ test("mention mode override wins over inferred mode", () => {
 });
 
 test("role mentions can invoke the bot", () => {
-  const request = parseMentionRequest("<@&456> what's the status on the web build", "123", [project("pullprice", "/tmp/pullprice")], [
+  const request = parseMentionRequest("<@&456> what's the status on the web build", "123", [project("webapp", "/tmp/webapp")], [
     "456"
   ]);
 
@@ -174,15 +192,15 @@ test("work status reports empty and active Codex work", () => {
   const startedAt = new Date("2026-06-23T20:00:00.000Z");
   const work = tracker.start({
     mode: "action",
-    projectName: "pullprice",
-    requester: "Shadow.bk",
+    projectName: "webapp",
+    requester: "Alex",
     text: "run a repo health check"
   });
   work.startedAt = startedAt;
 
   assert.equal(
     formatWorkStatus(tracker.snapshot(), new Date("2026-06-23T20:01:05.000Z")),
-    "Codex dev work currently in progress: 1\n- `pullprice` action via bot for Shadow.bk, running 1m 5s: run a repo health check"
+    "Codex dev work currently in progress: 1\n- `webapp` action via bot for Alex, running 1m 5s: run a repo health check"
   );
 
   tracker.finish(work.id);
@@ -288,8 +306,8 @@ test("autocomplete helpers suggest projects commands tasks and peers", () => {
       [
         {
           botId: "123",
-          owner: "shadow",
-          botName: "shadow-devbot",
+          owner: "alex",
+          botName: "alex-devbot",
           projects: ["demo"],
           commands: ["status"],
           supportsScreenshots: true,
@@ -297,9 +315,9 @@ test("autocomplete helpers suggest projects commands tasks and peers", () => {
           lastSeenAt: "2026-06-23T20:00:00.000Z"
         }
       ],
-      "shadow"
+      "alex"
     ),
-    [{ name: "shadow-devbot (shadow)", value: "123" }]
+    [{ name: "alex-devbot (alex)", value: "123" }]
   );
 });
 
@@ -342,9 +360,9 @@ test("peer envelopes round-trip through Discord-friendly fenced JSON", () => {
   const envelope = createPeerEnvelope({
     type: "devbot.peer.request",
     from: "111",
-    owner: "shadow",
+    owner: "alex",
     action: "snip",
-    project: "pullprice",
+    project: "webapp",
     target: "browse page"
   });
 
@@ -353,22 +371,22 @@ test("peer envelopes round-trip through Discord-friendly fenced JSON", () => {
   assert.equal(parsed?.type, "devbot.peer.request");
   assert.equal(parsed?.from, "111");
   assert.equal(parsed?.action, "snip");
-  assert.equal(parsed?.project, "pullprice");
+  assert.equal(parsed?.project, "webapp");
   assert.equal(parsed?.target, "browse page");
 });
 
 test("status image renderer returns a png", async () => {
-  const image = await renderStatusImage("Codex dev work currently in progress: 1\n- pullprice session");
+  const image = await renderStatusImage("Codex dev work currently in progress: 1\n- webapp session");
   assert.equal(image.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
 });
 
 test("project screenshot detection finds a running Next dev server for the project", () => {
   const output = [
-    "node /Users/bernard/Documents/PullPrice/PullPriceWeb/web/node_modules/.bin/next dev -p 3001",
-    "node /Users/bernard/Documents/Other/web/node_modules/.bin/vite --port 5174"
+    "node /tmp/webapp/web/node_modules/.bin/next dev -p 3001",
+    "node /tmp/other/web/node_modules/.bin/vite --port 5174"
   ].join("\n");
 
-  assert.deepEqual(detectLocalWebUrlsFromPs(output, project("pullprice", "/Users/bernard/Documents/PullPrice")), [
+  assert.deepEqual(detectLocalWebUrlsFromPs(output, project("webapp", "/tmp/webapp")), [
     "http://127.0.0.1:3001"
   ]);
 });
@@ -392,20 +410,20 @@ test("project screenshot navigation chooses visible UI by request text", () => {
 
 test("external Codex process parser detects configured project sessions without leaking commands", () => {
   const output = [
-    "42248 16:54 /Applications/Codex.app/Contents/Resources/cua_node/bin/node --experimental-vm-modules /tmp/kernel.js --session-id abc --working-dir /Users/bernard/Documents/PullPrice",
-    "59726 01:02 /Applications/Codex.app/Contents/Resources/codex exec --ephemeral --sandbox workspace-write --cd /Users/bernard/Documents/PullPrice --output-last-message /tmp/answer.txt long prompt text",
-    "59727 01:02 /Applications/Codex.app/Contents/Resources/codex exec --cd /Users/bernard/Documents/PullPrice --output-last-message /tmp/devbot-codex-abc/answer.txt bot-owned prompt",
-    "99999 00:01 rg PullPrice"
+    "42248 16:54 /Applications/Codex.app/Contents/Resources/cua_node/bin/node --experimental-vm-modules /tmp/kernel.js --session-id abc --working-dir /tmp/webapp",
+    "59726 01:02 /Applications/Codex.app/Contents/Resources/codex exec --ephemeral --sandbox workspace-write --cd /tmp/webapp --output-last-message /tmp/answer.txt long prompt text",
+    "59727 01:02 /Applications/Codex.app/Contents/Resources/codex exec --cd /tmp/webapp --output-last-message /tmp/devbot-codex-abc/answer.txt bot-owned prompt",
+    "99999 00:01 rg webapp"
   ].join("\n");
 
   const work = parseExternalCodexWork(
     output,
-    [project("pullprice", "/Users/bernard/Documents/PullPrice")],
+    [project("webapp", "/tmp/webapp")],
     new Date("2026-06-23T20:20:00.000Z")
   );
 
   assert.equal(work.length, 2);
-  assert.equal(work[0]?.projectName, "pullprice");
+  assert.equal(work[0]?.projectName, "webapp");
   assert.equal(work[0]?.source, "local-codex");
   assert.equal(work[0]?.mode, "session");
   assert.equal(work[0]?.pid, 42248);
