@@ -35,6 +35,7 @@ export interface ProjectMetadata {
   ownerBot: string | undefined;
   aliases: string[];
   commands: ProjectCommands;
+  policy: ProjectPolicy;
 }
 
 export interface ProjectCommands {
@@ -43,6 +44,17 @@ export interface ProjectCommands {
   lint: string[];
   verify: string[];
   presets: Record<string, string>;
+}
+
+export interface ProjectPolicy {
+  visibility: "private" | "team" | "public";
+  allowedUsers: string[];
+  allowedRoles: string[];
+  allowedPeers: string[];
+  screenshotPolicy: "allow" | "approval" | "deny";
+  maxContextChars: number | undefined;
+  readOnlyCommands: string[];
+  approvalRequiredCommands: string[];
 }
 
 export interface CodexConfig {

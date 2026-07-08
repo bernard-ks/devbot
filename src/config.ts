@@ -151,7 +151,24 @@ function loadProjectMetadata(root: string, projectName: string): ProjectMetadata
     backendUrl: stringValue(raw.backendUrl),
     ownerBot: stringValue(raw.ownerBot),
     aliases,
-    commands
+    commands,
+    policy: readProjectPolicy(raw.policy)
+  };
+}
+
+function readProjectPolicy(value: unknown): ProjectMetadata["policy"] {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  const visibility = stringValue(raw.visibility);
+  const screenshotPolicy = stringValue(raw.screenshotPolicy);
+  return {
+    visibility: visibility === "team" || visibility === "public" ? visibility : "private",
+    allowedUsers: stringArray(raw.allowedUsers),
+    allowedRoles: stringArray(raw.allowedRoles),
+    allowedPeers: stringArray(raw.allowedPeers),
+    screenshotPolicy: screenshotPolicy === "approval" || screenshotPolicy === "deny" ? screenshotPolicy : "allow",
+    maxContextChars: numberValue(raw.maxContextChars),
+    readOnlyCommands: stringArray(raw.readOnlyCommands).map(normalizeProjectName),
+    approvalRequiredCommands: stringArray(raw.approvalRequiredCommands).map(normalizeProjectName)
   };
 }
 
@@ -192,6 +209,19 @@ function stringArray(value: unknown): string[] {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  }
+
+  return undefined;
 }
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {

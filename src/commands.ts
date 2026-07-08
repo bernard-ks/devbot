@@ -199,6 +199,158 @@ export const commandDefinitions = [
         )
     ),
   new SlashCommandBuilder()
+    .setName("lab")
+    .setDescription("Run private devbot collaboration lab workflows.")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("roundtable")
+        .setDescription("Invite devbots to give role-based angles on a project question.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addStringOption((option) => option.setName("prompt").setDescription("Question or decision for the room.").setRequired(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("see")
+        .setDescription("Collect local and peer screenshots for a target.")
+        .addStringOption((option) => option.setName("target").setDescription("Natural-language target or route.").setRequired(true))
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+        .addStringOption((option) =>
+          option
+            .setName("viewport")
+            .setDescription("Local screenshot viewport.")
+            .setRequired(false)
+            .addChoices(
+              { name: "desktop", value: "desktop" },
+              { name: "tablet", value: "tablet" },
+              { name: "mobile", value: "mobile" }
+            )
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("handoff")
+        .setDescription("Create a baton-pass card for a task or review.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addStringOption((option) => option.setName("target").setDescription("Human, bot, or team receiving the baton.").setRequired(true))
+        .addStringOption((option) => option.setName("task").setDescription("Optional saved task ID.").setRequired(false).setAutocomplete(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("bossfight")
+        .setDescription("Build a merge-readiness boss bar from review gates and peer evidence.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addStringOption((option) => option.setName("task").setDescription("Optional saved task ID.").setRequired(false).setAutocomplete(true))
+        .addStringOption((option) =>
+          option.setName("commands").setDescription("Optional comma-separated configured validation commands.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("jam")
+        .setDescription("Brainstorm playful options and convert the best one into a task.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addStringOption((option) => option.setName("theme").setDescription("Theme or rough idea to riff on.").setRequired(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("argue")
+        .setDescription("Ask devbots to challenge a proposal from several angles.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addStringOption((option) => option.setName("proposal").setDescription("Proposal to pressure-test.").setRequired(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("fix-from-snip")
+        .setDescription("Turn a visual complaint into a scoped fix plan and approval card.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addStringOption((option) => option.setName("target").setDescription("UI target or route to screenshot.").setRequired(true))
+        .addStringOption((option) => option.setName("complaint").setDescription("What looks wrong or should change.").setRequired(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("campfire")
+        .setDescription("Show stale running tasks and recovery options.")
+        .addIntegerOption((option) =>
+          option.setName("minutes").setDescription("Age threshold in minutes.").setRequired(false).setMinValue(1).setMaxValue(1440)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) => subcommand.setName("roster").setDescription("Show peer devbot capability cards."))
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("ritual")
+        .setDescription("Create a merge ritual card from task, review packet, validation, and safety state.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addStringOption((option) => option.setName("task").setDescription("Optional saved task ID.").setRequired(false).setAutocomplete(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("recent")
+        .setDescription("List recent collaboration lab sessions.")
+        .addIntegerOption((option) =>
+          option.setName("limit").setDescription("Number of sessions to show, 1-25.").setRequired(false).setMinValue(1).setMaxValue(25)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("events")
+        .setDescription("Show recent events for one collaboration lab session.")
+        .addStringOption((option) => option.setName("id").setDescription("Collaboration session ID.").setRequired(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("approve")
+        .setDescription("Record a human approval or denial for a lab session.")
+        .addStringOption((option) => option.setName("id").setDescription("Collaboration session ID.").setRequired(true))
+        .addStringOption((option) =>
+          option
+            .setName("decision")
+            .setDescription("Approval decision.")
+            .setRequired(true)
+            .addChoices({ name: "approve", value: "approve" }, { name: "deny", value: "deny" }, { name: "read-only", value: "read-only" })
+        )
+        .addStringOption((option) =>
+          option
+            .setName("action")
+            .setDescription("Optional approved action to run now.")
+            .setRequired(false)
+            .addChoices({ name: "record only", value: "record" }, { name: "run validation", value: "validate" }, { name: "run merge gates", value: "gates" })
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Project for the approved action.").setRequired(false).setAutocomplete(true)
+        )
+        .addStringOption((option) =>
+          option.setName("commands").setDescription("Optional comma-separated validation commands.").setRequired(false).setAutocomplete(true)
+        )
+        .addStringOption((option) => option.setName("note").setDescription("Optional approval note or condition.").setRequired(false))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("safety")
+        .setDescription("Show active collaboration safety rules.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+    ),
+  new SlashCommandBuilder()
     .setName("refresh")
     .setDescription("Refresh the indexed context for a project.")
     .addStringOption((option) =>
