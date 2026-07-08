@@ -79,7 +79,7 @@ function loadProjects(): ProjectEntry[] {
   const entries = Object.entries(parsed)
     .filter(([name, projectPath]) => name.trim() && projectPath.trim())
     .map(([name, projectPath]) => {
-      const root = path.resolve(projectPath);
+      const root = path.resolve(expandEnvPlaceholders(projectPath, `project ${name}`));
       const projectName = normalizeProjectName(name);
       return {
         name: projectName,
@@ -124,6 +124,17 @@ function csvSet(value: string | undefined): Set<string> {
 
 function normalizeProjectName(name: string): string {
   return name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+}
+
+export function expandEnvPlaceholders(value: string, label = "value"): string {
+  return value.replace(/\$\{([A-Z0-9_]+)\}/gi, (_match, name: string) => {
+    const replacement = process.env[name]?.trim();
+    if (!replacement) {
+      throw new Error(`Missing environment variable ${name} referenced by ${label}.`);
+    }
+
+    return replacement;
+  });
 }
 
 function loadProjectMetadata(root: string, projectName: string): ProjectMetadata {

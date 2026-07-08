@@ -29,14 +29,23 @@ Configure project roots with `config/projects.json`:
 
 ```json
 {
-  "pullprice": "/Users/bernard/Documents/PullPrice"
+  "webapp": "${DEVBOT_PROJECT_ROOT}"
 }
 ```
+
+Keep machine-specific paths in `.env`, for example:
+
+```bash
+DEVBOT_PROJECT_ROOT=/path/to/local/webapp
+```
+
+For quick local testing, you can also set `PROJECTS_JSON` in `.env`; when it is
+omitted, devbot reads `config/projects.json`.
 
 Optional per-project metadata lives inside the target project:
 
 ```text
-/Users/bernard/Documents/PullPrice/.devbot/project.json
+/path/to/local/webapp/.devbot/project.json
 ```
 
 Use `.devbot/project.example.json` from this repo as the template.
@@ -66,6 +75,9 @@ Override these paths with:
 
 - `DEVBOT_TASK_STORE`
 - `DEVBOT_PEER_STORE`
+
+Relative override paths are resolved from the devbot process working directory.
+Use absolute paths if you want state stored outside this repo.
 
 These files are intentionally not committed.
 
@@ -106,10 +118,10 @@ If screenshots always hit the wrong app, set `frontendUrl` in the target project
 Each developer should run a unique Discord bot application. Configure:
 
 ```bash
-BOT_OWNER=shadow
-BOT_DISPLAY_NAME=shadow-devbot
+BOT_OWNER=local
+BOT_DISPLAY_NAME=local-devbot
 PEER_BOT_IDS=123456789012345678,234567890123456789
-COORDINATION_CHANNEL_ID=1519068605613080790
+COORDINATION_CHANNEL_ID=123456789012345678
 ```
 
 Then run:
@@ -117,8 +129,8 @@ Then run:
 ```text
 /devbot announce
 /devbot peers
-/peer status bot:<peer-bot-id> project:pullprice
-/peer snip bot:<peer-bot-id> project:pullprice target:browse page
+/peer status bot:<peer-bot-id> project:webapp
+/peer snip bot:<peer-bot-id> project:webapp target:browse page
 ```
 
 Peer actions are read-only in this MVP. File edits, pushes, merges, and arbitrary commands remain human-initiated locally.

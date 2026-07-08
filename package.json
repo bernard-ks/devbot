@@ -2,6 +2,7 @@
   "name": "devbot",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "A Discord bot that answers and acts on development requests with local Codex project context.",
   "scripts": {

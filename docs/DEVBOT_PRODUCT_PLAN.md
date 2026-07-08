@@ -119,9 +119,9 @@ The most promising collaborative model is each developer running their own devbo
 
 Each bot should represent its local machine and owner:
 
-- `shadow-devbot`
-- `tom-devbot`
-- `a5omic-devbot`
+- `alex-devbot`
+- `casey-devbot`
+- `riley-devbot`
 
 Each bot can expose what it can safely do:
 
@@ -148,14 +148,14 @@ Recommended protocol:
 Useful interactions:
 
 - Query peer status:
-  - "Tom Devbot, what are you working on?"
-  - "Shadow Devbot, do you have PullPrice frontend running?"
+  - "Casey Devbot, what are you working on?"
+  - "Alex Devbot, do you have the web frontend running?"
 - Request a screenshot from the peer who owns the UI:
-  - "Shadow Devbot, send a snip of the browse page."
+  - "Alex Devbot, send a snip of the browse page."
 - Ask another bot to validate a branch:
-  - "A5omic Devbot, pull PR 42 and run backend tests."
+  - "Riley Devbot, pull PR 42 and run backend tests."
 - Handoff a task:
-  - "Shadow Devbot, hand off PR 42 to Tom Devbot for review."
+  - "Alex Devbot, hand off PR 42 to Casey Devbot for review."
 - Merge with peer validation:
   - author bot creates a branch/review request
   - reviewer bot pulls branch and validates
