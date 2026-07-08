@@ -15,5 +15,15 @@
       "web-build": "npm run build",
       "quick-check": "npm run build"
     }
+  },
+  "policy": {
+    "visibility": "team",
+    "allowedUsers": [],
+    "allowedRoles": [],
+    "allowedPeers": [],
+    "screenshotPolicy": "allow",
+    "maxContextChars": 120000,
+    "readOnlyCommands": ["test", "lint"],
+    "approvalRequiredCommands": ["verify", "web-build"]
   }
 }

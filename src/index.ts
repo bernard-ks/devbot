@@ -7,6 +7,9 @@ import {
 } from "discord.js";
 import type { AutocompleteInteraction, ChatInputCommandInteraction, Interaction, Message } from "discord.js";
 import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
+import { createCollabEnvelope, formatCollabEnvelope, parseCollabEnvelope } from "./collab-protocol.js";
+import type { CollabCapability, CollabEnvelopeV2, CollabIntent, CollabMode } from "./collab-protocol.js";
+import { CollabStore, formatCollabRecent } from "./collab-store.js";
 import { loadConfig } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
@@ -24,16 +27,38 @@ import {
   PeerStore
 } from "./peer.js";
 import { createReviewPacket, evaluateMergeGates, formatMergeGateResult, formatReviewPacket, formatValidationResults, validateReview } from "./review.js";
-import { isWriteBlockedBySafeMode, safeModeActionMessage } from "./safety.js";
+import {
+  commandRequiresApproval,
+  isPeerAllowedForProject,
+  isScreenshotBlocked,
+  isWriteBlockedBySafeMode,
+  safeModeActionMessage,
+  screenshotRequiresApproval
+} from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskStatus } from "./task-store.js";
 import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
+import {
+  eventArtifact,
+  formatApprovalCard,
+  formatBossFight,
+  formatCampfire,
+  formatCollabEvents,
+  formatHandoffCard,
+  formatLabHeader,
+  formatPeerFanout,
+  formatRitual,
+  formatRoundtableResult,
+  formatSafetySummary,
+  labPrompt
+} from "./lab.js";
 
 const config = loadConfig();
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
+const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const activeTaskControllers = new Map<string, AbortController>();
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
@@ -175,6 +200,9 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     const projectName = interaction.options.getString("project");
     const question = interaction.options.getString("question") ?? undefined;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+    if (project && !(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
     const snapshot = await getStatusSnapshotResponse(appConfig, interaction.options.getBoolean("image") ?? false, project, question);
     await editInteractionWithChunks(interaction, snapshot);
 
@@ -196,6 +224,9 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     const target = interaction.options.getString("target", true);
     const viewport = interaction.options.getString("viewport") as "desktop" | "tablet" | "mobile" | null;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : defaultProject(appConfig.projects);
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
     const screenshot = await captureProjectScreenshot(project, { requestText: target, viewport: viewport ?? "desktop" });
     if (!screenshot) {
       await interaction.editReply(`I could not find a running local web UI to screenshot for \`${project.name}\`.`);
@@ -240,6 +271,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     return;
   }
 
+  if (interaction.commandName === "lab") {
+    await handleLabCommand(interaction, appConfig);
+    return;
+  }
+
   if (interaction.commandName === "refresh") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
@@ -251,6 +287,9 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
   if (interaction.commandName === "ask") {
     await interaction.deferReply();
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
     const question = interaction.options.getString("question", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
     const { answer, context, taskId } = await runProjectRequest({
@@ -289,6 +328,9 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     }
 
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
     const task = interaction.options.getString("task", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
     const { answer, taskId } = await runProjectRequest({
@@ -560,6 +602,9 @@ async function handleRunCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+  if (!(await ensureProjectAccess(interaction, project))) {
+    return;
+  }
   const command = interaction.options.getString("command", true);
   const result = await runConfiguredProjectCommand(project, command);
   await editInteractionWithChunks(interaction, { content: formatProjectCommandResult(result) });
@@ -568,6 +613,9 @@ async function handleRunCommand(interaction: ChatInputCommandInteraction, appCon
 async function handleReviewCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   const subcommand = interaction.options.getSubcommand();
   const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+  if (!(await ensureProjectAccess(interaction, project))) {
+    return;
+  }
 
   if (subcommand === "packet") {
     await interaction.deferReply();
@@ -655,8 +703,385 @@ async function handlePeerCommand(interaction: ChatInputCommandInteraction, appCo
   await interaction.editReply(`Sent ${action} request \`${envelope.requestId}\` to <@${peerBotId}>.`);
 }
 
+async function handleLabCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === "recent") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await interaction.editReply(formatCollabRecent(await collabStore.recent(interaction.options.getInteger("limit") ?? 10)));
+    return;
+  }
+
+  if (subcommand === "events") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const id = interaction.options.getString("id", true);
+    const events = await collabStore.events(id);
+    await interaction.editReply([`Events for \`${id}\`:`, formatCollabEvents(events)].join("\n"));
+    return;
+  }
+
+  if (subcommand === "approve") {
+    await interaction.deferReply();
+    const id = interaction.options.getString("id", true);
+    const decision = interaction.options.getString("decision", true);
+    const action = interaction.options.getString("action") ?? "record";
+    const projectName = interaction.options.getString("project") ?? undefined;
+    const commandNames = parseCommandNames(interaction.options.getString("commands"));
+    const note = interaction.options.getString("note") ?? "";
+    let actionResult: string | undefined;
+
+    if (decision === "approve" && action !== "record") {
+      if (appConfig.safeMode) {
+        actionResult = "Safe mode is on, so the approval was recorded but no command was executed.";
+      } else if (!projectName) {
+        actionResult = "Approval recorded. Add `project:<name>` to execute validation or gates.";
+      } else {
+        const project = mustFindProject(appConfig.projects, projectName);
+        if (action === "validate") {
+          const results = await validateReview(project, commandNames);
+          actionResult = formatValidationResults(project, results);
+        } else if (action === "gates") {
+          const result = await evaluateMergeGates(project, commandNames);
+          actionResult = formatMergeGateResult(project, result);
+        }
+      }
+    }
+
+    await collabStore.addEvent({
+      conversationId: id,
+      type: "approval",
+      actor: interaction.user.tag,
+      summary: `${decision}${action !== "record" ? ` ${action}` : ""}${note ? `: ${note}` : ""}`,
+      mode: decision === "approve" ? "write" : "read",
+      artifacts: [
+        eventArtifact("approval", decision, note || undefined),
+        ...(actionResult ? [eventArtifact(action === "gates" ? "validation" : "validation", action, projectName)] : [])
+      ]
+    });
+    await editInteractionWithChunks(interaction, {
+      content: [
+        `Recorded \`${decision}\` for lab session \`${id}\`${note ? `: ${note}` : "."}`,
+        actionResult ? ["", actionResult].join("\n") : undefined
+      ]
+        .filter((line) => line !== undefined)
+        .join("\n")
+    });
+    return;
+  }
+
+  if (subcommand === "safety") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const projectName = interaction.options.getString("project");
+    const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+    if (project && !(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    await interaction.editReply(formatSafetySummary(appConfig, project));
+    return;
+  }
+
+  if (subcommand === "roster") {
+    await interaction.deferReply();
+    const peers = await allowedPeerRecords(appConfig);
+    const conversation = await startLabConversation(interaction, subcommand, undefined, "Capability Trading Cards");
+    await collabStore.addEvent({
+      conversationId: conversation.id,
+      type: "artifact",
+      actor: interaction.user.tag,
+      summary: `Rendered ${peers.length} peer capability card(s).`,
+      artifacts: [eventArtifact("log", "peer roster", `${peers.length} peer(s)`)]
+    });
+    await interaction.editReply([formatLabHeader(conversation), "", formatPeerList(peers)].join("\n"));
+    return;
+  }
+
+  if (subcommand === "campfire") {
+    await interaction.deferReply();
+    const minutes = interaction.options.getInteger("minutes") ?? 30;
+    const projectName = interaction.options.getString("project") ?? undefined;
+    const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+    if (project && !(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const running = await taskStore.listRecent({
+      status: "running",
+      limit: 25,
+      ...(project ? { projectName: project.name } : {})
+    });
+    const cutoff = Date.now() - minutes * 60_000;
+    const stale = running.filter((task) => new Date(task.startedAt).getTime() < cutoff);
+    const conversation = await startLabConversation(interaction, subcommand, project, `Stale Task Campfire (${minutes}m)`);
+    await collabStore.addEvent({
+      conversationId: conversation.id,
+      type: "artifact",
+      actor: interaction.user.tag,
+      summary: `Found ${stale.length} stale task(s).`,
+      artifacts: stale.map((task) => eventArtifact("task", task.id, task.status))
+    });
+    await interaction.editReply([formatLabHeader(conversation), "", formatCampfire(stale, minutes)].join("\n"));
+    return;
+  }
+
+  if (subcommand === "roundtable" || subcommand === "jam" || subcommand === "argue") {
+    await interaction.deferReply();
+    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const text =
+      subcommand === "roundtable"
+        ? interaction.options.getString("prompt", true)
+        : subcommand === "jam"
+          ? interaction.options.getString("theme", true)
+          : interaction.options.getString("proposal", true);
+    const conversation = await startLabConversation(interaction, subcommand, project, `${subcommand}: ${text}`);
+    const prompt = labPrompt(subcommand, text);
+    const { answer, taskId } = await runProjectRequest({
+      appConfig,
+      project,
+      text: prompt,
+      includePatterns: [],
+      mode: "answer",
+      requester: interaction.user.tag,
+      source: `lab:${subcommand}`
+    });
+    await collabStore.addEvent({
+      conversationId: conversation.id,
+      type: "artifact",
+      actor: appConfig.botIdentity.displayName,
+      summary: `Local ${subcommand} response saved as ${taskId}.`,
+      mode: "think",
+      artifacts: [eventArtifact("plan", taskId, subcommand)]
+    });
+    const peerCount = await fanOutLabRequest(interaction, appConfig, {
+      conversationId: conversation.id,
+      project,
+      intent: subcommand,
+      capability: "task.plan",
+      mode: "think",
+      target: text,
+      payload: { prompt, sourceTaskId: taskId }
+    });
+    const content =
+      subcommand === "roundtable"
+        ? formatRoundtableResult(conversation, answer, peerCount)
+        : [formatLabHeader(conversation), "", answer, "", peerCount > 0 ? `Invited ${peerCount} peer devbot(s) to riff too.` : "No peer devbots invited."].join("\n");
+    await editInteractionWithChunks(interaction, { content });
+    return;
+  }
+
+  if (subcommand === "see") {
+    await interaction.deferReply();
+    const projectName = interaction.options.getString("project");
+    const project = projectName ? mustFindProject(appConfig.projects, projectName) : defaultProject(appConfig.projects);
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const target = interaction.options.getString("target", true);
+    const viewport = interaction.options.getString("viewport") as "desktop" | "tablet" | "mobile" | null;
+    const conversation = await startLabConversation(interaction, subcommand, project, `Screenshot Seance: ${target}`);
+    const screenshotApproval = screenshotPolicyMessage(project, interaction.user.tag);
+    const screenshot = screenshotApproval ? undefined : await captureProjectScreenshot(project, { requestText: target, viewport: viewport ?? "desktop" });
+    const peerCount = await fanOutLabRequest(interaction, appConfig, {
+      conversationId: conversation.id,
+      project,
+      intent: "see",
+      capability: "screenshot.read",
+      mode: "read",
+      target,
+      payload: { target, viewport: viewport ?? "desktop" }
+    });
+    await collabStore.addEvent({
+      conversationId: conversation.id,
+      type: "artifact",
+      actor: appConfig.botIdentity.displayName,
+      summary: screenshot ? `Captured local screenshot for ${target}.` : `No local screenshot available for ${target}.`,
+      mode: "read",
+      artifacts: screenshot ? [eventArtifact("screenshot", screenshot.fileName, screenshot.metadata.finalUrl)] : []
+    });
+    const content = [
+      formatLabHeader(conversation),
+      "",
+      screenshotApproval ?? (screenshot ? formatScreenshotReply(project, screenshot) : `No running local web UI found for \`${project.name}\`.`),
+      "",
+      formatPeerFanout("see", await allowedPeerRecords(appConfig, project), target),
+      peerCount > 0 ? `Sent ${peerCount} peer screenshot request(s).` : undefined
+    ]
+      .filter(Boolean)
+      .join("\n");
+    await editInteractionWithChunks(interaction, {
+      content,
+      ...(screenshot ? { image: screenshot.image, imageName: screenshot.fileName } : {})
+    });
+    return;
+  }
+
+  if (subcommand === "handoff") {
+    await interaction.deferReply();
+    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const target = interaction.options.getString("target", true);
+    const taskId = interaction.options.getString("task") ?? undefined;
+    const task = taskId ? await taskStore.get(taskId) : undefined;
+    const packet = await createReviewPacket(project, task);
+    const conversation = await startLabConversation(interaction, subcommand, project, `Baton Pass to ${target}`);
+    await collabStore.addEvent({
+      conversationId: conversation.id,
+      type: "artifact",
+      actor: interaction.user.tag,
+      summary: `Created handoff for ${target}.`,
+      artifacts: [eventArtifact("review-packet", "handoff packet", project.name)]
+    });
+    await maybeSendTargetedReviewRequest(interaction, appConfig, conversation.id, target, project, formatReviewPacket(packet), taskId);
+    await editInteractionWithChunks(interaction, {
+      content: formatHandoffCard({
+        conversation,
+        task,
+        target,
+        reviewPacket: formatReviewPacket(packet)
+      })
+    });
+    return;
+  }
+
+  if (subcommand === "bossfight") {
+    await interaction.deferReply();
+    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const taskId = interaction.options.getString("task") ?? undefined;
+    const task = taskId ? await taskStore.get(taskId) : undefined;
+    const packet = await createReviewPacket(project, task);
+    const conversation = await startLabConversation(interaction, subcommand, project, "Boss Fight Review");
+    const commandNames = parseCommandNames(interaction.options.getString("commands"));
+    const commandApprovalRequired = commandsNeedApproval(project, commandNames);
+    const gates = appConfig.safeMode || commandApprovalRequired ? undefined : await evaluateMergeGates(project, commandNames).then((result) => formatMergeGateResult(project, result));
+    const approval = appConfig.safeMode || commandApprovalRequired
+      ? formatApprovalCard({
+          action: "Run local merge gates",
+          actor: interaction.user.tag,
+          projectName: project.name,
+          risk: "medium",
+          reason: appConfig.safeMode
+            ? "Safe mode blocks validation commands because project presets may mutate local state."
+            : "Project policy marks one or more validation commands as approval-required.",
+          scope: "Configured project command presets only",
+          sideEffects: "May run package scripts, build artifacts, tests, or network calls depending on project config."
+        })
+      : undefined;
+    const peerCount = await fanOutLabRequest(interaction, appConfig, {
+      conversationId: conversation.id,
+      project,
+      intent: "bossfight",
+      capability: "review.packet",
+      mode: "read",
+      target: "bossfight review",
+      payload: { taskId, reviewPacket: formatReviewPacket(packet) }
+    });
+    await collabStore.addEvent({
+      conversationId: conversation.id,
+      type: "artifact",
+      actor: appConfig.botIdentity.displayName,
+      summary: `Boss fight prepared with ${peerCount} peer observer(s).`,
+      artifacts: [eventArtifact("review-packet", "bossfight review", project.name)]
+    });
+    await editInteractionWithChunks(interaction, {
+      content: formatBossFight({
+        conversation,
+        reviewPacket: formatReviewPacket(packet),
+        gates,
+        peerCount,
+        ...(approval ? { approval } : {})
+      })
+    });
+    return;
+  }
+
+  if (subcommand === "fix-from-snip") {
+    await interaction.deferReply();
+    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const target = interaction.options.getString("target", true);
+    const complaint = interaction.options.getString("complaint", true);
+    const conversation = await startLabConversation(interaction, subcommand, project, `Snip-to-Fix: ${target}`);
+    const screenshotApproval = screenshotPolicyMessage(project, interaction.user.tag);
+    const screenshot = screenshotApproval ? undefined : await captureProjectScreenshot(project, { requestText: target });
+    const prompt = labPrompt("fix-from-snip", `${complaint}\n\nTarget: ${target}`);
+    const { answer, taskId } = await runProjectRequest({
+      appConfig,
+      project,
+      text: prompt,
+      includePatterns: [],
+      mode: "answer",
+      requester: interaction.user.tag,
+      source: "lab:fix-from-snip"
+    });
+    const approval = formatApprovalCard({
+      action: "Run scoped UI fix from screenshot complaint",
+      actor: interaction.user.tag,
+      projectName: project.name,
+      risk: "medium",
+      reason: "This would start write-capable Codex work based on visual evidence.",
+      scope: "Selected project only; no secrets/config; before/after screenshot expected.",
+      sideEffects: "May edit UI files and run verification commands."
+    });
+    await collabStore.addEvent({
+      conversationId: conversation.id,
+      type: "approval",
+      actor: appConfig.botIdentity.displayName,
+      summary: `Prepared fix plan ${taskId}; waiting for owner approval before writes.`,
+      mode: "write",
+      artifacts: [eventArtifact("plan", taskId, "fix-from-snip")]
+    });
+    await editInteractionWithChunks(interaction, {
+      content: [formatLabHeader(conversation), "", screenshotApproval ?? (screenshot ? formatScreenshotReply(project, screenshot) : "No local screenshot captured."), "", answer, "", approval].join("\n"),
+      ...(screenshot ? { image: screenshot.image, imageName: screenshot.fileName } : {})
+    });
+    return;
+  }
+
+  if (subcommand === "ritual") {
+    await interaction.deferReply();
+    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const taskId = interaction.options.getString("task") ?? undefined;
+    const task = taskId ? await taskStore.get(taskId) : undefined;
+    const packet = await createReviewPacket(project, task);
+    const recentTasks = await taskStore.listRecent({ limit: 5, projectName: project.name });
+    const conversation = await startLabConversation(interaction, subcommand, project, "Merge Ritual Thread");
+    await collabStore.addEvent({
+      conversationId: conversation.id,
+      type: "artifact",
+      actor: interaction.user.tag,
+      summary: "Created merge ritual card.",
+      artifacts: [eventArtifact("review-packet", "merge ritual", project.name)]
+    });
+    await editInteractionWithChunks(interaction, {
+      content: formatRitual({
+        conversation,
+        reviewPacket: formatReviewPacket(packet),
+        tasks: recentTasks,
+        safety: formatSafetySummary(appConfig, project)
+      })
+    });
+  }
+}
+
 async function maybeHandlePeerMessage(message: Message, appConfig: AppConfig): Promise<void> {
   if (!client.user || !appConfig.peerBotIds.has(message.author.id)) {
+    return;
+  }
+
+  const collabEnvelope = parseCollabEnvelope(message.content);
+  if (collabEnvelope) {
+    await maybeHandleCollabPeerMessage(message, appConfig, collabEnvelope);
     return;
   }
 
@@ -716,6 +1141,20 @@ async function maybeHandlePeerMessage(message: Message, appConfig: AppConfig): P
     await message.reply(formatPeerEnvelope(result));
     return;
   }
+  if (!isPeerAllowedForProject(project, message.author.id)) {
+    const result = createPeerEnvelope({
+      type: "devbot.peer.result",
+      requestId: envelope.requestId,
+      from: client.user.id,
+      owner: appConfig.botIdentity.owner,
+      action: envelope.action,
+      project: project.name,
+      ok: false,
+      message: `Peer <@${message.author.id}> is not allowed for project ${project.name}.`
+    });
+    await message.reply(formatPeerEnvelope(result));
+    return;
+  }
 
   if (envelope.action === "status") {
     const status = await getStatusSnapshotResponse(appConfig, false, project, envelope.target ?? "");
@@ -734,6 +1173,22 @@ async function maybeHandlePeerMessage(message: Message, appConfig: AppConfig): P
   }
 
   if (envelope.action === "snip") {
+    const approval = screenshotPolicyMessage(project, envelope.owner);
+    if (approval) {
+      const result = createPeerEnvelope({
+        type: "devbot.peer.result",
+        requestId: envelope.requestId,
+        from: client.user.id,
+        owner: appConfig.botIdentity.owner,
+        action: envelope.action,
+        project: project.name,
+        ok: false,
+        message: approval
+      });
+      await message.reply(formatPeerEnvelope(result));
+      return;
+    }
+
     const screenshot = await captureProjectScreenshot(project, { requestText: envelope.target ?? "" });
     const result = createPeerEnvelope({
       type: "devbot.peer.result",
@@ -750,6 +1205,181 @@ async function maybeHandlePeerMessage(message: Message, appConfig: AppConfig): P
       files: screenshot ? [new AttachmentBuilder(screenshot.image, { name: screenshot.fileName })] : []
     });
   }
+}
+
+async function maybeHandleCollabPeerMessage(
+  message: Message,
+  appConfig: AppConfig,
+  envelope: CollabEnvelopeV2
+): Promise<void> {
+  if (!client.user) {
+    return;
+  }
+
+  if (envelope.type !== "devbot.peer.request") {
+    await collabStore.addEvent({
+      conversationId: envelope.conversationId,
+      type: envelope.type === "devbot.peer.result" ? "peer-result" : envelope.type === "devbot.peer.approval" ? "approval" : "note",
+      actor: envelope.from.botName ?? envelope.from.owner,
+      summary: `${envelope.intent} ${envelope.capability}`,
+      mode: envelope.mode,
+      artifacts: envelope.artifacts
+    });
+    return;
+  }
+
+  if (!message.mentions.users.has(client.user.id)) {
+    return;
+  }
+
+  let project: ProjectEntry | undefined;
+  try {
+    project = envelope.to?.project ? findProject(appConfig.projects, envelope.to.project) : defaultProject(appConfig.projects);
+  } catch {
+    project = undefined;
+  }
+  if (!project) {
+    await replyWithCollabResult(message, appConfig, envelope, false, `Unknown project: ${envelope.to?.project ?? "(default)"}`);
+    return;
+  }
+  if (!isPeerAllowedForProject(project, message.author.id)) {
+    await replyWithCollabResult(message, appConfig, envelope, false, `Peer <@${message.author.id}> is not allowed for project ${project.name}.`);
+    return;
+  }
+
+  if (envelope.capability === "status.read") {
+    const status = await getStatusSnapshotResponse(appConfig, false, project, String(envelope.payload.target ?? ""));
+    await replyWithCollabResult(message, appConfig, envelope, true, status.content);
+    return;
+  }
+
+  if (envelope.capability === "screenshot.read") {
+    const approval = screenshotPolicyMessage(project, envelope.from.botName ?? envelope.from.owner);
+    if (approval) {
+      await replyWithCollabApproval(message, appConfig, envelope, approval);
+      return;
+    }
+
+    const target = String(envelope.payload.target ?? envelope.payload.prompt ?? "");
+    const screenshot = await captureProjectScreenshot(project, { requestText: target });
+    await replyWithCollabResult(message, appConfig, envelope, Boolean(screenshot), screenshot ? formatScreenshotReply(project, screenshot) : `No running local web UI found for ${project.name}.`, screenshot);
+    return;
+  }
+
+  if (envelope.capability === "task.plan") {
+    const prompt = String(envelope.payload.prompt ?? envelope.payload.target ?? "Give a concise read-only plan.");
+    const { answer, taskId } = await runProjectRequest({
+      appConfig,
+      project,
+      text: prompt,
+      includePatterns: [],
+      mode: "answer",
+      requester: envelope.from.owner,
+      source: "peer:plan"
+    });
+    await replyWithCollabResult(message, appConfig, envelope, true, answer, undefined, [eventArtifact("plan", taskId, envelope.intent)]);
+    return;
+  }
+
+  if (envelope.capability === "review.packet") {
+    const taskId = typeof envelope.payload.taskId === "string" ? envelope.payload.taskId : undefined;
+    const task = taskId ? await taskStore.get(taskId) : undefined;
+    const packet = await createReviewPacket(project, task);
+    await replyWithCollabResult(message, appConfig, envelope, true, formatReviewPacket(packet), undefined, [
+      eventArtifact("review-packet", "peer review packet", project.name)
+    ]);
+    return;
+  }
+
+  const approval = formatApprovalCard({
+    action: envelope.capability,
+    actor: envelope.from.botName ?? envelope.from.owner,
+    projectName: project.name,
+    risk: envelope.capability === "review.validate" ? "medium" : "high",
+    reason: "Peer-requested validation or mutation requires explicit owner approval.",
+    scope: "Selected project only after owner approval.",
+    sideEffects: "May run local commands, edit files, push, merge, deploy, or otherwise mutate state depending on the approved action."
+  });
+  await replyWithCollabApproval(message, appConfig, envelope, approval);
+}
+
+async function replyWithCollabResult(
+  message: Message,
+  appConfig: AppConfig,
+  request: CollabEnvelopeV2,
+  ok: boolean,
+  resultMessage: string,
+  screenshot?: ProjectScreenshot,
+  artifacts = request.artifacts
+): Promise<void> {
+  if (!client.user) {
+    return;
+  }
+
+  const result = createCollabEnvelope({
+    type: "devbot.peer.result",
+    conversationId: request.conversationId,
+    requestId: request.requestId,
+    correlationId: request.requestId,
+    from: {
+      botId: client.user.id,
+      owner: appConfig.botIdentity.owner,
+      botName: appConfig.botIdentity.displayName
+    },
+    to: {
+      botId: request.from.botId,
+      ...(request.to?.project ? { project: request.to.project } : {})
+    },
+    capability: request.capability,
+    intent: request.intent,
+    mode: request.mode,
+    requiresApproval: false,
+    payload: {
+      ok,
+      message: resultMessage
+    },
+    artifacts
+  });
+  await message.reply({
+    content: formatCollabEnvelope(result),
+    files: screenshot ? [new AttachmentBuilder(screenshot.image, { name: screenshot.fileName })] : []
+  });
+}
+
+async function replyWithCollabApproval(
+  message: Message,
+  appConfig: AppConfig,
+  request: CollabEnvelopeV2,
+  approval: string
+): Promise<void> {
+  if (!client.user) {
+    return;
+  }
+
+  const result = createCollabEnvelope({
+    type: "devbot.peer.approval",
+    conversationId: request.conversationId,
+    requestId: request.requestId,
+    correlationId: request.requestId,
+    from: {
+      botId: client.user.id,
+      owner: appConfig.botIdentity.owner,
+      botName: appConfig.botIdentity.displayName
+    },
+    to: {
+      botId: request.from.botId,
+      ...(request.to?.project ? { project: request.to.project } : {})
+    },
+    capability: request.capability,
+    intent: request.intent,
+    mode: request.mode,
+    requiresApproval: true,
+    payload: {
+      message: approval
+    },
+    artifacts: [eventArtifact("approval", "approval required", request.capability)]
+  });
+  await message.reply([approval, "", formatCollabEnvelope(result)].join("\n"));
 }
 
 async function replyToMessageWithChunks(message: Message, response: BotResponse): Promise<void> {
@@ -839,6 +1469,7 @@ function formatDevbotHelp(appConfig: AppConfig): string {
     "- Run configured validation: `/run project:<name> command:<preset>` or `/review validate`.",
     "- Prepare handoff: `/review packet project:<name> task:<task-id>`.",
     "- Coordinate peers: `/devbot announce`, `/devbot peers`, `/peer status`, `/peer snip`.",
+    "- Collaborate in the private lab: `/lab roundtable`, `/lab see`, `/lab bossfight`, `/lab ritual`, `/lab safety`.",
     "",
     appConfig.safeMode
       ? "Write-capable actions are disabled while safe mode is on: `/act`, action-style mentions, `/run`, and review validation."
@@ -887,6 +1518,225 @@ async function sendToTextChannel(channel: unknown, content: string): Promise<voi
 
 function optionalPeerField(key: "project" | "target", value: string | null): Partial<Record<"project" | "target", string>> {
   return value?.trim() ? { [key]: value.trim() } : {};
+}
+
+async function startLabConversation(
+  interaction: ChatInputCommandInteraction,
+  intent: CollabIntent,
+  project: ProjectEntry | undefined,
+  title: string
+) {
+  const conversation = await collabStore.start({
+    intent,
+    title,
+    requester: interaction.user.tag,
+    channelId: interaction.channelId,
+    ...(project ? { projectName: project.name } : {})
+  });
+  const thread = await createLabThread(interaction, conversation.id, intent, title);
+  if (!thread) {
+    return conversation;
+  }
+
+  const updated = await collabStore.setThread(conversation.id, thread.id);
+  const withThread = updated ?? { ...conversation, threadId: thread.id };
+  await sendToTextChannel(thread, [
+    formatLabHeader(withThread),
+    "",
+    `Started by ${interaction.user.tag}.`,
+    "This thread is the human-visible audit room for this lab session."
+  ].join("\n"));
+  return withThread;
+}
+
+async function createLabThread(
+  interaction: ChatInputCommandInteraction,
+  conversationId: string,
+  intent: CollabIntent,
+  title: string
+): Promise<{ id: string; send?: (message: string) => Promise<unknown> } | undefined> {
+  const threaded = interaction.channel as
+    | {
+        threads?: {
+          create?: (options: { name: string; autoArchiveDuration?: number; reason?: string }) => Promise<{
+            id: string;
+            send?: (message: string) => Promise<unknown>;
+          }>;
+        };
+      }
+    | null;
+  if (!threaded?.threads?.create) {
+    return undefined;
+  }
+
+  try {
+    return await threaded.threads.create({
+      name: labThreadName(conversationId, intent, title),
+      autoArchiveDuration: 1440,
+      reason: "Devbot collaboration lab session"
+    });
+  } catch (error) {
+    console.warn(`Unable to create lab thread for ${conversationId}: ${(error as Error).message}`);
+    return undefined;
+  }
+}
+
+function labThreadName(conversationId: string, intent: CollabIntent, title: string): string {
+  const compactTitle = title
+    .replace(/[`*_~|>#[\]\n\r]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const suffix = conversationId.split("-").slice(-1)[0] ?? conversationId;
+  return `${intent} ${compactTitle || "lab"} ${suffix}`.slice(0, 100);
+}
+
+async function allowedPeerRecords(appConfig: AppConfig, project?: ProjectEntry) {
+  const known = await peerStore.list();
+  const records = known.filter((peer) => appConfig.peerBotIds.has(peer.botId) && (!project || isPeerAllowedForProject(project, peer.botId)));
+  const knownIds = new Set(records.map((peer) => peer.botId));
+  for (const botId of appConfig.peerBotIds) {
+    if (!knownIds.has(botId) && (!project || isPeerAllowedForProject(project, botId))) {
+      records.push({
+        botId,
+        owner: "unknown",
+        botName: botId,
+        projects: [],
+        commands: [],
+        supportsScreenshots: false,
+        safeMode: true,
+        lastSeenAt: new Date(0).toISOString()
+      });
+    }
+  }
+  return records;
+}
+
+function screenshotPolicyMessage(project: ProjectEntry, actor: string): string | undefined {
+  if (isScreenshotBlocked(project)) {
+    return formatApprovalCard({
+      action: "Capture project screenshot",
+      actor,
+      projectName: project.name,
+      risk: "medium",
+      reason: "Project policy blocks screenshots for this project.",
+      scope: "No screenshot captured.",
+      sideEffects: "None."
+    });
+  }
+
+  if (screenshotRequiresApproval(project)) {
+    return formatApprovalCard({
+      action: "Capture project screenshot",
+      actor,
+      projectName: project.name,
+      risk: "medium",
+      reason: "Project policy requires approval before screenshots, because local UI may expose authenticated or private state.",
+      scope: "Configured frontend URL or detected local dev server only.",
+      sideEffects: "May expose visible UI contents in Discord."
+    });
+  }
+
+  return undefined;
+}
+
+function commandsNeedApproval(project: ProjectEntry, commandNames: string[] | undefined): boolean {
+  const names = commandNames?.length ? commandNames : configuredCommandNames(project);
+  return names.some((name) => commandRequiresApproval(project, name));
+}
+
+async function fanOutLabRequest(
+  interaction: ChatInputCommandInteraction,
+  appConfig: AppConfig,
+  input: {
+    conversationId: string;
+    project: ProjectEntry;
+    intent: CollabIntent;
+    capability: CollabCapability;
+    mode: CollabMode;
+    target: string;
+    payload: Record<string, unknown>;
+  }
+): Promise<number> {
+  const peers = await allowedPeerRecords(appConfig, input.project);
+  let sent = 0;
+  for (const peer of peers) {
+    const envelope = createCollabEnvelope({
+      type: "devbot.peer.request",
+      conversationId: input.conversationId,
+      from: {
+        botId: client.user?.id ?? "unknown",
+        owner: appConfig.botIdentity.owner,
+        botName: appConfig.botIdentity.displayName
+      },
+      to: {
+        botId: peer.botId,
+        project: input.project.name
+      },
+      capability: input.capability,
+      intent: input.intent,
+      mode: input.mode,
+      requiresApproval: input.mode === "write" || input.capability === "review.validate",
+      payload: input.payload,
+      artifacts: []
+    });
+    await sendPeerMessage(interaction, appConfig, `<@${peer.botId}>\n${formatCollabEnvelope(envelope)}`);
+    await collabStore.addEvent({
+      conversationId: input.conversationId,
+      type: "peer-request",
+      actor: appConfig.botIdentity.displayName,
+      summary: `Requested ${input.capability} from ${peer.botName} for ${input.target}.`,
+      mode: input.mode
+    });
+    sent += 1;
+  }
+  return sent;
+}
+
+async function maybeSendTargetedReviewRequest(
+  interaction: ChatInputCommandInteraction,
+  appConfig: AppConfig,
+  conversationId: string,
+  target: string,
+  project: ProjectEntry,
+  reviewPacket: string,
+  taskId: string | undefined
+): Promise<void> {
+  const botId = parseBotId(target);
+  if (!botId || !appConfig.peerBotIds.has(botId)) {
+    return;
+  }
+
+  const envelope = createCollabEnvelope({
+    type: "devbot.peer.request",
+    conversationId,
+    from: {
+      botId: client.user?.id ?? "unknown",
+      owner: appConfig.botIdentity.owner,
+      botName: appConfig.botIdentity.displayName
+    },
+    to: {
+      botId,
+      project: project.name
+    },
+    capability: "review.packet",
+    intent: "handoff",
+    mode: "read",
+    requiresApproval: false,
+    payload: {
+      taskId,
+      reviewPacket
+    },
+    artifacts: [eventArtifact("review-packet", "handoff packet", project.name)]
+  });
+  await sendPeerMessage(interaction, appConfig, `<@${botId}>\n${formatCollabEnvelope(envelope)}`);
+  await collabStore.addEvent({
+    conversationId,
+    type: "peer-request",
+    actor: appConfig.botIdentity.displayName,
+    summary: `Sent review handoff to <@${botId}>.`,
+    mode: "read",
+    artifacts: [eventArtifact("review-packet", "peer handoff", project.name)]
+  });
 }
 
 async function runCodex(
@@ -1002,6 +1852,20 @@ function getBotRoleMentionIds(message: Message, botUsername: string): string[] {
     .map((role) => role.id);
 }
 
+async function ensureProjectAccess(interaction: ChatInputCommandInteraction, project: ProjectEntry): Promise<boolean> {
+  if (isAllowedForProject(interaction, project)) {
+    return true;
+  }
+
+  const content = `You are not allowed to use project \`${project.name}\` under its .devbot policy.`;
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(content);
+  } else {
+    await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+  }
+  return false;
+}
+
 function isAllowed(interaction: ChatInputCommandInteraction, appConfig: AppConfig): boolean {
   const hasUserAllowList = appConfig.allowedUserIds.size > 0;
   const hasRoleAllowList = appConfig.allowedRoleIds.size > 0;
@@ -1020,6 +1884,29 @@ function isAllowed(interaction: ChatInputCommandInteraction, appConfig: AppConfi
   const memberRoles = interaction.member?.roles;
   if (Array.isArray(memberRoles)) {
     return memberRoles.some((roleId) => appConfig.allowedRoleIds.has(roleId));
+  }
+
+  return false;
+}
+
+function isAllowedForProject(interaction: ChatInputCommandInteraction, project: ProjectEntry): boolean {
+  const policy = project.metadata.policy;
+  const hasProjectAllowList = policy.allowedUsers.length > 0 || policy.allowedRoles.length > 0;
+  if (!hasProjectAllowList) {
+    return true;
+  }
+
+  if (policy.allowedUsers.includes(interaction.user.id)) {
+    return true;
+  }
+
+  if (interaction.member instanceof GuildMember) {
+    return interaction.member.roles.cache.some((role) => policy.allowedRoles.includes(role.id));
+  }
+
+  const memberRoles = interaction.member?.roles;
+  if (Array.isArray(memberRoles)) {
+    return memberRoles.some((roleId) => policy.allowedRoles.includes(roleId));
   }
 
   return false;

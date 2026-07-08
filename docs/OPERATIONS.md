@@ -50,6 +50,24 @@ Optional per-project metadata lives inside the target project:
 
 Use `.devbot/project.example.json` from this repo as the template.
 
+Project metadata can also include a `policy` block:
+
+```json
+{
+  "policy": {
+    "visibility": "team",
+    "allowedUsers": [],
+    "allowedRoles": [],
+    "allowedPeers": ["123456789012345678"],
+    "screenshotPolicy": "approval",
+    "readOnlyCommands": ["test", "lint"],
+    "approvalRequiredCommands": ["verify", "deploy"]
+  }
+}
+```
+
+Empty `allowedUsers` and `allowedRoles` preserve the global bot allow-list for project-specific commands. Empty `allowedPeers` means any globally allow-listed peer can ask about the project. `screenshotPolicy` can be `allow`, `approval`, or `deny`.
+
 ## Common Commands
 
 ```bash
@@ -70,11 +88,13 @@ By default, devbot writes local runtime state under `.devbot/` in this repo:
 
 - `.devbot/tasks.json`
 - `.devbot/peers.json`
+- `.devbot/collab.json`
 
 Override these paths with:
 
 - `DEVBOT_TASK_STORE`
 - `DEVBOT_PEER_STORE`
+- `DEVBOT_COLLAB_STORE`
 
 Relative override paths are resolved from the devbot process working directory.
 Use absolute paths if you want state stored outside this repo.
@@ -134,6 +154,28 @@ Then run:
 ```
 
 Peer actions are read-only in this MVP. File edits, pushes, merges, and arbitrary commands remain human-initiated locally.
+
+## Collaboration Lab
+
+Use `/lab` for private devbot collaboration in Discord:
+
+```text
+/lab roundtable project:webapp prompt:what should we build first?
+/lab see project:webapp target:browse page
+/lab bossfight project:webapp task:<task-id>
+/lab handoff project:webapp task:<task-id> target:<peer-bot-id-or-human>
+/lab fix-from-snip project:webapp target:/settings complaint:the spacing feels broken
+/lab campfire minutes:30
+/lab roster
+/lab ritual project:webapp task:<task-id>
+/lab events id:<collab-id>
+/lab approve id:<collab-id> decision:approve action:validate project:webapp commands:test note:run tests only
+/lab safety project:webapp
+```
+
+Lab sessions write an append-only local index to `.devbot/collab.json`. Discord remains the human-visible audit trail; the local store exists so the bot can list recent lab sessions, inspect events, record approvals, and correlate peer replies.
+
+Peer lab requests use versioned envelopes. Read-only peer actions can return status, screenshots, plans, and review packets. Validation and gates can be run after `/lab approve`; arbitrary command execution, writes, pushes, merges, deploys, installs, and secret/config changes should show an approval card and wait for the owner.
 
 ## Review Workflow
 

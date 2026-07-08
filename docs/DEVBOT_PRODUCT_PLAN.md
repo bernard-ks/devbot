@@ -216,17 +216,20 @@ MVP multi-bot flow:
 - Add `/devbot announce` and `/devbot peers`. Done.
 - Add structured peer requests over Discord. Done with JSON envelopes.
 - Support peer status and peer screenshot requests. Done for allow-listed peers.
-- Support peer review validation requests. Deferred; peer validation implies command execution on another machine and should be gated separately.
-- Keep edits and merges human-confirmed. Done by limiting peer MVP to read-only status/screenshot/capability requests.
+- Add versioned collaboration envelopes for lab workflows. Done with v2 collab request/result/approval/event envelopes.
+- Support peer planning and review-packet requests. Done through `/lab` workflows.
+- Support peer review validation requests. Implemented as approval-card requests; command execution remains owner-gated.
+- Keep edits and merges human-confirmed. Done by keeping write, command, push, merge, deploy, install, and secret/config operations behind approval boundaries.
 
 ### Phase 4: Team Workflow Automation
 
 - Add durable task queues.
 - Add reviewer assignment.
 - Add verification/check summarization.
-- Add cross-bot handoff threads.
+- Add cross-bot handoff threads. MVP implemented as `/lab handoff` cards and peer review-packet requests; Discord thread creation remains a next UI step.
 - Add project dashboards in Discord. MVP implemented as `/dashboard`.
 - Add automatic stale task reminders. MVP implemented as `/task stale`; automatic timed reminders remain deferred to avoid surprise channel noise.
+- Add private devbot collaboration lab. MVP implemented with `/lab roundtable`, `/lab see`, `/lab handoff`, `/lab bossfight`, `/lab jam`, `/lab argue`, `/lab fix-from-snip`, `/lab campfire`, `/lab roster`, `/lab ritual`, `/lab recent`, `/lab events`, `/lab approve`, and `/lab safety`.
 
 ## Near-Term Backlog
 
@@ -239,6 +242,7 @@ MVP multi-bot flow:
 - Add `BOT_OWNER`, `BOT_DISPLAY_NAME`, and `PEER_BOT_IDS` config. Done.
 - Add a coordination channel ID config. Done with `COORDINATION_CHANNEL_ID`.
 - Add structured result envelopes for bot-to-bot messages. Done.
+- Add collaboration event persistence. Done with `.devbot/collab.json`.
 - Add tests for peer message parsing and permission enforcement. Peer parsing tests added; permission enforcement is handled by `PEER_BOT_IDS` and should get deeper integration tests when Discord handlers are split out.
 
 ## Open Questions

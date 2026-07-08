@@ -1,0 +1,243 @@
+import type { CollabArtifact, CollabIntent } from "./collab-protocol.js";
+import { newCollabId } from "./collab-protocol.js";
+import type { CollabConversation, CollabEvent } from "./collab-store.js";
+import type { PeerRecord } from "./peer.js";
+import { formatPeerList } from "./peer.js";
+import type { TaskRecord } from "./task-store.js";
+import { formatTaskList } from "./task-store.js";
+import type { AppConfig, ProjectEntry } from "./types.js";
+
+export type LabSubcommand =
+  | "roundtable"
+  | "see"
+  | "handoff"
+  | "bossfight"
+  | "jam"
+  | "argue"
+  | "fix-from-snip"
+  | "campfire"
+  | "roster"
+  | "ritual"
+  | "recent"
+  | "events"
+  | "approve"
+  | "safety";
+
+export interface LabApprovalCard {
+  action: string;
+  actor: string;
+  projectName?: string;
+  risk: "low" | "medium" | "high";
+  reason: string;
+  scope: string;
+  sideEffects: string;
+}
+
+export function labPrompt(kind: "roundtable" | "jam" | "argue" | "fix-from-snip", input: string): string {
+  const shared = [
+    "You are participating in a private Discord devbot collaboration lab.",
+    "Think out loud only as much as needed to help the human choose the next move.",
+    "Keep output Discord-friendly: short sections, concrete options, and explicit risks.",
+    ""
+  ];
+
+  if (kind === "roundtable") {
+    return [
+      ...shared,
+      "Run a Devbot Roundtable. Give five distinct lenses: product, frontend, backend, testing, and risk.",
+      "End with a synthesized recommended next action.",
+      "",
+      "Prompt:",
+      input
+    ].join("\n");
+  }
+
+  if (kind === "jam") {
+    return [
+      ...shared,
+      "Run a Prompt Jam. Produce playful but buildable riffs, then convert the best one into a concrete dev task.",
+      "Return: 3 riffs, the strongest pick, and a ready-to-run task sentence.",
+      "",
+      "Theme:",
+      input
+    ].join("\n");
+  }
+
+  if (kind === "argue") {
+    return [
+      ...shared,
+      "Run a Contrarian Council. Argue against the proposal from speed, safety, UX, and maintenance angles.",
+      "End with what would change your mind.",
+      "",
+      "Proposal:",
+      input
+    ].join("\n");
+  }
+
+  return [
+    ...shared,
+    "Turn this screenshot complaint into a scoped fix plan.",
+    "Return: likely cause, files/areas to inspect, acceptance check, and an approval-ready action request.",
+    "",
+    "Complaint:",
+    input
+  ].join("\n");
+}
+
+export function formatLabHeader(conversation: CollabConversation): string {
+  const project = conversation.projectName ? ` on \`${conversation.projectName}\`` : "";
+  return `Lab session \`${conversation.id}\` (${conversation.intent}${project})\n${conversation.title}`;
+}
+
+export function formatRoundtableResult(conversation: CollabConversation, localAnswer: string, peerCount: number): string {
+  return [
+    formatLabHeader(conversation),
+    "",
+    "Local take:",
+    localAnswer,
+    "",
+    peerCount > 0
+      ? `Invited ${peerCount} peer devbot(s) to add their own angle.`
+      : "No allow-listed peer devbots are configured yet; this roundtable ran locally."
+  ].join("\n");
+}
+
+export function formatPeerFanout(intent: CollabIntent, peers: PeerRecord[], target: string): string {
+  if (peers.length === 0) {
+    return `No known allow-listed peers to invite for ${intent}. Run \`/devbot announce\` from each bot first.`;
+  }
+
+  return [
+    `Invited ${peers.length} peer devbot(s) for ${intent}.`,
+    `Target: ${target}`,
+    "",
+    formatPeerList(peers)
+  ].join("\n");
+}
+
+export function formatHandoffCard(input: {
+  conversation: CollabConversation;
+  task: TaskRecord | undefined;
+  target: string;
+  reviewPacket: string;
+}): string {
+  return [
+    formatLabHeader(input.conversation),
+    "",
+    `Baton target: ${input.target}`,
+    input.task ? `Task: \`${input.task.id}\` (${input.task.status})` : "Task: not found; handoff is context-only.",
+    "",
+    "Handoff packet:",
+    input.reviewPacket,
+    "",
+    "Suggested next clicks: claim review, ask a question, run validation, or send back a smaller task."
+  ].join("\n");
+}
+
+export function formatBossFight(input: {
+  conversation: CollabConversation;
+  reviewPacket: string;
+  gates: string | undefined;
+  peerCount: number;
+  approval?: string;
+}): string {
+  return [
+    formatLabHeader(input.conversation),
+    "",
+    "Boss bar:",
+    "- Review packet: ready",
+    input.gates ? "- Local gates: checked" : "- Local gates: waiting for approval or configured commands",
+    input.peerCount > 0 ? `- Peer observers: ${input.peerCount} invited` : "- Peer observers: none configured",
+    "",
+    input.reviewPacket,
+    input.gates ? ["", input.gates].join("\n") : undefined,
+    input.approval ? ["", input.approval].join("\n") : undefined
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n");
+}
+
+export function formatRitual(input: {
+  conversation: CollabConversation;
+  reviewPacket: string;
+  tasks: TaskRecord[];
+  safety: string;
+}): string {
+  return [
+    formatLabHeader(input.conversation),
+    "",
+    "Ritual thread contents:",
+    "1. Request and task context",
+    "2. Review packet",
+    "3. Recent task history",
+    "4. Safety and approval state",
+    "5. Final human decision",
+    "",
+    input.reviewPacket,
+    "",
+    "Recent related tasks:",
+    formatTaskList(input.tasks),
+    "",
+    input.safety
+  ].join("\n");
+}
+
+export function formatApprovalCard(card: LabApprovalCard): string {
+  return [
+    "Approval required",
+    `Action: ${card.action}`,
+    `Actor: ${card.actor}`,
+    card.projectName ? `Project: \`${card.projectName}\`` : undefined,
+    `Risk: ${card.risk}`,
+    `Reason: ${card.reason}`,
+    `Scope: ${card.scope}`,
+    `Expected side effects: ${card.sideEffects}`,
+    "",
+    "Owner options: approve once, deny, or run read-only instead."
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n");
+}
+
+export function formatSafetySummary(appConfig: Pick<AppConfig, "safeMode" | "peerBotIds" | "botIdentity" | "codex">, project?: ProjectEntry): string {
+  const peers = appConfig.peerBotIds.size > 0 ? [...appConfig.peerBotIds].map((id) => `<@${id}>`).join(", ") : "(none)";
+  return [
+    `Safety for \`${appConfig.botIdentity.displayName}\``,
+    `Safe mode: ${appConfig.safeMode ? "on" : "off"}`,
+    `Read-only sandbox: \`${appConfig.codex.sandbox}\``,
+    `Action sandbox: \`${appConfig.codex.actionSandbox}\``,
+    `Allowed peers: ${peers}`,
+    project ? `Project scope: \`${project.name}\` at \`${project.root}\`` : "Project scope: select a project for root-specific rules.",
+    "",
+    "No peer request may execute writes, shell commands, pushes, merges, package installs, deploys, migrations, or secret/config changes without human approval.",
+    "Peer bots may ask, observe, plan, review packets, and hand off freely inside allow-listed project scope."
+  ].join("\n");
+}
+
+export function formatCampfire(tasks: TaskRecord[], minutes: number): string {
+  return [
+    `Stale Task Campfire (${minutes}m threshold)`,
+    tasks.length ? formatTaskList(tasks) : "No stale running tasks found.",
+    "",
+    "Good next moves: inspect logs, cancel, retry as read-only, or turn the stale task into a handoff."
+  ].join("\n");
+}
+
+export function eventArtifact(kind: CollabArtifact["kind"], label: string, summary?: string): CollabArtifact {
+  return {
+    id: newCollabId("artifact"),
+    kind,
+    label,
+    ...(summary ? { summary } : {})
+  };
+}
+
+export function formatCollabEvents(events: CollabEvent[]): string {
+  if (events.length === 0) {
+    return "No events recorded for this lab session.";
+  }
+
+  return events
+    .map((event) => `- ${new Date(event.createdAt).toLocaleString()} ${event.type} by ${event.actor}: ${event.summary}`)
+    .join("\n");
+}

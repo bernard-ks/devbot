@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig, ProjectEntry } from "./types.js";
 
-export type PeerAction = "capabilities" | "status" | "snip";
+export type PeerAction = "capabilities" | "status" | "snip" | "plan" | "review" | "validate";
 
 export interface PeerEnvelope {
   type: "devbot.peer.request" | "devbot.peer.result" | "devbot.peer.announce";
@@ -13,6 +13,9 @@ export interface PeerEnvelope {
   action?: PeerAction;
   project?: string;
   target?: string;
+  prompt?: string;
+  task?: string;
+  commands?: string;
   ok?: boolean;
   message?: string;
   capabilities?: PeerCapabilities;
@@ -105,7 +108,7 @@ export function buildCapabilities(appConfig: AppConfig, botUserId: string | unde
     botName: appConfig.botIdentity.displayName || botUserId || "devbot",
     owner: appConfig.botIdentity.owner,
     projects: appConfig.projects.map((project) => project.name),
-    commands: ["projects", "status", "snip", "task", "dashboard", "run", "review", "devbot", "peer"],
+    commands: ["projects", "status", "snip", "task", "dashboard", "run", "review", "devbot", "peer", "lab"],
     supportsScreenshots: true,
     safeMode: appConfig.safeMode
   };

@@ -4,7 +4,7 @@ A local Discord bot that lets you ask development questions and request focused 
 
 It uses:
 
-- Discord slash commands for `/ask`, `/act`, `/status`, `/snip`, `/task`, `/dashboard`, `/run`, `/review`, `/devbot`, `/peer`, `/projects`, and `/refresh`
+- Discord slash commands for `/ask`, `/act`, `/status`, `/snip`, `/task`, `/dashboard`, `/run`, `/review`, `/devbot`, `/peer`, `/lab`, `/projects`, and `/refresh`
 - `@devbot` mentions for action-style requests
 - the local Codex CLI for model answers
 - Local project scanning with default ignores for `.git`, `node_modules`, build output, lock artifacts, and secret-looking files
@@ -64,6 +64,20 @@ npm start
 - `/devbot peers`: List peer devbots that have announced themselves.
 - `/peer status bot:<id-or-mention> project:<optional>`: Ask an allow-listed peer bot for read-only status.
 - `/peer snip bot:<id-or-mention> target:<text> project:<optional>`: Ask an allow-listed peer bot for a live UI screenshot.
+- `/lab roundtable project:<name> prompt:<text>`: Start a private devbot strategy room with role-based product, frontend, backend, testing, and risk angles.
+- `/lab see target:<text> project:<optional>`: Collect a local screenshot plus peer screenshot requests for the same target.
+- `/lab handoff project:<name> target:<human-or-bot> task:<optional>`: Create a baton-pass review handoff card and send a peer review-packet request when the target is an allow-listed bot.
+- `/lab bossfight project:<name> task:<optional> commands:<optional>`: Build a merge-readiness boss bar from review packets, local gates, peer observers, and approval state.
+- `/lab jam project:<name> theme:<text>`: Brainstorm playful options and convert the best one into a concrete task.
+- `/lab argue project:<name> proposal:<text>`: Run a contrarian council against a proposal from speed, safety, UX, and maintenance angles.
+- `/lab fix-from-snip project:<name> target:<text> complaint:<text>`: Capture visual context and produce an approval-ready fix plan.
+- `/lab campfire minutes:<optional> project:<optional>`: Surface stale running tasks with recovery options.
+- `/lab roster`: Show peer capability cards.
+- `/lab ritual project:<name> task:<optional>`: Build a merge ritual card with review packet, recent tasks, and safety state.
+- `/lab recent`: List recent collaboration lab sessions.
+- `/lab events id:<collab-id>`: Show recent events for a lab session.
+- `/lab approve id:<collab-id> decision:<approve|deny|read-only> action:<record|validate|gates> project:<optional> commands:<optional> note:<optional>`: Record a human approval, denial, or read-only decision, optionally running validation or gates after approval.
+- `/lab safety project:<optional>`: Show active collaboration safety rules and approval boundaries.
 - `/refresh project:<name>`: Rebuild the in-memory file index for a project.
 - `/ask project:<name> question:<text> include:<optional patterns>`: Ask the model a question with local project context.
 - `/act project:<name> task:<text> include:<optional patterns>`: Ask local Codex to perform a focused project task and return a fixed `Project / Request / Actions / Verification / Result` summary.
@@ -83,7 +97,7 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Peer registry state is stored in `.devbot/peers.json`. Set `DEVBOT_TASK_STORE` or `DEVBOT_PEER_STORE` to use different files; relative paths resolve from the devbot process working directory.
+Task history is stored locally in `.devbot/tasks.json` by default. Peer registry state is stored in `.devbot/peers.json`, and collaboration lab sessions are stored in `.devbot/collab.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PEER_STORE`, or `DEVBOT_COLLAB_STORE` to use different files; relative paths resolve from the devbot process working directory.
 
 ## Project Metadata
 
@@ -102,17 +116,30 @@ Each target project can define optional metadata at `<project>/.devbot/project.j
     "presets": {
       "quick-check": "npm run build"
     }
+  },
+  "policy": {
+    "visibility": "team",
+    "allowedUsers": [],
+    "allowedRoles": [],
+    "allowedPeers": [],
+    "screenshotPolicy": "allow",
+    "readOnlyCommands": ["test"],
+    "approvalRequiredCommands": ["verify"]
   }
 }
 ```
 
 Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables write-capable work: `/act`, action-style mentions, `/task retry` for action tasks, `/run`, `/review validate`, and `/review gates`.
 
+Project policy lets each repo narrow collaboration behavior. `allowedUsers` and `allowedRoles` scope project-specific slash command access, `allowedPeers` limits peer bot access per project, `screenshotPolicy` can be `allow`, `approval`, or `deny`, and command policy marks presets that are safe to run versus approval-gated.
+
 ## Peer Bots
 
 For multi-dev servers, each developer can run a separate bot application and add the other bot user IDs to `PEER_BOT_IDS`.
 
-Use `/devbot announce` to publish capabilities. Peer requests are sent as structured Discord messages and are limited to read-only capabilities in this MVP: capabilities, status, and screenshots. Peer-triggered edits, pushes, and merges are intentionally not enabled.
+Use `/devbot announce` to publish capabilities. Basic peer requests are sent as structured Discord messages for capabilities, status, and screenshots. The `/lab` workflows add versioned collaboration envelopes for planning, review packets, screenshot requests, approval cards, and event recording.
+
+The safety boundary is deliberate: peer bots can ask, observe, plan, review, and hand off inside allow-listed projects. Peer-triggered edits, command execution, validation with side effects, pushes, merges, deploys, dependency installs, and secret/config changes require explicit human approval.
 
 ## Project Context Behavior
 

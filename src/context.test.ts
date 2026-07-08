@@ -4,6 +4,8 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
+import { createCollabEnvelope, formatCollabEnvelope, parseCollabEnvelope } from "./collab-protocol.js";
+import { CollabStore } from "./collab-store.js";
 import { commandDefinitions } from "./commands.js";
 import { expandEnvPlaceholders } from "./config.js";
 import { configuredCommandNames, resolveProjectCommand } from "./command-runner.js";
@@ -12,7 +14,15 @@ import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from ".
 import { splitDiscordMessage } from "./messages.js";
 import { createPeerEnvelope, formatPeerEnvelope, parsePeerEnvelope } from "./peer.js";
 import { bestNavigationCandidate, detectLocalWebUrlsFromPs, extractScreenshotKeywords } from "./project-screenshot.js";
-import { isWriteBlockedBySafeMode, safeModeActionMessage } from "./safety.js";
+import {
+  commandRequiresApproval,
+  isPeerAllowedForProject,
+  isScreenshotBlocked,
+  isWriteBlockedBySafeMode,
+  safeModeActionMessage,
+  screenshotRequiresApproval
+} from "./safety.js";
+import { formatApprovalCard, formatSafetySummary, labPrompt } from "./lab.js";
 import { renderStatusImage } from "./status-image.js";
 import { TaskStore } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
@@ -43,6 +53,16 @@ function project(name: string, root: string, overrides: Partial<ProjectEntry["me
         lint: [],
         verify: [],
         presets: {}
+      },
+      policy: {
+        visibility: "private",
+        allowedUsers: [],
+        allowedRoles: [],
+        allowedPeers: [],
+        screenshotPolicy: "allow",
+        maxContextChars: undefined,
+        readOnlyCommands: [],
+        approvalRequiredCommands: []
       },
       ...overrides
     }
@@ -340,6 +360,19 @@ test("command schema exposes help and autocomplete for high-friction options", (
   const status = peer?.options?.find((option) => option.name === "status");
   const bot = status?.options?.find((option) => option.name === "bot");
   assert.equal(bot?.autocomplete, true);
+
+  const lab = commands.find((command) => command.name === "lab");
+  assert.ok(lab?.options?.some((option) => option.name === "roundtable"));
+  assert.ok(lab?.options?.some((option) => option.name === "bossfight"));
+  assert.ok(lab?.options?.some((option) => option.name === "fix-from-snip"));
+  assert.ok(lab?.options?.some((option) => option.name === "approve"));
+  assert.ok(lab?.options?.some((option) => option.name === "events"));
+  const roundtable = lab?.options?.find((option) => option.name === "roundtable");
+  const roundtableProject = roundtable?.options?.find((option) => option.name === "project");
+  assert.equal(roundtableProject?.autocomplete, true);
+  const approve = lab?.options?.find((option) => option.name === "approve");
+  assert.ok(approve?.options?.some((option) => option.name === "action"));
+  assert.ok(approve?.options?.some((option) => option.name === "commands"));
 });
 
 interface CommandJson {
@@ -373,6 +406,114 @@ test("peer envelopes round-trip through Discord-friendly fenced JSON", () => {
   assert.equal(parsed?.action, "snip");
   assert.equal(parsed?.project, "webapp");
   assert.equal(parsed?.target, "browse page");
+});
+
+test("collab envelopes round-trip with v2 protocol fields", () => {
+  const envelope = createCollabEnvelope({
+    type: "devbot.peer.request",
+    conversationId: "collab-abc",
+    from: { botId: "111", owner: "alex", botName: "alex-devbot" },
+    to: { botId: "222", project: "webapp" },
+    capability: "task.plan",
+    intent: "roundtable",
+    mode: "think",
+    requiresApproval: false,
+    payload: { prompt: "compare options" }
+  });
+
+  const parsed = parseCollabEnvelope(`<@222>\n${formatCollabEnvelope(envelope)}`);
+
+  assert.equal(parsed?.version, 2);
+  assert.equal(parsed?.conversationId, "collab-abc");
+  assert.equal(parsed?.capability, "task.plan");
+  assert.equal(parsed?.payload.prompt, "compare options");
+});
+
+test("collab store persists conversations and events", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-collab-store-"));
+  const store = new CollabStore(path.join(root, "collab.json"));
+  const conversation = await store.start({
+    intent: "roundtable",
+    projectName: "webapp",
+    title: "Pick a direction",
+    requester: "tester"
+  });
+  await store.addEvent({
+    conversationId: conversation.id,
+    type: "decision",
+    actor: "tester",
+    summary: "Choose the smallest shippable slice."
+  });
+  await store.setThread(conversation.id, "thread-123");
+
+  const reloaded = new CollabStore(path.join(root, "collab.json"));
+  const recent = await reloaded.recent();
+  const events = await reloaded.events(conversation.id);
+
+  assert.equal(recent[0]?.id, conversation.id);
+  assert.equal(recent[0]?.threadId, "thread-123");
+  assert.equal(events.some((event) => event.summary.includes("smallest shippable")), true);
+  assert.equal(events.some((event) => event.summary.includes("thread-123")), true);
+});
+
+test("lab prompts and approval cards expose collaboration intent safely", () => {
+  assert.match(labPrompt("roundtable", "fix onboarding"), /product, frontend, backend, testing, and risk/);
+  assert.match(labPrompt("argue", "ship now"), /Contrarian Council/);
+  assert.match(
+    formatApprovalCard({
+      action: "Run validation",
+      actor: "tester",
+      projectName: "webapp",
+      risk: "medium",
+      reason: "Command may write build output.",
+      scope: "project root",
+      sideEffects: "runs configured scripts"
+    }),
+    /Approval required/
+  );
+});
+
+test("lab safety summary names peer and mutation boundaries", () => {
+  const summary = formatSafetySummary(
+    {
+      safeMode: true,
+      peerBotIds: new Set(["123"]),
+      botIdentity: { owner: "alex", displayName: "alex-devbot" },
+      codex: {
+        bin: "codex",
+        model: undefined,
+        sandbox: "read-only",
+        actionSandbox: "workspace-write",
+        timeoutMs: 1_000
+      }
+    },
+    project("webapp", "/tmp/webapp")
+  );
+
+  assert.match(summary, /Safe mode: on/);
+  assert.match(summary, /No peer request may execute writes/);
+});
+
+test("project policy gates peers screenshots and commands", () => {
+  const gated = project("webapp", "/tmp/webapp", {
+    policy: {
+      visibility: "team",
+      allowedUsers: [],
+      allowedRoles: [],
+      allowedPeers: ["222"],
+      screenshotPolicy: "approval",
+      maxContextChars: 12_000,
+      readOnlyCommands: ["test"],
+      approvalRequiredCommands: ["verify"]
+    }
+  });
+
+  assert.equal(isPeerAllowedForProject(gated, "222"), true);
+  assert.equal(isPeerAllowedForProject(gated, "333"), false);
+  assert.equal(screenshotRequiresApproval(gated), true);
+  assert.equal(isScreenshotBlocked(gated), false);
+  assert.equal(commandRequiresApproval(gated, "verify"), true);
+  assert.equal(commandRequiresApproval(gated, "test"), false);
 });
 
 test("status image renderer returns a png", async () => {
