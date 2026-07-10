@@ -90,6 +90,18 @@ Appended as new commits on top of the reviewed branch; existing commits were not
 
 # Lane I — Opt-in preview tunnels
 
+## Rebase note
+
+Rebased onto `85e2530` (main after bernard's `dd0af6b` "Add ambient Discord workrooms and security hardening"). Conflicts were in `src/setup-store.ts`, `src/setup-store.test.ts`, `src/commands.ts`, and `src/index.ts` — all additive "both sides added a field/subcommand/function" shapes, resolved by keeping both sides (e.g. `previewTunnelsEnabled` alongside `projectRoomIds`, the `/setup preview` subcommand alongside `/setup project-room`, `handlePreviewCommand`/friends alongside `projectRoomAudienceProblem`). No feature from either side was dropped.
+
+While resolving, brought the tunnel code up to bernard's new `src/security.ts` conventions, since they didn't exist when this lane was originally written:
+- The real `cloudflared` spawn in `index.ts` (`tunnelManager`'s `spawnFn`) now passes `env: minimalChildEnvironment()`, so the tunnel child no longer inherits the bot token or other credentials from `process.env`.
+- The Discord-facing error reply in `handlePreviewCommand`'s catch block, and the `console.warn` in `editTunnelMessageExpired`, now go through `publicErrorMessage()` instead of raw `(error as Error).message`.
+- No duplicate shutdown handling: bernard's ambient-workrooms commit didn't add its own `SIGINT`/`SIGTERM` handler, so this lane's single handler (still calling `tunnelManager.stopAll()`) remains the only one.
+- Owner-only + default-off gating (`previewGateReason`, `/setup preview` owner check) was untouched by the merge and still sits in front of `/preview` after the restructured command dispatch.
+
+`npm test`: 137/137 green. One rerun was needed — `security.test.ts`'s "configured project commands receive an empty temporary home" failed once (known flaky child-process timeout under load) and passed clean on immediate rerun.
+
 ## What was built
 
 Owner-only, default-off public preview tunnels via `cloudflared`, turning a detected local dev server into an expiring `https://*.trycloudflare.com` link.
