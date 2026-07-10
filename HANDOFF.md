@@ -115,3 +115,33 @@ turns the ramble into an Ask or Make-change task.
 - Voice note transcripts persist in `.devbot/voice-notes.json` (git-ignored,
   owner-only file mode) until Dismiss is clicked or the 200-record retention
   cap evicts them; there is no auto-expiry by age.
+
+## Rebase note
+
+Rebased onto `85e2530` (origin/main after bernard's "Add ambient Discord
+workrooms and security hardening", `dd0af6b`). One real conflict, in
+`src/index.ts`: bernard's new ambient-proposal block (`AmbientProposalRequest`
+and friends) and this lane's `maybeHandleVoiceMessage`/`handleVoiceControl`/
+`handleVoiceActModal` block were both inserted after `taskStatusForProgress`.
+Resolved by keeping both function blocks back-to-back (ambient proposal code
+first, voice handling second) — they don't call each other. The
+`messageCreate` call site merged cleanly on its own: `maybeHandleVoiceMessage`
+still runs immediately after the `message.author.bot` check and before
+bernard's new `threadTask`/`mentionsBot`/natural-intent flow, so voice notes
+are still detected and short-circuit (`return`) independently of the new
+ambient-workroom/natural-intent proposal path. `src/config.ts` and
+`src/types.ts` (`AppConfig.voice`) merged with no conflicts.
+
+Also adopted bernard's new conventions in this lane:
+- `src/transcribe.ts`: `ffmpeg`/`whisper` are now spawned via `execFile` with
+  `env: minimalChildEnvironment()` (from the new `src/security.ts`) so they
+  don't inherit the Discord bot token or other application secrets.
+- `maybeHandleVoiceMessage`'s transcription-failure reply now uses
+  `publicErrorMessage(error)` instead of raw `(error as Error).message`,
+  matching how every other Discord-facing error reply in `index.ts` redacts
+  secrets before display.
+
+`npm test`: 145/145 passing after the rebase (build + full `node --test`
+suite), confirmed on two consecutive runs (no flake observed in
+`security.test.ts`'s "configured project commands receive an empty temporary
+home" test this time).
