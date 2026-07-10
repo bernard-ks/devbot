@@ -1,16 +1,15 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createTaskWorktree } from "./task-worktree.js";
 import {
   buildFixTaskPrompt,
+  formatDuelSummary,
   gatherDuelChangeEvidence,
   parseDuelRebuttal,
   parseDuelVerdict,
-  resolveDuelFixWorkspace,
   resolveIssueStatuses,
   reviewerIndependenceFor,
   reviewerTierFor,
@@ -19,6 +18,7 @@ import {
   truncateDiffForDuel,
   type DuelChangeEvidence,
   type DuelIssue,
+  type ResolvedDuelIssue,
   type RunDuelInput
 } from "./duel.js";
 import type { ProjectEntry } from "./types.js";
@@ -244,14 +244,11 @@ test("reviewer independence is flagged when the reviewer resolves to the same mo
   assert.equal(result.reviewerIndependence, "same-model");
 });
 
-// The following two tests share one real git fixture each (rather than one per assertion) to keep
-// the suite's total child-process/subprocess load down, since each fixture + isolated worktree
-// costs a couple dozen real `git` spawns.
+// The real-git test shares one fixture across its assertions (rather than one per assertion) to
+// keep the suite's total child-process/subprocess load down, since each fixture costs a couple
+// dozen real `git` spawns.
 
 test("gathers byte-pinned diff evidence covering committed, staged, unstaged, and untracked changes, excludes sensitive paths, and is patch-hash stable/sensitive", async () => {
-  // Deliberately does not create an isolated task worktree: gatherDuelChangeEvidence only needs a
-  // git working directory and a base revision, and skipping worktree creation here keeps this
-  // test's real-subprocess footprint down (isolation is exercised by the Accept & fix test below).
   const fixture = await createGitFixture();
   const baseRevision = await git(fixture.repo, ["rev-parse", "HEAD"]);
   const project: ProjectEntry = fakeProject(fixture.repo);
@@ -283,47 +280,81 @@ test("gathers byte-pinned diff evidence covering committed, staged, unstaged, an
   assert.notEqual(evidence.patchHash, beforeAny.patchHash, "patch hash must change once real content changed");
 });
 
-test("Accept & fix resolves the exact reviewed workspace (surviving an untracked file) and refuses once the workspace drifts", async () => {
-  const fixture = await createGitFixture();
-  const isolated = await createTaskWorktree({ sourcePath: fixture.repo, taskName: "duel-fix", worktreeRoot: fixture.worktreeRoot });
-  assert.equal(isolated.available, true);
-  if (!isolated.available) return;
-
-  await writeFile(path.join(isolated.worktree.path, "new-file.txt"), "reviewed content that must survive\n");
-  const registeredProject = fakeProject(fixture.repo);
-  const task = {
-    id: "task-fix",
-    workspaceIsolated: true,
-    workspacePath: isolated.worktree.path,
-    branchName: isolated.worktree.branch,
-    baseBranch: isolated.worktree.baseRevision
+function summaryInput(overrides: Partial<Parameters<typeof formatDuelSummary>[0]> = {}): Parameters<typeof formatDuelSummary>[0] {
+  const evidence: DuelChangeEvidence = {
+    text: "diff",
+    fileCount: 2,
+    includedFileCount: 2,
+    truncated: false,
+    baseRevision: "aaaabbbbccccdddd",
+    headRevision: "eeeeffff00001111",
+    patchHash: "0123456789abcdef0123456789abcdef"
   };
-  const evidence = await gatherDuelChangeEvidence(fakeProject(isolated.worktree.path), task);
+  return {
+    taskId: "task-abc",
+    projectName: "webapp",
+    authorTier: "standard",
+    reviewerTier: "deep",
+    reviewerIndependence: "independent",
+    evidence,
+    overall: "approve",
+    issues: [],
+    skippedRebuttal: true,
+    warnings: [],
+    ...overrides
+  };
+}
 
-  const resolved = await resolveDuelFixWorkspace({ project: registeredProject, task, expectedPatchHash: evidence.patchHash });
-  assert.equal(resolved.available, true);
-  if (resolved.available) {
-    assert.equal(resolved.root, isolated.worktree.path);
-    assert.equal(await readFile(path.join(resolved.root, "new-file.txt"), "utf8"), "reviewed content that must survive\n");
-    // The source checkout must never be touched.
-    assert.equal(await git(fixture.repo, ["status", "--porcelain"]), "");
-  }
-
-  await writeFile(path.join(isolated.worktree.path, "tracked.txt"), "changed after the duel ran\n");
-  const afterDrift = await resolveDuelFixWorkspace({ project: registeredProject, task, expectedPatchHash: evidence.patchHash });
-  assert.equal(afterDrift.available, false);
-  if (!afterDrift.available) {
-    assert.match(afterDrift.reason, /changed since the duel review ran/);
-  }
+test("summary for a clean, full-coverage approve reports coverage, snapshot identity, and clean language", () => {
+  const summary = formatDuelSummary(summaryInput());
+  assert.match(summary, /Evidence coverage: 2\/2 changed section\(s\) included/);
+  assert.match(summary, /Snapshot: base `aaaabbbbcccc` -> head `eeeeffff0000`, patch `0123456789ab`/);
+  assert.match(summary, /No substantive issues found/);
 });
 
-test("refuses Accept & fix when the task has no isolated workspace to reproduce", async () => {
-  const resolved = await resolveDuelFixWorkspace({
-    project: fakeProject("/tmp/does-not-matter"),
-    task: { id: "task-no-isolation", workspaceIsolated: false },
-    expectedPatchHash: "anything"
+test("summary never uses clean/approved language when the evidence was truncated", () => {
+  const truncatedEvidence = { ...summaryInput().evidence, includedFileCount: 1, truncated: true };
+  const summary = formatDuelSummary(summaryInput({ evidence: truncatedEvidence }));
+  assert.match(summary, /TRUNCATED, some changes were not reviewed/);
+  assert.match(summary, /partial review, not a clean pass/);
+  assert.doesNotMatch(summary, /No substantive issues found/);
+});
+
+test("summary renders an indeterminate verdict as unresolved, never approved", () => {
+  const summary = formatDuelSummary(summaryInput({ overall: "indeterminate" }));
+  assert.match(summary, /INDETERMINATE/);
+  assert.match(summary, /UNRESOLVED, not approved/);
+  assert.doesNotMatch(summary, /No substantive issues found/);
+});
+
+test("summary surfaces parser warnings and the same-model independence failure", () => {
+  const summary = formatDuelSummary(
+    summaryInput({ reviewerIndependence: "same-model", warnings: ["Reviewer response did not include a valid VERDICT line."] })
+  );
+  assert.match(summary, /WARNING: reviewer resolved to the same model as the author/);
+  assert.match(summary, /Warning: Reviewer response did not include a valid VERDICT line\./);
+});
+
+test("summary labels the rebuttal as author-side with no session continuity", () => {
+  const issues: ResolvedDuelIssue[] = [{ id: "I1", severity: "high", claim: "bug", status: "conceded", authorNote: "conceded" }];
+  const summary = formatDuelSummary(summaryInput({ overall: "request-changes", issues, skippedRebuttal: false }));
+  assert.match(summary, /author-side rebuttal only, no session continuity/);
+  assert.match(summary, /1 issue\(s\): 1 conceded \/ 0 disputed/);
+});
+
+test("duel results carry reviewer and rebuttal parser warnings for Discord surfacing", async () => {
+  let calls = 0;
+  const input = duelInput({
+    complete: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return "VERDICT: request-changes\nISSUE severity=high file=src/x.ts line=5 claim=Off-by-one.";
+      }
+      return "no structured response at all";
+    }
   });
-  assert.equal(resolved.available, false);
+  const result = await runDuelReview(input);
+  assert.ok(result.warnings.some((warning) => warning.includes("No rebuttal was recorded for issue I1")));
 });
 
 function fakeProject(root: string): ProjectEntry {
@@ -354,7 +385,7 @@ function fakeProject(root: string): ProjectEntry {
   };
 }
 
-async function createGitFixture(): Promise<{ repo: string; worktreeRoot: string }> {
+async function createGitFixture(): Promise<{ repo: string }> {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-duel-"));
   const repo = path.join(root, "source");
   await git(root, ["init", "source"]);
@@ -363,7 +394,7 @@ async function createGitFixture(): Promise<{ repo: string; worktreeRoot: string 
   await writeFile(path.join(repo, "tracked.txt"), "original\n");
   await git(repo, ["add", "tracked.txt"]);
   await git(repo, ["commit", "-m", "Initial commit"]);
-  return { repo, worktreeRoot: path.join(root, "worktrees") };
+  return { repo };
 }
 
 function git(cwd: string, args: string[]): Promise<string> {

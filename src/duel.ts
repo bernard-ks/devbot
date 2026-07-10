@@ -7,7 +7,7 @@ import { isIgnoredProjectPath } from "./context.js";
 import { completeCodexPrompt } from "./codex-client.js";
 import type { CompleteCodexOptions } from "./codex-client.js";
 import type { ModelTier } from "./request-router.js";
-import { commitTaskWorktree, inspectTaskWorktree, parsePorcelainStatus } from "./task-worktree.js";
+import { parsePorcelainStatus } from "./task-worktree.js";
 import type { TaskRecord } from "./task-store.js";
 import { hardenedGitArguments, hardenedGitEnvironment, redactSensitiveText } from "./security.js";
 import type { ProjectEntry, RoutingConfig } from "./types.js";
@@ -89,6 +89,7 @@ export interface DuelResult {
   rebuttalRaw: string | undefined;
   issues: ResolvedDuelIssue[];
   skippedRebuttal: boolean;
+  warnings: string[];
 }
 
 /** Fixes JS-string-length budgeting: caps by actual UTF-8 byte length, not JS string length. */
@@ -385,6 +386,9 @@ export function duelRebuttalPrompt(input: { projectName: string; taskText: strin
   ].join("\n");
 }
 
+/** Copyable follow-up prompt for the conceded issues. This stage never runs it automatically:
+ *  the reviewed snapshot cannot yet be reproduced safely for a fix task, so the honest output is
+ *  a prompt the owner can paste into a task themselves. */
 export function buildFixTaskPrompt(taskText: string, issues: ResolvedDuelIssue[]): string {
   const conceded = issues.filter((issue) => issue.status === "conceded");
   const lines = ["Fix the following reviewer-confirmed issues from an agent-vs-agent duel review.", `Original task: ${truncate(taskText, 400)}`, ""];
@@ -408,6 +412,7 @@ export function formatDuelSummary(input: {
   overall: DuelVerdictOverall;
   issues: ResolvedDuelIssue[];
   skippedRebuttal: boolean;
+  warnings: string[];
 }): string {
   const conceded = input.issues.filter((issue) => issue.status === "conceded").length;
   const disputed = input.issues.filter((issue) => issue.status === "disputed").length;
@@ -443,7 +448,8 @@ export function formatDuelSummary(input: {
     }`,
     verdictLine,
     issuesLine,
-    input.skippedRebuttal && input.issues.length === 0 && !incomplete ? "No rebuttal round was needed; the diff was clean." : undefined
+    input.skippedRebuttal && input.issues.length === 0 && !incomplete ? "No rebuttal round was needed; the diff was clean." : undefined,
+    ...input.warnings.map((warning) => `Warning: ${warning}`)
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n");
@@ -587,104 +593,6 @@ async function git(cwd: string, args: string[]): Promise<GitResult> {
   }
 }
 
-export interface DuelFixWorkspaceReady {
-  available: true;
-  root: string;
-  revision: string;
-}
-
-export interface DuelFixWorkspaceUnavailable {
-  available: false;
-  reason: string;
-}
-
-export type DuelFixWorkspaceResult = DuelFixWorkspaceReady | DuelFixWorkspaceUnavailable;
-
-export interface DuelFixReproducibilityInput {
-  project: ProjectEntry;
-  task: Pick<TaskRecord, "id" | "workspaceIsolated" | "workspacePath" | "branchName" | "baseBranch">;
-  expectedPatchHash: string;
-  budget?: DiffBudget;
-}
-
-/**
- * Read-only reproducibility check: confirms the task's isolated worktree still exists, is still
- * verifiably the one that was reviewed, and has not drifted since the duel ran (by recomputing the
- * patch hash). Does not mutate anything, so it is safe to call repeatedly (e.g. once before
- * showing the "Accept & fix" modal, and again at submission) without changing what it is checking.
- */
-export async function verifyDuelFixReproducible(input: DuelFixReproducibilityInput): Promise<{ available: true } | DuelFixWorkspaceUnavailable> {
-  const { project, task } = input;
-  if (!task.workspaceIsolated || !task.workspacePath || !task.branchName || !task.baseBranch) {
-    return unavailable(
-      "The reviewed task has no isolated workspace to reproduce, so Accept & fix cannot safely target its exact reviewed state."
-    );
-  }
-
-  const inspection = await inspectTaskWorktree(
-    { sourcePath: project.root, path: task.workspacePath, branch: task.branchName, baseRevision: task.baseBranch },
-    0
-  );
-  if (!inspection.available) {
-    return unavailable(`The reviewed task's isolated workspace can no longer be verified: ${inspection.message}`);
-  }
-
-  const currentEvidence = await gatherDuelChangeEvidence({ ...project, root: task.workspacePath }, task, input.budget ?? DEFAULT_DUEL_DIFF_BUDGET);
-  if (currentEvidence.patchHash !== input.expectedPatchHash) {
-    return unavailable(
-      "The reviewed workspace has changed since the duel review ran. Accept & fix was refused to avoid fixing the wrong state; re-run a duel review first."
-    );
-  }
-  return { available: true };
-}
-
-/**
- * Resolves the exact reviewed workspace for "Accept & fix" instead of letting the fix task start
- * a brand-new worktree from the source checkout's HEAD. Re-runs the same reproducibility check as
- * {@link verifyDuelFixReproducible}, then commits any still-uncommitted reviewed changes so a fix
- * task can branch from a stable revision that actually contains them. Mutates the isolated
- * worktree (never the source checkout), so callers should only invoke this once, after atomically
- * claiming acceptance.
- */
-export async function resolveDuelFixWorkspace(input: DuelFixReproducibilityInput): Promise<DuelFixWorkspaceResult> {
-  const { project, task } = input;
-  const reproducible = await verifyDuelFixReproducible(input);
-  if (!reproducible.available) {
-    return reproducible;
-  }
-  // task.workspaceIsolated/workspacePath/branchName/baseBranch are already known-defined here
-  // because verifyDuelFixReproducible only returns { available: true } once it has checked them.
-  const worktreePath = task.workspacePath as string;
-  const inspection = await inspectTaskWorktree(
-    { sourcePath: project.root, path: worktreePath, branch: task.branchName as string, baseRevision: task.baseBranch as string },
-    0
-  );
-  if (!inspection.available) {
-    return unavailable(`The reviewed task's isolated workspace can no longer be verified: ${inspection.message}`);
-  }
-
-  if (inspection.changes.length > 0) {
-    const commit = await commitTaskWorktree(inspection.worktree, {
-      message: `Duel-reviewed snapshot for task ${task.id}`,
-      files: inspection.changes.map((change) => change.path)
-    });
-    if (!commit.available) {
-      return unavailable(`Could not create a stable snapshot of the reviewed workspace: ${commit.message}`);
-    }
-    if (!commit.committed) {
-      return unavailable(`Could not create a stable snapshot of the reviewed workspace: ${commit.message ?? "commit failed"}`);
-    }
-    return { available: true, root: worktreePath, revision: commit.revision ?? (task.baseBranch as string) };
-  }
-
-  const head = await git(worktreePath, ["rev-parse", "HEAD"]);
-  return { available: true, root: worktreePath, revision: head.ok ? head.stdout.trim() : (task.baseBranch as string) };
-}
-
-function unavailable(reason: string): DuelFixWorkspaceUnavailable {
-  return { available: false, reason };
-}
-
 export async function runDuelReview(input: RunDuelInput): Promise<DuelResult> {
   const complete = input.complete ?? completeCodexPrompt;
   const authorTier: ModelTier = input.task.modelTier === "fast" || input.task.modelTier === "deep" ? input.task.modelTier : "standard";
@@ -714,7 +622,8 @@ export async function runDuelReview(input: RunDuelInput): Promise<DuelResult> {
       reviewerVerdict,
       rebuttalRaw: undefined,
       issues: [],
-      skippedRebuttal: true
+      skippedRebuttal: true,
+      warnings: [...reviewerVerdict.warnings]
     };
   }
 
@@ -749,7 +658,8 @@ export async function runDuelReview(input: RunDuelInput): Promise<DuelResult> {
     reviewerVerdict,
     rebuttalRaw,
     issues,
-    skippedRebuttal: false
+    skippedRebuttal: false,
+    warnings: [...reviewerVerdict.warnings, ...rebuttal.warnings]
   };
 }
 
