@@ -503,9 +503,63 @@ async function performFlowStep(page: Page, step: string, allowedOrigins: Readonl
   }
 
   if (/\bhover\b/i.test(step)) {
-    await links
-      .nth(target.index)
-      .hover({ timeout: 5_000 })
+    // `/clip` is a read-level command. A Playwright `.hover()` dispatches real mouse/pointer
+    // events, which run the element's own `onmouseenter`/`onmouseover` handlers and can mutate
+    // application state under a boundary that is only authorized to read. Represent the hover
+    // step visually without touching the page's mouse handlers: scroll the scored element into
+    // view (`scrollIntoViewIfNeeded` is a layout-only DOM scroll that never synthesizes mouse
+    // events) and draw a replay cursor + highlight ring over it via an injected overlay. The
+    // overlay is appended DOM with `pointer-events: none`; creating an element and setting its
+    // style dispatches no mouse/pointer events to the underlying page, so no hover handler can
+    // fire. See the "mutating mouseenter/mouseover handler never fires" regression in
+    // project-video.e2e.test.ts.
+    const hovered = links.nth(target.index);
+    await hovered.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+    // Draw the replay cursor + highlight ring purely by appending overlay DOM and setting
+    // styles. Creating an element and mutating its style dispatches no mouse/pointer events to
+    // the underlying page, so the target's hover handlers cannot fire. The param type is
+    // inferred from `.evaluate` (this project has no DOM lib to name element types explicitly).
+    await hovered
+      .evaluate((element) => {
+        const doc = element.ownerDocument;
+        if (!doc?.body) {
+          return;
+        }
+        const rect = element.getBoundingClientRect();
+        const ringId = "__devbot_clip_hover_ring__";
+        let ring = doc.getElementById(ringId);
+        if (!ring) {
+          ring = doc.createElement("div");
+          ring.id = ringId;
+          ring.style.cssText =
+            "position:fixed;pointer-events:none;z-index:2147483647;box-sizing:border-box;" +
+            "border:3px solid #4c8bf5;border-radius:6px;box-shadow:0 0 0 3px rgba(76,139,245,0.35);" +
+            "transition:left 120ms ease,top 120ms ease,width 120ms ease,height 120ms ease;";
+          doc.body.appendChild(ring);
+        }
+        ring.style.left = `${rect.left}px`;
+        ring.style.top = `${rect.top}px`;
+        ring.style.width = `${rect.width}px`;
+        ring.style.height = `${rect.height}px`;
+
+        const cursorId = "__devbot_clip_hover_cursor__";
+        let cursor = doc.getElementById(cursorId);
+        if (!cursor) {
+          cursor = doc.createElement("div");
+          cursor.id = cursorId;
+          cursor.style.cssText =
+            "position:fixed;pointer-events:none;z-index:2147483647;width:22px;height:22px;" +
+            "margin:-2px 0 0 -2px;background-repeat:no-repeat;background-size:contain;" +
+            "filter:drop-shadow(0 1px 1px rgba(0,0,0,0.4));" +
+            "background-image:url(\"data:image/svg+xml;utf8," +
+            "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E" +
+            "%3Cpath d='M4 2l7 18 2.5-7.5L21 10z' fill='white' stroke='black' stroke-width='1.5'/%3E" +
+            "%3C/svg%3E\");";
+          doc.body.appendChild(cursor);
+        }
+        cursor.style.left = `${rect.left + rect.width / 2}px`;
+        cursor.style.top = `${rect.top + rect.height / 2}px`;
+      })
       .catch(() => undefined);
     return true;
   }

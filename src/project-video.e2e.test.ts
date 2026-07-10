@@ -137,6 +137,37 @@ function startAnchorMutationServer(): Promise<{ server: http.Server; port: numbe
   });
 }
 
+function startHoverMutationServer(): Promise<{ server: http.Server; port: number; log: AnchorMutationLog }> {
+  const log: AnchorMutationLog = { mutations: 0, navigations: [] };
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (request.method === "POST" && url.pathname === "/mutate") {
+      log.mutations += 1;
+      response.writeHead(200, { "content-type": "text/plain" });
+      response.end("mutated");
+      return;
+    }
+    if (url.pathname === "/reports") {
+      log.navigations.push(url.pathname);
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end("<!doctype html><html><body><h1>Reports overview</h1></body></html>");
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/html" });
+    response.end(`<!doctype html><html><body>
+      <div style="height:2000px"></div>
+      <a href="/reports"
+         onmouseenter="fetch('/mutate',{method:'POST'});"
+         onmouseover="fetch('/mutate',{method:'POST'});">Open reports overview</a>
+    </body></html>`);
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ server, port: (server.address() as AddressInfo).port, log });
+    });
+  });
+}
+
 function startHangingServer(): Promise<{ server: http.Server; port: number }> {
   const server = http.createServer((request, response) => {
     if (request.url === "/hang") {
@@ -256,6 +287,30 @@ test("recorded flows navigate anchors without firing their click handlers", asyn
     assert.ok(outcome.metadata.stepsPerformed.some((step) => /reports overview/i.test(step)));
     assert.deepEqual(site.log.navigations, ["/reports"]);
     // ... but its onclick handler never ran, so no mutation was issued.
+    assert.equal(site.log.mutations, 0);
+  } finally {
+    site.server.closeAllConnections();
+    await new Promise((resolve) => site.server.close(resolve));
+  }
+});
+
+test("hover steps are represented visually without firing mutating mouseenter/mouseover handlers", async () => {
+  const site = await startHoverMutationServer();
+  try {
+    const entry = project(`http://127.0.0.1:${site.port}`);
+    const outcome = await recordProjectFlow(entry, "hover reports overview");
+
+    assert.equal(outcome.kind, "video");
+    if (outcome.kind !== "video") {
+      return;
+    }
+    // The hover step is honestly reported as performed (the element was scrolled into view and a
+    // replay cursor/highlight overlay was drawn over it) ...
+    assert.ok(outcome.metadata.stepsPerformed.some((step) => /hover reports overview/i.test(step)));
+    // ... but the read-level clip never dispatches mouse/pointer events, so the anchor's
+    // onmouseenter/onmouseover handlers never run: no mutation request and no navigation.
+    assert.equal(outcome.metadata.finalUrl, `http://127.0.0.1:${site.port}/`);
+    assert.deepEqual(site.log.navigations, []);
     assert.equal(site.log.mutations, 0);
   } finally {
     site.server.closeAllConnections();
