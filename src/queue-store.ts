@@ -1,9 +1,21 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import {
+  hardenPrivateDirectoryPermissions,
+  hardenPrivateFilePermissions,
+  neutralizeMentions,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+  redactSensitiveText
+} from "./security.js";
 
 export type QueueMode = "answer" | "action";
 export type QueueItemState = "queued" | "running" | "done" | "failed" | "skipped";
+
+const QUEUE_ITEM_ID_PATTERN = /^queue-[a-z0-9-]{1,64}$/i;
+const QUEUE_STATES: QueueItemState[] = ["queued", "running", "done", "failed", "skipped"];
+const QUEUE_MODES: QueueMode[] = ["answer", "action"];
 
 export interface QueueItem {
   id: string;
@@ -12,12 +24,14 @@ export interface QueueItem {
   mode: QueueMode;
   state: QueueItemState;
   addedBy: string;
+  addedById: string;
   addedAt: string;
   taskId?: string;
   messageId?: string;
   startedAt?: string;
   finishedAt?: string;
   summary?: string;
+  digestedAt?: string;
 }
 
 export interface QueueRunnerState {
@@ -25,7 +39,6 @@ export interface QueueRunnerState {
   stopOnFailure: boolean;
   startedBy?: string;
   startedAt?: string;
-  pendingDigest: boolean;
 }
 
 export interface AddQueueItemInput {
@@ -33,6 +46,7 @@ export interface AddQueueItemInput {
   taskText: string;
   mode: QueueMode;
   addedBy: string;
+  addedById: string;
 }
 
 interface QueueStateFile {
@@ -43,8 +57,7 @@ interface QueueStateFile {
 
 const DEFAULT_RUNNER_STATE: QueueRunnerState = {
   running: false,
-  stopOnFailure: false,
-  pendingDigest: false
+  stopOnFailure: false
 };
 
 export class QueueStore {
@@ -62,10 +75,11 @@ export class QueueStore {
       const item: QueueItem = {
         id: newQueueItemId(),
         project: input.project,
-        taskText: input.taskText,
+        taskText: sanitizeText(input.taskText),
         mode: input.mode,
         state: "queued",
         addedBy: input.addedBy,
+        addedById: input.addedById,
         addedAt: now
       };
       state.items.push(item);
@@ -85,52 +99,25 @@ export class QueueStore {
     return item ? { ...item } : undefined;
   }
 
-  async removeAtPosition(position: number): Promise<QueueItem | undefined> {
+  /** Atomically claims the next queued item by transitioning it to `running` before any execution side effect starts. */
+  async claimNext(): Promise<QueueItem | undefined> {
     return this.mutate((state) => {
-      const item = state.items[position - 1];
+      const item = nextQueuedItem(state.items);
       if (!item) {
-        throw new Error(`No queue item at position ${position}.`);
+        return undefined;
       }
-      if (item.state === "running") {
-        throw new Error("The currently running item cannot be removed. Use `/queue stop` first.");
-      }
-      if (item.state !== "queued") {
-        throw new Error(`Queue item at position ${position} already finished (${item.state}).`);
-      }
-      item.state = "skipped";
-      item.finishedAt = new Date().toISOString();
-      item.summary = "Removed before it started.";
+      item.state = "running";
+      item.startedAt = new Date().toISOString();
       return { ...item };
     });
   }
 
-  async clear(): Promise<number> {
-    return this.mutate((state) => {
-      const now = new Date().toISOString();
-      let cleared = 0;
-      for (const item of state.items) {
-        if (item.state === "queued") {
-          item.state = "skipped";
-          item.finishedAt = now;
-          item.summary = "Removed by `/queue clear`.";
-          cleared += 1;
-        }
-      }
-      return cleared;
-    });
-  }
-
-  async nextQueued(): Promise<QueueItem | undefined> {
-    const state = await this.readState();
-    const item = nextQueuedItem(state.items);
-    return item ? { ...item } : undefined;
-  }
-
-  async markRunning(id: string, taskId: string): Promise<void> {
+  async attachTaskId(id: string, taskId: string): Promise<void> {
     await this.mutateItem(id, (item) => {
-      item.state = "running";
+      if (item.state !== "running") {
+        throw new Error(`Queue item ${id} is not running; refusing to attach a task id.`);
+      }
       item.taskId = taskId;
-      item.startedAt = new Date().toISOString();
     });
   }
 
@@ -142,9 +129,48 @@ export class QueueStore {
 
   async markFinished(id: string, result: { state: "done" | "failed"; summary: string }): Promise<void> {
     await this.mutateItem(id, (item) => {
+      if (item.state !== "running") {
+        throw new Error(`Queue item ${id} is not running; refusing to record a finished state.`);
+      }
       item.state = result.state;
-      item.summary = result.summary;
+      item.summary = sanitizeText(result.summary);
       item.finishedAt = new Date().toISOString();
+    });
+  }
+
+  async removeById(id: string): Promise<QueueItem | undefined> {
+    return this.mutate((state) => {
+      const item = state.items.find((entry) => entry.id === id);
+      if (!item) {
+        throw new Error(`No queue item found for \`${id}\`.`);
+      }
+      if (item.state === "running") {
+        throw new Error("The currently running item cannot be removed. Use `/queue stop` first.");
+      }
+      if (item.state !== "queued") {
+        throw new Error(`Queue item \`${id}\` already finished (${item.state}).`);
+      }
+      item.state = "skipped";
+      item.finishedAt = new Date().toISOString();
+      item.summary = "Removed before it started.";
+      return { ...item };
+    });
+  }
+
+  /** Only skips queued items whose project is in `allowedProjectNames`, so a controller can never clear work they cannot see. */
+  async clear(allowedProjectNames: ReadonlySet<string>): Promise<number> {
+    return this.mutate((state) => {
+      const now = new Date().toISOString();
+      let cleared = 0;
+      for (const item of state.items) {
+        if (item.state === "queued" && allowedProjectNames.has(item.project)) {
+          item.state = "skipped";
+          item.finishedAt = now;
+          item.summary = "Removed by `/queue clear`.";
+          cleared += 1;
+        }
+      }
+      return cleared;
     });
   }
 
@@ -170,9 +196,24 @@ export class QueueStore {
     });
   }
 
-  async setPendingDigest(pending: boolean): Promise<void> {
+  /** Items that finished a run but have not yet been included in a posted digest. */
+  async listUndigested(): Promise<QueueItem[]> {
+    const state = await this.readState();
+    return state.items.filter((item) => (item.state === "done" || item.state === "failed") && !item.digestedAt).map((item) => ({ ...item }));
+  }
+
+  async markDigested(ids: readonly string[]): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+    const targets = new Set(ids);
     await this.mutate((state) => {
-      state.runner.pendingDigest = pending;
+      const now = new Date().toISOString();
+      for (const item of state.items) {
+        if (targets.has(item.id)) {
+          item.digestedAt = now;
+        }
+      }
     });
   }
 
@@ -232,11 +273,19 @@ export class QueueStore {
     }
 
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as QueueStateFile;
+      const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as unknown;
+      await hardenPrivateFilePermissions(this.stateFile);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Queue state must be a JSON object.");
+      }
+      const raw = parsed as { version?: unknown; items?: unknown; runner?: unknown };
+      if (raw.version !== undefined && raw.version !== 1) {
+        throw new Error(`Unsupported queue state version: ${String(raw.version)}.`);
+      }
       this.state = {
         version: 1,
-        items: Array.isArray(parsed.items) ? parsed.items : [],
-        runner: { ...DEFAULT_RUNNER_STATE, ...(parsed.runner ?? {}) }
+        items: Array.isArray(raw.items) ? raw.items.map(normalizeLoadedItem).filter((item): item is QueueItem => item !== undefined) : [],
+        runner: normalizeLoadedRunner(raw.runner)
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -253,11 +302,21 @@ export class QueueStore {
       return;
     }
 
-    await mkdir(path.dirname(this.stateFile), { recursive: true });
-    const tempFile = `${this.stateFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`);
+    const directory = path.dirname(this.stateFile);
+    await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    await hardenPrivateDirectoryPermissions(directory);
+    const tempFile = `${this.stateFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE
+    });
     await rename(tempFile, this.stateFile);
   }
+}
+
+function sanitizeText(value: string): string {
+  return neutralizeMentions(redactSensitiveText(value));
 }
 
 export function nextQueuedItem(items: QueueItem[]): QueueItem | undefined {
@@ -290,6 +349,19 @@ export function retainQueueItems(items: QueueItem[], maxRecords: number): QueueI
   return keep.reverse();
 }
 
+export function groupQueueItemsByProject(items: QueueItem[]): Map<string, QueueItem[]> {
+  const groups = new Map<string, QueueItem[]>();
+  for (const item of items) {
+    const group = groups.get(item.project);
+    if (group) {
+      group.push(item);
+    } else {
+      groups.set(item.project, [item]);
+    }
+  }
+  return groups;
+}
+
 export function formatQueueList(items: QueueItem[]): string {
   if (items.length === 0) {
     return "The queue is empty. Use `/queue add` to stack a task.";
@@ -298,7 +370,7 @@ export function formatQueueList(items: QueueItem[]): string {
   return items
     .map((item, index) => {
       const summary = item.summary ? `: ${truncate(item.summary, 90)}` : "";
-      return `${index + 1}. **${item.state}** ${item.mode} on \`${item.project}\` by ${item.addedBy}${summary}\n   ${truncate(item.taskText, 120)}`;
+      return `${index + 1}. **${item.state}** ${item.mode} on \`${item.project}\` by ${item.addedBy} (\`${item.id}\`)${summary}\n   ${truncate(item.taskText, 120)}`;
     })
     .join("\n");
 }
@@ -345,7 +417,7 @@ function newQueueItemId(): string {
 }
 
 export function isQueueItemId(value: string): boolean {
-  return /^queue-[a-z0-9-]{1,64}$/i.test(value);
+  return QUEUE_ITEM_ID_PATTERN.test(value);
 }
 
 function truncate(value: string, maxLength: number): string {
@@ -354,4 +426,59 @@ function truncate(value: string, maxLength: number): string {
     return normalized;
   }
   return `${normalized.slice(0, maxLength - 1)}...`;
+}
+
+function normalizeLoadedItem(value: unknown): QueueItem | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Partial<QueueItem>;
+  if (
+    typeof item.id !== "string" ||
+    !isQueueItemId(item.id) ||
+    typeof item.project !== "string" ||
+    typeof item.taskText !== "string" ||
+    !QUEUE_MODES.includes(item.mode as QueueMode) ||
+    !QUEUE_STATES.includes(item.state as QueueItemState) ||
+    typeof item.addedBy !== "string" ||
+    typeof item.addedAt !== "string" ||
+    !Number.isFinite(Date.parse(item.addedAt))
+  ) {
+    return undefined;
+  }
+  return {
+    id: item.id,
+    project: item.project,
+    taskText: sanitizeText(item.taskText),
+    mode: item.mode as QueueMode,
+    state: item.state as QueueItemState,
+    addedBy: item.addedBy,
+    addedById: stringValue(item.addedById) ?? "unknown",
+    addedAt: item.addedAt,
+    ...(stringValue(item.taskId) ? { taskId: stringValue(item.taskId)! } : {}),
+    ...(stringValue(item.messageId) ? { messageId: stringValue(item.messageId)! } : {}),
+    ...(validTimestamp(item.startedAt) ? { startedAt: validTimestamp(item.startedAt)! } : {}),
+    ...(validTimestamp(item.finishedAt) ? { finishedAt: validTimestamp(item.finishedAt)! } : {}),
+    ...(stringValue(item.summary) ? { summary: sanitizeText(stringValue(item.summary)!) } : {}),
+    ...(validTimestamp(item.digestedAt) ? { digestedAt: validTimestamp(item.digestedAt)! } : {})
+  };
+}
+
+function normalizeLoadedRunner(value: unknown): QueueRunnerState {
+  if (!value || typeof value !== "object") {
+    return { ...DEFAULT_RUNNER_STATE };
+  }
+  const runner = value as Partial<QueueRunnerState>;
+  return {
+    running: runner.running === true,
+    stopOnFailure: runner.stopOnFailure === true,
+    ...(stringValue(runner.startedBy) ? { startedBy: stringValue(runner.startedBy)! } : {}),
+    ...(validTimestamp(runner.startedAt) ? { startedAt: validTimestamp(runner.startedAt)! } : {})
+  };
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function validTimestamp(value: unknown): string | undefined {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : undefined;
 }
