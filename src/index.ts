@@ -37,6 +37,7 @@ import {
   type AmbientAction,
   type AmbientRole
 } from "./ambient-ui.js";
+import { AuditLedger, formatAuditRecords, formatAuditVerification, isAuditRecordVisible } from "./audit-ledger.js";
 import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
 import {
   collabDeliveryKey,
@@ -72,6 +73,7 @@ import { contextLimitForRoute, routeRequest, type RequestRoute } from "./request
 import { publicErrorMessage, redactSensitiveText } from "./security.js";
 import {
   commandRequiresApproval,
+  commandRequiresController,
   isPeerAllowedForProject,
   isScreenshotBlocked,
   isWriteBlockedBySafeMode,
@@ -153,10 +155,13 @@ const bootstrapConfig = captureBootstrapConfig(config);
 applySetupState(config, bootstrapConfig, setupStore.snapshot());
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
+const auditLedger = new AuditLedger(process.env.DEVBOT_AUDIT_LEDGER?.trim() || undefined);
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
+taskStore.setAuditor(auditLedger);
 const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
+collabStore.setAuditor(auditLedger);
 const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
 const activeWorkroomActions = new Set<string>();
@@ -579,7 +584,10 @@ client.on("messageCreate", async (message) => {
 await client.login(config.discordToken);
 
 async function handleCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
-  if (commandRequiresController(interaction) && !(await ensureControllerAccess(interaction, appConfig))) {
+  if (
+    commandRequiresController(interaction.commandName, interaction.options.getSubcommand(false)) &&
+    !(await ensureControllerAccess(interaction, appConfig))
+  ) {
     return;
   }
 
@@ -661,6 +669,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
 
   if (interaction.commandName === "task") {
     await handleTaskCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "audit") {
+    await handleAuditCommand(interaction, appConfig);
     return;
   }
 
@@ -797,6 +810,7 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
 
     const state = await setupStore.setUser(user.id, permission, action === "add");
     applySetupState(appConfig, bootstrapConfig, state);
+    await recordSetupAudit(interaction.user.tag, `user:${user.id}`, `${action === "add" ? "granted" : "removed"} ${permission} access`);
     await syncPrivateRoomPermissions(interaction, state, appConfig);
     await interaction.editReply(
       `${action === "add" ? "Granted" : "Removed"} ${permission} access ${action === "add" ? "to" : "from"} <@${user.id}>.`
@@ -814,6 +828,7 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
 
     const state = await setupStore.setPeer(bot.id, action === "add");
     applySetupState(appConfig, bootstrapConfig, state);
+    await recordSetupAudit(interaction.user.tag, `peer:${bot.id}`, `${action === "add" ? "added" : "removed"} peer devbot`);
     await syncPrivateRoomPermissions(interaction, state, appConfig);
     await interaction.editReply(`${action === "add" ? "Added" : "Removed"} peer Devbot <@${bot.id}>.`);
     return;
@@ -844,6 +859,7 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
       const state = await setupStore.setRepository(name, root);
       contextService.invalidate(name);
       applySetupState(appConfig, bootstrapConfig, state);
+      await recordSetupAudit(interaction.user.tag, `project:${name}`, `registered repository at ${root}`);
       await interaction.editReply(`Registered \`${name}\` at \`${root}\`.`);
       return;
     }
@@ -857,6 +873,7 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
       const state = await setupStore.removeRepository(name);
       contextService.invalidate(name);
       applySetupState(appConfig, bootstrapConfig, state);
+      await recordSetupAudit(interaction.user.tag, `project:${name}`, "removed setup-managed repository");
       await interaction.editReply(`Removed setup-managed repository \`${name}\`.`);
       return;
     }
@@ -867,6 +884,7 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
     }
     const state = await setupStore.setDefaultProject(name);
     applySetupState(appConfig, bootstrapConfig, state);
+    await recordSetupAudit(interaction.user.tag, `project:${name}`, "selected default project");
     await interaction.editReply(`Selected \`${name}\` as Devbot's default project root.`);
     return;
   }
@@ -878,6 +896,7 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
       const previousRoomId = setupStore.snapshot().projectRoomIds[project.name];
       await setupStore.unbindProjectRoom(project.name);
       if (previousRoomId) verifiedProjectRoomAudiences.delete(previousRoomId);
+      await recordSetupAudit(interaction.user.tag, `project:${project.name}`, "removed ambient project room binding");
       await interaction.editReply(`Removed the ambient room binding for \`${project.name}\`.`);
       return;
     }
@@ -903,6 +922,7 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
     }
     await setupStore.bindProjectRoom(project.name, channel.id);
     verifiedProjectRoomAudiences.set(channel.id, Date.now());
+    await recordSetupAudit(interaction.user.tag, `project:${project.name}`, `bound ambient project room ${channel.id}`);
     await interaction.editReply(`Bound \`${project.name}\` to its ambient room: <#${channel.id}>.`);
     return;
   }
@@ -910,6 +930,10 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
   const channel = await createOrSyncPrivateRoom(interaction, appConfig, interaction.options.getString("name") ?? undefined);
   await ensureWorkspaceLauncher(appConfig);
   await interaction.editReply(`Private Devbot room ready: <#${channel.id}>.`);
+}
+
+async function recordSetupAudit(actor: string, subject: string, summary: string): Promise<void> {
+  await auditLedger.recordSafely({ type: "setup.changed", actor, subject, summary });
 }
 
 async function projectRoomAudienceProblem(
@@ -980,6 +1004,11 @@ async function handleSetupUserSelect(
     state = action === "peer"
       ? await setupStore.setPeer(user.id, true)
       : await setupStore.setUser(user.id, action === "viewer" ? "view" : "control", true);
+    await recordSetupAudit(
+      interaction.user.tag,
+      `${action === "peer" ? "peer" : "user"}:${user.id}`,
+      action === "peer" ? "added peer devbot" : `granted ${action === "viewer" ? "view" : "control"} access`
+    );
   }
   applySetupState(appConfig, bootstrapConfig, state);
   await syncPrivateRoomPermissions(interaction, state, appConfig);
@@ -1007,6 +1036,7 @@ async function handleSetupProjectSelect(
   }
   const state = await setupStore.setDefaultProject(projectName);
   applySetupState(appConfig, bootstrapConfig, state);
+  await recordSetupAudit(interaction.user.tag, `project:${projectName}`, "selected default project");
   await interaction.editReply(setupWizardView(state, appConfig, effectivePrivateRoomId()));
 }
 
@@ -1026,12 +1056,13 @@ async function handleSetupRepoModal(
   const state = await registerSetupRepository(
     interaction.fields.getTextInputValue("name"),
     interaction.fields.getTextInputValue("path"),
-    appConfig
+    appConfig,
+    interaction.user.tag
   );
   await interaction.editReply(setupWizardView(state, appConfig, effectivePrivateRoomId()));
 }
 
-async function registerSetupRepository(rawName: string, pathValue: string, appConfig: AppConfig): Promise<SetupState> {
+async function registerSetupRepository(rawName: string, pathValue: string, appConfig: AppConfig, actor: string): Promise<SetupState> {
   const name = normalizeProjectName(rawName);
   if (!/[a-z0-9_]/.test(name)) {
     throw new Error("Repository name must contain a letter, number, underscore, or hyphen.");
@@ -1045,9 +1076,11 @@ async function registerSetupRepository(rawName: string, pathValue: string, appCo
   let state = await setupStore.setRepository(name, root);
   contextService.invalidate(name);
   applySetupState(appConfig, bootstrapConfig, state);
+  await recordSetupAudit(actor, `project:${name}`, `registered repository at ${root}`);
   if (!hadDefault) {
     state = await setupStore.setDefaultProject(name);
     applySetupState(appConfig, bootstrapConfig, state);
+    await recordSetupAudit(actor, `project:${name}`, "selected default project");
   }
   return state;
 }
@@ -1095,6 +1128,7 @@ async function createOrSyncPrivateRoom(
     }
     state = await setupStore.setPrivateChannel(channel.id);
     applySetupState(appConfig, bootstrapConfig, state);
+    await recordSetupAudit(interaction.user.tag, `room:${channel.id}`, "bound the private devbot room");
   }
 
   await syncPrivateRoomChannel(channel, guild.roles.everyone.id, state, appConfig);
@@ -1231,13 +1265,15 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
   const codexReady = path.isAbsolute(appConfig.codex.bin)
     ? Boolean((await stat(appConfig.codex.bin).catch(() => undefined))?.isFile())
     : Boolean(appConfig.codex.bin);
+  const auditHealth = await auditLedger.health();
   const checks = [
     [Boolean(appConfig.ownerUserId), "Owner identity", "Set DEVBOT_OWNER_USER_ID locally and restart."],
     [Boolean(effectivePrivateRoomId()), "Private room", "Run /setup wizard and choose Use private room."],
     [repoReady, "Default repository", "Add or repair a repository in /setup wizard."],
     [codexReady, "Codex executable", "Set CODEX_BIN to an installed Codex CLI."],
     [appConfig.routing.enabled && Boolean(appConfig.routing.fastModel && appConfig.routing.standardModel && appConfig.routing.deepModel), "Luna / Terra / Sol routing", "Check CODEX_ROUTER_MODEL and tier model settings."],
-    [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."]
+    [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."],
+    [auditHealth.ok, "Audit ledger", `${auditHealth.detail} Run /audit verify for the first divergence.`]
   ] as const;
   const passed = checks.filter(([ready]) => ready).length;
   return [
@@ -2919,6 +2955,52 @@ async function handleDashboardCommand(interaction: ChatInputCommandInteraction, 
   await interaction.editReply(await buildWorkspacePanel(interaction, appConfig, project));
 }
 
+async function handleAuditCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === "verify") {
+    const verification = await auditLedger.verify();
+    await interaction.editReply(formatAuditVerification(verification));
+    return;
+  }
+
+  const projectName = interaction.options.getString("project");
+  const projectFilter = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+  if (projectFilter && !(await ensureProjectAccess(interaction, projectFilter))) {
+    return;
+  }
+  const access = {
+    ownerView: isOwner(interaction.user.id, appConfig),
+    visibleProjects: new Set(
+      appConfig.projects.filter((project) => isAllowedForProject(interaction, project)).map((project) => project.name)
+    ),
+    ...(projectFilter ? { projectFilter: projectFilter.name } : {})
+  };
+
+  try {
+    if (subcommand === "show") {
+      const seq = interaction.options.getInteger("seq", true);
+      const record = await auditLedger.show(seq);
+      if (!record || !isAuditRecordVisible(record, access)) {
+        await interaction.editReply(`No accessible audit record was found for seq ${seq}.`);
+        return;
+      }
+      await interaction.editReply(formatAuditRecords([record]));
+      return;
+    }
+
+    const limit = Math.max(1, Math.min(interaction.options.getInteger("limit") ?? 10, 25));
+    const records = (await auditLedger.records())
+      .filter((record) => isAuditRecordVisible(record, access))
+      .slice(-limit)
+      .reverse();
+    await interaction.editReply(formatAuditRecords(records));
+  } catch (error) {
+    await interaction.editReply(`The audit ledger read failed closed: ${publicErrorMessage(error)}`);
+  }
+}
+
 async function handleRunCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
   const privateReply = hasProjectAudienceRestriction(project);
@@ -2933,6 +3015,13 @@ async function handleRunCommand(interaction: ChatInputCommandInteraction, appCon
   }
   const command = interaction.options.getString("command", true);
   const result = await runConfiguredProjectCommand(project, command);
+  await auditLedger.recordSafely({
+    type: "command.executed",
+    actor: interaction.user.tag,
+    subject: `command:${result.kind}`,
+    project: project.name,
+    summary: `/run ${result.command} ${result.ok ? "passed" : "failed"}${result.exitCode !== undefined ? ` (exit ${result.exitCode})` : ""}`
+  });
   await editInteractionWithChunks(interaction, { content: formatProjectCommandResult(result) }, privateReply);
 }
 
@@ -2966,14 +3055,32 @@ async function handleReviewCommand(interaction: ChatInputCommandInteraction, app
   const commandNames = parseCommandNames(interaction.options.getString("commands"));
   if (subcommand === "validate") {
     const results = await validateReview(project, commandNames);
+    await recordCommandBatchAudit(interaction.user.tag, project.name, "/review validate", results);
     await editInteractionWithChunks(interaction, { content: formatValidationResults(project, results) }, privateReply);
     return;
   }
 
   if (subcommand === "gates") {
     const result = await evaluateMergeGates(project, commandNames);
+    await recordCommandBatchAudit(interaction.user.tag, project.name, "/review gates", result.validation);
     await editInteractionWithChunks(interaction, { content: formatMergeGateResult(project, result) }, privateReply);
   }
+}
+
+async function recordCommandBatchAudit(
+  actor: string,
+  projectName: string,
+  surface: string,
+  results: readonly { kind: string; ok: boolean }[]
+): Promise<void> {
+  const passed = results.filter((result) => result.ok).length;
+  await auditLedger.recordSafely({
+    type: "command.executed",
+    actor,
+    subject: `command:${results.map((result) => result.kind).join(",") || "none"}`,
+    project: projectName,
+    summary: `${surface} ran ${results.length} command(s): ${passed} passed, ${results.length - passed} failed`
+  });
 }
 
 async function handleDevbotCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
@@ -3233,14 +3340,25 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
       } else {
         if (action === "validate") {
           const results = await validateReview(project, commandNames);
+          await recordCommandBatchAudit(interaction.user.tag, project.name, `/lab approve ${id}`, results);
           actionResult = formatValidationResults(project, results);
         } else if (action === "gates") {
           const result = await evaluateMergeGates(project, commandNames);
+          await recordCommandBatchAudit(interaction.user.tag, project.name, `/lab approve ${id}`, result.validation);
           actionResult = formatMergeGateResult(project, result);
         }
       }
     }
 
+    if (conversation.intent !== "council") {
+      await auditLedger.recordSafely({
+        type: "collab.decided",
+        actor: interaction.user.tag,
+        subject: id,
+        project: conversation.projectName ?? "",
+        summary: `${decision}${note ? `: ${note}` : ""}`
+      });
+    }
     if (conversation.intent !== "council" || actionResult) {
       await collabStore.addEvent({
         conversationId: id,
@@ -5121,20 +5239,6 @@ function isControllerUser(userId: string, appConfig: AppConfig): boolean {
     return false;
   }
   return isSetupController(setupStore.snapshot(), appConfig.ownerUserId, userId);
-}
-
-function commandRequiresController(interaction: ChatInputCommandInteraction): boolean {
-  if (interaction.commandName === "do" || interaction.commandName === "run") {
-    return true;
-  }
-  const subcommand = interaction.options.getSubcommand(false);
-  if (interaction.commandName === "review") {
-    return subcommand === "validate" || subcommand === "gates";
-  }
-  if (interaction.commandName === "task") {
-    return subcommand === "cancel" || subcommand === "retry";
-  }
-  return interaction.commandName === "lab" && (subcommand === "approve" || subcommand === "bossfight");
 }
 
 async function ensureControllerAccess(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<boolean> {

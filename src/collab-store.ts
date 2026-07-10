@@ -1,13 +1,15 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
+import type { AuditRecorder } from "./audit-ledger.js";
 import type { CollabArtifact, CollabIntent, CollabMode } from "./collab-protocol.js";
 import { newCollabId } from "./collab-protocol.js";
 import {
   hardenPrivateDirectoryPermissions,
   hardenPrivateFilePermissions,
   PRIVATE_DIRECTORY_MODE,
-  PRIVATE_FILE_MODE
+  PRIVATE_FILE_MODE,
+  publicErrorMessage
 } from "./security.js";
 
 export type WorkroomPhase = "collecting" | "deliberating" | "synthesized" | "decided" | "closed";
@@ -89,6 +91,7 @@ interface CollabStateFile {
 export class CollabStore {
   private state: CollabStateFile | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
+  private auditor: AuditRecorder | undefined;
 
   constructor(
     private readonly stateFile = path.resolve(".devbot", "collab.json"),
@@ -97,6 +100,10 @@ export class CollabStore {
     private readonly maxContributions = 1_000,
     private readonly maxProcessedDeliveries = 2_000
   ) {}
+
+  setAuditor(auditor: AuditRecorder): void {
+    this.auditor = auditor;
+  }
 
   async start(input: {
     intent: CollabIntent;
@@ -408,7 +415,7 @@ export class CollabStore {
     actor: string;
     note?: string;
   }): Promise<CollabConversation | undefined> {
-    return this.mutate((state) => {
+    const decided = await this.mutate((state) => {
       const conversation = findConversation(state, input.conversationId);
       if (
         !conversation ||
@@ -438,6 +445,20 @@ export class CollabStore {
       });
       return cloneConversation(conversation);
     });
+    if (decided && this.auditor) {
+      try {
+        await this.auditor.record({
+          type: "collab.decided",
+          actor: input.actor,
+          subject: decided.id,
+          project: decided.projectName ?? "",
+          summary: `${input.outcome}${input.note ? `: ${input.note}` : ""}`
+        });
+      } catch (error) {
+        console.warn(`Audit ledger append failed for ${decided.id}: ${publicErrorMessage(error)}`);
+      }
+    }
+    return decided;
   }
 
   async close(conversationId: string, actor: string): Promise<CollabConversation | undefined> {
