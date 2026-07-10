@@ -22,6 +22,7 @@ import {
   MAX_FALLBACK_AUDIO_BYTES,
   MAX_VOICE_SECONDS,
   quoteTranscript,
+  resolveVoiceIntake,
   resolveFfmpegBinary,
   resolveWhisperBinary,
   resolveWhisperModel,
@@ -327,6 +328,46 @@ test("voiceEnablementSetupResult refuses enable-voice-without-intent with the se
   assert.equal(refusal, messageContentIntentSetupInstructions());
   assert.equal(voiceEnablementSetupResult({ enabled: true, messageContentIntent: true }), undefined);
   assert.equal(voiceEnablementSetupResult({ enabled: false, messageContentIntent: false }), undefined);
+});
+
+test("resolveVoiceIntake refuses a native voice note with empty attachments and no intent before the empty-attachment path", () => {
+  // The exact silent-failure case the maintainer flagged: Discord strips the attachment from a
+  // native room voice note when the Message Content Intent is off, but the IsVoiceMessage flag
+  // survives. The intent gate must win over the empty-attachment path so the refusal is reachable.
+  assert.equal(
+    resolveVoiceIntake({ isVoiceMessage: true, hasAudioAttachment: false, messageContentIntent: false }),
+    "refuse-intent"
+  );
+});
+
+test("resolveVoiceIntake transcribes a native voice note whose attachment arrives with the intent on", () => {
+  assert.equal(
+    resolveVoiceIntake({ isVoiceMessage: true, hasAudioAttachment: true, messageContentIntent: true }),
+    "transcribe"
+  );
+});
+
+test("resolveVoiceIntake ignores an ordinary message that is neither a voice note nor an audio attachment", () => {
+  assert.equal(
+    resolveVoiceIntake({ isVoiceMessage: false, hasAudioAttachment: false, messageContentIntent: true }),
+    "ignore-not-candidate"
+  );
+  // Still not a candidate when the intent happens to be off, so it never reaches the refusal path.
+  assert.equal(
+    resolveVoiceIntake({ isVoiceMessage: false, hasAudioAttachment: false, messageContentIntent: false }),
+    "ignore-not-candidate"
+  );
+});
+
+test("resolveVoiceIntake refuses an audio-attachment message without the intent and ignores an empty one with it", () => {
+  assert.equal(
+    resolveVoiceIntake({ isVoiceMessage: false, hasAudioAttachment: true, messageContentIntent: false }),
+    "refuse-intent"
+  );
+  assert.equal(
+    resolveVoiceIntake({ isVoiceMessage: true, hasAudioAttachment: false, messageContentIntent: true }),
+    "ignore-empty"
+  );
 });
 
 test("formatVoiceDoctorSection reports voice disabled regardless of intent", () => {

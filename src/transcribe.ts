@@ -366,6 +366,37 @@ export function messageContentIntentSetupInstructions(): string {
   ].join("\n");
 }
 
+export interface VoiceIntakeInput {
+  isVoiceMessage: boolean;
+  hasAudioAttachment: boolean;
+  messageContentIntent: boolean;
+}
+
+// The ordered gate the voice handler applies to an incoming message. Extracted as a pure decision so
+// the ordering the maintainer flagged is directly testable:
+//  - "ignore-not-candidate": neither a native voice message nor an audio attachment; not ours.
+//  - "refuse-intent": a voice-intake candidate arrived, but the Message Content Intent is off. This
+//    is checked BEFORE the attachment, because without the intent Discord strips the attachment from
+//    an ordinary room voice note (the IsVoiceMessage flag survives), so a native voice note reaches
+//    us with no attachment. Returning the refusal here — rather than bailing on the empty attachment
+//    first — is what makes the actionable message reachable for the exact case it exists for.
+//  - "ignore-empty": the intent is on but no transcribable audio arrived; nothing to do.
+//  - "transcribe": proceed to download/transcription.
+export type VoiceIntakeDecision = "ignore-not-candidate" | "refuse-intent" | "ignore-empty" | "transcribe";
+
+export function resolveVoiceIntake(input: VoiceIntakeInput): VoiceIntakeDecision {
+  if (!input.isVoiceMessage && !input.hasAudioAttachment) {
+    return "ignore-not-candidate";
+  }
+  if (!input.messageContentIntent) {
+    return "refuse-intent";
+  }
+  if (!input.hasAudioAttachment) {
+    return "ignore-empty";
+  }
+  return "transcribe";
+}
+
 export interface VoiceEnablementInput {
   enabled: boolean;
   messageContentIntent: boolean;

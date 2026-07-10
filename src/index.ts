@@ -130,9 +130,11 @@ import {
   formatVoiceDoctorSection,
   messageContentIntentSetupInstructions,
   quoteTranscript,
+  resolveVoiceIntake,
   selectVoiceAttachment,
   transcribeAttachment,
   truncateTranscriptForReply,
+  voiceEnablementSetupResult,
   voiceSetupInstructions
 } from "./transcribe.js";
 import { UserPreferenceStore } from "./user-preferences.js";
@@ -224,10 +226,15 @@ const gatewayIntents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessage
 if (config.voice.messageContentIntent) {
   gatewayIntents.push(GatewayIntentBits.MessageContent);
 }
-if (config.voice.enabled && !config.voice.messageContentIntent) {
-  console.warn(
-    "Voice notes are enabled but DEVBOT_MESSAGE_CONTENT_INTENT is not true; native voice messages in the project room will arrive without an attachment. Enable MESSAGE CONTENT INTENT in the Discord Developer Portal and set DEVBOT_MESSAGE_CONTENT_INTENT=true."
-  );
+const voiceEnablementProblem = voiceEnablementSetupResult({
+  enabled: config.voice.enabled,
+  messageContentIntent: config.voice.messageContentIntent
+});
+if (voiceEnablementProblem) {
+  // Refuse to advertise voice as working when its gateway prerequisite is missing: warn at the
+  // earliest coherent point with the same actionable message the handler returns per voice note,
+  // so startup and runtime stay consistent.
+  console.warn(`Voice notes are enabled but not usable yet.\n${voiceEnablementProblem}`);
 }
 const client = new Client({
   intents: gatewayIntents,
@@ -2611,8 +2618,18 @@ async function maybeHandleVoiceMessage(message: OmitPartialGroupDMChannel<Messag
     return false;
   }
 
-  const attachment = selectVoiceAttachment(message.flags.has(MessageFlags.IsVoiceMessage), [...message.attachments.values()]);
-  if (!attachment) {
+  // A native Discord voice message is identifiable by its IsVoiceMessage flag, which the gateway
+  // delivers even without the Message Content Intent (the attachment is what gets stripped, not the
+  // flag). resolveVoiceIntake encodes the ordered gate: candidate detection, then the intent gate
+  // BEFORE the attachment, then the empty-attachment case.
+  const isVoiceMessage = message.flags.has(MessageFlags.IsVoiceMessage);
+  const attachment = selectVoiceAttachment(isVoiceMessage, [...message.attachments.values()]);
+  const intake = resolveVoiceIntake({
+    isVoiceMessage,
+    hasAudioAttachment: Boolean(attachment),
+    messageContentIntent: appConfig.voice.messageContentIntent
+  });
+  if (intake === "ignore-not-candidate") {
     return false;
   }
 
@@ -2625,14 +2642,16 @@ async function maybeHandleVoiceMessage(message: OmitPartialGroupDMChannel<Messag
     return true;
   }
 
-  // Voice intake depends on message.attachments, which Discord only populates under the privileged
-  // Message Content Intent (except for DMs, mentions, bot-authored, and context-menu targets). An
-  // attachment reached us here via one of those exceptions, but ordinary room voice notes would
-  // arrive empty without the intent, so refuse with an actionable setup message instead of a path
-  // that silently works for some messages and not others.
-  if (!appConfig.voice.messageContentIntent) {
+  // Runs before any use of the attachment: without the intent Discord strips the attachment from an
+  // ordinary room voice note, so it reaches us empty. The native voice flag survives, so we refuse
+  // with an actionable Developer Portal setup message instead of dropping the note silently.
+  if (intake === "refuse-intent") {
     await message.reply(messageContentIntentSetupInstructions());
     return true;
+  }
+  // Intent is on but nothing transcribable arrived; stay silent rather than replying to noise.
+  if (intake === "ignore-empty" || !attachment) {
+    return false;
   }
 
   const visibleProjects = appConfig.projects.filter((project) => isAllowedMessageForProject(message, project));
