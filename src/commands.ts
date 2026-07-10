@@ -584,7 +584,18 @@ const commandBuilders = [
       subcommand
         .setName("search")
         .setDescription("Search memory entries by relevance to a query.")
-        .addStringOption((option) => option.setName("query").setDescription("What to search for.").setRequired(true))
+        .addStringOption((option) =>
+          option.setName("query").setDescription("What to search for.").setRequired(true).setMaxLength(200)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("promote")
+        .setDescription("Owner/controller-only: mark an automatically captured outcome as approved for recall.")
+        .addStringOption((option) => option.setName("id").setDescription("Memory entry ID.").setRequired(true).setAutocomplete(true))
         .addStringOption((option) =>
           option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
         )
