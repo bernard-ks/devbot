@@ -12,12 +12,15 @@ import {
 import { probeWorker, type WorkerIdentity, type WorkerLiveness } from "./worker-identity.js";
 
 /**
- * Recurring schedules are read-only by design: an occurrence fires unattended, with
- * nobody in the loop to approve that specific run, so it can never be write-capable
- * (`action` mode). Write-capable work always goes through `/do` or `/queue`, both of
- * which are single explicit commands a controller issues themselves.
+ * Recurring schedules are read-only (`answer`) by default and by omission: an occurrence
+ * fires unattended, with nobody in the loop to approve that specific run. `action` mode
+ * is an explicit choice, and even then an occurrence never executes writes by itself: it
+ * either posts an approval-gated proposal card, or runs under a standing approval a
+ * controller granted ahead of time with a mandatory expiry, max-run budget, and review
+ * policy. Every ambiguous or degraded state falls back to a proposal card, never to
+ * silent execution.
  */
-export type ScheduleMode = "answer";
+export type ScheduleMode = "answer" | "action";
 
 export type ScheduleSpec =
   | { kind: "daily"; hour: number; minute: number }
@@ -25,6 +28,45 @@ export type ScheduleSpec =
   | { kind: "every-hours"; hours: number };
 
 const SCHEDULE_ID_PATTERN = /^sched-[a-z0-9-]{1,64}$/i;
+const PROPOSAL_TASK_ID_PATTERN = /^task-[a-z0-9-]{1,52}$/i;
+
+/**
+ * A controller's pre-authorization for unattended `action` occurrences. Expiry and the
+ * max-run budget are mandatory, and at least one review checkpoint (run count or time)
+ * must be set: once any of them is crossed, the next occurrence requires fresh approval
+ * again via a proposal card.
+ */
+export interface StandingApproval {
+  grantedBy: string;
+  grantedById: string;
+  grantedAt: string;
+  expiresAt: string;
+  maxRuns: number;
+  runsUsed: number;
+  reviewAfterRuns?: number;
+  reviewAt?: string;
+}
+
+export interface StandingApprovalRevocation {
+  by: string;
+  byId: string;
+  at: string;
+}
+
+export type StandingApprovalRefusal = "none" | "revoked" | "expired" | "exhausted" | "review-due";
+
+export type StandingApprovalDecision =
+  | { ok: true; approval: StandingApproval }
+  | { ok: false; reason: StandingApprovalRefusal };
+
+export interface GrantStandingApprovalInput {
+  grantedBy: string;
+  grantedById: string;
+  expiresAt: Date;
+  maxRuns: number;
+  reviewAfterRuns?: number;
+  reviewAt?: Date;
+}
 
 export interface ScheduleEntry {
   id: string;
@@ -38,6 +80,9 @@ export interface ScheduleEntry {
   createdAt: string;
   lastRun?: string;
   lastResult?: string;
+  lastProposalTaskId?: string;
+  standingApproval?: StandingApproval;
+  standingApprovalRevoked?: StandingApprovalRevocation;
   nextRun: string;
   running: boolean;
   runStartedAt?: string;
@@ -59,6 +104,7 @@ export interface AddScheduleInput {
   spec: string;
   project: string;
   taskText: string;
+  mode?: ScheduleMode;
   addedBy: string;
   addedById: string;
 }
@@ -162,7 +208,9 @@ export class ScheduleStore {
         spec: describeScheduleSpec(parsed),
         project: input.project,
         taskText: sanitizeText(input.taskText),
-        mode: "answer",
+        // Omission fails safe: only an explicit `action` choice yields a write-capable
+        // (still approval-gated) schedule.
+        mode: input.mode === "action" ? "action" : "answer",
         enabled: true,
         addedBy: input.addedBy,
         addedById: input.addedById,
@@ -211,6 +259,84 @@ export class ScheduleStore {
         }
       }
       return { ...entry };
+    });
+  }
+
+  async grantStandingApproval(id: string, input: GrantStandingApprovalInput): Promise<ScheduleEntry> {
+    return this.mutate((state) => {
+      const entry = state.entries.find((item) => item.id === id);
+      if (!entry) {
+        throw new Error(`No scheduled task found for \`${id}\`.`);
+      }
+      if (entry.mode !== "action") {
+        throw new Error("Standing approvals only apply to action schedules; read-only schedules never need one.");
+      }
+      const now = new Date();
+      if (!(input.expiresAt.getTime() > now.getTime())) {
+        throw new Error("A standing approval needs an expiry in the future.");
+      }
+      if (!Number.isSafeInteger(input.maxRuns) || input.maxRuns < 1) {
+        throw new Error("A standing approval needs a positive max-run budget.");
+      }
+      if (input.reviewAfterRuns !== undefined && (!Number.isSafeInteger(input.reviewAfterRuns) || input.reviewAfterRuns < 1)) {
+        throw new Error("The review-after-runs checkpoint must be a positive number of runs.");
+      }
+      if (input.reviewAt !== undefined && !(input.reviewAt.getTime() > now.getTime())) {
+        throw new Error("The review time checkpoint must be in the future.");
+      }
+      if (input.reviewAfterRuns === undefined && input.reviewAt === undefined) {
+        throw new Error("A standing approval needs a review policy: set review-after-runs and/or review-after-hours.");
+      }
+      entry.standingApproval = {
+        grantedBy: input.grantedBy,
+        grantedById: input.grantedById,
+        grantedAt: now.toISOString(),
+        expiresAt: input.expiresAt.toISOString(),
+        maxRuns: input.maxRuns,
+        runsUsed: 0,
+        ...(input.reviewAfterRuns !== undefined ? { reviewAfterRuns: input.reviewAfterRuns } : {}),
+        ...(input.reviewAt !== undefined ? { reviewAt: input.reviewAt.toISOString() } : {})
+      };
+      delete entry.standingApprovalRevoked;
+      return { ...entry };
+    });
+  }
+
+  async revokeStandingApproval(id: string, actor: string, actorId: string): Promise<ScheduleEntry | undefined> {
+    return this.mutate((state) => {
+      const entry = state.entries.find((item) => item.id === id);
+      if (!entry?.standingApproval) {
+        return undefined;
+      }
+      delete entry.standingApproval;
+      entry.standingApprovalRevoked = { by: actor, byId: actorId, at: new Date().toISOString() };
+      return { ...entry };
+    });
+  }
+
+  /**
+   * Atomically checks the entry's standing approval and, only when it is still valid,
+   * consumes one run from its budget in the same persisted mutation. Any other state
+   * (missing, revoked, expired, exhausted, or past a review checkpoint) refuses with a
+   * reason so the occurrence falls back to an approval-gated proposal, never to silent
+   * execution.
+   */
+  async consumeStandingApproval(id: string, now = new Date()): Promise<StandingApprovalDecision> {
+    return this.mutate((state) => {
+      const entry = state.entries.find((item) => item.id === id);
+      if (!entry || entry.mode !== "action") {
+        return { ok: false, reason: "none" };
+      }
+      const approval = entry.standingApproval;
+      if (!approval) {
+        return { ok: false, reason: entry.standingApprovalRevoked ? "revoked" : "none" };
+      }
+      const validity = standingApprovalState(approval, now);
+      if (validity !== "active") {
+        return { ok: false, reason: validity };
+      }
+      approval.runsUsed += 1;
+      return { ok: true, approval: { ...approval } };
     });
   }
 
@@ -280,6 +406,35 @@ export class ScheduleStore {
       delete entry.worker;
       entry.lastRun = now.toISOString();
       entry.lastResult = sanitizeText(result);
+      if (parsed) {
+        entry.nextRun = nextRunAfter(parsed, now).toISOString();
+      }
+    });
+  }
+
+  /**
+   * Completes an action occurrence that produced an approval-gated proposal instead of
+   * executing: releases the lease, advances `nextRun`, and durably links the occurrence
+   * to its proposal task in the same mutation, so each occurrence yields at most one
+   * proposal even across restarts.
+   */
+  async markProposed(id: string, proposalTaskId: string, note: string, now = new Date()): Promise<void> {
+    if (!PROPOSAL_TASK_ID_PATTERN.test(proposalTaskId)) {
+      throw new Error("Schedule occurrences can only link to a valid proposal task id.");
+    }
+    await this.mutate((state) => {
+      const entry = state.entries.find((item) => item.id === id);
+      if (!entry) {
+        return;
+      }
+      const parsed = parseScheduleSpec(entry.spec);
+      entry.running = false;
+      entry.recoveryBlocked = false;
+      delete entry.runStartedAt;
+      delete entry.worker;
+      entry.lastRun = now.toISOString();
+      entry.lastResult = sanitizeText(note);
+      entry.lastProposalTaskId = proposalTaskId;
       if (parsed) {
         entry.nextRun = nextRunAfter(parsed, now).toISOString();
       }
@@ -442,6 +597,46 @@ function sanitizeText(value: string): string {
   return neutralizeMentions(redactSensitiveText(value));
 }
 
+export function standingApprovalState(
+  approval: StandingApproval,
+  now = new Date()
+): "active" | "expired" | "exhausted" | "review-due" {
+  if (now.getTime() >= new Date(approval.expiresAt).getTime()) {
+    return "expired";
+  }
+  if (approval.runsUsed >= approval.maxRuns) {
+    return "exhausted";
+  }
+  if (approval.reviewAfterRuns !== undefined && approval.runsUsed >= approval.reviewAfterRuns) {
+    return "review-due";
+  }
+  if (approval.reviewAt !== undefined && now.getTime() >= new Date(approval.reviewAt).getTime()) {
+    return "review-due";
+  }
+  return "active";
+}
+
+export function describeStandingApproval(entry: ScheduleEntry, now = new Date()): string {
+  if (entry.mode !== "action") {
+    return "read-only";
+  }
+  const approval = entry.standingApproval;
+  if (!approval) {
+    return entry.standingApprovalRevoked
+      ? `standing approval revoked by ${entry.standingApprovalRevoked.by}; occurrences post approval cards`
+      : "no standing approval; occurrences post approval cards";
+  }
+  const state = standingApprovalState(approval, now);
+  if (state === "active") {
+    const review = [
+      approval.reviewAfterRuns !== undefined ? `review after ${approval.reviewAfterRuns} runs` : undefined,
+      approval.reviewAt !== undefined ? `review at ${new Date(approval.reviewAt).toLocaleString()}` : undefined
+    ].filter(Boolean).join(", ");
+    return `standing approval by ${approval.grantedBy}: ${approval.runsUsed}/${approval.maxRuns} runs used, expires ${new Date(approval.expiresAt).toLocaleString()}, ${review}`;
+  }
+  return `standing approval ${state}; occurrences post approval cards`;
+}
+
 export function formatScheduleList(entries: ScheduleEntry[]): string {
   if (entries.length === 0) {
     return "No scheduled tasks. Use `/schedule add` to create one.";
@@ -458,7 +653,9 @@ export function formatScheduleList(entries: ScheduleEntry[]): string {
             : "paused";
       const last = entry.lastRun ? `, last run ${new Date(entry.lastRun).toLocaleString()}` : "";
       const next = entry.enabled ? `, next ${new Date(entry.nextRun).toLocaleString()}` : "";
-      return `- \`${entry.id}\` ${state} \`${entry.spec}\` ask on \`${entry.project}\` by ${entry.addedBy}${last}${next}\n  ${truncate(entry.taskText, 120)}`;
+      const modeLabel = entry.mode === "action" ? "action" : "ask";
+      const standing = entry.mode === "action" ? `\n  ${describeStandingApproval(entry)}` : "";
+      return `- \`${entry.id}\` ${state} \`${entry.spec}\` ${modeLabel} on \`${entry.project}\` by ${entry.addedBy}${last}${next}${standing}\n  ${truncate(entry.taskText, 120)}`;
     })
     .join("\n");
 }
@@ -483,10 +680,10 @@ function normalizeLoadedEntry(value: unknown): ScheduleEntry | undefined {
   if (!value || typeof value !== "object") return undefined;
   const entry = value as Partial<ScheduleEntry> & { mode?: unknown };
   if (
-    // Fail closed on legacy/foreign records that claim any mode other than read-only:
-    // they are dropped rather than coerced, so a persisted write-capable schedule can
-    // never execute.
-    (entry.mode !== undefined && entry.mode !== "answer") ||
+    // Fail closed on foreign records that claim any unknown mode: they are dropped
+    // rather than coerced. A persisted `action` record is only ever approval-gated
+    // (proposal card or a validated standing approval), so it is safe to keep.
+    (entry.mode !== undefined && entry.mode !== "answer" && entry.mode !== "action") ||
     typeof entry.id !== "string" ||
     !isScheduleId(entry.id) ||
     typeof entry.spec !== "string" ||
@@ -501,18 +698,28 @@ function normalizeLoadedEntry(value: unknown): ScheduleEntry | undefined {
   ) {
     return undefined;
   }
+  const mode: ScheduleMode = entry.mode === "action" ? "action" : "answer";
+  const standingApproval = mode === "action" ? normalizeStandingApproval(entry.standingApproval) : undefined;
+  const revocation = mode === "action" ? normalizeRevocation(entry.standingApprovalRevoked) : undefined;
+  const lastProposalTaskId =
+    mode === "action" && typeof entry.lastProposalTaskId === "string" && PROPOSAL_TASK_ID_PATTERN.test(entry.lastProposalTaskId)
+      ? entry.lastProposalTaskId
+      : undefined;
   return {
     id: entry.id,
     spec: entry.spec,
     project: entry.project,
     taskText: sanitizeText(entry.taskText),
-    mode: "answer",
+    mode,
     enabled: entry.enabled === true,
     addedBy: entry.addedBy,
     addedById: stringValue(entry.addedById) ?? "unknown",
     createdAt: entry.createdAt,
     ...(validTimestamp(entry.lastRun) ? { lastRun: validTimestamp(entry.lastRun)! } : {}),
     ...(stringValue(entry.lastResult) ? { lastResult: sanitizeText(stringValue(entry.lastResult)!) } : {}),
+    ...(lastProposalTaskId ? { lastProposalTaskId } : {}),
+    ...(standingApproval ? { standingApproval } : {}),
+    ...(revocation ? { standingApprovalRevoked: revocation } : {}),
     nextRun: entry.nextRun,
     running: entry.running === true,
     ...(validTimestamp(entry.runStartedAt) ? { runStartedAt: validTimestamp(entry.runStartedAt)! } : {}),
@@ -543,6 +750,55 @@ function normalizeWorker(value: unknown): WorkerIdentity | undefined {
     recordedAt: worker.recordedAt as string,
     ...(stringValue(worker.startToken) ? { startToken: stringValue(worker.startToken)! } : {})
   };
+}
+
+/**
+ * A standing approval that fails any structural check is dropped rather than repaired,
+ * so a tampered or corrupted record degrades to "no standing approval" (proposal cards)
+ * instead of unattended execution.
+ */
+function normalizeStandingApproval(value: unknown): StandingApproval | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const approval = value as Partial<StandingApproval>;
+  if (
+    typeof approval.grantedBy !== "string" ||
+    !approval.grantedBy.trim() ||
+    typeof approval.grantedById !== "string" ||
+    !approval.grantedById.trim() ||
+    !validTimestamp(approval.grantedAt) ||
+    !validTimestamp(approval.expiresAt) ||
+    !isPositiveInteger(approval.maxRuns) ||
+    !Number.isSafeInteger(approval.runsUsed) ||
+    (approval.runsUsed as number) < 0 ||
+    (approval.reviewAfterRuns !== undefined && !isPositiveInteger(approval.reviewAfterRuns)) ||
+    (approval.reviewAt !== undefined && !validTimestamp(approval.reviewAt)) ||
+    (approval.reviewAfterRuns === undefined && approval.reviewAt === undefined)
+  ) {
+    return undefined;
+  }
+  return {
+    grantedBy: approval.grantedBy,
+    grantedById: approval.grantedById,
+    grantedAt: approval.grantedAt as string,
+    expiresAt: approval.expiresAt as string,
+    maxRuns: approval.maxRuns as number,
+    runsUsed: approval.runsUsed as number,
+    ...(approval.reviewAfterRuns !== undefined ? { reviewAfterRuns: approval.reviewAfterRuns } : {}),
+    ...(approval.reviewAt !== undefined ? { reviewAt: approval.reviewAt } : {})
+  };
+}
+
+function normalizeRevocation(value: unknown): StandingApprovalRevocation | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const revocation = value as Partial<StandingApprovalRevocation>;
+  if (typeof revocation.by !== "string" || !revocation.by.trim() || typeof revocation.byId !== "string" || !revocation.byId.trim() || !validTimestamp(revocation.at)) {
+    return undefined;
+  }
+  return { by: revocation.by, byId: revocation.byId, at: revocation.at as string };
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 function stringValue(value: unknown): string | undefined {

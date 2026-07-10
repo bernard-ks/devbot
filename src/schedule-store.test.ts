@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,6 +11,7 @@ import {
   nextRunAfter,
   parseScheduleSpec,
   ScheduleStore,
+  standingApprovalState,
   type ScheduleSpec
 } from "./schedule-store.js";
 import { captureWorkerIdentity, type WorkerIdentity } from "./worker-identity.js";
@@ -81,8 +82,19 @@ async function tempStore(): Promise<ScheduleStore> {
   return new ScheduleStore(path.join(root, "schedule.json"));
 }
 
-function addInput(overrides: Partial<{ spec: string; project: string; taskText: string }> = {}) {
+function addInput(overrides: Partial<{ spec: string; project: string; taskText: string; mode: "answer" | "action" }> = {}) {
   return { spec: "every 1h", project: "web", taskText: "x", addedBy: "tom", addedById: "user-1", ...overrides };
+}
+
+function grantInput(overrides: Partial<{ expiresAt: Date; maxRuns: number; reviewAfterRuns: number; reviewAt: Date }> = {}) {
+  return {
+    grantedBy: "tom",
+    grantedById: "user-1",
+    expiresAt: new Date(Date.now() + 24 * 3_600_000),
+    maxRuns: 3,
+    reviewAfterRuns: 3,
+    ...overrides
+  };
 }
 
 test("schedule add computes a future nextRun, defaults to read-only, and rejects a bad spec", async () => {
@@ -128,7 +140,7 @@ test("schedule drops malformed records and rejects an unsupported version on loa
   await assert.rejects(() => new ScheduleStore(badVersionFile).list(), /Unsupported schedule state version/);
 });
 
-test("schedule load fails closed on a legacy write-capable record", async () => {
+test("schedule load fails closed on unknown modes and keeps approval-gated action records", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-schedule-legacy-"));
   const filePath = path.join(root, "schedule.json");
   const now = new Date().toISOString();
@@ -145,13 +157,15 @@ test("schedule load fails closed on a legacy write-capable record", async () => 
     nextRun: now,
     running: false
   });
-  await writeFile(filePath, JSON.stringify({ version: 1, entries: [record("action"), record("answer")] }));
+  // "action" is a supported mode now (it is only ever approval-gated), but any other
+  // claimed mode is dropped rather than coerced.
+  await writeFile(filePath, JSON.stringify({ version: 1, entries: [record("write"), record("do"), record("action"), record("answer")] }));
 
   const store = new ScheduleStore(filePath);
   const entries = await store.list();
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0]?.id, "sched-legacy-answer");
-  assert.equal((await store.claimDue(new Date(Date.now() + 1000))).length, 1);
+  assert.deepEqual(entries.map((entry) => entry.id).sort(), ["sched-legacy-action", "sched-legacy-answer"]);
+  assert.equal(entries.find((entry) => entry.id === "sched-legacy-action")?.mode, "action");
+  assert.equal(entries.find((entry) => entry.id === "sched-legacy-action")?.standingApproval, undefined);
 });
 
 test("schedule state directory and file are owner-only", async () => {
@@ -435,6 +449,151 @@ test("reconcileOnBoot leaves a still-running entry alone", async () => {
   assert.equal(after?.running, true);
 });
 
+test("schedule add only creates an action entry on the explicit choice", async () => {
+  const store = await tempStore();
+  const explicit = await store.add(addInput({ mode: "action" }));
+  assert.equal(explicit.mode, "action");
+  const omitted = await store.add(addInput());
+  assert.equal(omitted.mode, "answer");
+  const readOnly = await store.add(addInput({ mode: "answer" }));
+  assert.equal(readOnly.mode, "answer");
+});
+
+test("grantStandingApproval validates mode, expiry, budget, and review policy", async () => {
+  const store = await tempStore();
+  const readOnly = await store.add(addInput());
+  await assert.rejects(() => store.grantStandingApproval(readOnly.id, grantInput()), /only apply to action schedules/);
+  await assert.rejects(() => store.grantStandingApproval("sched-missing", grantInput()), /No scheduled task found/);
+
+  const entry = await store.add(addInput({ mode: "action" }));
+  await assert.rejects(
+    () => store.grantStandingApproval(entry.id, grantInput({ expiresAt: new Date(Date.now() - 1000) })),
+    /expiry in the future/
+  );
+  await assert.rejects(() => store.grantStandingApproval(entry.id, grantInput({ maxRuns: 0 })), /positive max-run budget/);
+  await assert.rejects(
+    () => store.grantStandingApproval(entry.id, { grantedBy: "tom", grantedById: "user-1", expiresAt: new Date(Date.now() + 3_600_000), maxRuns: 3 }),
+    /needs a review policy/
+  );
+
+  const granted = await store.grantStandingApproval(entry.id, grantInput());
+  assert.equal(granted.standingApproval?.grantedBy, "tom");
+  assert.equal(granted.standingApproval?.grantedById, "user-1");
+  assert.equal(granted.standingApproval?.runsUsed, 0);
+  assert.equal(granted.standingApproval?.maxRuns, 3);
+});
+
+test("consumeStandingApproval decrements the budget atomically and persists it", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-schedule-standing-"));
+  const filePath = path.join(root, "schedule.json");
+  const store = new ScheduleStore(filePath);
+  const entry = await store.add(addInput({ mode: "action" }));
+  assert.deepEqual(await store.consumeStandingApproval(entry.id), { ok: false, reason: "none" });
+
+  await store.grantStandingApproval(entry.id, grantInput({ maxRuns: 2, reviewAfterRuns: 2 }));
+  const first = await store.consumeStandingApproval(entry.id);
+  assert.equal(first.ok, true);
+  assert.equal(first.ok && first.approval.runsUsed, 1);
+
+  const reloaded = new ScheduleStore(filePath);
+  const second = await reloaded.consumeStandingApproval(entry.id);
+  assert.equal(second.ok, true);
+  assert.equal(second.ok && second.approval.runsUsed, 2);
+  assert.deepEqual(await reloaded.consumeStandingApproval(entry.id), { ok: false, reason: "exhausted" });
+});
+
+test("consumeStandingApproval fails closed on expiry and review checkpoints", async () => {
+  const store = await tempStore();
+  const entry = await store.add(addInput({ mode: "action" }));
+
+  await store.grantStandingApproval(entry.id, grantInput({ maxRuns: 10, reviewAfterRuns: 1 }));
+  assert.equal((await store.consumeStandingApproval(entry.id)).ok, true);
+  assert.deepEqual(await store.consumeStandingApproval(entry.id), { ok: false, reason: "review-due" });
+
+  await store.grantStandingApproval(entry.id, grantInput({ maxRuns: 10, reviewAt: new Date(Date.now() + 3_600_000) }));
+  assert.deepEqual(await store.consumeStandingApproval(entry.id, new Date(Date.now() + 2 * 3_600_000)), { ok: false, reason: "review-due" });
+
+  await store.grantStandingApproval(entry.id, grantInput({ expiresAt: new Date(Date.now() + 3_600_000), maxRuns: 10, reviewAfterRuns: 10 }));
+  assert.deepEqual(await store.consumeStandingApproval(entry.id, new Date(Date.now() + 2 * 3_600_000)), { ok: false, reason: "expired" });
+});
+
+test("revokeStandingApproval records the actor and future consumes report revoked", async () => {
+  const store = await tempStore();
+  const entry = await store.add(addInput({ mode: "action" }));
+  assert.equal(await store.revokeStandingApproval(entry.id, "sam", "user-2"), undefined);
+
+  await store.grantStandingApproval(entry.id, grantInput());
+  const revoked = await store.revokeStandingApproval(entry.id, "sam", "user-2");
+  assert.equal(revoked?.standingApproval, undefined);
+  assert.equal(revoked?.standingApprovalRevoked?.by, "sam");
+  assert.equal(revoked?.standingApprovalRevoked?.byId, "user-2");
+  assert.deepEqual(await store.consumeStandingApproval(entry.id), { ok: false, reason: "revoked" });
+
+  const regranted = await store.grantStandingApproval(entry.id, grantInput());
+  assert.equal(regranted.standingApprovalRevoked, undefined);
+  assert.equal((await store.consumeStandingApproval(entry.id)).ok, true);
+});
+
+test("markProposed links the occurrence to its proposal, releases the lease, and advances nextRun", async () => {
+  const store = await tempStore();
+  const entry = await store.add(addInput({ mode: "action" }));
+  const runAt = new Date(entry.nextRun);
+  await store.claimDue(runAt);
+  await assert.rejects(() => store.markProposed(entry.id, "not-a-task-id", "note", runAt), /valid proposal task id/);
+
+  await store.markProposed(entry.id, "task-abc123", "Posted approval card `task-abc123` (no standing approval).", runAt);
+  const updated = await store.get(entry.id);
+  assert.equal(updated?.running, false);
+  assert.equal(updated?.lastProposalTaskId, "task-abc123");
+  assert.equal(updated?.lastRun, runAt.toISOString());
+  assert.match(updated?.lastResult ?? "", /Posted approval card/);
+  assert.equal(new Date(updated!.nextRun).getTime(), runAt.getTime() + 3_600_000);
+});
+
+test("a malformed standing approval on disk degrades to no standing approval", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-schedule-badapproval-"));
+  const filePath = path.join(root, "schedule.json");
+  const store = new ScheduleStore(filePath);
+  const entry = await store.add(addInput({ mode: "action" }));
+  await store.grantStandingApproval(entry.id, grantInput());
+
+  const raw = JSON.parse(await readFile(filePath, "utf8")) as { entries: Array<Record<string, unknown>> };
+  (raw.entries[0]!.standingApproval as Record<string, unknown>).maxRuns = "unlimited";
+  await writeFile(filePath, JSON.stringify(raw));
+
+  const reloaded = new ScheduleStore(filePath);
+  const loaded = await reloaded.get(entry.id);
+  assert.equal(loaded?.standingApproval, undefined);
+  assert.deepEqual(await reloaded.consumeStandingApproval(entry.id), { ok: false, reason: "none" });
+});
+
+test("standingApprovalState reports active, exhausted, review-due, and expired", () => {
+  const base = {
+    grantedBy: "tom",
+    grantedById: "user-1",
+    grantedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    maxRuns: 3,
+    runsUsed: 0,
+    reviewAfterRuns: 2
+  };
+  assert.equal(standingApprovalState(base), "active");
+  assert.equal(standingApprovalState({ ...base, runsUsed: 3 }), "exhausted");
+  assert.equal(standingApprovalState({ ...base, runsUsed: 2 }), "review-due");
+  assert.equal(standingApprovalState(base, new Date(Date.now() + 2 * 3_600_000)), "expired");
+});
+
 test("formatScheduleList reports empty and populated schedules", () => {
   assert.match(formatScheduleList([]), /No scheduled tasks/);
+});
+
+test("formatScheduleList labels action entries and their standing-approval state", async () => {
+  const store = await tempStore();
+  const entry = await store.add(addInput({ mode: "action", taskText: "rotate logs" }));
+  const withoutApproval = formatScheduleList(await store.list());
+  assert.match(withoutApproval, /action on `web`/);
+  assert.match(withoutApproval, /no standing approval; occurrences post approval cards/);
+
+  await store.grantStandingApproval(entry.id, grantInput());
+  assert.match(formatScheduleList(await store.list()), /standing approval by tom: 0\/3 runs used/);
 });
