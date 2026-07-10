@@ -3,7 +3,8 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { isLoopbackHost, projectScreenshotOrigins } from "./project-screenshot.js";
 import { redactSensitiveText } from "./security.js";
-import { runConfiguredProjectCommand } from "./command-runner.js";
+import { configuredCommandNames, runConfiguredProjectCommand } from "./command-runner.js";
+import { commandRequiresApproval, isScreenshotBlocked, screenshotRequiresApproval } from "./safety.js";
 import {
   DEBOUNCE_THRESHOLD,
   defaultExpectedStatus,
@@ -144,6 +145,10 @@ export async function checkUrl(
       }
 
       const response = await fetchImpl(currentUrl, { method: "GET", redirect: "manual", signal: controller.signal });
+      // The sentinel only needs the status line and (for redirects) the location
+      // header; it never reads the body. Discard it explicitly on every hop so a
+      // recurring poll cannot leak sockets by leaving response bodies unconsumed.
+      await discardResponseBody(response);
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get("location");
         if (!location) {
@@ -190,12 +195,80 @@ function isApprovedWatchOrigin(value: string, allowedOrigins: ReadonlySet<string
   }
 }
 
+/**
+ * Releases a fetch response's body so the underlying connection is returned to
+ * the pool (or closed) instead of being held open. Tolerates responses whose
+ * body is absent or already consumed, including lightweight fetch mocks used in
+ * tests. Prefers cancelling the stream (no buffering); falls back to draining.
+ */
+async function discardResponseBody(response: { body?: unknown; arrayBuffer?: () => Promise<unknown> }): Promise<void> {
+  try {
+    const body = response.body as { cancel?: () => Promise<void> } | null | undefined;
+    if (body && typeof body.cancel === "function") {
+      await body.cancel();
+      return;
+    }
+    if (typeof response.arrayBuffer === "function") {
+      await response.arrayBuffer();
+    }
+  } catch {
+    // A body that is missing, already consumed, or errors on cancel is not a
+    // check failure; the status has already been captured.
+  }
+}
+
 function safeOrigin(value: string): string {
   try {
     return new URL(value).origin;
   } catch {
     return "(unparseable url)";
   }
+}
+
+/**
+ * A fast command may only run unattended if it is currently both configured on
+ * the project and classified read-only by the project's policy. This is the
+ * single source of truth for that decision: the `/sentinel fast-command`
+ * configuration path and `resolveWatchTargets` (which materializes the command
+ * target on every cycle) both call it, so a policy change that later reclassifies
+ * the command as approval-required or write-capable drops it from the next cycle
+ * instead of silently keeping the previously-approved command running.
+ */
+export function isSentinelFastCommandEligible(project: ProjectEntry, commandName: string): boolean {
+  const normalized = commandName.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return configuredCommandNames(project).includes(normalized) && !commandRequiresApproval(project, normalized);
+}
+
+/**
+ * Whether an unattended sentinel alert may attach a screenshot for this project.
+ * A sentinel capture has no interactive actor to satisfy an approval prompt, so
+ * only a project whose policy allows screenshots outright is captured; both
+ * `deny` and `approval` policies suppress the capture entirely.
+ */
+export function sentinelScreenshotAllowed(project: ProjectEntry): boolean {
+  return !isScreenshotBlocked(project) && !screenshotRequiresApproval(project);
+}
+
+const SENTINEL_MUTATION_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "on",
+  "off",
+  "interval",
+  "watch",
+  "fast-command",
+  "expected-status"
+]);
+
+/**
+ * Every `/sentinel` subcommand that changes persisted watcher configuration or
+ * lifecycle. Only `status` (read-only) is excluded. Mutations are controller-only
+ * and this predicate is the authority the command handler revalidates against at
+ * time of use, independent of the dispatcher-level gate.
+ */
+export function isSentinelMutationSubcommand(subcommand: string): boolean {
+  return SENTINEL_MUTATION_SUBCOMMANDS.has(subcommand);
 }
 
 export async function checkCommand(
@@ -278,7 +351,12 @@ export function resolveWatchTargets(project: ProjectEntry, config: SentinelProje
   }
 
   const targets: WatchTarget[] = [...urls].map((url) => ({ id: watchIdForUrl(url), kind: "url" as const, target: url }));
-  if (config.fastCommand) {
+  // Revalidate the persisted fast command against current project policy on every
+  // cycle. A command that was read-only when configured but has since been
+  // reclassified (removed, moved to approvalRequiredCommands, or dropped from
+  // readOnlyCommands) is not materialized as a target and therefore never runs
+  // unattended — closing the policy-drift approval bypass.
+  if (config.fastCommand && isSentinelFastCommandEligible(project, config.fastCommand)) {
     targets.push({ id: watchIdForCommand(config.fastCommand), kind: "command", target: config.fastCommand });
   }
   return targets;
@@ -315,6 +393,15 @@ export interface SentinelDeps {
   checkUrlFn: (url: string, allowedOrigins: ReadonlySet<string>, isExpectedStatus: (statusCode: number) => boolean) => Promise<WatchCheckResult>;
   checkCommandFn: (project: ProjectEntry, commandName: string) => Promise<WatchCheckResult>;
   now: () => Date;
+  /**
+   * Revalidates, at the start of every cycle, that the actor who enabled the
+   * watcher is still an authorized controller and the project is still
+   * configured and reachable to the bot. Returning false skips the cycle
+   * entirely (no URL fetches, no command execution, no screenshots), so a
+   * de-authorized controller or a removed project cannot keep the unattended
+   * poller running. When omitted, cycles are not actor-gated.
+   */
+  authorizeCycle?: (project: ProjectEntry, config: SentinelProjectConfig) => boolean | Promise<boolean>;
 }
 
 export class SentinelManager {
@@ -337,8 +424,8 @@ export class SentinelManager {
     }
   }
 
-  async setEnabled(projectName: string, enabled: boolean): Promise<SentinelProjectConfig> {
-    const config = await this.store.setEnabled(projectName, enabled);
+  async setEnabled(projectName: string, enabled: boolean, actorId?: string): Promise<SentinelProjectConfig> {
+    const config = await this.store.setEnabled(projectName, enabled, actorId);
     if (enabled) {
       this.schedule(projectName, config.intervalSeconds);
       await this.runCycle(projectName);
@@ -380,6 +467,14 @@ export class SentinelManager {
       const config = await this.store.getProjectConfig(projectName);
       if (!project || !config.enabled) {
         return [];
+      }
+
+      if (this.deps.authorizeCycle) {
+        const authorized = await this.deps.authorizeCycle(project, config);
+        if (!authorized) {
+          console.warn(`Sentinel cycle for ${projectName} skipped: enabling actor or project is no longer authorized.`);
+          return [];
+        }
       }
 
       const nowIso = this.deps.now().toISOString();

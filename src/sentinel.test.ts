@@ -10,8 +10,11 @@ import {
   checkCommand,
   checkUrl,
   initialWatchState,
+  isSentinelFastCommandEligible,
+  isSentinelMutationSubcommand,
   resolveWatchTargets,
   SentinelManager,
+  sentinelScreenshotAllowed,
   watchIdForCommand,
   watchIdForUrl,
   type WatchCheckResult,
@@ -311,6 +314,72 @@ test("resolveWatchTargets drops a manual absolute URL whose origin is not among 
   );
 });
 
+test("isSentinelFastCommandEligible requires the command to be configured and read-only", () => {
+  const configured = fakeProject();
+  assert.equal(isSentinelFastCommandEligible(configured, "test"), true, "a configured read-only command is eligible");
+  assert.equal(isSentinelFastCommandEligible(configured, "TEST"), true, "eligibility is case-insensitive");
+  assert.equal(isSentinelFastCommandEligible(configured, "deploy"), false, "an unconfigured command is not eligible");
+
+  const approvalRequired = fakeProject();
+  approvalRequired.metadata.policy.approvalRequiredCommands = ["test"];
+  assert.equal(
+    isSentinelFastCommandEligible(approvalRequired, "test"),
+    false,
+    "a command reclassified as approval-required is no longer eligible"
+  );
+
+  const noLongerReadOnly = fakeProject();
+  noLongerReadOnly.metadata.policy.readOnlyCommands = [];
+  assert.equal(
+    isSentinelFastCommandEligible(noLongerReadOnly, "test"),
+    false,
+    "a command dropped from readOnlyCommands is no longer eligible"
+  );
+});
+
+test("resolveWatchTargets drops a persisted fast command once policy reclassifies it (policy drift)", () => {
+  const config: SentinelProjectConfig = { enabled: true, intervalSeconds: 60, manualPaths: [], fastCommand: "test" };
+
+  const eligible = fakeProject();
+  const withCommand = resolveWatchTargets(eligible, config, ["http://127.0.0.1:3000/"]);
+  assert.ok(
+    withCommand.some((target) => target.kind === "command"),
+    "a still-eligible fast command is materialized as a target"
+  );
+
+  const drifted = fakeProject();
+  drifted.metadata.policy.approvalRequiredCommands = ["test"];
+  const afterDrift = resolveWatchTargets(drifted, config, ["http://127.0.0.1:3000/"]);
+  assert.ok(
+    !afterDrift.some((target) => target.kind === "command"),
+    "a fast command that policy now requires approval for must not run unattended, even though it is still persisted"
+  );
+});
+
+test("isSentinelMutationSubcommand gates every configuration change but not read-only status", () => {
+  for (const sub of ["on", "off", "interval", "watch", "fast-command", "expected-status"]) {
+    assert.equal(isSentinelMutationSubcommand(sub), true, `${sub} must be controller-only`);
+  }
+  assert.equal(isSentinelMutationSubcommand("status"), false, "status is read-only and stays viewable");
+});
+
+test("sentinelScreenshotAllowed captures only under an allow policy, never deny or approval", () => {
+  const allowed = fakeProject();
+  assert.equal(sentinelScreenshotAllowed(allowed), true);
+
+  const denied = fakeProject();
+  denied.metadata.policy.screenshotPolicy = "deny";
+  assert.equal(sentinelScreenshotAllowed(denied), false, "a deny policy suppresses the unattended capture");
+
+  const approval = fakeProject();
+  approval.metadata.policy.screenshotPolicy = "approval";
+  assert.equal(
+    sentinelScreenshotAllowed(approval),
+    false,
+    "an approval policy has no actor to approve an unattended capture, so it is suppressed"
+  );
+});
+
 test("SentinelManager.runCycle debounces a flap into one alert and one recovery end to end", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-"));
   const store = new SentinelStore(path.join(root, "sentinel.json"));
@@ -451,6 +520,105 @@ test("SentinelManager.runCycle never overlaps checks for the same project", asyn
   manager.stopAll();
 });
 
+test("SentinelManager.runCycle skips every check when the cycle is no longer authorized", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-authz-"));
+  const store = new SentinelStore(path.join(root, "sentinel.json"));
+  const project = fakeProject();
+  await store.setEnabled(project.name, true, "controller-1");
+
+  let urlChecks = 0;
+  let commandChecks = 0;
+  let authorized = true;
+  const events: string[] = [];
+  const manager = new SentinelManager(
+    [project],
+    store,
+    {
+      discoverUrls: async () => ["http://127.0.0.1:4000"],
+      checkUrlFn: async () => {
+        urlChecks += 1;
+        return bad(500);
+      },
+      checkCommandFn: async () => {
+        commandChecks += 1;
+        return bad(500);
+      },
+      now: () => new Date(),
+      authorizeCycle: (_project, watchConfig) => {
+        assert.equal(watchConfig.enabledBy, "controller-1", "the enabling actor is revalidated each cycle");
+        return authorized;
+      }
+    },
+    async (event) => {
+      events.push(event.event);
+    }
+  );
+
+  await manager.runCycle(project.name);
+  await manager.runCycle(project.name);
+  const authorizedUrlChecks = urlChecks;
+
+  authorized = false;
+  await manager.runCycle(project.name);
+  await manager.runCycle(project.name);
+
+  assert.ok(authorizedUrlChecks > 0, "checks run while authorized");
+  assert.equal(urlChecks, authorizedUrlChecks, "no URL fetch runs once the actor is de-authorized");
+  assert.equal(commandChecks, 0, "no command runs once the actor is de-authorized");
+  manager.stopAll();
+});
+
+test("checkUrl discards the response body so repeated polls cannot leak connections", async () => {
+  let cancelled = 0;
+  let redirectCancelled = 0;
+  const url = "http://127.0.0.1:3000";
+  const allowedOrigins = new Set([url]);
+
+  const finalOnly: typeof fetch = (async () =>
+    ({
+      status: 200,
+      headers: new Headers(),
+      body: {
+        cancel: async () => {
+          cancelled += 1;
+        }
+      }
+    }) as unknown as Response) as unknown as typeof fetch;
+
+  const result = await checkUrl(url, allowedOrigins, { fetchImpl: finalOnly });
+  assert.equal(result.ok, true);
+  assert.equal(cancelled, 1, "the final response body is cancelled exactly once");
+
+  let hop = 0;
+  const withRedirect: typeof fetch = (async () => {
+    hop += 1;
+    if (hop === 1) {
+      return {
+        status: 302,
+        headers: new Headers({ location: `${url}/next` }),
+        body: {
+          cancel: async () => {
+            redirectCancelled += 1;
+          }
+        }
+      } as unknown as Response;
+    }
+    return {
+      status: 200,
+      headers: new Headers(),
+      body: {
+        cancel: async () => {
+          redirectCancelled += 1;
+        }
+      }
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  const redirected = await checkUrl(url, allowedOrigins, { fetchImpl: withRedirect });
+  assert.equal(redirected.ok, true);
+  assert.equal(redirectCancelled, 2, "the redirect hop's body is drained as well as the final response's");
+});
+
 function ok(): WatchCheckResult {
   return { reachable: true, ok: true, statusCode: 200 };
 }
@@ -510,7 +678,7 @@ function fakeProject(): ProjectEntry {
         allowedPeers: [],
         screenshotPolicy: "allow",
         maxContextChars: undefined,
-        readOnlyCommands: [],
+        readOnlyCommands: ["test"],
         approvalRequiredCommands: []
       }
     }

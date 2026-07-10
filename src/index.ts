@@ -149,8 +149,17 @@ import {
   type ProjectWorkSnapshot
 } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
-import { checkCommand, checkUrl, recentCommits, SentinelManager, type SentinelEvent } from "./sentinel.js";
-import { isValidExpectedStatusSpec, SentinelStore } from "./sentinel-store.js";
+import {
+  checkCommand,
+  checkUrl,
+  isSentinelFastCommandEligible,
+  isSentinelMutationSubcommand,
+  recentCommits,
+  sentinelScreenshotAllowed,
+  SentinelManager,
+  type SentinelEvent
+} from "./sentinel.js";
+import { isValidExpectedStatusSpec, SentinelStore, type SentinelProjectConfig } from "./sentinel-store.js";
 import {
   formatSentinelStatus,
   parseSentinelControl,
@@ -218,7 +227,8 @@ const sentinelManager = new SentinelManager(
     discoverUrls: findProjectWebUrls,
     checkUrlFn: (url, allowedOrigins, isExpectedStatus) => checkUrl(url, allowedOrigins, { isExpectedStatus }),
     checkCommandFn: (project, commandName) => checkCommand(project, commandName),
-    now: () => new Date()
+    now: () => new Date(),
+    authorizeCycle: (project, watchConfig) => sentinelCycleAuthorized(project, watchConfig)
   },
   (event) => handleSentinelEvent(event)
 );
@@ -3483,9 +3493,20 @@ async function handleSentinelCommand(interaction: ChatInputCommandInteraction, a
   if (!(await ensureProjectAccess(interaction, project))) {
     return;
   }
+  // Revalidate controller authority at time of use for every mutating subcommand,
+  // independent of the dispatcher-level gate. Enabling, disabling, or configuring
+  // the unattended poller and its fast command is controller-only; project view
+  // access alone is not sufficient. `status` is read-only and stays viewable.
+  if (isSentinelMutationSubcommand(subcommand) && !isControllerUser(interaction.user.id, appConfig)) {
+    await interaction.reply({
+      content: "You have view access, but only the owner or an approved controller can change sentinel settings.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
 
   if (subcommand === "on") {
-    const watchConfig = await sentinelManager.setEnabled(project.name, true);
+    const watchConfig = await sentinelManager.setEnabled(project.name, true, interaction.user.id);
     await interaction.reply({
       content: `Sentinel enabled for \`${project.name}\` (checking every ${watchConfig.intervalSeconds}s).`,
       flags: MessageFlags.Ephemeral
@@ -3531,7 +3552,7 @@ async function handleSentinelCommand(interaction: ChatInputCommandInteraction, a
       return;
     }
     const normalized = requested.toLowerCase();
-    const eligible = configuredCommandNames(project).includes(normalized) && !commandRequiresApproval(project, normalized);
+    const eligible = isSentinelFastCommandEligible(project, normalized);
     if (!eligible) {
       await interaction.reply({
         content: `\`${requested}\` is not eligible as a sentinel fast command for \`${project.name}\`. Only commands listed in that project's \`.devbot/project.json\` \`policy.readOnlyCommands\` can run unattended.`,
@@ -3641,6 +3662,23 @@ async function resolveSentinelAlertRoomId(project: ProjectEntry): Promise<string
   });
 }
 
+/**
+ * Revalidated at the start of every sentinel cycle. Fails closed: the project
+ * must still be configured on this bot, and if the watcher records the controller
+ * who enabled it, that actor must still hold controller authority. A watcher whose
+ * enabling controller has since been de-authorized, or whose project has been
+ * removed, runs no checks until a current controller re-enables it.
+ */
+function sentinelCycleAuthorized(project: ProjectEntry, watchConfig: SentinelProjectConfig): boolean {
+  if (!config.projects.some((candidate) => candidate.name === project.name)) {
+    return false;
+  }
+  if (watchConfig.enabledBy && !isControllerUser(watchConfig.enabledBy, config)) {
+    return false;
+  }
+  return true;
+}
+
 async function handleSentinelEvent(event: SentinelEvent): Promise<void> {
   const project = config.projects.find((item) => item.name === event.projectName);
   if (!project) {
@@ -3654,8 +3692,13 @@ async function handleSentinelEvent(event: SentinelEvent): Promise<void> {
       return;
     }
     const commits = await recentCommits(project);
+    // Enforce the project's screenshot policy on this unattended capture just as
+    // the interactive paths do. A sentinel alert has no actor to approve, so a
+    // project that denies screenshots or requires approval gets no capture at all;
+    // only a project that allows screenshots outright is captured.
+    const screenshotAllowed = sentinelScreenshotAllowed(project);
     const screenshot =
-      event.target.kind === "url"
+      event.target.kind === "url" && screenshotAllowed
         ? await captureProjectScreenshot(project, { requestText: event.target.target }).catch(() => undefined)
         : undefined;
     const content = sentinelAlertContent({

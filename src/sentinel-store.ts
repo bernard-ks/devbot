@@ -36,6 +36,12 @@ export interface SentinelProjectConfig {
   manualPaths: string[];
   fastCommand?: string;
   expectedStatus?: string;
+  /**
+   * Discord user id of the controller who last enabled the watcher. Recorded so
+   * each unattended cycle can revalidate that this actor is still an authorized
+   * controller before running any checks. Cleared when the watcher is disabled.
+   */
+  enabledBy?: string;
 }
 
 interface SentinelProjectRecord {
@@ -159,9 +165,19 @@ export class SentinelStore {
     return record ? cloneConfig(record.config) : cloneConfig(DEFAULT_PROJECT_CONFIG);
   }
 
-  async setEnabled(projectName: string, enabled: boolean): Promise<SentinelProjectConfig> {
+  async setEnabled(projectName: string, enabled: boolean, actorId?: string): Promise<SentinelProjectConfig> {
     return this.mutateProject(projectName, (record) => {
       record.config.enabled = enabled;
+      if (enabled) {
+        const trimmed = actorId?.trim();
+        if (trimmed) {
+          record.config.enabledBy = trimmed;
+        } else {
+          delete record.config.enabledBy;
+        }
+      } else {
+        delete record.config.enabledBy;
+      }
     });
   }
 
@@ -386,13 +402,16 @@ function normalizeLoadedConfig(value: unknown): SentinelProjectConfig {
     typeof raw.expectedStatus === "string" && isValidExpectedStatusSpec(raw.expectedStatus.trim())
       ? raw.expectedStatus.trim()
       : undefined;
+  const enabled = raw.enabled === true;
+  const enabledBy = enabled && typeof raw.enabledBy === "string" && raw.enabledBy.trim() ? raw.enabledBy.trim() : undefined;
 
   return {
-    enabled: raw.enabled === true,
+    enabled,
     intervalSeconds: clampIntervalSeconds(typeof raw.intervalSeconds === "number" ? raw.intervalSeconds : DEFAULT_INTERVAL_SECONDS),
     manualPaths,
     ...(fastCommand ? { fastCommand } : {}),
-    ...(expectedStatus ? { expectedStatus } : {})
+    ...(expectedStatus ? { expectedStatus } : {}),
+    ...(enabledBy ? { enabledBy } : {})
   };
 }
 

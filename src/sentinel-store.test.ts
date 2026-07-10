@@ -80,6 +80,24 @@ test("sentinel store defaults, persists config, and survives reload", async () =
   assert.deepEqual(afterRemoval.manualPaths, ["/health"]);
 });
 
+test("sentinel store records the enabling controller and clears it when disabled", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-actor-"));
+  const filePath = path.join(root, "sentinel.json");
+  const store = new SentinelStore(filePath);
+
+  const enabled = await store.setEnabled("demo", true, "controller-42");
+  assert.equal(enabled.enabledBy, "controller-42", "the enabling actor is recorded");
+
+  const reloaded = await new SentinelStore(filePath).getProjectConfig("demo");
+  assert.equal(reloaded.enabledBy, "controller-42", "the enabling actor survives reload for per-cycle revalidation");
+
+  const disabled = await store.setEnabled("demo", false);
+  assert.equal(disabled.enabledBy, undefined, "disabling clears the recorded actor");
+
+  const reEnabledWithoutActor = await store.setEnabled("demo", true);
+  assert.equal(reEnabledWithoutActor.enabledBy, undefined, "enabling without an actor leaves no stale attribution");
+});
+
 test("sentinel store persists and reloads an expected-status option, rejecting an invalid one", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-status-store-"));
   const store = new SentinelStore(path.join(root, "sentinel.json"));
