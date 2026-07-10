@@ -1,14 +1,14 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { hardenedGitArguments, hardenedGitEnvironment } from "./security.js";
 
 const execFileAsync = promisify(execFile);
 
 const CHECKPOINT_NAMESPACE = "refs/devbot/checkpoints";
 const DEFAULT_KEEP = 20;
-const DEFAULT_MTIME_TOLERANCE_MS = 1_000;
 
 export interface CheckpointMeta {
   ref: string;
@@ -29,8 +29,7 @@ export interface CheckpointChange {
 export interface RestoreOptions {
   expectedHeadSha?: string;
   expectedBranch?: string;
-  guardMs?: number;
-  mtimeToleranceMs?: number;
+  expectedPostTaskTree?: string;
 }
 
 export interface RestoreSummary {
@@ -39,7 +38,7 @@ export interface RestoreSummary {
   changes: CheckpointChange[];
 }
 
-export type RollbackRefusalReason = "head-moved" | "branch-moved" | "newer-changes";
+export type RollbackRefusalReason = "head-moved" | "branch-moved" | "workspace-changed";
 
 export class RollbackRefusedError extends Error {
   readonly reason: RollbackRefusalReason;
@@ -58,6 +57,11 @@ export function checkpointRefFor(taskId: string): string {
     throw new Error("Checkpoint ref requires a valid task ID.");
   }
   return `${CHECKPOINT_NAMESPACE}/${taskId}`;
+}
+
+/** Computes the exact working-tree hash (tracked, staged, and untracked content) without touching the real index. */
+export async function hashWorkingTree(repoPath: string): Promise<string> {
+  return snapshotWorkingTree(repoPath);
 }
 
 export async function createCheckpoint(repoPath: string, taskId: string): Promise<CheckpointMeta> {
@@ -83,8 +87,7 @@ export async function createCheckpoint(repoPath: string, taskId: string): Promis
 
 export async function diffSinceCheckpoint(repoPath: string, ref: string): Promise<CheckpointChange[]> {
   const currentTree = await snapshotWorkingTree(repoPath);
-  const raw = await runGit(repoPath, ["diff", "--name-status", "--no-renames", "-z", ref, currentTree]);
-  return parseNameStatus(raw);
+  return diffTrees(repoPath, ref, currentTree);
 }
 
 export async function restoreCheckpoint(
@@ -108,28 +111,18 @@ export async function restoreCheckpoint(
     );
   }
 
-  const changes = await diffSinceCheckpoint(repoPath, ref);
+  const currentTree = await snapshotWorkingTree(repoPath);
 
-  if (options.guardMs !== undefined) {
-    const tolerance = options.mtimeToleranceMs ?? DEFAULT_MTIME_TOLERANCE_MS;
-    const newer: string[] = [];
-    for (const change of changes) {
-      if (change.status === "deleted") {
-        continue;
-      }
-      const mtimeMs = await fileMtimeMs(path.join(repoPath, change.path));
-      if (mtimeMs !== undefined && mtimeMs > options.guardMs + tolerance) {
-        newer.push(change.path);
-      }
-    }
-    if (newer.length > 0) {
-      throw new RollbackRefusedError(
-        "newer-changes",
-        "Some files changed after this task finished. Undo would clobber that newer work, so manual review is needed.",
-        newer
-      );
-    }
+  if (options.expectedPostTaskTree !== undefined && currentTree !== options.expectedPostTaskTree) {
+    const driftedPaths = (await diffTrees(repoPath, options.expectedPostTaskTree, currentTree)).map((change) => change.path);
+    throw new RollbackRefusedError(
+      "workspace-changed",
+      "The workspace no longer matches its state right after this task finished (a file was edited, added, or deleted since). Undo would clobber that work, so manual review is needed.",
+      driftedPaths
+    );
   }
+
+  const changes = await diffTrees(repoPath, ref, currentTree);
 
   const restorePaths = changes.filter((change) => change.status !== "added").map((change) => change.path);
   const deletePaths = changes.filter((change) => change.status === "added").map((change) => change.path);
@@ -206,12 +199,9 @@ async function resolveBranch(repoPath: string): Promise<string> {
   return "HEAD";
 }
 
-async function fileMtimeMs(absolutePath: string): Promise<number | undefined> {
-  try {
-    return (await stat(absolutePath)).mtimeMs;
-  } catch {
-    return undefined;
-  }
+async function diffTrees(repoPath: string, fromTree: string, toTree: string): Promise<CheckpointChange[]> {
+  const raw = await runGit(repoPath, ["diff", "--name-status", "--no-renames", "-z", fromTree, toTree]);
+  return parseNameStatus(raw);
 }
 
 function parseNameStatus(raw: string): CheckpointChange[] {
@@ -243,16 +233,16 @@ function changeGlyph(status: CheckpointChangeStatus): string {
 
 async function runGit(repoPath: string, args: string[], indexFile?: string): Promise<string> {
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "devbot",
-    GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "devbot@localhost",
-    GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "devbot",
-    GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "devbot@localhost"
+    ...hardenedGitEnvironment(),
+    GIT_AUTHOR_NAME: "devbot",
+    GIT_AUTHOR_EMAIL: "devbot@localhost",
+    GIT_COMMITTER_NAME: "devbot",
+    GIT_COMMITTER_EMAIL: "devbot@localhost"
   };
   if (indexFile) {
     env.GIT_INDEX_FILE = indexFile;
   }
-  const { stdout } = await execFileAsync("git", ["-C", repoPath, ...args], {
+  const { stdout } = await execFileAsync("git", hardenedGitArguments(repoPath, args), {
     env,
     timeout: 30_000,
     maxBuffer: 32_000_000
