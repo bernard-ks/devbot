@@ -131,6 +131,23 @@ test("completion card puts bounded proof before result", () => {
   assert.match(content, /\[PASS\] Focused tests/);
   assert.equal(findControl(json, "completion-proof")?.label, "Open proof");
   assert.equal(findControl(json, "completion-reviewed")?.label, "Mark reviewed");
+  assert.equal(findControl(json, "schedule-revoke"), undefined);
+  assertDiscordBounds(json);
+});
+
+test("standing-approval completion card carries a routable revoke control", () => {
+  const payload = proofFirstCompletionCard({
+    taskId: "task-3",
+    project: "devbot",
+    title: "Scheduled maintenance",
+    proof: [{ label: "Standing approval", detail: "Run 1 of 3, granted by tom.", status: "info" }],
+    summary: "Rotated the deploy logs.",
+    standingApprovalScheduleId: "sched-abc-123"
+  });
+  const json = serialize(payload);
+  const revoke = findControl(json, "schedule-revoke");
+  assert.equal(revoke?.label, "Revoke standing approval");
+  assert.deepEqual(parseAmbientCustomId(revoke!.custom_id!), { action: "schedule-revoke", entityId: "sched-abc-123" });
   assertDiscordBounds(json);
 });
 
