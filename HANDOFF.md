@@ -175,3 +175,14 @@ A background regression watcher per project, owner/controller-gated, that notice
 ## Tests
 
 `npm test` (tsc build + `node --test`): **93 passed, 0 failed** (19 of those are new: `sentinel.test.ts` — state machine transitions incl. debounce/idle/mute, `checkUrl` against a real local `node:http` server, `checkCommand` mapping, target resolution, and end-to-end `SentinelManager.runCycle` flap/mute scenarios; `sentinel-store.test.ts` — interval clamping, path normalization, persistence/reload; `sentinel-ui.test.ts` — button custom-id round-trip, alert/recovery/fix-prompt/status formatting).
+
+## Rebased onto 85e2530
+
+Rebased onto `origin/main` at `85e2530` (merge of #15, "Add ambient Discord workrooms and security hardening", dd0af6b). One textual conflict, in `src/index.ts`'s import block: main added `natural-intent.js` (`buildAgentPrompt`/`classifyNaturalIntent`) while this lane added `findProjectWebUrls` to the existing `project-screenshot.js` import — resolved by keeping both (`buildAgentPrompt`, `classifyNaturalIntent`, `captureProjectScreenshot`, `findProjectWebUrls`). No other files conflicted; `commands.ts` auto-merged cleanly.
+
+Adopted bernard's new conventions from dd0af6b, since this lane predated them:
+
+- **`publicErrorMessage()` before Discord.** `sentinelAlertContent` and `sentinelFixTaskPrompt` (`src/sentinel-ui.ts`) now pass `watch.lastError` and screenshot console-error lines through `publicErrorMessage()` (from the new `src/security.ts`) before truncating/displaying them, so a failing command's raw output can't leak secrets into the private room the way an unredacted `lastError` could have.
+- **Hardened/loopback-only URL path.** The sentinel screenshot-on-alert call already went through `captureProjectScreenshot` (now internally SSRF-hardened via `canReach`'s `allowedOrigins` on main) — no code change needed there, it inherits the hardening automatically. Separately, `/sentinel watch add path:<url>` accepted *any* absolute `http(s)://` URL as a recurring poll target, which is the same class of SSRF risk `canReach` was hardened against (e.g., an owner/controller could point sentinel at an internal metadata endpoint or a third party host on an unattended timer). Closed the gap directly in `normalizeManualPath` (`src/sentinel-store.ts`): absolute watch URLs are now rejected unless the host is `localhost`/`127.0.0.1`/`::1`, matching project-screenshot.ts's loopback-only convention. Same-host different-port watch URLs (the existing/tested use case) still work. New tests in `sentinel-store.test.ts` cover the rejection.
+
+`npm test` after rebase + these changes: **138 passed, 0 failed**, run twice (the known-flaky `security.test.ts` child-process timeout test — "configured project commands receive an empty temporary home" — passed cleanly both times).

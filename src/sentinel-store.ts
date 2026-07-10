@@ -56,10 +56,28 @@ export function clampIntervalSeconds(seconds: number): number {
 export function normalizeManualPath(value: string): string {
   const trimmed = value.trim();
   if (/^https?:\/\//i.test(trimmed)) {
-    return trimmed.replace(/\/+$/, "");
+    return isLoopbackWatchUrl(trimmed) ? trimmed.replace(/\/+$/, "") : "";
   }
   const cleaned = trimmed.replace(/^\/+|\/+$/g, "");
   return `/${cleaned}`;
+}
+
+/**
+ * Sentinel only ever polls a project's own dev server. A manually added watch
+ * path that names a full URL must stay on loopback, matching the same
+ * SSRF-hardening convention project-screenshot.ts applies to captured pages.
+ */
+function isLoopbackWatchUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return false;
+    }
+    const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  } catch {
+    return false;
+  }
 }
 
 export class SentinelStore {

@@ -1,4 +1,5 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+import { publicErrorMessage } from "./security.js";
 import type { SentinelProjectConfig, WatchState } from "./sentinel-store.js";
 
 export type SentinelButtonAction = "fix" | "mute";
@@ -50,13 +51,17 @@ export function sentinelAlertContent(input: SentinelAlertInput): string {
   return [
     `**Sentinel alert: ${input.projectName}**`,
     headline,
-    watch.lastError ? `Detail: ${truncate(watch.lastError, 300)}` : undefined,
+    watch.lastError ? `Detail: ${truncate(publicErrorMessage(watch.lastError), 300)}` : undefined,
     `Last OK: ${watch.lastOkAt ? formatSentinelTime(watch.lastOkAt) : "never observed"}`,
     "",
     "Recent commits:",
     input.recentCommits.length > 0 ? input.recentCommits.map((commit) => `- ${commit}`).join("\n") : "(no recent commits)",
     input.consoleErrors && input.consoleErrors.length > 0
-      ? ["", "Console errors:", ...input.consoleErrors.slice(0, 3).map((line) => `- ${truncate(line, 200)}`)].join("\n")
+      ? [
+          "",
+          "Console errors:",
+          ...input.consoleErrors.slice(0, 3).map((line) => `- ${truncate(publicErrorMessage(line), 200)}`)
+        ].join("\n")
       : undefined
   ]
     .filter((line) => line !== undefined)
@@ -73,7 +78,7 @@ export function sentinelFixTaskPrompt(watch: WatchState): string {
     watch.kind === "url"
       ? `The dev server at ${watch.target} returns ${watch.lastCode !== undefined ? `status ${watch.lastCode}` : "an error"}.`
       : `The command \`${watch.target}\` is failing${watch.lastCode !== undefined ? ` (exit ${watch.lastCode})` : ""}.`;
-  const errorDetail = watch.lastError ? ` The first error observed: ${truncate(watch.lastError, 400)}` : "";
+  const errorDetail = watch.lastError ? ` The first error observed: ${truncate(publicErrorMessage(watch.lastError), 400)}` : "";
   return `${detail}${errorDetail} Investigate and fix.`;
 }
 

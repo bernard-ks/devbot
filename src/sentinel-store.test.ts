@@ -18,6 +18,12 @@ test("normalizeManualPath normalizes bare paths and preserves absolute urls", ()
   assert.equal(normalizeManualPath("/admin/"), "/admin");
   assert.equal(normalizeManualPath("//admin//nested//"), "/admin//nested");
   assert.equal(normalizeManualPath("http://127.0.0.1:9/status/"), "http://127.0.0.1:9/status");
+  assert.equal(normalizeManualPath("http://localhost:9/status"), "http://localhost:9/status");
+});
+
+test("normalizeManualPath rejects non-loopback urls to prevent sentinel from becoming an SSRF proxy", () => {
+  assert.equal(normalizeManualPath("http://evil.example.com/admin"), "");
+  assert.equal(normalizeManualPath("https://169.254.169.254/latest/meta-data"), "");
 });
 
 test("sentinel store defaults, persists config, and survives reload", async () => {
