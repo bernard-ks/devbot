@@ -666,6 +666,23 @@ export class TaskPreviewManager {
     if (message) {
       managed.snapshot.message = redactSensitiveText(message);
     }
+    // The leader exiting does not mean the managed work is gone: a preset can
+    // background or unref a same-process-group child that keeps serving the
+    // loopback origin after its leader is dead. Reap the whole group and prove
+    // it is quiescent before clearing durable state; an unconfirmed cleanup
+    // keeps the ledger entry and isolated home so a restart can finish the job,
+    // mirroring the tunnel/recovery fail-closed conventions in this repo.
+    const quiescent = await this.reapManagedGroup(managed);
+    if (!quiescent) {
+      managed.snapshot.message = redactSensitiveText(
+        withOutputTail(
+          `The preview leader exited but its process group (pgid ${managed.groupId ?? "unknown"}) is not yet quiescent; its ledger entry and isolated home are kept for the next restart.`,
+          managed.outputTail
+        )
+      );
+      this.pruneFinished();
+      return;
+    }
     await this.mutateLedger((ledger) => {
       ledger.previews = ledger.previews.filter((entry) => entry.id !== managed.snapshot.id);
     }).catch(() => undefined);
@@ -674,6 +691,60 @@ export class TaskPreviewManager {
       delete managed.tempHome;
     }
     this.pruneFinished();
+  }
+
+  /**
+   * Terminates the managed child's entire process group and proves it is
+   * quiescent. Because the child is spawned detached as a group leader, every
+   * descendant the dev command forks shares its process group, so signaling
+   * `kill(-pgid)` reaches an orphaned same-group child that outlived the leader.
+   * Quiescence requires BOTH that the group is gone (`kill(-pgid, 0)` fails) and
+   * that no owned listener still holds the port; until both are proven the
+   * caller retains durable state. Returns true immediately on Windows or when no
+   * group was recorded (nothing to reap).
+   */
+  private async reapManagedGroup(managed: ManagedPreview): Promise<boolean> {
+    const groupId = managed.groupId;
+    if (process.platform === "win32" || groupId === undefined) {
+      return true;
+    }
+    if (await this.managedGroupQuiescent(managed, groupId)) {
+      return true;
+    }
+    signalPreviewProcess(groupId, "SIGTERM");
+    const deadline = Date.now() + this.exitWaitMs;
+    const killAt = Date.now() + this.sigkillDelayMs;
+    let escalated = false;
+    while (Date.now() < deadline) {
+      if (await this.managedGroupQuiescent(managed, groupId)) {
+        return true;
+      }
+      if (!escalated && Date.now() >= killAt) {
+        escalated = true;
+        managed.snapshot.escalatedToSigkill = true;
+        signalPreviewProcess(groupId, "SIGKILL");
+      }
+      await sleep(this.pollIntervalMs);
+    }
+    return this.managedGroupQuiescent(managed, groupId);
+  }
+
+  /**
+   * Proves the managed child's process group is fully quiescent: no member of
+   * the group is still alive and no listener the group owned still holds the
+   * port. The group-liveness probe (`kill(-pgid, 0)`) is cheap and is checked
+   * first, so the `lsof`/`ps` attribution only runs once the group is already
+   * gone — the point at which a lingering owned listener is provably impossible
+   * but is confirmed anyway to fail closed against pid/pgid reuse.
+   */
+  private async managedGroupQuiescent(managed: ManagedPreview, groupId: number): Promise<boolean> {
+    if (processGroupExists(groupId)) {
+      return false;
+    }
+    if (!managed.snapshot.port) {
+      return true;
+    }
+    return (await classifyPortListener(managed.snapshot.port, groupId)) !== "owned";
   }
 
   private async reportStopOutcome(managed: ManagedPreview): Promise<StopPreviewResult> {
