@@ -678,6 +678,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
     ...(stringValue(task.routeSource) ? { routeSource: stringValue(task.routeSource)! } : {}),
     ...(stringValue(task.resultPreview) ? { resultPreview: stringValue(task.resultPreview)! } : {}),
     ...(stringValue(task.error) ? { error: stringValue(task.error)! } : {}),
+    ...(stringValue(task.captureNote) ? { captureNote: stringValue(task.captureNote)! } : {}),
     startedAt,
     updatedAt: validTimestamp(task.updatedAt) ?? startedAt,
     ...(validTimestamp(task.finishedAt) ? { finishedAt: validTimestamp(task.finishedAt)! } : {})

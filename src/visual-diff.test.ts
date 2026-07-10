@@ -96,6 +96,36 @@ test("diffImages counts a dimension change as a changed region instead of droppi
   assert.ok(result.regions.some((region) => region.y >= 120), "expected a changed region covering the newly added height");
 });
 
+test("diffImages composites a proportionally smaller before at native size instead of enlarging it", async () => {
+  // Same aspect ratio (1:1), so a stretch-to-fit would scale the 100x100
+  // before up to 200x200 and shift its square, spuriously reporting the
+  // overlap as changed. Padding at native size keeps the overlap identical.
+  const before = await solidWithSquare(100, 100, { x: 10, y: 10, size: 20 });
+  const after = await solidWithSquare(200, 200, { x: 10, y: 10, size: 20 });
+
+  const result = await diffImages(before, after);
+  assert.equal(result.width, 200);
+  assert.equal(result.height, 200);
+  // Only the added strip outside the 100x100 overlap should change: 75% of the
+  // union canvas. Enlarging the before would instead leave the overlap mostly
+  // matched and report a far smaller change.
+  assert.ok(result.changedPixelPercent > 70, `expected the added strip to dominate, got ${result.changedPixelPercent}`);
+  assert.ok(result.changedPixelPercent < 80, `expected the matched overlap to stay unchanged, got ${result.changedPixelPercent}`);
+  assert.ok(result.regions.some((region) => region.x + region.width > 100 || region.y + region.height > 100), "expected a changed region covering the added area");
+});
+
+test("diffImages composites a proportionally smaller after at native size instead of enlarging it", async () => {
+  const before = await solidWithSquare(200, 200, { x: 10, y: 10, size: 20 });
+  const after = await solidWithSquare(100, 100, { x: 10, y: 10, size: 20 });
+
+  const result = await diffImages(before, after);
+  assert.equal(result.width, 200);
+  assert.equal(result.height, 200);
+  assert.ok(result.changedPixelPercent > 70, `expected the removed strip to dominate, got ${result.changedPixelPercent}`);
+  assert.ok(result.changedPixelPercent < 80, `expected the matched overlap to stay unchanged, got ${result.changedPixelPercent}`);
+  assert.ok(result.regions.some((region) => region.x + region.width > 100 || region.y + region.height > 100), "expected a changed region covering the removed area");
+});
+
 test("composeBeforeAfter renders a side-by-side card sized for the source screenshots", async () => {
   const before = await solidWithSquare(100, 80, { x: 5, y: 5, size: 20 });
   const after = await solidWithSquare(100, 80, { x: 60, y: 40, size: 20 });

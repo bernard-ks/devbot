@@ -111,6 +111,23 @@ export function clusterChangedCells(
   return regions;
 }
 
+async function padToCanvasRaw(png: Buffer, source: Size, canvas: Size): Promise<Buffer> {
+  const right = canvas.width - source.width;
+  const bottom = canvas.height - source.height;
+  const image = sharp(png).ensureAlpha();
+  const padded =
+    right > 0 || bottom > 0
+      ? image.extend({
+          top: 0,
+          left: 0,
+          right: Math.max(0, right),
+          bottom: Math.max(0, bottom),
+          background: { r: 0, g: 0, b: 0, alpha: 0 }
+        })
+      : image;
+  return padded.raw().toBuffer();
+}
+
 export async function diffImages(beforePng: Buffer, afterPng: Buffer, options: DiffImagesOptions = {}): Promise<DiffResult> {
   const [beforeMeta, afterMeta] = await Promise.all([sharp(beforePng).metadata(), sharp(afterPng).metadata()]);
   const beforeSize = { width: beforeMeta.width ?? 0, height: beforeMeta.height ?? 0 };
@@ -121,21 +138,15 @@ export async function diffImages(beforePng: Buffer, afterPng: Buffer, options: D
     return { width: 0, height: 0, changedPixelPercent: 0, regions: [] };
   }
 
-  // Pad onto the union canvas instead of stretching to it, so a dimension
-  // change shows up as real added/removed content rather than distorted
-  // pixels; anything outside an image's original bounds is transparent and
-  // therefore always counted as changed below.
+  // Composite each source at its native resolution onto the shared canvas by
+  // padding the right/bottom edges only — never resize either image. Because
+  // the canvas is the union of both dimensions, every source is padded (never
+  // cropped), so a dimension change shows up as real added/removed content
+  // rather than the proportional stretching sharp's `fit: "contain"` would
+  // introduce. Padding is transparent and always counted as changed below.
   const [beforeRaw, afterRaw] = await Promise.all([
-    sharp(beforePng)
-      .resize(size.width, size.height, { fit: "contain", position: "left top", background: { r: 0, g: 0, b: 0, alpha: 0 } })
-      .ensureAlpha()
-      .raw()
-      .toBuffer(),
-    sharp(afterPng)
-      .resize(size.width, size.height, { fit: "contain", position: "left top", background: { r: 0, g: 0, b: 0, alpha: 0 } })
-      .ensureAlpha()
-      .raw()
-      .toBuffer()
+    padToCanvasRaw(beforePng, beforeSize, size),
+    padToCanvasRaw(afterPng, afterSize, size)
   ]);
 
   const pixelThreshold = options.pixelThreshold ?? DEFAULT_PIXEL_THRESHOLD;

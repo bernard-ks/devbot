@@ -394,6 +394,31 @@ test("task store persists task lifecycle to disk", async () => {
   assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
 });
 
+test("task store persists and normalizes the visual-proof capture note across reload", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-capture-"));
+  const stateFile = path.join(root, "tasks.json");
+  const store = new TaskStore(stateFile);
+  const task = await store.start({
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    text: "make the header sticky"
+  });
+  const note = "Visual proof unavailable: this task ran on isolated branch `devbot/task/task-1`.";
+  await store.recordCapture(task.id, { captureNote: note });
+
+  const reloaded = new TaskStore(stateFile);
+  const saved = await reloaded.get(task.id);
+  assert.equal(saved?.captureNote, note);
+  assert.match(formatTaskDetail(saved!), /Visual proof: Visual proof unavailable/);
+
+  // A blank note must be dropped by normalization, never restored as an empty string.
+  await store.recordCapture(task.id, { captureNote: "   " });
+  const blanked = await new TaskStore(stateFile).get(task.id);
+  assert.equal(blanked?.captureNote, undefined);
+});
+
 test("task store preserves proposals and their Discord workroom context", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-task-proposal-"));
   const stateFile = path.join(root, "tasks.json");
