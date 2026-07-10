@@ -28,6 +28,7 @@ export interface AnswerOptions {
   reasoningEffort?: string;
   contextMode?: RequestContextMode;
   signal?: AbortSignal;
+  onSpawn?: (pid: number) => void;
 }
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
@@ -40,7 +41,8 @@ export async function answerWithProjectContext(options: AnswerOptions): Promise<
     sandbox: mode === "action" ? options.codex.actionSandbox : options.codex.sandbox,
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
-    ...(options.signal ? { signal: options.signal } : {})
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.onSpawn ? { onSpawn: options.onSpawn } : {})
   });
 }
 
@@ -54,6 +56,7 @@ export interface CompleteCodexOptions {
   timeoutMs?: number;
   skipGitRepoCheck?: boolean;
   signal?: AbortSignal;
+  onSpawn?: (pid: number) => void;
 }
 
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
@@ -127,7 +130,8 @@ export async function completeCodexPrompt(options: CompleteCodexOptions): Promis
       options.prompt,
       options.timeoutMs ?? options.codex.timeoutMs,
       childEnvironment,
-      options.signal
+      options.signal,
+      options.onSpawn
     );
     const answer = redactSensitiveText((await readFile(outputFile, "utf8")).trim());
     return answer || "Codex did not produce a final text answer.";
@@ -212,7 +216,8 @@ function runCodex(
   prompt: string,
   timeoutMs: number,
   environment: NodeJS.ProcessEnv,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onSpawn?: (pid: number) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -220,6 +225,13 @@ function runCodex(
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });
+    if (child.pid && onSpawn) {
+      try {
+        onSpawn(child.pid);
+      } catch {
+        // Observers must not break the run.
+      }
+    }
     let stdout = "";
     let stderr = "";
     let settled = false;

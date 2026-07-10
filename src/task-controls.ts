@@ -8,6 +8,7 @@ export type TaskControlAction =
   | "review"
   | "retry"
   | "cancel"
+  | "dismiss"
   | "promote"
   | "validate"
   | "adjust";
@@ -21,6 +22,7 @@ interface PrivateTaskControlOptions {
   canControl: boolean;
   safeMode: boolean;
   hasChecks: boolean;
+  canRecover?: boolean;
 }
 
 export function taskControlRow(
@@ -72,9 +74,27 @@ export function taskActionRows(
     }
   }
 
+  if (task.status === "interrupted" && (options.canRecover ?? options.canControl)) {
+    const blockedBySafeMode = mode === "action" && options.safeMode;
+    buttons.push(button("retry", task.id, "Retry", ButtonStyle.Primary).setDisabled(blockedBySafeMode));
+    buttons.push(button("dismiss", task.id, "Dismiss", ButtonStyle.Secondary));
+  }
+
   return buttons.length > 0
     ? [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons.slice(0, 5))]
     : [];
+}
+
+export function interruptedTaskNoticeRow(
+  taskId: string,
+  options: { mode?: string; safeMode: boolean }
+): ActionRowBuilder<ButtonBuilder> {
+  const retryBlocked = (options.mode ?? "answer") === "action" && options.safeMode;
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    button("retry", taskId, "Retry", ButtonStyle.Primary).setDisabled(retryBlocked),
+    button("dismiss", taskId, "Dismiss", ButtonStyle.Secondary),
+    button("details", taskId, "Details", ButtonStyle.Secondary)
+  );
 }
 
 export function taskActionMatchesState(action: TaskControlAction, task: TaskRecord): boolean {
@@ -85,8 +105,14 @@ export function taskActionMatchesState(action: TaskControlAction, task: TaskReco
   if (action === "cancel") {
     return task.status === "running";
   }
-  if (action === "adjust" || action === "retry") {
+  if (action === "adjust") {
     return task.status === "failed" || task.status === "canceled";
+  }
+  if (action === "retry") {
+    return task.status === "failed" || task.status === "canceled" || task.status === "interrupted";
+  }
+  if (action === "dismiss") {
+    return task.status === "interrupted";
   }
   if (action === "followup") {
     return task.status === "succeeded";
@@ -98,7 +124,7 @@ export function taskActionMatchesState(action: TaskControlAction, task: TaskReco
 }
 
 export function parseTaskControl(customId: string): { action: TaskControlAction; taskId: string } | undefined {
-  const match = /^devbot:task-control:(details|actions|followup|review|retry|cancel|promote|validate|adjust):(.+)$/i.exec(customId);
+  const match = /^devbot:task-control:(details|actions|followup|review|retry|cancel|dismiss|promote|validate|adjust):(.+)$/i.exec(customId);
   if (!match?.[1] || !match[2] || !isTaskId(match[2])) {
     return undefined;
   }

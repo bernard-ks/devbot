@@ -577,9 +577,11 @@ test("task store recovers tasks interrupted by a restart", async () => {
   await store.succeed(finished.id, { resultPreview: "done" });
 
   const recovered = new TaskStore(stateFile);
-  assert.equal(await recovered.interruptRunning(), 1);
-  assert.equal((await recovered.get(running.id))?.status, "canceled");
+  const interrupted = await recovered.interrupt(running.id, "Devbot restarted while this task was running.");
+  assert.equal(interrupted?.status, "interrupted");
+  assert.equal((await recovered.get(running.id))?.status, "interrupted");
   assert.match((await recovered.get(running.id))?.error ?? "", /restarted/);
+  assert.equal(await recovered.interrupt(finished.id), undefined);
   assert.equal((await recovered.get(finished.id))?.status, "succeeded");
 });
 

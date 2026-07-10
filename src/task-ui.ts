@@ -41,6 +41,24 @@ export function formatTaskProgress(progress: TaskProgressEvent, now = new Date()
   ].join("\n");
 }
 
+export function formatInterruptedTaskNotice(task: TaskRecord): string {
+  const access = task.mode === "action" ? "write-capable" : "read-only";
+  return [
+    `**${task.projectName} task interrupted**`,
+    `${access} | started ${formatElapsed(Date.now() - new Date(task.startedAt).getTime())} ago`,
+    "",
+    "**Devbot restarted mid-task**",
+    truncate(task.error ?? "Devbot restarted while this task was running, so the model run was not resumed.", 900),
+    "",
+    task.branchName
+      ? `Workspace: branch \`${task.branchName}\` is preserved; any changes may be partial.`
+      : "No isolated workspace was created before the restart.",
+    `Request: \`${inlineCode(truncate(task.text, 240))}\``,
+    "",
+    "The requester or a controller can Retry this request through the normal path or Dismiss it."
+  ].join("\n");
+}
+
 export function taskRequestModal(action: TaskModalAction, task: TaskRecord): ModalBuilder {
   if (!isTaskId(task.id)) {
     throw new Error("Task ID cannot be encoded in a Discord modal.");
