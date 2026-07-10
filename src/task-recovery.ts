@@ -11,10 +11,17 @@ import {
 } from "./security.js";
 import { isTaskId, type TaskAccessScope, type TaskRecord } from "./task-store.js";
 
-export type ExecutionPhase = "starting" | "routing" | "gathering-context" | "running-codex";
+export type ExecutionPhase =
+  | "starting"
+  | "routing"
+  | "gathering-context"
+  | "spawning-worker"
+  | "running-codex"
+  | "worker-exited";
 
 export interface ExecutionChildIdentity {
   pid: number;
+  groupId?: number;
   command: string;
   startedAt: string;
 }
@@ -101,7 +108,18 @@ export class ExecutionLedger {
   async setChild(taskId: string, child: ExecutionChildIdentity): Promise<void> {
     await this.update(taskId, (record) => {
       const normalized = normalizeChildIdentity(child);
-      if (normalized) record.child = normalized;
+      if (!normalized) throw new Error(`The worker identity for task ${taskId} is invalid.`);
+      record.child = normalized;
+    });
+  }
+
+  /** Atomically records the worker identity and the fact that work may now be sent. */
+  async startChild(taskId: string, child: ExecutionChildIdentity): Promise<void> {
+    await this.update(taskId, (record) => {
+      const normalized = normalizeChildIdentity(child);
+      if (!normalized) throw new Error(`The worker identity for task ${taskId} is invalid.`);
+      record.child = normalized;
+      record.phase = "running-codex";
     });
   }
 
@@ -140,6 +158,13 @@ export class ExecutionLedger {
     return state.executions.map((record) => structuredClone(record));
   }
 
+  async get(taskId: string): Promise<ExecutionRecord | undefined> {
+    await this.mutationTail;
+    const state = await this.load();
+    const record = state.executions.find((item) => item.taskId === taskId);
+    return record ? structuredClone(record) : undefined;
+  }
+
   /**
    * Authoritative retry gate: true while a durable record for this task still
    * represents an unresolved worker (see executionWorkerUnresolved). Derived
@@ -163,7 +188,9 @@ export class ExecutionLedger {
   private async update(taskId: string, apply: (record: ExecutionRecord) => void): Promise<void> {
     await this.mutate((state) => {
       const record = state.executions.find((item) => item.taskId === taskId);
-      if (!record) return;
+      if (!record) {
+        throw new Error(`No durable execution record exists for task ${taskId}.`);
+      }
       apply(record);
       record.updatedAt = new Date().toISOString();
     });
@@ -266,11 +293,21 @@ export async function captureChildIdentity(pid: number): Promise<ExecutionChildI
   if (process.platform === "win32" || !Number.isSafeInteger(pid) || pid <= 0) {
     return undefined;
   }
-  const [startedAt, command] = await Promise.all([psColumn(pid, "lstart="), psColumn(pid, "comm=")]);
+  const [startedAt, command, group] = await Promise.all([
+    psColumn(pid, "lstart="),
+    psColumn(pid, "comm="),
+    psColumn(pid, "pgid=")
+  ]);
   if (!startedAt || !command) {
     return undefined;
   }
-  return { pid, startedAt, command };
+  const groupId = Number.parseInt(group ?? "", 10);
+  return {
+    pid,
+    ...(Number.isSafeInteger(groupId) && groupId > 0 ? { groupId } : {}),
+    startedAt,
+    command
+  };
 }
 
 export type OrphanTerminationOutcome =
@@ -284,9 +321,9 @@ export type OrphanTerminationOutcome =
 /**
  * Stops an orphaned child from a previous runtime with an observed exit:
  * verify spawn identity, SIGTERM its process group, wait, then SIGKILL after
- * re-verifying identity. A pid whose identity no longer matches is never
- * signaled. If the process still has not exited after the post-SIGKILL wait,
- * the exit is left unconfirmed rather than reported as an observed kill.
+ * re-verifying identity. If the leader already exited but its original process
+ * group still exists, the surviving group is reaped before cleanup is reported.
+ * A reused leader pid whose identity no longer matches is never signaled.
  */
 export async function terminateOrphanedChild(
   child: ExecutionChildIdentity,
@@ -299,21 +336,23 @@ export async function terminateOrphanedChild(
   const killWaitMs = options.killWaitMs ?? 2_000;
   const pollIntervalMs = options.pollIntervalMs ?? 100;
 
+  const groupId = child.groupId ?? child.pid;
+  const ownsProcessGroup = child.groupId === undefined || child.groupId === child.pid;
   const current = await captureChildIdentity(child.pid);
-  if (!current) return "already-exited";
-  if (!sameIdentity(current, child)) return "not-ours";
+  if (current && !sameIdentity(current, child)) return "not-ours";
+  if (!current && (!ownsProcessGroup || !processGroupExists(groupId))) return "already-exited";
 
-  signalProcessGroup(child.pid, "SIGTERM");
-  if (await waitForExit(child.pid, gracePeriodMs, pollIntervalMs)) {
+  signalManagedWorker(child.pid, groupId, ownsProcessGroup, "SIGTERM");
+  if (await waitForManagedWorkerExit(child.pid, groupId, ownsProcessGroup, gracePeriodMs, pollIntervalMs)) {
     return "terminated";
   }
 
   const beforeKill = await captureChildIdentity(child.pid);
-  if (!beforeKill) return "terminated";
-  if (!sameIdentity(beforeKill, child)) return "not-ours";
+  if (beforeKill && !sameIdentity(beforeKill, child)) return "not-ours";
+  if (!beforeKill && (!ownsProcessGroup || !processGroupExists(groupId))) return "terminated";
 
-  signalProcessGroup(child.pid, "SIGKILL");
-  if (await waitForExit(child.pid, killWaitMs, pollIntervalMs)) {
+  signalManagedWorker(child.pid, groupId, ownsProcessGroup, "SIGKILL");
+  if (await waitForManagedWorkerExit(child.pid, groupId, ownsProcessGroup, killWaitMs, pollIntervalMs)) {
     return "killed";
   }
   return "kill-unconfirmed";
@@ -472,6 +511,41 @@ export function executionWorkerUnresolved(record: ExecutionRecord): boolean {
 }
 
 /**
+ * Settles one in-process terminal task without erasing recovery evidence early.
+ * A record is cleared only after its managed process group is confirmed gone.
+ * The spawning-worker phase is safe without a child identity because runSpec
+ * withholds stdin until startChild() commits both identity and running phase.
+ */
+export async function settleExecutionRecord(options: {
+  ledger: ExecutionLedger;
+  tasks: Pick<RecoveryTaskStore, "setCleanupPending">;
+  taskId: string;
+  terminate?: (child: ExecutionChildIdentity) => Promise<OrphanTerminationOutcome>;
+}): Promise<OrphanTerminationOutcome | "no-child" | "no-record"> {
+  const record = await options.ledger.get(options.taskId);
+  if (!record) return "no-record";
+
+  if (!record.child) {
+    if (executionWorkerUnresolved(record)) {
+      await options.tasks.setCleanupPending(options.taskId, true);
+      return "unverifiable";
+    }
+    await options.ledger.clear(options.taskId);
+    await options.tasks.setCleanupPending(options.taskId, false);
+    return "no-child";
+  }
+
+  const outcome = await (options.terminate ?? terminateOrphanedChild)(record.child);
+  if (childExitObserved(outcome)) {
+    await options.ledger.clear(options.taskId);
+    await options.tasks.setCleanupPending(options.taskId, false);
+  } else {
+    await options.tasks.setCleanupPending(options.taskId, true);
+  }
+  return outcome;
+}
+
+/**
  * A durable execution record is only cleared once the previous runtime's worker
  * is known to be gone. An unconfirmed hard kill or an unverifiable outcome
  * leaves the record in place so the execution stays visible for cleanup.
@@ -519,11 +593,18 @@ function phaseLabel(phase: ExecutionPhase): string {
   if (phase === "starting") return "preparing to run";
   if (phase === "routing") return "choosing an approach";
   if (phase === "gathering-context") return "reading project context";
+  if (phase === "spawning-worker") return "starting the model worker";
+  if (phase === "worker-exited") return "finishing after the model worker exited";
   return "running the model";
 }
 
 function sameIdentity(left: ExecutionChildIdentity, right: ExecutionChildIdentity): boolean {
-  return left.pid === right.pid && left.startedAt === right.startedAt && left.command === right.command;
+  return (
+    left.pid === right.pid &&
+    (left.groupId ?? left.pid) === (right.groupId ?? right.pid) &&
+    left.startedAt === right.startedAt &&
+    left.command === right.command
+  );
 }
 
 function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
@@ -538,7 +619,50 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
-async function waitForExit(pid: number, timeoutMs: number, pollIntervalMs: number): Promise<boolean> {
+function signalManagedWorker(pid: number, groupId: number, ownsProcessGroup: boolean, signal: NodeJS.Signals): void {
+  if (ownsProcessGroup) {
+    signalProcessGroup(groupId, signal);
+    return;
+  }
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // Process already exited.
+  }
+}
+
+function processGroupExists(groupId: number): boolean {
+  try {
+    process.kill(-groupId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitForProcessGroupExit(groupId: number, timeoutMs: number, pollIntervalMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!processGroupExists(groupId)) {
+      return true;
+    }
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+}
+
+async function waitForManagedWorkerExit(
+  pid: number,
+  groupId: number,
+  ownsProcessGroup: boolean,
+  timeoutMs: number,
+  pollIntervalMs: number
+): Promise<boolean> {
+  if (ownsProcessGroup) {
+    return waitForProcessGroupExit(groupId, timeoutMs, pollIntervalMs);
+  }
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
@@ -546,9 +670,7 @@ async function waitForExit(pid: number, timeoutMs: number, pollIntervalMs: numbe
     } catch {
       return true;
     }
-    if (Date.now() >= deadline) {
-      return false;
-    }
+    if (Date.now() >= deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
 }
@@ -579,7 +701,10 @@ function normalizeLoadedExecution(value: unknown): ExecutionRecord | undefined {
   ) {
     return undefined;
   }
-  const phase = oneOf(record.phase, ["starting", "routing", "gathering-context", "running-codex"] as const);
+  const phase = oneOf(
+    record.phase,
+    ["starting", "routing", "gathering-context", "spawning-worker", "running-codex", "worker-exited"] as const
+  );
   if (!phase) return undefined;
   const startedAt = validTimestamp(record.startedAt);
   if (!startedAt) return undefined;
@@ -620,6 +745,9 @@ function normalizeChildIdentity(value: unknown): ExecutionChildIdentity | undefi
   }
   return {
     pid: child.pid,
+    ...(typeof child.groupId === "number" && Number.isSafeInteger(child.groupId) && child.groupId > 0
+      ? { groupId: child.groupId }
+      : {}),
     command: redactSensitiveText(child.command!.trim()),
     startedAt: redactSensitiveText(child.startedAt!.trim())
   };

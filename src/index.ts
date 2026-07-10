@@ -102,7 +102,7 @@ import {
   type BranchFreshnessResult,
   type SyncTaskBranchResult
 } from "./branch-freshness.js";
-import { captureChildIdentity, ExecutionLedger, reconcileInterruptedTasks } from "./task-recovery.js";
+import { captureChildIdentity, ExecutionLedger, reconcileInterruptedTasks, settleExecutionRecord } from "./task-recovery.js";
 import {
   createTaskWorktree,
   inspectTaskWorktree,
@@ -1496,18 +1496,27 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       console.warn(`Unable to run the post-start hook for task ${task.id}: ${publicErrorMessage(error)}`);
     }
   }
-  await recordExecutionState(task.id, executionLedger.record({
-    taskId: task.id,
-    projectName: options.project.name,
-    mode: options.mode,
-    requester: options.requester,
-    ...(task.requesterId ? { requesterId: task.requesterId } : {}),
-    ...(task.accessScope ? { accessScope: task.accessScope } : {}),
-    ...(task.channelId ? { channelId: task.channelId } : {}),
-    ...(task.threadId ? { threadId: task.threadId } : {}),
-    ...(task.controlMessageId ? { controlMessageId: task.controlMessageId } : {}),
-    startedAt: task.startedAt
-  }));
+  try {
+    await executionLedger.record({
+      taskId: task.id,
+      projectName: options.project.name,
+      mode: options.mode,
+      requester: options.requester,
+      ...(task.requesterId ? { requesterId: task.requesterId } : {}),
+      ...(task.accessScope ? { accessScope: task.accessScope } : {}),
+      ...(task.channelId ? { channelId: task.channelId } : {}),
+      ...(task.threadId ? { threadId: task.threadId } : {}),
+      ...(task.controlMessageId ? { controlMessageId: task.controlMessageId } : {}),
+      startedAt: task.startedAt
+    });
+  } catch (error) {
+    const failure = new Error(
+      `Task stopped before execution because its durable recovery record could not be created: ${publicErrorMessage(error)}`,
+      { cause: error }
+    );
+    await taskStore.fail(task.id, failure);
+    throw failure;
+  }
   const controller = new AbortController();
   const abortFromParent = (): void => controller.abort(options.signal?.reason);
   if (options.signal?.aborted) abortFromParent();
@@ -1554,12 +1563,12 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
           baseBranch: isolated.worktree.baseRevision,
           isolated: true
         });
-        await recordExecutionState(task.id, executionLedger.setWorkspace(task.id, {
+        await executionLedger.setWorkspace(task.id, {
           workspacePath: isolated.worktree.path,
           branchName: isolated.worktree.branch,
           baseBranch: isolated.worktree.baseRevision,
           isolated: true
-        }));
+        });
         await ensureRequestStillActive();
       } else {
         await taskStore.setWorkspace(task.id, {
@@ -1578,7 +1587,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
   } catch (error) {
     if (controller.signal.aborted) await taskStore.cancel(task.id, "Canceled by user request.");
     else await taskStore.fail(task.id, error);
-    await recordExecutionState(task.id, executionLedger.clear(task.id));
+    await settleExecutionRecordSafely(task.id);
     releaseController();
     throw error;
   }
@@ -1642,8 +1651,15 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       route,
       contextFileCount: context.files.length
     });
-    await recordExecutionState(task.id, executionLedger.setPhase(task.id, "running-codex"));
+    // A worker may be spawned after this durable transition, but runCodex
+    // withholds stdin until recordExecutionChild atomically persists the exact
+    // child identity and advances the phase to running-codex.
+    await executionLedger.setPhase(task.id, "spawning-worker");
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal, recordExecutionChild(task.id));
+    // runCodex resolves only after the leader's close event. Persist that fact
+    // before terminal settlement; on Windows this is what distinguishes a safe
+    // no-child record from an interrupted worker whose identity cannot be read.
+    await recordExecutionState(task.id, executionLedger.setPhase(task.id, "worker-exited"));
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree, true, workspaceNotes);
       // Every action task runs in an isolated Git worktree (task-worktree.ts); Codex's edits land
@@ -1706,7 +1722,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     if (options.mode === "action") {
       contextService.invalidate(options.project.name);
     }
-    await recordExecutionState(task.id, executionLedger.clear(task.id));
+    await settleExecutionRecordSafely(task.id);
     releaseController();
     if (work) workTracker.finish(work.id);
   }
@@ -1739,16 +1755,21 @@ function recordExecutionChild(taskId: string): (pid: number) => Promise<void> {
   return async (pid) => {
     const identity = await captureChildIdentity(pid);
     if (identity) {
+      if (process.platform !== "win32" && identity.groupId !== pid) {
+        throw new Error(`Worker ${pid} did not start as an isolated process-group leader.`);
+      }
       // Persist the child identity durably before the caller sends work. A
       // failed write throws, so the caller stops the child and the retained
       // ledger record keeps this task's retry gate blocked.
-      await executionLedger.setChild(taskId, identity);
+      await executionLedger.startChild(taskId, identity);
       return;
     }
     if (process.platform === "win32") {
-      // Spawn identities cannot be probed here (no ps / process groups), so the
-      // recovery gate is derived from the record's running phase instead. Let
-      // the run proceed; reconciliation still treats the worker as unaccounted.
+      // Spawn identities cannot be probed here (no ps / process groups). Mark
+      // the worker as potentially active before stdin is released; a normal
+      // close advances to worker-exited, while a crash/fallback retains the
+      // conservative retry block.
+      await executionLedger.setPhase(taskId, "running-codex");
       return;
     }
     // A supported platform could not capture a durable identity for a worker it
@@ -1756,6 +1777,19 @@ function recordExecutionChild(taskId: string): (pid: number) => Promise<void> {
     // child and the retained record keeps retry blocked.
     throw new Error(`Could not durably record the worker for task ${taskId} before sending work.`);
   };
+}
+
+async function settleExecutionRecordSafely(taskId: string): Promise<void> {
+  try {
+    const outcome = await settleExecutionRecord({ ledger: executionLedger, tasks: taskStore, taskId });
+    if (outcome === "kill-unconfirmed" || outcome === "unverifiable") {
+      console.warn(`Kept the execution ledger for ${taskId}; worker cleanup is still ${outcome}.`);
+    }
+  } catch (error) {
+    // Failing to settle must never erase the record. A later restart will
+    // reconcile it and the ledger-derived retry gate remains closed.
+    console.warn(`Unable to settle the execution ledger for ${taskId}: ${publicErrorMessage(error)}`);
+  }
 }
 
 async function rememberTaskMessage(taskId: string, channelId: string, messageId: string): Promise<void> {

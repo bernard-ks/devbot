@@ -9,6 +9,7 @@ import {
   ExecutionLedger,
   interruptionNote,
   reconcileInterruptedTasks,
+  settleExecutionRecord,
   terminateOrphanedChild,
   type InterruptedTaskNotice,
   type OrphanTerminationOutcome
@@ -58,6 +59,62 @@ test("execution ledger persists records privately and never stores raw secrets",
 
   await reloaded.clear("task-abc123");
   assert.deepEqual(await new ExecutionLedger(stateFile).listActive(), []);
+});
+
+test("execution ledger rejects critical updates when the durable task record is missing", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-recovery-missing-record-"));
+  const ledger = new ExecutionLedger(path.join(root, "executions.json"));
+
+  await assert.rejects(
+    ledger.setPhase("task-missing", "running-codex"),
+    /No durable execution record exists for task task-missing/
+  );
+  await assert.rejects(
+    ledger.setWorkspace("task-missing", {
+      workspacePath: path.join(root, "worktree"),
+      branchName: "devbot/task/task-missing",
+      baseBranch: "abc",
+      isolated: true
+    }),
+    /No durable execution record exists for task task-missing/
+  );
+  await assert.rejects(
+    ledger.setChild("task-missing", {
+      pid: 12345,
+      startedAt: "Mon Jan  1 00:00:00 2001",
+      command: "codex"
+    }),
+    /No durable execution record exists for task task-missing/
+  );
+  assert.deepEqual(await ledger.listActive(), []);
+});
+
+test("worker identity and work-started phase are committed atomically before stdin may be sent", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-recovery-start-child-"));
+  const ledger = new ExecutionLedger(path.join(root, "executions.json"));
+  await ledger.record({
+    taskId: "task-atomic-child",
+    projectName: "demo",
+    mode: "action",
+    requester: "tester",
+    startedAt: new Date().toISOString()
+  });
+  await ledger.setPhase("task-atomic-child", "spawning-worker");
+  await ledger.startChild("task-atomic-child", {
+    pid: 12345,
+    groupId: 12345,
+    startedAt: "Mon Jan  1 00:00:00 2001",
+    command: "codex"
+  });
+
+  const record = await new ExecutionLedger(path.join(root, "executions.json")).get("task-atomic-child");
+  assert.equal(record?.phase, "running-codex");
+  assert.deepEqual(record?.child, {
+    pid: 12345,
+    groupId: 12345,
+    startedAt: "Mon Jan  1 00:00:00 2001",
+    command: "codex"
+  });
 });
 
 test("restart reconciliation marks dead-pid work interrupted and announces it", posixOnly, async () => {
@@ -664,6 +721,112 @@ test("a worker spawned but never recorded (crash at spawn) keeps retry blocked a
   });
   await noWorkerLedger.setPhase("task-noworker", "gathering-context");
   assert.equal(await new ExecutionLedger(ledgerFile).hasUnresolvedWorker("task-noworker"), false);
+});
+
+test("terminal settlement retains an unconfirmed worker and clears it only after group cleanup is observed", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-recovery-settle-"));
+  const ledgerFile = path.join(root, "executions.json");
+  const ledger = new ExecutionLedger(ledgerFile);
+  await ledger.record({
+    taskId: "task-settle",
+    projectName: "demo",
+    mode: "action",
+    requester: "tester",
+    startedAt: new Date().toISOString()
+  });
+  await ledger.startChild("task-settle", {
+    pid: 987654,
+    groupId: 987654,
+    startedAt: "Mon Jan  1 00:00:00 2001",
+    command: "codex"
+  });
+  const cleanupStates: boolean[] = [];
+  const tasks = {
+    setCleanupPending: async (_taskId: string, pending: boolean) => {
+      cleanupStates.push(pending);
+      return undefined;
+    }
+  };
+
+  const first = await settleExecutionRecord({
+    ledger,
+    tasks,
+    taskId: "task-settle",
+    terminate: async () => "kill-unconfirmed"
+  });
+  assert.equal(first, "kill-unconfirmed");
+  assert.equal((await new ExecutionLedger(ledgerFile).listActive()).length, 1);
+  assert.deepEqual(cleanupStates, [true]);
+
+  const second = await settleExecutionRecord({
+    ledger,
+    tasks,
+    taskId: "task-settle",
+    terminate: async () => "killed"
+  });
+  assert.equal(second, "killed");
+  assert.equal((await new ExecutionLedger(ledgerFile).listActive()).length, 0);
+  assert.deepEqual(cleanupStates, [true, false]);
+});
+
+test("a crash in spawning-worker before identity persistence is safe to clear because stdin was withheld", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-recovery-spawning-"));
+  const ledgerFile = path.join(root, "executions.json");
+  const ledger = new ExecutionLedger(ledgerFile);
+  await ledger.record({
+    taskId: "task-spawning",
+    projectName: "demo",
+    mode: "action",
+    requester: "tester",
+    startedAt: new Date().toISOString()
+  });
+  await ledger.setPhase("task-spawning", "spawning-worker");
+
+  const outcome = await settleExecutionRecord({
+    ledger,
+    tasks: { setCleanupPending: async () => undefined },
+    taskId: "task-spawning"
+  });
+  assert.equal(outcome, "no-child");
+  assert.equal((await new ExecutionLedger(ledgerFile).listActive()).length, 0);
+});
+
+test("orphan cleanup reaps same-group descendants after the recorded leader exits", posixOnly, async () => {
+  const leader = spawn("/bin/sh", ["-c", "sleep 60 & sleep 0.5"], {
+    detached: true,
+    stdio: "ignore"
+  });
+  assert.ok(leader.pid);
+  const groupId = leader.pid!;
+  const leaderClosed = new Promise<void>((resolve) => leader.once("close", () => resolve()));
+  try {
+    let identity;
+    for (let attempt = 0; attempt < 20 && !identity; attempt += 1) {
+      identity = await captureChildIdentity(leader.pid!);
+      if (!identity) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(identity);
+    assert.equal(identity!.groupId, groupId);
+    await leaderClosed;
+
+    // The shell leader is gone, but its background sleep still owns the group.
+    assert.throws(() => process.kill(leader.pid!, 0));
+    assert.doesNotThrow(() => process.kill(-groupId, 0));
+
+    const outcome = await terminateOrphanedChild(identity!, {
+      gracePeriodMs: 500,
+      killWaitMs: 500,
+      pollIntervalMs: 25
+    });
+    assert.equal(outcome === "terminated" || outcome === "killed", true);
+    assert.throws(() => process.kill(-groupId, 0));
+  } finally {
+    try {
+      process.kill(-groupId, "SIGKILL");
+    } catch {
+      // Group was already reaped.
+    }
+  }
 });
 
 function git(cwd: string, args: string[]): Promise<string> {
