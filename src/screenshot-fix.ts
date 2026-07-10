@@ -248,6 +248,20 @@ export function newScreenshotFixId(): string {
 
 export type ScreenshotFixAction = "fix" | "dismiss";
 
+export interface ScreenshotFixActionContext {
+  userId: string;
+  controller: boolean;
+}
+
+export function canActOnScreenshotFix(
+  action: ScreenshotFixAction,
+  record: { requesterId: string },
+  context: ScreenshotFixActionContext
+): boolean {
+  if (context.controller) return true;
+  return action === "dismiss" && record.requesterId === context.userId;
+}
+
 export function screenshotFixControlRow(id: string): ActionRowBuilder<ButtonBuilder> {
   if (!isScreenshotFixId(id)) {
     throw new Error("Screenshot analysis ID cannot be encoded in a Discord control.");

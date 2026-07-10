@@ -51,6 +51,19 @@ test("screenshot-fix store hardens the state directory and file to owner-only pe
   assert.equal(fileStats.mode & 0o777, 0o600);
 });
 
+test("screenshot-fix store hardens a pre-existing state file left with loose permissions", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-snapfix-store-preexisting-"));
+  const filePath = path.join(root, "screenshot-fixes.json");
+  await writeFile(filePath, JSON.stringify({ version: 1, records: [] }), { mode: 0o644 });
+
+  const store = new ScreenshotFixStore(filePath);
+  await store.get("snapfix-any");
+
+  const fileStats = await stat(filePath);
+  assert.equal(fileStats.mode & 0o777, 0o600);
+});
+
 test("screenshot-fix store redacts secret-shaped text in transcription, location, and approach before persisting", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-snapfix-store-redact-"));
   const filePath = path.join(root, "screenshot-fixes.json");

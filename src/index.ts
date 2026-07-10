@@ -111,6 +111,7 @@ import {
 import { UserPreferenceStore } from "./user-preferences.js";
 import {
   buildFixTaskPrompt,
+  canActOnScreenshotFix,
   downloadImageAttachment,
   filterImageAttachments,
   formatNoErrorFoundReply,
@@ -119,7 +120,8 @@ import {
   screenshotFixControlRow,
   withTempImageDir,
   type ImageAttachmentInput,
-  type ScreenshotFixAction
+  type ScreenshotFixAction,
+  type ScreenshotFixActionContext
 } from "./screenshot-fix.js";
 import { ScreenshotFixStore } from "./screenshot-fix-store.js";
 import {
@@ -2826,11 +2828,13 @@ async function handleScreenshotFixControl(
     return;
   }
 
-  const isRequester = record.requesterId === interaction.user.id;
-  const isController = isControllerUser(interaction.user.id, appConfig);
+  const actor: ScreenshotFixActionContext = {
+    userId: interaction.user.id,
+    controller: isControllerUser(interaction.user.id, appConfig)
+  };
 
   if (action === "dismiss") {
-    if (!isRequester && !isController) {
+    if (!canActOnScreenshotFix("dismiss", record, actor)) {
       await interaction.reply({
         content: "Only the person who reported this screenshot, or an approved controller, can dismiss it.",
         flags: MessageFlags.Ephemeral
@@ -2842,7 +2846,7 @@ async function handleScreenshotFixControl(
     return;
   }
 
-  if (!isController) {
+  if (!canActOnScreenshotFix("fix", record, actor)) {
     await interaction.reply({
       content: "You have view access, but only the owner or an approved controller can start write-capable work.",
       flags: MessageFlags.Ephemeral

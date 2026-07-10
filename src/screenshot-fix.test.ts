@@ -3,6 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import test from "node:test";
 import {
   buildFixTaskPrompt,
+  canActOnScreenshotFix,
   detectImageExtension,
   downloadImageAttachment,
   filterImageAttachments,
@@ -278,4 +279,22 @@ test("screenshot-fix control IDs and buttons round-trip through Discord custom I
 
 test("screenshotFixControlRow rejects IDs that cannot be safely encoded", () => {
   assert.throws(() => screenshotFixControlRow("not-a-valid-id"), /cannot be encoded/);
+});
+
+test("a project viewer cannot dismiss another reporter's pending analysis", () => {
+  const record = { requesterId: "reporter-1" };
+  assert.equal(canActOnScreenshotFix("dismiss", record, { userId: "viewer-2", controller: false }), false);
+});
+
+test("the reporter or a controller can dismiss a pending analysis", () => {
+  const record = { requesterId: "reporter-1" };
+  assert.equal(canActOnScreenshotFix("dismiss", record, { userId: "reporter-1", controller: false }), true);
+  assert.equal(canActOnScreenshotFix("dismiss", record, { userId: "controller-9", controller: true }), true);
+});
+
+test("starting a fix requires a controller, even for the reporter", () => {
+  const record = { requesterId: "reporter-1" };
+  assert.equal(canActOnScreenshotFix("fix", record, { userId: "reporter-1", controller: false }), false);
+  assert.equal(canActOnScreenshotFix("fix", record, { userId: "viewer-2", controller: false }), false);
+  assert.equal(canActOnScreenshotFix("fix", record, { userId: "controller-9", controller: true }), true);
 });
