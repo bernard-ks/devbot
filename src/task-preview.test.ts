@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
-import { mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,6 +16,7 @@ import {
   type TaskPreviewManagerOptions
 } from "./task-preview.js";
 import { parsePreviewControl } from "./task-controls.js";
+import { captureChildIdentity, type ExecutionChildIdentity } from "./task-recovery.js";
 import type { ProjectEntry } from "./types.js";
 
 interface Fixture {
@@ -52,13 +53,19 @@ async function writeFakeServer(
       options.ignoreSigterm ? 'process.on("SIGTERM", () => {});' : "",
       'const server = http.createServer((request, response) => { response.statusCode = 200; response.end("ok"); });',
       "setTimeout(() => {",
+      "  let ledgerReady = false;",
+      "  try {",
+      `    const ledger = JSON.parse(fs.readFileSync(${JSON.stringify(fixture.ledgerFile)}, "utf8"));`,
+      "    ledgerReady = ledger.previews.some((entry) => entry.pid === entry.childIdentity?.pid && entry.tempHome === process.env.HOME);",
+      "  } catch {}",
       "  server.listen(port, host, () => {",
       `    fs.writeFileSync(${JSON.stringify(fixture.reportFile)}, JSON.stringify({`,
       "      home: process.env.HOME ?? null,",
       "      discordToken: process.env.DISCORD_TOKEN ?? null,",
       "      host,",
       "      port,",
-      "      cwd: process.cwd()",
+      "      cwd: process.cwd(),",
+      "      ledgerReady",
       "    }));",
       "  });",
       `}, ${options.listenDelayMs ?? 0});`
@@ -156,6 +163,15 @@ async function readLedger(fixture: Fixture): Promise<{ version: number; previews
   return JSON.parse(await readFile(fixture.ledgerFile, "utf8")) as { version: number; previews: unknown[] };
 }
 
+async function pathExists(candidate: string): Promise<boolean> {
+  try {
+    await stat(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 test("starts a preview on a loopback origin with an isolated child environment", async () => {
   const fixture = await createFixture();
   const script = await writeFakeServer(fixture);
@@ -181,6 +197,7 @@ test("starts a preview on a loopback origin with an isolated child environment",
       host: string;
       port: number;
       cwd: string;
+      ledgerReady: boolean;
     };
     assert.equal(report.discordToken, null);
     assert.ok(report.home && report.home.includes("devbot-preview-home-"));
@@ -188,6 +205,7 @@ test("starts a preview on a loopback origin with an isolated child environment",
     assert.equal(report.host, "127.0.0.1");
     assert.equal(report.port, instance.port);
     assert.equal(await realpath(report.cwd), await realpath(fixture.workspace));
+    assert.equal(report.ledgerReady, true, "the configured command must not run before durable worker identity is saved");
 
     if (process.platform !== "win32") {
       assert.equal(((await stat(fixture.ledgerFile)).mode & 0o777), 0o600);
@@ -195,6 +213,16 @@ test("starts a preview on a loopback origin with an isolated child environment",
     }
     const ledger = await readLedger(fixture);
     assert.equal(ledger.previews.length, 1);
+    const entry = ledger.previews[0] as {
+      pid?: number;
+      childIdentity?: ExecutionChildIdentity;
+      tempHome?: string;
+    };
+    assert.equal(entry.pid, instance.pid);
+    assert.equal(entry.childIdentity?.pid, instance.pid);
+    assert.equal(entry.childIdentity?.groupId, instance.pid);
+    assert.equal(entry.tempHome, report.home);
+    const tempHome = entry.tempHome!;
 
     const stopped = await manager.stop(instance.id, "requested");
     assert.equal(stopped.ok, true);
@@ -202,6 +230,7 @@ test("starts a preview on a loopback origin with an isolated child environment",
     assert.ok(instance.pid);
     await waitFor(() => processGone(instance.pid!));
     assert.equal((await readLedger(fixture)).previews.length, 0);
+    assert.equal(await pathExists(tempHome), false);
   } finally {
     delete process.env.DISCORD_TOKEN;
     await manager.stopAll("requested");
@@ -322,7 +351,7 @@ test("restart reconciliation kills identifiable orphans and never signals other 
   const fixture = await createFixture();
   const script = await writeFakeServer(fixture, { listenDelayMs: 60_000 });
   const orphanId = `prv-${randomBytes(6).toString("hex")}`;
-  const orphan = spawn("/bin/sh", ["-c", `node ${script}`, `devbot-preview-${orphanId}`], {
+  const orphan = spawn("/bin/sh", ["-c", `node ${script} & wait`, `devbot-preview-${orphanId}`], {
     cwd: fixture.workspace,
     detached: true,
     stdio: "ignore",
@@ -330,10 +359,17 @@ test("restart reconciliation kills identifiable orphans and never signals other 
   });
   orphan.unref();
   assert.ok(orphan.pid);
+  let orphanIdentity: ExecutionChildIdentity | undefined;
+  await waitFor(async () => {
+    orphanIdentity = await captureChildIdentity(orphan.pid!);
+    return orphanIdentity !== undefined && orphanIdentity.groupId === orphan.pid;
+  });
 
   const foreignId = `prv-${randomBytes(6).toString("hex")}`;
   const now = new Date().toISOString();
-  const entry = (id: string, pid: number, command: string) => ({
+  const orphanHome = await mkdtemp(path.join(tmpdir(), "devbot-preview-home-"));
+  const foreignHome = await mkdtemp(path.join(tmpdir(), "devbot-preview-home-"));
+  const entry = (id: string, pid: number, command: string, childIdentity: ExecutionChildIdentity, tempHome: string) => ({
     id,
     taskId: "task-orphan",
     projectName: "demo",
@@ -343,6 +379,8 @@ test("restart reconciliation kills identifiable orphans and never signals other 
     port: 4_321,
     origin: "http://127.0.0.1:4321",
     pid,
+    childIdentity,
+    tempHome,
     createdAt: now,
     expiresAt: now
   });
@@ -352,8 +390,19 @@ test("restart reconciliation kills identifiable orphans and never signals other 
     JSON.stringify({
       version: 1,
       previews: [
-        entry(orphanId, orphan.pid!, `node ${script}`),
-        entry(foreignId, process.pid, "definitely-not-this-test-process-xyz")
+        entry(orphanId, orphan.pid!, `node ${script}`, orphanIdentity!, orphanHome),
+        entry(
+          foreignId,
+          process.pid,
+          "definitely-not-this-test-process-xyz",
+          {
+            pid: process.pid,
+            groupId: process.pid,
+            startedAt: "stale process start time",
+            command: "definitely-not-this-test-process-xyz"
+          },
+          foreignHome
+        )
       ]
     }),
     { encoding: "utf8", mode: 0o600 }
@@ -361,10 +410,57 @@ test("restart reconciliation kills identifiable orphans and never signals other 
 
   const manager = makeManager(fixture, { sigkillDelayMs: 300 });
   const notes = await manager.reconcile();
-  assert.ok(notes.some((note) => note.includes(`Stopped orphaned preview ${orphanId}`)));
+  assert.ok(notes.some((note) => note.includes(`Reconciled preview ${orphanId}`)));
   assert.ok(notes.some((note) => note.includes(`no longer belongs to preview ${foreignId}`)));
   await waitFor(() => processGone(orphan.pid!));
   assert.equal((await readLedger(fixture)).previews.length, 0);
+  assert.equal(await pathExists(orphanHome), false);
+  assert.equal(await pathExists(foreignHome), false);
+});
+
+test("restart reconciliation clears gated pre-start state but retains an unverifiable bare pid", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX process reconciliation");
+    return;
+  }
+  const fixture = await createFixture();
+  const prestartId = `prv-${randomBytes(6).toString("hex")}`;
+  const barePidId = `prv-${randomBytes(6).toString("hex")}`;
+  const prestartHome = await mkdtemp(path.join(tmpdir(), "devbot-preview-home-"));
+  const barePidHome = await mkdtemp(path.join(tmpdir(), "devbot-preview-home-"));
+  const now = new Date().toISOString();
+  const base = (id: string, tempHome: string) => ({
+    id,
+    taskId: "task-incomplete-preview",
+    projectName: "demo",
+    workspacePath: fixture.workspace,
+    command: "node fake-server.cjs",
+    marker: `devbot-preview-${id}`,
+    port: 4_321,
+    origin: "http://127.0.0.1:4321",
+    tempHome,
+    createdAt: now,
+    expiresAt: now
+  });
+  await mkdir(path.dirname(fixture.ledgerFile), { recursive: true, mode: 0o700 });
+  await writeFile(
+    fixture.ledgerFile,
+    JSON.stringify({
+      version: 1,
+      previews: [base(prestartId, prestartHome), { ...base(barePidId, barePidHome), pid: process.pid }]
+    }),
+    { encoding: "utf8", mode: 0o600 }
+  );
+
+  const manager = makeManager(fixture);
+  const notes = await manager.reconcile();
+  assert.ok(notes.some((note) => note.includes(`${prestartId} never recorded a worker`)));
+  assert.ok(notes.some((note) => note.includes(`${barePidId} has no complete durable process identity`)));
+  const remaining = (await readLedger(fixture)).previews as Array<{ id: string }>;
+  assert.deepEqual(remaining.map((entry) => entry.id), [barePidId]);
+  assert.equal(await pathExists(prestartHome), false);
+  assert.equal(await pathExists(barePidHome), true);
+  await rm(barePidHome, { force: true, recursive: true });
 });
 
 test("reaps a same-group child that outlives its exiting leader before clearing state", async (t) => {
@@ -531,13 +627,14 @@ test("resolves only configured presets or allow-listed package scripts", async (
   assert.equal(unlisted.ok, false);
 });
 
-test("authorization requires project access plus requester or controller, and safe mode blocks only start", () => {
+test("authorization requires a controller to start while the requester may stop or inspect", () => {
   const task = { id: "task-authz", requesterId: "requester" };
   const base = { userId: "requester", controller: false, projectAllowed: true, safeMode: false };
 
-  assert.equal(authorizeTaskPreview("start", task, base).allowed, true);
+  assert.equal(authorizeTaskPreview("start", task, base).allowed, false);
   assert.equal(authorizeTaskPreview("stop", task, base).allowed, true);
   assert.equal(authorizeTaskPreview("status", task, base).allowed, true);
+  assert.equal(authorizeTaskPreview("start", task, { ...base, controller: true }).allowed, true);
 
   assert.equal(authorizeTaskPreview("start", task, { ...base, projectAllowed: false }).allowed, false);
   assert.equal(authorizeTaskPreview("stop", task, { ...base, projectAllowed: false }).allowed, false);
@@ -548,7 +645,7 @@ test("authorization requires project access plus requester or controller, and sa
   assert.equal(authorizeTaskPreview("status", task, stranger).allowed, false);
   assert.equal(authorizeTaskPreview("stop", task, { ...stranger, controller: true }).allowed, true);
 
-  const safeMode = { ...base, safeMode: true };
+  const safeMode = { ...base, controller: true, safeMode: true };
   const blockedStart = authorizeTaskPreview("start", task, safeMode);
   assert.equal(blockedStart.allowed, false);
   if (!blockedStart.allowed) assert.match(blockedStart.message, /Safe mode/);
@@ -558,6 +655,15 @@ test("authorization requires project access plus requester or controller, and sa
   const anonymousRequester = { id: "task-anon" } as { id: string; requesterId?: string };
   assert.equal(authorizeTaskPreview("stop", anonymousRequester, base).allowed, false);
   assert.equal(authorizeTaskPreview("stop", anonymousRequester, { ...base, controller: true }).allowed, true);
+});
+
+test("preview start fails closed when listener ownership is unavailable on Windows", async () => {
+  const fixture = await createFixture();
+  const manager = makeManager(fixture, { platform: "win32" });
+  const result = await manager.start(startInput(fixture, { source: "preset", name: "dev", command: "node server.cjs" }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.message, /unavailable on Windows.*ownership/i);
+  await assert.rejects(() => readLedger(fixture));
 });
 
 test("preview controls parse strictly and expire when unknown", async () => {

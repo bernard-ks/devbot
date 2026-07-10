@@ -14,6 +14,7 @@ import {
   redactSensitiveText
 } from "./security.js";
 import type { TaskRecord } from "./task-store.js";
+import { captureChildIdentity, terminateOrphanedChild, type ExecutionChildIdentity } from "./task-recovery.js";
 import type { ProjectEntry } from "./types.js";
 
 const PREVIEW_ID_PATTERN = /^prv-[a-f0-9]{12}$/;
@@ -101,6 +102,8 @@ export interface TaskPreviewManagerOptions {
    * port is refused rather than accepted.
    */
   reservePort?: () => Promise<number>;
+  /** Test seam; production uses the current runtime platform. */
+  platform?: NodeJS.Platform;
 }
 
 type PortOwnership = "owned" | "foreign" | "unknown";
@@ -112,6 +115,7 @@ interface ManagedPreview {
   outputTail: string;
   aborted: boolean;
   exitObserved: boolean;
+  cleanupConfirmed: boolean;
   exitPromise?: Promise<void>;
   ttlTimer?: NodeJS.Timeout;
   killTimer?: NodeJS.Timeout;
@@ -122,6 +126,7 @@ interface ManagedPreview {
    * group is provably the managed child. Undefined on Windows.
    */
   groupId?: number;
+  childIdentity?: ExecutionChildIdentity;
 }
 
 interface PreviewLedgerEntry {
@@ -134,6 +139,8 @@ interface PreviewLedgerEntry {
   port: number;
   origin: string;
   pid?: number;
+  childIdentity?: ExecutionChildIdentity;
+  tempHome?: string;
   createdAt: string;
   expiresAt: string;
 }
@@ -152,8 +159,9 @@ export function isPreviewId(value: string): boolean {
 /**
  * Central authorization for every preview control. Previews expose a running
  * project command, so start/stop/status all require project access and the
- * task requester or an approved controller. Safe mode blocks only starting
- * (it spawns a project command); stop and status always stay available.
+ * task requester or an approved controller. Starting is controller-only because
+ * it spawns a configured project command; requesters may still inspect or stop
+ * a preview that a controller started. Safe mode blocks only starting.
  */
 export function authorizeTaskPreview(
   action: PreviewControlAction,
@@ -162,6 +170,12 @@ export function authorizeTaskPreview(
 ): { allowed: true } | { allowed: false; message: string } {
   if (!context.projectAllowed) {
     return { allowed: false, message: "You are not allowed to use this task's project." };
+  }
+  if (action === "start" && !context.controller) {
+    return {
+      allowed: false,
+      message: "Only the owner or an approved controller can start a task preview because it runs a project command."
+    };
   }
   if (!context.controller && (!task.requesterId || task.requesterId !== context.userId)) {
     return {
@@ -257,6 +271,7 @@ export class TaskPreviewManager {
   private readonly exitWaitMs: number;
   private readonly shell: string;
   private readonly reservePort: () => Promise<number>;
+  private readonly platform: NodeJS.Platform;
   private ledger: PreviewLedgerFile | undefined;
   private ledgerTail: Promise<void> = Promise.resolve();
   private shuttingDown = false;
@@ -271,11 +286,18 @@ export class TaskPreviewManager {
     this.exitWaitMs = Math.max(this.sigkillDelayMs + 1_000, Math.floor(options.exitWaitMs ?? DEFAULT_EXIT_WAIT_MS));
     this.shell = options.shell ?? (process.platform === "win32" ? process.env.COMSPEC ?? "cmd.exe" : "/bin/sh");
     this.reservePort = options.reservePort ?? reserveLoopbackPort;
+    this.platform = options.platform ?? process.platform;
   }
 
   async start(input: StartPreviewInput): Promise<StartPreviewResult> {
     if (this.shuttingDown) {
       return { ok: false, message: "Devbot is shutting down; no new previews can start." };
+    }
+    if (this.platform === "win32") {
+      return {
+        ok: false,
+        message: "Managed task previews are unavailable on Windows until listener ownership can be verified safely."
+      };
     }
 
     const existing = this.findOpenForTask(input.taskId);
@@ -319,7 +341,8 @@ export class TaskPreviewManager {
       },
       outputTail: "",
       aborted: false,
-      exitObserved: false
+      exitObserved: false,
+      cleanupConfirmed: false
     };
     this.instances.set(id, managed);
 
@@ -336,17 +359,41 @@ export class TaskPreviewManager {
       } else {
         this.spawnPreviewProcess(managed);
         if (managed.snapshot.pid !== undefined) {
+          const identity = await capturePreviewIdentity(managed.snapshot.pid, this.pollIntervalMs);
+          if (!identity || identity.groupId !== managed.snapshot.pid) {
+            throw new Error("The preview worker could not be bound to a durable isolated process-group identity.");
+          }
+          managed.childIdentity = identity;
+          managed.groupId = identity.groupId;
           await this.writeLedgerEntry(managed);
         }
         if (managed.aborted) {
           this.terminate(managed);
           await this.awaitExit(managed);
         } else {
+          // The shell waits on this private stdin gate. No configured command
+          // can run until its exact worker identity and temporary home are
+          // durably persisted above.
+          managed.child?.stdin?.end("start\n");
           await this.waitForReady(managed);
         }
       }
     } catch (error) {
-      await this.finalize(managed, "failed", `The preview could not start: ${redactSensitiveText((error as Error).message)}`);
+      const message = `The preview could not start: ${redactSensitiveText((error as Error).message)}`;
+      if (managed.child) {
+        // A child that failed before the durable identity write is still ours
+        // in this runtime and is still blocked on the private stdin gate. Reap
+        // its process group and observe exit before clearing the pre-start
+        // ledger entry; never leave a gated shell behind.
+        managed.aborted = true;
+        managed.snapshot.state = "stopping";
+        managed.snapshot.message = message;
+        this.terminate(managed);
+        await this.awaitExit(managed);
+        managed.snapshot.state = "failed";
+      } else {
+        await this.finalize(managed, "failed", message);
+      }
     }
 
     const snapshot = cloneInstance(managed.snapshot);
@@ -367,7 +414,7 @@ export class TaskPreviewManager {
     }
     const state = managed.snapshot.state;
     if (state === "stopped" || state === "failed") {
-      return { ok: true, instance: cloneInstance(managed.snapshot) };
+      return this.reportStopOutcome(managed);
     }
     if (state === "stopping") {
       await this.awaitExit(managed);
@@ -389,32 +436,6 @@ export class TaskPreviewManager {
     return this.reportStopOutcome(managed);
   }
 
-  /**
-   * Confirms the loopback listener owned by the managed child's process group is
-   * gone. After the group is signaled and its leader's exit is observed, no
-   * descendant should still hold the port. A foreign listener that happens to
-   * occupy the port is not ours and does not block a successful stop.
-   */
-  private async confirmOwnedListenerGone(managed: ManagedPreview): Promise<boolean> {
-    if (process.platform === "win32" || managed.groupId === undefined || !managed.snapshot.port) {
-      return true;
-    }
-    const deadline = Date.now() + Math.min(this.exitWaitMs, 3_000);
-    while (Date.now() < deadline) {
-      // Cheap proof first: if the child's whole process group is gone, no member
-      // of it can still hold the port, so the owned listener is provably gone
-      // without paying for an `lsof` scan on the common stop path.
-      if (!processGroupExists(managed.groupId)) {
-        return true;
-      }
-      if ((await classifyPortListener(managed.snapshot.port, managed.groupId)) !== "owned") {
-        return true;
-      }
-      await sleep(this.pollIntervalMs);
-    }
-    return !processGroupExists(managed.groupId) || (await classifyPortListener(managed.snapshot.port, managed.groupId)) !== "owned";
-  }
-
   status(id: string): PreviewInstance | undefined {
     const managed = this.instances.get(id);
     return managed ? cloneInstance(managed.snapshot) : undefined;
@@ -434,20 +455,18 @@ export class TaskPreviewManager {
     await Promise.all(open.map((managed) => this.stop(managed.snapshot.id, reason).catch(() => undefined)));
   }
 
-  /**
-   * Reconciles the persisted pid ledger after a restart. A recorded pid is
-   * signaled only when its current command line still identifies it as the
-   * spawned preview (per-instance marker or the exact recorded command);
-   * anything else is left untouched and dropped from the ledger.
-   */
+  /** Reconciles persisted previews using the same pid/start-time/command/group identity as task recovery. */
   async reconcile(): Promise<string[]> {
     const notes: string[] = [];
     const ledger = await this.loadLedger();
     if (ledger.previews.length === 0) {
       return notes;
     }
-    if (process.platform === "win32") {
-      notes.push("Preview reconciliation is unsupported on Windows; clearing the ledger without signaling.");
+    if (this.platform === "win32") {
+      notes.push("Preview reconciliation is unsupported on Windows; clearing only validated temporary homes and ledger metadata.");
+      for (const entry of ledger.previews) {
+        if (entry.tempHome) await rm(entry.tempHome, { force: true, recursive: true }).catch(() => undefined);
+      }
       await this.mutateLedger((state) => {
         state.previews = [];
       });
@@ -456,21 +475,35 @@ export class TaskPreviewManager {
 
     for (const entry of [...ledger.previews]) {
       if (entry.pid === undefined) {
-        notes.push(`Preview ${entry.id} has no recorded pid; dropped without signaling.`);
+        notes.push(`Preview ${entry.id} never recorded a worker; clearing its gated pre-start state without signaling.`);
+      } else if (!entry.childIdentity || entry.childIdentity.pid !== entry.pid) {
+        notes.push(
+          `Preview ${entry.id} has no complete durable process identity; refusing to signal pid ${entry.pid} and keeping its ledger entry.`
+        );
+        continue;
       } else {
-        const commandLine = await processCommandLine(entry.pid);
-        if (commandLine === undefined) {
-          notes.push(`Preview ${entry.id} (pid ${entry.pid}) already exited.`);
-        } else if (commandLine.includes(entry.marker) || commandLine.includes(entry.command)) {
-          const gone = await this.killOrphan(entry.pid);
-          if (gone) {
-            notes.push(`Stopped orphaned preview ${entry.id} (pid ${entry.pid}) for task ${entry.taskId}.`);
-          } else {
-            notes.push(`Could not confirm exit of orphaned preview ${entry.id} (pid ${entry.pid}); keeping its ledger entry.`);
-            continue;
-          }
-        } else {
-          notes.push(`Pid ${entry.pid} no longer belongs to preview ${entry.id}; left untouched.`);
+        const outcome = await terminateOrphanedChild(entry.childIdentity, {
+          gracePeriodMs: this.sigkillDelayMs,
+          killWaitMs: Math.max(0, this.exitWaitMs - this.sigkillDelayMs),
+          pollIntervalMs: this.pollIntervalMs
+        });
+        if (outcome === "kill-unconfirmed" || outcome === "unverifiable") {
+          notes.push(`Could not confirm cleanup of preview ${entry.id} (pid ${entry.pid}; ${outcome}); keeping its ledger entry.`);
+          continue;
+        }
+        notes.push(
+          outcome === "not-ours"
+            ? `Pid ${entry.pid} no longer belongs to preview ${entry.id}; it was left untouched and stale metadata was cleared.`
+            : `Reconciled preview ${entry.id} for task ${entry.taskId}: ${outcome}.`
+        );
+      }
+      if (entry.tempHome) {
+        try {
+          assertManagedTempHome(entry.tempHome);
+          await rm(entry.tempHome, { force: true, recursive: true });
+        } catch (error) {
+          notes.push(`Could not remove the isolated home for preview ${entry.id}; keeping its ledger entry: ${(error as Error).message}`);
+          continue;
         }
       }
       await this.mutateLedger((state) => {
@@ -502,17 +535,24 @@ export class TaskPreviewManager {
 
     const shellArguments = process.platform === "win32"
       ? ["/d", "/s", "/c", managed.snapshot.command.command]
-      : ["-c", managed.snapshot.command.command, previewMarker(managed.snapshot.id)];
+      : [
+          "-c",
+          `IFS= read -r _devbot_gate || exit 125\n${managed.snapshot.command.command}`,
+          previewMarker(managed.snapshot.id)
+        ];
     const child = spawn(this.shell, shellArguments, {
       cwd: managed.snapshot.workspacePath,
       env: environment,
       detached: process.platform !== "win32",
       windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"]
     });
     managed.child = child;
     managed.snapshot.pid = child.pid;
-    if (process.platform !== "win32" && child.pid !== undefined) {
+    if (child.pid !== undefined && this.platform !== "win32") {
+      // `detached: true` makes the spawned shell its process-group leader. Keep
+      // this in-memory handle immediately so even a failure while capturing or
+      // persisting the stronger restart identity can reap the still-gated shell.
       managed.groupId = child.pid;
     }
 
@@ -521,6 +561,9 @@ export class TaskPreviewManager {
     };
     child.stdout?.on("data", appendOutput);
     child.stderr?.on("data", appendOutput);
+    child.stdin?.on("error", (error) => {
+      if (!managed.exitObserved) managed.snapshot.message = `The preview start gate failed: ${redactSensitiveText(error.message)}`;
+    });
 
     managed.exitPromise = new Promise((resolve) => {
       let settled = false;
@@ -683,13 +726,31 @@ export class TaskPreviewManager {
       this.pruneFinished();
       return;
     }
-    await this.mutateLedger((ledger) => {
-      ledger.previews = ledger.previews.filter((entry) => entry.id !== managed.snapshot.id);
-    }).catch(() => undefined);
     if (managed.tempHome) {
-      await rm(managed.tempHome, { force: true, recursive: true }).catch(() => undefined);
-      delete managed.tempHome;
+      try {
+        assertManagedTempHome(managed.tempHome);
+        await rm(managed.tempHome, { force: true, recursive: true });
+        delete managed.tempHome;
+      } catch (error) {
+        managed.snapshot.message = redactSensitiveText(
+          `The preview process stopped, but its isolated home could not be removed; durable cleanup is retained: ${(error as Error).message}`
+        );
+        this.pruneFinished();
+        return;
+      }
     }
+    try {
+      await this.mutateLedger((ledger) => {
+        ledger.previews = ledger.previews.filter((entry) => entry.id !== managed.snapshot.id);
+      });
+    } catch (error) {
+      managed.snapshot.message = redactSensitiveText(
+        `The preview process stopped, but durable cleanup state could not be cleared: ${(error as Error).message}`
+      );
+      this.pruneFinished();
+      return;
+    }
+    managed.cleanupConfirmed = true;
     this.pruneFinished();
   }
 
@@ -755,34 +816,16 @@ export class TaskPreviewManager {
         instance: cloneInstance(managed.snapshot)
       };
     }
-    if (!(await this.confirmOwnedListenerGone(managed))) {
+    if (!managed.cleanupConfirmed) {
       return {
         ok: false,
         message:
           managed.snapshot.message ??
-          "The preview process exited but a loopback listener it owned is still bound; the stop is not yet confirmed.",
+          "The preview process exited, but process-group, listener, or durable resource cleanup is not yet confirmed.",
         instance: cloneInstance(managed.snapshot)
       };
     }
     return { ok: true, instance: cloneInstance(managed.snapshot) };
-  }
-
-  private async killOrphan(pid: number): Promise<boolean> {
-    signalPreviewProcess(pid, "SIGTERM");
-    const deadline = Date.now() + this.exitWaitMs;
-    let escalated = false;
-    const killAt = Date.now() + this.sigkillDelayMs;
-    while (Date.now() < deadline) {
-      if (!processExists(pid)) {
-        return true;
-      }
-      if (!escalated && Date.now() >= killAt) {
-        escalated = true;
-        signalPreviewProcess(pid, "SIGKILL");
-      }
-      await sleep(this.pollIntervalMs);
-    }
-    return !processExists(pid);
   }
 
   private pruneFinished(): void {
@@ -806,6 +849,8 @@ export class TaskPreviewManager {
         port: managed.snapshot.port,
         origin: managed.snapshot.origin,
         ...(managed.snapshot.pid !== undefined ? { pid: managed.snapshot.pid } : {}),
+        ...(managed.childIdentity ? { childIdentity: managed.childIdentity } : {}),
+        ...(managed.tempHome ? { tempHome: managed.tempHome } : {}),
         createdAt: managed.snapshot.startedAt,
         expiresAt: managed.snapshot.expiresAt
       };
@@ -900,6 +945,9 @@ function normalizeLedgerEntry(value: unknown): PreviewLedgerEntry | undefined {
     return undefined;
   }
   const pid = typeof entry.pid === "number" && Number.isSafeInteger(entry.pid) && entry.pid > 0 ? entry.pid : undefined;
+  const parsedChildIdentity = normalizePreviewChildIdentity(entry.childIdentity);
+  const childIdentity = parsedChildIdentity && parsedChildIdentity.pid === pid ? parsedChildIdentity : undefined;
+  const tempHome = typeof entry.tempHome === "string" && isManagedTempHome(entry.tempHome) ? path.resolve(entry.tempHome) : undefined;
   return {
     id: entry.id,
     taskId: entry.taskId,
@@ -910,6 +958,8 @@ function normalizeLedgerEntry(value: unknown): PreviewLedgerEntry | undefined {
     port: entry.port,
     origin: entry.origin,
     ...(pid !== undefined ? { pid } : {}),
+    ...(childIdentity ? { childIdentity } : {}),
+    ...(tempHome ? { tempHome } : {}),
     createdAt: typeof entry.createdAt === "string" ? entry.createdAt : new Date(0).toISOString(),
     expiresAt: typeof entry.expiresAt === "string" ? entry.expiresAt : new Date(0).toISOString()
   };
@@ -917,6 +967,50 @@ function normalizeLedgerEntry(value: unknown): PreviewLedgerEntry | undefined {
 
 function previewMarker(id: string): string {
   return `devbot-preview-${id}`;
+}
+
+function normalizePreviewChildIdentity(value: unknown): ExecutionChildIdentity | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const child = value as Partial<ExecutionChildIdentity>;
+  if (
+    typeof child.pid !== "number" ||
+    !Number.isSafeInteger(child.pid) ||
+    child.pid <= 0 ||
+    typeof child.groupId !== "number" ||
+    !Number.isSafeInteger(child.groupId) ||
+    child.groupId !== child.pid ||
+    typeof child.startedAt !== "string" ||
+    !child.startedAt.trim() ||
+    typeof child.command !== "string" ||
+    !child.command.trim()
+  ) {
+    return undefined;
+  }
+  return {
+    pid: child.pid,
+    groupId: child.groupId,
+    startedAt: child.startedAt.trim(),
+    command: child.command.trim()
+  };
+}
+
+function isManagedTempHome(candidate: string): boolean {
+  const resolved = path.resolve(candidate);
+  const tempRoot = path.resolve(tmpdir());
+  const relative = path.relative(tempRoot, resolved);
+  return (
+    relative !== "" &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative) &&
+    path.basename(resolved).startsWith("devbot-preview-home-")
+  );
+}
+
+function assertManagedTempHome(candidate: string): void {
+  if (!isManagedTempHome(candidate)) {
+    throw new Error(`Refusing to remove a preview home outside the managed temp namespace: ${candidate}`);
+  }
 }
 
 function newPreviewId(): string {
@@ -964,20 +1058,9 @@ function signalPreviewProcess(pid: number, signal: NodeJS.Signals): void {
       process.kill(-pid, signal);
     }
   } catch {
-    try {
-      process.kill(pid, signal);
-    } catch {
-      // Process already exited.
-    }
-  }
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    // A detached preview is its process-group leader. Never fall back to the
+    // positive pid after a failed group signal: the group may have vanished
+    // and that numeric pid may already belong to an unrelated process.
   }
 }
 
@@ -1066,18 +1149,14 @@ async function processGroupId(pid: number): Promise<number | undefined> {
   }
 }
 
-async function processCommandLine(pid: number): Promise<string | undefined> {
-  try {
-    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "command="], {
-      env: minimalChildEnvironment(),
-      maxBuffer: 1_000_000,
-      timeout: 10_000
-    });
-    const commandLine = stdout.trim();
-    return commandLine || undefined;
-  } catch {
-    return undefined;
-  }
+async function capturePreviewIdentity(pid: number, pollIntervalMs: number): Promise<ExecutionChildIdentity | undefined> {
+  const deadline = Date.now() + 2_000;
+  do {
+    const identity = await captureChildIdentity(pid);
+    if (identity) return identity;
+    await sleep(pollIntervalMs);
+  } while (Date.now() < deadline);
+  return undefined;
 }
 
 async function readPackageScripts(workspacePath: string): Promise<Record<string, unknown> | undefined> {

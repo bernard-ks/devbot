@@ -132,10 +132,10 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/task status id:<task-id>`: Alias for showing one saved task.
 - `/task logs id:<task-id>`: Show the saved request, result preview, and error text.
 - `/task cancel id:<task-id>`: Mark a running saved task as canceled in local history.
-- `/task retry id:<task-id>`: Retry a saved task with the same project, mode, text, and include patterns.
+- `/task retry id:<task-id>`: Retry a failed, canceled, or interrupted saved task with the same project, mode, text, and include patterns.
 - `/task freshness project:<name> limit:<optional>`: Show merged state and behind/ahead counts for saved task branches against the project's local default branch. Branches that are fully merged are marked durably on the task record and flagged as prune-eligible worktrees.
 - `/task sync task:<task-id>`: Rebase one task branch onto the current local default branch inside its isolated worktree. Available to the task requester, the owner, or an approved controller; blocked by safe mode and while the task is still open. The pre-sync tip is preserved under `refs/devbot/backup/<task-id>` first, conflicts abort with the branch restored and the conflicted files reported, and configured validation runs afterwards for controllers with results reported as-is.
-- `/task preview task:<task-id> action:<start|stop|status>`: Start, stop, or inspect a managed dev server for the task's isolated worktree. The server runs only the project's configured `dev`/`preview`/`serve`/`start` preset or an allow-listed package.json script, binds to a loopback origin (`http://127.0.0.1:<ephemeral port>`) on the machine running Devbot, and stops automatically after its TTL. It is not a public tunnel and is reachable only from that machine. Only the task requester, the owner, or an approved controller can manage a preview; safe mode blocks starting one but never stopping it. Missing dependencies fail closed; Devbot does not install them.
+- `/task preview task:<task-id> action:<start|stop|status>`: Start, stop, or inspect a managed dev server for the task's isolated worktree. The server runs only the project's configured `dev`/`preview`/`serve`/`start` preset or an allow-listed package.json script, binds to a loopback origin (`http://127.0.0.1:<ephemeral port>`) on the machine running Devbot, and stops automatically after its TTL. It is not a public tunnel and is reachable only from that machine. Only the owner or an approved controller can start one; the task requester may inspect or stop it. Safe mode blocks starting one but never stopping it. Missing dependencies fail closed; Devbot does not install them.
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
 - `/dashboard project:<optional>`: Open the personal interactive workspace with project selection, current status, recent work, and native Ask / Change controls.
 - `/inbox project:<optional> limit:<optional>`: Open the ephemeral **Needs Me** inbox for pending proposals and decisions, with review controls and refresh.
@@ -183,7 +183,18 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, owner-managed setup in `.devbot/setup.json`, and the running-preview pid ledger in `.devbot/previews.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, `DEVBOT_SETUP_STORE`, or `DEVBOT_PREVIEW_STORE` to use different files; relative paths resolve from the devbot process working directory.
+Task history is stored locally in `.devbot/tasks.json` by default. In-flight execution records live in `.devbot/executions.json`, the managed-preview ledger in `.devbot/previews.json`, per-user project selection in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, and owner-managed setup in `.devbot/setup.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_EXECUTION_STORE`, `DEVBOT_PREVIEW_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, or `DEVBOT_SETUP_STORE` to use different files; relative paths resolve from the devbot process working directory.
+
+## Restart Recovery
+
+While a task runs, Devbot keeps a durable execution record with the task identity, phase, isolated workspace, Discord message references, and the worker process id plus its spawn identity. On startup, Devbot reconciles those records instead of silently closing interrupted work as canceled:
+
+- Each task the previous runtime left running is marked `interrupted`, a distinct honest state rather than `canceled`, with an account of what is known.
+- If the recorded worker process is still running and its spawn identity (pid, kernel start time, and command) still matches, it is stopped with an observed exit (SIGTERM, then SIGKILL) so no unsupervised writer stays alive. A pid alone is never trusted; a pid whose identity no longer matches is never signaled.
+- The original task message is edited in place, in the task's original audience only, to say the bot restarted mid-task, with **Retry** and **Dismiss** controls. Retry goes back through the normal authorization, safe-mode, and isolation checks, and reuses the preserved isolated worktree when its branch identity still verifies; otherwise a fresh worktree is created. Only the requester or an approved controller can retry or dismiss interrupted work, and safe mode blocks retrying write-capable tasks.
+- The isolated worktree and branch from the interrupted run are preserved as evidence, subject to the normal worktree retention cap.
+
+Model work is not resumed or re-attached: an interrupted Codex run is never continued, only the workspace, branch, and task history survive the restart. Corrupt or malformed execution records are quarantined beside the store file and never crash startup.
 
 ## Owner Setup And Visibility
 
