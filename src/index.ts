@@ -86,7 +86,7 @@ import { createReviewPacket, evaluateMergeGates, formatMergeGateResult, formatRe
 import { contextLimitForRoute, routeRequest, type RequestRoute } from "./request-router.js";
 import { publicErrorMessage, redactSensitiveText } from "./security.js";
 import {
-  buildFixTaskPrompt,
+  buildFixTaskPrompt as buildDuelFixTaskPrompt,
   formatDuelIssues,
   formatDuelSummary,
   gatherDuelChangeEvidence,
@@ -3710,7 +3710,7 @@ async function handleDuelControl(interaction: ButtonInteraction, appConfig: AppC
       "Devbot does not create write tasks from duel findings in this stage: the reviewed snapshot cannot yet be reproduced safely for a fix task.",
       "Copy this prompt into a `/do` task (or your own session) to fix the conceded issues:",
       "```",
-      buildFixTaskPrompt(conversation.brief ?? "", conceded).slice(0, 1_800),
+      buildDuelFixTaskPrompt(conversation.brief ?? "", conceded).slice(0, 1_800),
       "```"
     ].join("\n"),
     flags: MessageFlags.Ephemeral
