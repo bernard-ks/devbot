@@ -51,6 +51,13 @@ export interface ProjectWorkSnapshot {
   lastCommit: string;
 }
 
+export function scopeStatusToProject<T extends { projects: ProjectEntry[] }>(
+  appConfig: T,
+  project: ProjectEntry
+): Omit<T, "projects"> & { projects: ProjectEntry[] } {
+  return { ...appConfig, projects: [project] };
+}
+
 export function filterWorkForProjects(activeWork: ActiveWork[], projects: ProjectEntry[]): ActiveWork[] {
   const visibleProjectNames = new Set(projects.map((project) => project.name));
   return activeWork.filter((work) => visibleProjectNames.has(work.projectName));
@@ -175,7 +182,7 @@ function modelTierName(tier: ModelTier): "Luna" | "Terra" | "Sol" {
 }
 
 function formatProjectSnapshot(snapshot: ProjectWorkSnapshot): string {
-  const statusUnavailable = snapshot.status.startsWith("Unable to read status:");
+  const statusUnavailable = isProjectSnapshotUnavailable(snapshot);
   const branch = snapshot.branch === "unknown" ? "branch unknown" : `branch \`${inlineCode(snapshot.branch)}\``;
   const lastCommit = snapshot.lastCommit === "unknown"
     ? "last commit unavailable"
@@ -224,6 +231,13 @@ function formatRisks(activeWork: ActiveWork[], snapshots: ProjectWorkSnapshot[],
   }
 
   for (const snapshot of snapshots) {
+    if (isProjectSnapshotUnavailable(snapshot)) {
+      risks.push(
+        `- Repository risk: \`${inlineCode(snapshot.projectName)}\` state is unavailable, so Devbot cannot assess changes or readiness.`
+      );
+      continue;
+    }
+
     const paths = changedPaths(snapshot.status);
     if (paths.length > 0 && snapshot.branch === snapshot.defaultBranch) {
       risks.push(
@@ -248,6 +262,11 @@ function formatNextStep(
   const overlappingProject = findOverlappingProject([...botWork, ...externalRuns, ...openSessions]);
   if (overlappingProject) {
     return `Pause new work on \`${inlineCode(overlappingProject)}\` and get a checkpoint from each context: \`completed / in progress / blocked / next\`.`;
+  }
+
+  const unavailableSnapshot = snapshots.find(isProjectSnapshotUnavailable);
+  if (unavailableSnapshot) {
+    return `Fix the project path or Git access for \`${inlineCode(unavailableSnapshot.projectName)}\`, then run \`/status project:${inlineCode(unavailableSnapshot.projectName)}\` again before assigning work.`;
   }
 
   const oldestSession = [...openSessions].sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime())[0];
@@ -301,6 +320,10 @@ function changedPaths(status: string): string[] {
     .split(/\r?\n/)
     .map((line) => line.length >= 4 ? line.slice(3).trim() : "")
     .filter(Boolean);
+}
+
+function isProjectSnapshotUnavailable(snapshot: ProjectWorkSnapshot): boolean {
+  return snapshot.status.startsWith("Unable to read status:");
 }
 
 function formatChangedPath(value: string): string {

@@ -64,7 +64,14 @@ import {
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskStatus } from "./task-store.js";
 import { parseTaskControl, taskControlRow, type TaskControlAction } from "./task-controls.js";
-import { filterWorkForProjects, findExternalCodexWork, formatWorkStatus, WorkTracker, type ProjectWorkSnapshot } from "./work-status.js";
+import {
+  filterWorkForProjects,
+  findExternalCodexWork,
+  formatWorkStatus,
+  scopeStatusToProject,
+  WorkTracker,
+  type ProjectWorkSnapshot
+} from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
 import { applySetupState, captureBootstrapConfig, isSetupController } from "./runtime-setup.js";
 import { clearRuntimeLock, markRuntimeRunning, runtimeLockPath } from "./runtime-lock.js";
@@ -2468,7 +2475,7 @@ async function maybeHandlePeerMessage(message: Message, appConfig: AppConfig): P
   }
 
   if (envelope.action === "status") {
-    const status = await getStatusSnapshotResponse(appConfig, false, project, envelope.target ?? "");
+    const status = await getStatusSnapshotResponse(scopeStatusToProject(appConfig, project), false, project, envelope.target ?? "");
     const result = createPeerEnvelope({
       type: "devbot.peer.result",
       requestId: envelope.requestId,
@@ -2609,7 +2616,12 @@ async function maybeHandleCollabPeerMessage(
   }
 
   if (envelope.capability === "status.read") {
-    const status = await getStatusSnapshotResponse(appConfig, false, project, String(envelope.payload.target ?? ""));
+    const status = await getStatusSnapshotResponse(
+      scopeStatusToProject(appConfig, project),
+      false,
+      project,
+      String(envelope.payload.target ?? "")
+    );
     await replyWithCollabResult(message, appConfig, envelope, true, status.content);
     return;
   }

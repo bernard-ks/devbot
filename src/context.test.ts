@@ -44,7 +44,7 @@ import { renderStatusImage } from "./status-image.js";
 import { TaskStore } from "./task-store.js";
 import { parseTaskControl, taskControlRow } from "./task-controls.js";
 import type { ProjectEntry } from "./types.js";
-import { filterWorkForProjects, formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
+import { filterWorkForProjects, formatWorkStatus, parseExternalCodexWork, scopeStatusToProject, WorkTracker } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
 
 const scanner = {
@@ -326,6 +326,31 @@ test("work status reports empty and active Codex work", () => {
   ]);
   assert.match(dirtyDefaultBranch, /Branch risk: `webapp` has uncommitted work on its default branch `main`/);
   assert.match(dirtyDefaultBranch, /`\/review packet project:webapp`/);
+
+  const unavailableRepository = formatWorkStatus([], new Date("2026-06-23T20:01:05.000Z"), [
+    {
+      projectName: "webapp",
+      branch: "unknown",
+      defaultBranch: "main",
+      status: "Unable to read status: not a git repository",
+      diffStat: "",
+      lastCommit: "unknown"
+    }
+  ]);
+  assert.match(unavailableRepository, /Repository risk: `webapp` state is unavailable/);
+  assert.match(unavailableRepository, /Fix the project path or Git access for `webapp`/);
+  assert.doesNotMatch(unavailableRepository, /Ready for the next assignment/);
+});
+
+test("peer status scopes app configuration to the authorized project", () => {
+  const webapp = project("webapp", "/tmp/webapp");
+  const privateApi = project("private-api", "/tmp/private-api");
+  const config = { projects: [webapp, privateApi], marker: "preserved" };
+
+  const scoped = scopeStatusToProject(config, webapp);
+  assert.deepEqual(scoped.projects.map((item) => item.name), ["webapp"]);
+  assert.equal(scoped.marker, "preserved");
+  assert.equal(config.projects.length, 2);
 });
 
 test("task store persists task lifecycle to disk", async () => {
