@@ -133,21 +133,24 @@ import {
 } from "./intake-controls.js";
 import {
   askReporterFollowup,
-  buildClassificationQuestion,
+  boundEvidence,
   buildReproQuestion,
   buildTriageCard,
   checkIntakeRateLimit,
-  emptyIntakeRateLimitState,
+  classifyIntakeReport,
+  createConcurrencyLimiter,
   INTAKE_CHANNEL_LIMIT,
   INTAKE_USER_LIMIT,
+  isIntakeRecordOpen,
   loggedForTriageReply,
+  mergeIntakeFollowup,
   missingInfoReply,
   normalizeReportSignature,
-  parseClassificationResponse,
+  OPEN_INTAKE_STATUSES,
   parseReproResponse,
+  recordedWithoutDeliveryReply,
   recordIntakeAttempt,
-  type IntakeReproStatus,
-  type IntakeRateLimitState
+  type IntakeReproStatus
 } from "./intake.js";
 import { IntakeStore, type IntakeChannelConfig, type IntakeRecord } from "./intake-store.js";
 import { UserPreferenceStore } from "./user-preferences.js";
@@ -225,7 +228,8 @@ const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefin
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
 const intakeStore = new IntakeStore(process.env.DEVBOT_INTAKE_STORE?.trim() || undefined);
-const intakeRateLimits = new Map<string, IntakeRateLimitState>();
+const intakeCodexGate = createConcurrencyLimiter(1);
+const INTAKE_MAX_CONTEXT_CHARS = 8_000;
 const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
 const activeWorkroomActions = new Set<string>();
@@ -234,8 +238,9 @@ const verifiedProjectRoomAudiences = new Map<string, number>();
 let slashCommandsReady = false;
 const runtimePidFile = runtimeLockPath(process.env.DEVBOT_RUNTIME_LOCK);
 markRuntimeRunning(runtimePidFile);
+const messageContentIntentEnabled = process.env.DEVBOT_MESSAGE_CONTENT_INTENT?.trim().toLowerCase() === "true";
 const gatewayIntents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
-if (process.env.DEVBOT_MESSAGE_CONTENT_INTENT?.trim().toLowerCase() === "true") {
+if (messageContentIntentEnabled) {
   gatewayIntents.push(GatewayIntentBits.MessageContent);
 }
 const client = new Client({
@@ -1411,6 +1416,7 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
   const backendReady = Boolean(activeBackend?.installed && activeBackend.compatible);
   const answerReadOnly = activeBackend ? activeBackend.capabilities.enforcesAnswerReadOnly : true;
   const actionConfined = activeBackend ? activeBackend.capabilities.confinesActionWorkspace : true;
+  const intakeConfigured = Boolean((await intakeStore.snapshot()).channel);
   const checks = [
     [Boolean(appConfig.ownerUserId), "Owner identity", "Set DEVBOT_OWNER_USER_ID locally and restart."],
     [Boolean(effectivePrivateRoomId()), "Private room", "Run /setup wizard and choose Use private room."],
@@ -1419,7 +1425,12 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
     [answerReadOnly, `Read-only answers (${activeBackendId})`, "This backend cannot guarantee read-only /ask runs; switch to codex or claude with /setup backend."],
     [actionConfined, `Workspace-confined actions (${activeBackendId})`, "This backend cannot confine /do writes to the task workspace; switch to codex with /setup backend."],
     [appConfig.routing.enabled && Boolean(appConfig.routing.fastModel && appConfig.routing.standardModel && appConfig.routing.deepModel), "Luna / Terra / Sol routing", "Check CODEX_ROUTER_MODEL and tier model settings."],
-    [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."]
+    [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."],
+    [
+      !intakeConfigured || messageContentIntentEnabled,
+      "Community intake message content",
+      "Enable the Message Content privileged intent for this bot in the Discord Developer Portal, set DEVBOT_MESSAGE_CONTENT_INTENT=true, and restart."
+    ]
   ] as const;
   const passed = checks.filter(([ready]) => ready).length;
   const backendSummary = backends.length
@@ -5637,15 +5648,60 @@ async function handleIntakeCommand(interaction: ChatInputCommandInteraction, app
     return;
   }
 
-  const channel = interaction.options.getChannel("channel", true);
+  if (!messageContentIntentEnabled) {
+    await interaction.editReply(
+      [
+        "Community intake needs ordinary messages, which requires the privileged Message Content intent — currently off.",
+        "1. In the Discord Developer Portal, enable \"Message Content Intent\" for this bot.",
+        "2. Set `DEVBOT_MESSAGE_CONTENT_INTENT=true` locally.",
+        "3. Restart Devbot, then run `/intake set` again."
+      ].join("\n")
+    );
+    return;
+  }
+
+  const selectedChannel = interaction.options.getChannel("channel", true);
   const projectName = interaction.options.getString("project", true);
   const project = findProject(appConfig.projects, projectName);
   if (!project) {
     await interaction.editReply(`Unknown project: \`${projectName}\`.`);
     return;
   }
-  if (channel.type !== ChannelType.GuildText) {
+  if (selectedChannel.type !== ChannelType.GuildText) {
     await interaction.editReply("Choose a standard text channel for the intake channel.");
+    return;
+  }
+  const setupState = setupStore.snapshot();
+  if (selectedChannel.id === effectivePrivateRoomId() || Object.values(setupState.projectRoomIds).includes(selectedChannel.id)) {
+    await interaction.editReply(
+      "Choose a separate public channel; the private Devbot room and project rooms cannot also be the intake channel."
+    );
+    return;
+  }
+
+  const channel = interaction.guild ? await interaction.guild.channels.fetch(selectedChannel.id).catch(() => null) : null;
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    await interaction.editReply("That channel could not be verified. Choose a standard server text channel.");
+    return;
+  }
+  if (!isPubliclyVisibleChannel(channel)) {
+    await interaction.editReply(
+      "That channel denies `View Channel` to `@everyone`, so it is not actually public. Choose a channel the community can see, or use `/setup project-room` for a private workroom instead."
+    );
+    return;
+  }
+  const missingPermissions = missingBotChannelPermissions(channel);
+  if (missingPermissions.length > 0) {
+    await interaction.editReply(`Devbot is missing permissions in that channel: ${missingPermissions.join(", ")}. Grant them and try again.`);
+    return;
+  }
+  const deliveryRoomId = await resolveIntakeDeliveryRoomId(project);
+  if (!deliveryRoomId) {
+    await interaction.editReply(
+      hasProjectAudienceRestriction(project)
+        ? `\`${project.name}\` has a scoped audience but no bound ambient room. Run \`/setup project-room\` to bind one before enabling intake for it.`
+        : "Devbot has no verified private room yet. Run `/setup wizard` first so triage cards have somewhere authorized to go."
+    );
     return;
   }
 
@@ -5653,10 +5709,52 @@ async function handleIntakeCommand(interaction: ChatInputCommandInteraction, app
   await interaction.editReply(
     [
       `Community bug intake is on in <#${channel.id}> for project \`${project.name}\`.`,
+      `Triage cards will be delivered to <#${deliveryRoomId}>.`,
       `Rate limits: ${INTAKE_USER_LIMIT} reports/hour per user, ${INTAKE_CHANNEL_LIMIT} reports/hour channel-wide.`,
-      "Complete reports get a read-only repro attempt, then a triage card in this private room."
+      "Complete reports get a read-only repro attempt, then a triage card in that room."
     ].join("\n")
   );
+}
+
+function isPubliclyVisibleChannel(channel: GuildTextBasedChannel): boolean {
+  if (channel.type !== ChannelType.GuildText) {
+    return false;
+  }
+  const everyone = channel.permissionOverwrites.cache.get(channel.guild.roles.everyone.id);
+  return !everyone?.deny.has(PermissionFlagsBits.ViewChannel);
+}
+
+function missingBotChannelPermissions(channel: GuildTextBasedChannel): string[] {
+  const required = [
+    { flag: PermissionFlagsBits.ViewChannel, label: "View Channel" },
+    { flag: PermissionFlagsBits.SendMessages, label: "Send Messages" },
+    { flag: PermissionFlagsBits.ReadMessageHistory, label: "Read Message History" },
+    { flag: PermissionFlagsBits.AddReactions, label: "Add Reactions" }
+  ] as const;
+  const me = channel.guild.members.me;
+  const permissions = me ? channel.permissionsFor(me) : null;
+  if (!permissions) {
+    return required.map((entry) => entry.label);
+  }
+  return required.filter((entry) => !permissions.has(entry.flag)).map((entry) => entry.label);
+}
+
+/**
+ * Triage cards must land only where the project's own audience is
+ * authorized to see them: a verified room bound to this project, or (only
+ * when the project has no scoped audience of its own) the global private
+ * room. Returns undefined when neither destination is safely verified.
+ */
+async function resolveIntakeDeliveryRoomId(project: ProjectEntry): Promise<string | undefined> {
+  const state = setupStore.snapshot();
+  const boundRoomId = state.projectRoomIds[project.name];
+  if (boundRoomId) {
+    return (await isConfiguredRoomId(boundRoomId)) ? boundRoomId : undefined;
+  }
+  if (hasProjectAudienceRestriction(project)) {
+    return undefined;
+  }
+  return effectivePrivateRoomId();
 }
 
 async function formatIntakeStatus(): Promise<string> {
@@ -5664,16 +5762,26 @@ async function formatIntakeStatus(): Promise<string> {
   if (!state.channel) {
     return "Community bug intake is off. Run `/intake set` to designate a channel and project.";
   }
+  const project = findProject(config.projects, state.channel.projectName);
+  const deliveryRoomId = project ? await resolveIntakeDeliveryRoomId(project) : undefined;
   const recent = await intakeStore.listRecent(5);
   const lines = [
     `Community bug intake is on in <#${state.channel.channelId}> for project \`${state.channel.projectName}\`.`,
+    deliveryRoomId
+      ? `Triage delivery room: <#${deliveryRoomId}>.`
+      : "Triage delivery room: none verified right now — reports are recorded but not delivered. Check /setup.",
     `Rate limits: ${INTAKE_USER_LIMIT} reports/hour per user, ${INTAKE_CHANNEL_LIMIT} reports/hour channel-wide.`
   ];
   if (recent.length > 0) {
     lines.push(
       "",
       "Recent reports:",
-      recent.map((record) => `- \`${record.id}\` ${record.status} by ${record.authorTag}: ${truncateForLog(record.text)}`).join("\n")
+      recent
+        .map(
+          (record) =>
+            `- \`${record.id}\` ${record.status}${record.triageMessageId ? "" : " (not delivered)"} by ${record.authorTag}: ${truncateForLog(record.text)}`
+        )
+        .join("\n")
     );
   }
   return lines.join("\n");
@@ -5686,102 +5794,147 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
     return;
   }
 
-  const now = Date.now();
-  const limitState = intakeRateLimits.get(message.channelId) ?? emptyIntakeRateLimitState();
-  const check = checkIntakeRateLimit(limitState, message.author.id, now);
-  intakeRateLimits.set(message.channelId, recordIntakeAttempt(limitState, message.author.id, now));
-  if (check.limited) {
-    await message.react("⏳").catch(() => undefined);
-    return;
+  // A reply to Devbot's own "need more detail" prompt continues the same report instead of
+  // spending another rate-limit slot on what is really one bug report split across messages.
+  const referencedMessageId = message.reference?.messageId;
+  const followupOf = referencedMessageId ? await intakeStore.findByFollowupPrompt(referencedMessageId) : undefined;
+
+  if (!followupOf) {
+    const now = Date.now();
+    const limitState = await intakeStore.getRateLimitState(message.channelId);
+    const check = checkIntakeRateLimit(limitState, message.author.id, now);
+    await intakeStore.setRateLimitState(message.channelId, recordIntakeAttempt(limitState, message.author.id, now));
+    if (check.limited) {
+      await message.react("⏳").catch(() => undefined);
+      return;
+    }
   }
 
   await message.react("👀").catch(() => undefined);
 
-  let classification;
-  try {
-    const raw = await answerWithProjectContext({
-      codex: appConfig.codex,
-      question: buildClassificationQuestion(message.content),
-      context: { project, files: [], packedText: "" },
-      mode: "answer",
-      contextMode: "none"
-    });
-    classification = parseClassificationResponse(raw);
-  } catch (error) {
-    console.warn(`Intake classification failed: ${(error as Error).message}`);
-    return;
-  }
+  const reportText = followupOf ? mergeIntakeFollowup(followupOf.text, message.content) : message.content;
+  const classification = classifyIntakeReport(reportText);
 
   if (!classification.complete) {
-    await message.reply(missingInfoReply(classification.missing)).catch(() => undefined);
+    const reply = await message.reply(missingInfoReply(classification.missing)).catch(() => undefined);
+    if (followupOf) {
+      await intakeStore.updateRecord(followupOf.id, {
+        text: reportText,
+        ...(reply ? { followupPromptMessageId: reply.id } : { clearFollowupPrompt: true })
+      });
+    } else {
+      const created = await intakeStore.addRecord({
+        channelId: message.channelId,
+        messageId: message.id,
+        authorId: message.author.id,
+        authorTag: message.author.tag,
+        projectName: project.name,
+        text: reportText,
+        signature: normalizeReportSignature(reportText),
+        status: "incomplete"
+      });
+      if (reply) {
+        await intakeStore.updateRecord(created.id, { followupPromptMessageId: reply.id });
+      }
+    }
     return;
   }
 
-  const signature = normalizeReportSignature(message.content);
-  const duplicate = await intakeStore.findRecentBySignature(signature);
+  const signature = normalizeReportSignature(reportText);
+  const duplicate = await intakeStore.findRecentBySignature(signature, followupOf?.id);
 
   let screenshot: ProjectScreenshot | undefined;
-  try {
-    screenshot = await captureProjectScreenshot(project, { requestText: message.content });
-  } catch (error) {
-    console.warn(`Intake screenshot capture failed: ${(error as Error).message}`);
+  if (!isScreenshotBlocked(project) && !screenshotRequiresApproval(project)) {
+    try {
+      // Deliberately no `requestText`: intake capture always shoots the project's own
+      // configured/detected entry point and never lets reporter text pick a path/URL or
+      // click through visible UI, so a public message cannot steer navigation.
+      screenshot = await captureProjectScreenshot(project, { viewport: "desktop" });
+    } catch (error) {
+      console.warn(`Intake screenshot capture failed: ${(error as Error).message}`);
+    }
   }
 
-  const evidence: string[] = [];
+  const rawEvidence: string[] = [];
   if (screenshot) {
-    evidence.push(`Screenshot captured at ${screenshot.url}`);
-    for (const line of screenshot.metadata.consoleErrors) evidence.push(`Console error: ${line}`);
-    for (const line of screenshot.metadata.failedRequests) evidence.push(`Failed request: ${line}`);
-    for (const line of screenshot.metadata.badResponses) evidence.push(`Bad response: ${line}`);
+    rawEvidence.push(`Screenshot captured at ${screenshot.url}`);
+    for (const line of screenshot.metadata.consoleErrors) rawEvidence.push(`Console error: ${line}`);
+    for (const line of screenshot.metadata.failedRequests) rawEvidence.push(`Failed request: ${line}`);
+    for (const line of screenshot.metadata.badResponses) rawEvidence.push(`Bad response: ${line}`);
   }
+  const evidence = boundEvidence(rawEvidence);
 
   let assessment: { status: IntakeReproStatus; evidence: string };
   try {
-    const packed = await contextService.pack(project, message.content);
-    const raw = await answerWithProjectContext({
-      codex: appConfig.codex,
-      question: buildReproQuestion(message.content, evidence),
-      context: packed,
-      mode: "answer",
-      contextMode: "focused"
-    });
+    // Context is capped far below the default packing budget: reporter text may steer which
+    // files get ranked in, but never past a small bounded window, and a dedicated
+    // low-concurrency gate keeps public reports from crowding out owner Codex work.
+    const packed = await contextService.pack(project, reportText, [], INTAKE_MAX_CONTEXT_CHARS);
+    const raw = await intakeCodexGate.run(() =>
+      answerWithProjectContext({
+        codex: appConfig.codex,
+        question: buildReproQuestion(reportText, evidence),
+        context: packed,
+        mode: "answer",
+        contextMode: "focused"
+      })
+    );
     assessment = parseReproResponse(raw);
   } catch (error) {
     console.warn(`Intake repro assessment failed: ${(error as Error).message}`);
     assessment = { status: "needs-info", evidence: "Automated repro assessment failed to run." };
   }
 
-  const record = await intakeStore.addRecord({
-    channelId: message.channelId,
-    messageId: message.id,
-    authorId: message.author.id,
-    authorTag: message.author.tag,
-    projectName: project.name,
-    text: message.content,
-    signature,
-    status: assessment.status,
-    evidence: [...evidence, assessment.evidence],
-    ...(screenshot ? { screenshotUrl: screenshot.url } : {}),
-    ...(duplicate ? { duplicateOfId: duplicate.id } : {})
-  });
+  // The Codex-synthesized assessment sentence goes first so it always survives the cap even
+  // when the automated screenshot diagnostics alone would fill it.
+  const combinedEvidence = boundEvidence([assessment.evidence, ...evidence]);
+  const record = followupOf
+    ? await intakeStore.updateRecord(followupOf.id, {
+        text: reportText,
+        signature,
+        status: assessment.status,
+        evidence: combinedEvidence,
+        ...(screenshot ? { screenshotUrl: screenshot.url } : {}),
+        ...(duplicate ? { duplicateOfId: duplicate.id } : {}),
+        clearFollowupPrompt: true
+      })
+    : await intakeStore.addRecord({
+        channelId: message.channelId,
+        messageId: message.id,
+        authorId: message.author.id,
+        authorTag: message.author.tag,
+        projectName: project.name,
+        text: reportText,
+        signature,
+        status: assessment.status,
+        evidence: combinedEvidence,
+        ...(screenshot ? { screenshotUrl: screenshot.url } : {}),
+        ...(duplicate ? { duplicateOfId: duplicate.id } : {})
+      });
+  if (!record) {
+    console.warn(`Intake report from ${message.author.tag} disappeared before it could be completed.`);
+    return;
+  }
 
-  await message.reply(loggedForTriageReply(assessment.status)).catch(() => undefined);
-  await postIntakeTriageCard(record, duplicate, message, screenshot);
+  const delivered = await postIntakeTriageCard(project, record, duplicate, message, screenshot);
+  await message.reply(delivered ? loggedForTriageReply(assessment.status) : recordedWithoutDeliveryReply(assessment.status)).catch(() => undefined);
 }
 
 async function postIntakeTriageCard(
+  project: ProjectEntry,
   record: IntakeRecord,
   duplicate: IntakeRecord | undefined,
   sourceMessage: Message,
   screenshot: ProjectScreenshot | undefined
-): Promise<void> {
-  const privateChannelId = effectivePrivateRoomId();
-  if (!privateChannelId) {
-    return;
+): Promise<boolean> {
+  const deliveryRoomId = await resolveIntakeDeliveryRoomId(project);
+  if (!deliveryRoomId) {
+    console.warn(`No authorized delivery room is available for intake report ${record.id} on project \`${project.name}\`.`);
+    return false;
   }
-  const channel = await client.channels.fetch(privateChannelId).catch(() => undefined);
+  const channel = await client.channels.fetch(deliveryRoomId).catch(() => undefined);
   if (!channel) {
-    return;
+    return false;
   }
   const payload: { content: string; components: unknown[]; allowedMentions: { parse: [] }; files?: AttachmentBuilder[] } = {
     content: buildTriageCard({ record, ...(duplicate ? { duplicateOf: duplicate } : {}), messageUrl: sourceMessage.url }),
@@ -5795,18 +5948,20 @@ async function postIntakeTriageCard(
     console.warn(`Unable to post intake triage card: ${(error as Error).message}`);
     return undefined;
   })) as { id?: string } | undefined;
-  if (sent?.id) {
-    await intakeStore.updateRecord(record.id, { triageMessageId: sent.id });
+  if (!sent?.id) {
+    return false;
   }
+  await intakeStore.updateRecord(record.id, { triageMessageId: sent.id, triageChannelId: deliveryRoomId });
+  return true;
 }
 
 async function refreshIntakeCard(record: IntakeRecord): Promise<void> {
-  const privateChannelId = effectivePrivateRoomId();
-  if (!privateChannelId || !record.triageMessageId) {
+  const roomId = record.triageChannelId ?? effectivePrivateRoomId();
+  if (!roomId || !record.triageMessageId) {
     return;
   }
   try {
-    const channel = await client.channels.fetch(privateChannelId);
+    const channel = await client.channels.fetch(roomId);
     if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread)) {
       return;
     }
@@ -5816,7 +5971,7 @@ async function refreshIntakeCard(record: IntakeRecord): Promise<void> {
     const messageUrl = `https://discord.com/channels/${message.guildId ?? "@me"}/${record.channelId}/${record.messageId}`;
     await message.edit({
       content: buildTriageCard({ record, ...(duplicate ? { duplicateOf: duplicate } : {}), messageUrl }),
-      components: record.status === "dismissed" || record.status === "accepted" ? [] : [intakeControlRow(record.id)]
+      components: isIntakeRecordOpen(record.status) ? [intakeControlRow(record.id)] : []
     });
   } catch (error) {
     console.warn(`Unable to refresh intake triage card: ${(error as Error).message}`);
@@ -5834,14 +5989,22 @@ async function handleIntakeButton(
     await interaction.reply({ content: "This intake report is no longer in the local store.", flags: MessageFlags.Ephemeral });
     return;
   }
+  const project = findProject(appConfig.projects, record.projectName);
+  if (!project) {
+    await interaction.reply({ content: `Project \`${record.projectName}\` is no longer configured.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!isAllowedForProject(interaction, project)) {
+    await interaction.reply({
+      content: `You are not allowed to use project \`${project.name}\` under its .devbot policy.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
 
   if (action === "accept") {
-    if (record.status === "dismissed" || record.status === "accepted") {
+    if (!isIntakeRecordOpen(record.status)) {
       await interaction.reply({ content: `This report is already ${record.status}.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (!findProject(appConfig.projects, record.projectName)) {
-      await interaction.reply({ content: `Project \`${record.projectName}\` is no longer configured.`, flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.showModal(intakeAcceptModal(record));
@@ -5851,24 +6014,37 @@ async function handleIntakeButton(
   if (action === "ask") {
     await interaction.deferUpdate();
     const channel = await client.channels.fetch(record.channelId).catch(() => undefined);
-    if (channel) {
-      await sendToTextChannel(channel, {
-        content: askReporterFollowup(record.authorId),
-        allowedMentions: { parse: ["users"] }
-      }).catch((error) => console.warn(`Unable to post intake follow-up: ${(error as Error).message}`));
-    }
-    await interaction.followUp({ content: "Posted a follow-up request in the intake channel.", flags: MessageFlags.Ephemeral });
+    const posted = channel
+      ? await sendToTextChannel(channel, {
+          content: askReporterFollowup(record.authorId),
+          allowedMentions: { parse: ["users"] }
+        })
+          .then(() => true)
+          .catch((error) => {
+            console.warn(`Unable to post intake follow-up: ${(error as Error).message}`);
+            return false;
+          })
+      : false;
+    await interaction.followUp({
+      content: posted
+        ? "Posted a follow-up request in the intake channel."
+        : "Could not post the follow-up in the intake channel. Reply there manually.",
+      flags: MessageFlags.Ephemeral
+    });
     return;
   }
 
   await interaction.deferUpdate();
-  if (record.status !== "dismissed" && record.status !== "accepted") {
-    const updated = await intakeStore.updateRecord(recordId, { status: "dismissed" });
-    if (updated) {
-      await refreshIntakeCard(updated);
-    }
+  const dismissed = await intakeStore.transitionStatus(recordId, OPEN_INTAKE_STATUSES, "dismissed");
+  if (dismissed?.ok) {
+    await refreshIntakeCard(dismissed.record);
+    await interaction.followUp({ content: "Dismissed.", flags: MessageFlags.Ephemeral });
+    return;
   }
-  await interaction.followUp({ content: "Dismissed.", flags: MessageFlags.Ephemeral });
+  await interaction.followUp({
+    content: `This report is already ${dismissed?.record.status ?? record.status}.`,
+    flags: MessageFlags.Ephemeral
+  });
 }
 
 async function handleIntakeAcceptModal(interaction: ModalSubmitInteraction, appConfig: AppConfig, recordId: string): Promise<void> {
@@ -5882,8 +6058,11 @@ async function handleIntakeAcceptModal(interaction: ModalSubmitInteraction, appC
     await interaction.reply({ content: `Project \`${record.projectName}\` is no longer configured.`, flags: MessageFlags.Ephemeral });
     return;
   }
-  if (record.status === "dismissed" || record.status === "accepted") {
-    await interaction.reply({ content: `This report is already ${record.status}.`, flags: MessageFlags.Ephemeral });
+  if (!isAllowedForProject(interaction, project)) {
+    await interaction.reply({
+      content: `You are not allowed to use project \`${project.name}\` under its .devbot policy.`,
+      flags: MessageFlags.Ephemeral
+    });
     return;
   }
   if (isWriteBlockedBySafeMode(appConfig, "action")) {
@@ -5891,11 +6070,44 @@ async function handleIntakeAcceptModal(interaction: ModalSubmitInteraction, appC
     return;
   }
 
-  const task = interaction.fields.getTextInputValue("task").trim();
-  const updated = await intakeStore.updateRecord(recordId, { status: "accepted" });
-  if (updated) {
-    await refreshIntakeCard(updated);
+  // Compare-and-set: only one of two racing "Accept" submissions can move the record out of
+  // an open status, so only one can ever reach task creation below.
+  const transition = await intakeStore.transitionStatus(recordId, OPEN_INTAKE_STATUSES, "accepting");
+  if (!transition) {
+    await interaction.reply({ content: "This intake report is no longer in the local store.", flags: MessageFlags.Ephemeral });
+    return;
   }
+  if (!transition.ok) {
+    await interaction.reply({ content: `This report is already ${transition.record.status}.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await refreshIntakeCard(transition.record);
+
+  const task = interaction.fields.getTextInputValue("task").trim();
+  let started;
+  try {
+    started = await taskStore.start({
+      source: `intake:accept:${record.id}`,
+      mode: "action",
+      projectName: project.name,
+      requester: interaction.user.tag,
+      text: task,
+      dedupeKey: `intake-accept:${record.id}`
+    });
+  } catch (error) {
+    const failed = await intakeStore.transitionStatus(recordId, ["accepting"], "accept-failed");
+    if (failed?.ok) {
+      await refreshIntakeCard(failed.record);
+    }
+    await interaction.reply({ content: `Unable to start the task: ${publicErrorMessage(error)}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const accepted = await intakeStore.transitionStatus(recordId, ["accepting"], "accepted", { acceptedTaskId: started.id });
+  if (accepted?.ok) {
+    await refreshIntakeCard(accepted.record);
+  }
+
   await executeInteractionRequest({
     interaction,
     appConfig,
@@ -5905,6 +6117,7 @@ async function handleIntakeAcceptModal(interaction: ModalSubmitInteraction, appC
     mode: "action",
     requester: interaction.user.tag,
     source: `intake:accept:${record.id}`,
+    existingTaskId: started.id,
     ephemeral: false
   });
 }
