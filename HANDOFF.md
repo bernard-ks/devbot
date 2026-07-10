@@ -10,7 +10,7 @@ Branch: `claude/video-proof`
    - `isUiRelatedTask(taskText, changedFiles)`: pure heuristic (UI vocabulary in the task text, or UI-flavored changed file extensions/directories) used to decide whether a completed `/do` task deserves proof capture.
    - `listChangedFiles(project)`: `git diff --name-only HEAD` + untracked files, feeding the heuristic above.
    - `selectRecentFrames` / `computeGifPageLayout` / `buildTimelapseGif`: pure frame-selection and sharp page-layout math, plus the actual animated-GIF composition (verified end-to-end with real sharp-generated frames in tests — produces a valid multi-page `GIF89a` buffer).
-   - Exported two small previously-private helpers from `src/project-screenshot.ts` (`canReach`, `sanitizeFilePart`) for reuse instead of duplicating them.
+   - Exported previously-private helpers from `src/project-screenshot.ts` (`canReach`, `sanitizeFilePart`, `projectScreenshotOrigins`) for reuse instead of duplicating them.
 
 2. **`/clip` command** (`src/commands.ts`, handled in `src/index.ts` near the existing `/snip` handler): `target` (required, natural language or path/URL), optional `project` (autocomplete, reuses the existing `project` autocomplete wiring — no changes needed there since it's keyed by option name), optional `steps` (free-text extra actions). Follows the exact same access pattern as `/snip`: `ensureProjectAccess`, then additionally gated by the existing `screenshotPolicyMessage` (deny/approval project policy), since recording is more sensitive than a single screenshot. Posts the recording (or, on fallback/unavailable, a screenshot or an explicit reason) with metadata: URL, viewport, steps actually performed, console errors seen.
 
@@ -23,7 +23,7 @@ Branch: `claude/video-proof`
 ## Files touched
 - `src/project-video.ts` (new)
 - `src/project-video.test.ts` (new)
-- `src/project-screenshot.ts` (exported `canReach`, `sanitizeFilePart`)
+- `src/project-screenshot.ts` (exported `canReach`, `sanitizeFilePart`, `projectScreenshotOrigins`)
 - `src/commands.ts` (`/clip` command, `/do` `watch` option)
 - `src/index.ts` (`/clip` handler, `executeDoInteraction`, `startWatchSession`, `captureCompletionProof`, `replyWithVideoOutcome`, `formatVideoReply`)
 - `README.md`, `docs/DEVBOT_PRODUCT_PLAN.md`
@@ -43,3 +43,13 @@ I did not start the bot against Discord — verified via `npm test` (build + `no
 - The final `/do` message edit intentionally omits `files` on progress-phase edits (routing/gathering-context/running-codex) so a previously-swapped watch screenshot isn't wiped out early; only actual watch ticks and the final completion edit change attachments.
 - Size-cap fallback-to-screenshot path and the reduced-size retry path are covered by the `decideSizeCap` unit tests and manually reasoned through, but weren't exercised end-to-end with an actual >8MB recording (would require an artificially large capture to trigger in this environment).
 - No changes were made to `mention.ts` / `executeMessageRequest` (the `@devbot do ...` mention path); auto-proof and watch mode are scoped to the `/do` slash command per the brief's explicit wording. If the wave wants parity for mention-triggered action tasks, that would be a follow-up.
+
+## Rebased onto 85e2530 (origin/main, "Add ambient Discord workrooms and security hardening")
+
+`git rebase origin/main` replayed this lane's single commit on top of bernard's merge `85e2530`/`dd0af6b`, which added ambient Discord workrooms + security hardening (deny-by-default `commandRequiresApproval`, per-origin SSRF hardening in `project-screenshot.ts`, new context-menu command, `task-worktree.ts`/`task-access.ts`, etc.). Three files conflicted; all resolved semantically to keep both sides fully working together:
+
+- **`src/project-screenshot.ts`** — one hunk, around `canReach`. Bernard's security hardening changed `canReach` from `export async function canReach(url)` (this lane's version) to a private `canReach(url, allowedOrigins)` that also validates redirect targets against an allowlist (SSRF hardening). Kept bernard's stricter two-argument signature and made it `export` again (needed by `project-video.ts`). Also exported the previously-private `projectScreenshotOrigins(project, projectUrls)` helper so `project-video.ts` can compute the same allowlist bernard's screenshot path uses. Updated `src/project-video.ts`'s `recordAttempt` to build `allowedOrigins` via `projectScreenshotOrigins(project, urls)` and pass it into `canReach(startUrl, allowedOrigins)`, so the video-recording reachability check gets the same origin/SSRF protection as screenshots instead of silently losing it.
+- **`src/commands.ts`** — one hunk at the end of the `/do` subcommand definition. This lane added a `watch` boolean option to `/do`; bernard's side switched the command array to a `satisfies Array<...>` typed literal and appended a new `ContextMenuCommandBuilder` ("Start Devbot workroom") plus moved `commandDefinitions` to a separate exported `.map(...)` line. Resolution: kept the `watch` option on `/do`, then kept bernard's context-menu command and the `satisfies`/`commandDefinitions` structure, so both the new option and the new context menu command are present.
+- **`src/index.ts`** — one hunk in the import block. This lane imported `findProjectWebUrls`/`buildTimelapseGif`/`isUiRelatedTask`/`listChangedFiles`/`recordProjectFlow` from the new `project-video.js`, plus `captureProjectScreenshot`; bernard's side added the `natural-intent.js` import (`buildAgentPrompt`, `classifyNaturalIntent`, `AgentRole`) just above. Resolution: kept both import groups (natural-intent import unchanged, then the screenshot + video imports as this lane had them). No other index.ts hunks conflicted — `executeDoInteraction`, `startWatchSession`, `captureCompletionProof`, and `screenshotPolicyMessage` gating all auto-merged cleanly and did not need edits.
+
+After resolving, `npm run build` was clean (no TypeScript errors) and `npm test` passed 130/130 on the first run (up from this lane's pre-rebase baseline of 86/86 passing; the extra 44 are bernard's new tests for ambient workrooms/security/task-worktree). No flake observed, so no rerun was needed.
