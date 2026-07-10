@@ -85,6 +85,8 @@ import {
   inspectTaskWorktree,
   type TaskWorktree
 } from "./task-worktree.js";
+import { formatQueueDigest, formatQueueList, QueueStore, type QueueItem } from "./queue-store.js";
+import { formatScheduleList, ScheduleStore, type ScheduleEntry } from "./schedule-store.js";
 import {
   parseTaskControl,
   taskActionMatchesState,
@@ -154,6 +156,10 @@ applySetupState(config, bootstrapConfig, setupStore.snapshot());
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
+const queueStore = new QueueStore(process.env.DEVBOT_QUEUE_STORE?.trim() || undefined);
+const scheduleStore = new ScheduleStore(process.env.DEVBOT_SCHEDULE_STORE?.trim() || undefined);
+let queueAdvancing = false;
+let scheduleTimer: ReturnType<typeof setInterval> | undefined;
 const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
@@ -182,6 +188,19 @@ client.once("clientReady", async () => {
     }
   } catch (error) {
     console.warn(`Unable to recover interrupted tasks: ${publicErrorMessage(error)}`);
+  }
+  try {
+    const recoveredQueueItems = await queueStore.recoverInterrupted("Interrupted when Devbot restarted.");
+    if (recoveredQueueItems.length > 0) {
+      console.log(`Recovered ${recoveredQueueItems.length} interrupted queue item${recoveredQueueItems.length === 1 ? "" : "s"} from the previous runtime.`);
+    }
+  } catch (error) {
+    console.warn(`Unable to recover interrupted queue items: ${publicErrorMessage(error)}`);
+  }
+  try {
+    await scheduleStore.reconcileOnBoot();
+  } catch (error) {
+    console.warn(`Unable to reconcile scheduled tasks: ${publicErrorMessage(error)}`);
   }
   if (config.autoDeployCommands && client.application) {
     try {
@@ -226,9 +245,30 @@ client.once("clientReady", async () => {
       console.warn(`Unable to synchronize the workspace launcher: ${publicErrorMessage(error)}`);
     });
   }
+  if (verifiedPrivateRoomId) {
+    await tryPostQueueDigest(config).catch((error) => {
+      console.warn(`Unable to post the recovered queue digest: ${publicErrorMessage(error)}`);
+    });
+    const runner = await queueStore.getRunner();
+    if (runner.running) {
+      void advanceQueue(config).catch((error) => {
+        console.warn(`Queue runner stopped with an error: ${publicErrorMessage(error)}`);
+      });
+    }
+    scheduleTimer = setInterval(() => {
+      void tickSchedules(config).catch((error) => {
+        console.warn(`Scheduled task tick failed: ${publicErrorMessage(error)}`);
+      });
+    }, 30_000);
+  }
 });
 
-process.once("exit", () => clearRuntimeLock(runtimePidFile));
+process.once("exit", () => {
+  clearRuntimeLock(runtimePidFile);
+  if (scheduleTimer) {
+    clearInterval(scheduleTimer);
+  }
+});
 
 client.on("interactionCreate", async (interaction) => {
   try {
@@ -754,6 +794,20 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
       source: "slash:do",
       ephemeral: hasProjectAudienceRestriction(project)
     });
+    return;
+  }
+
+  if (interaction.commandName === "queue") {
+    await handleQueueCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "schedule") {
+    if (!isOwner(interaction.user.id, appConfig)) {
+      await interaction.reply({ content: "Only the configured Devbot owner can use `/schedule`.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await handleScheduleCommand(interaction, appConfig);
     return;
   }
 }
@@ -2309,6 +2363,345 @@ function ambientRolesForTask(task: TaskRecord): AmbientRole[] {
 
 function agentRole(role: AmbientRole): AgentRole {
   return role === "builder" ? "Builder" : role === "reviewer" ? "Reviewer" : "Verifier";
+}
+
+async function handleQueueCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === "add") {
+    const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const mode: CodexRequestMode = interaction.options.getString("mode") === "ask" ? "answer" : "action";
+    if (mode === "action" && isWriteBlockedBySafeMode(appConfig, "action")) {
+      await interaction.reply({ content: safeModeActionMessage("/queue add"), flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const taskText = interaction.options.getString("task", true);
+    const item = await queueStore.add({ project: project.name, taskText, mode, addedBy: interaction.user.tag });
+    const items = await queueStore.list();
+    const position = items.findIndex((entry) => entry.id === item.id) + 1;
+    await interaction.reply({
+      content: `Queued at position ${position} (${mode === "answer" ? "ask" : "do"}) on \`${project.name}\`. Use \`/queue start\` to begin.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (subcommand === "list") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const allowedProjectNames = new Set(
+      appConfig.projects.filter((project) => isAllowedForProject(interaction, project)).map((project) => project.name)
+    );
+    const items = (await queueStore.list()).filter((item) => allowedProjectNames.has(item.project));
+    const runner = await queueStore.getRunner();
+    const runnerLine = runner.running
+      ? `Runner: running${runner.stopOnFailure ? " (stop on first failure)" : ""}, started by ${runner.startedBy ?? "unknown"}.`
+      : "Runner: stopped.";
+    await interaction.editReply(`${runnerLine}\n\n${formatQueueList(items)}`);
+    return;
+  }
+
+  if (subcommand === "remove") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const position = interaction.options.getInteger("position", true);
+    try {
+      const removed = await queueStore.removeAtPosition(position);
+      await interaction.editReply(`Removed position ${position}: ${truncateSummary(removed?.taskText ?? "")}`);
+    } catch (error) {
+      await interaction.editReply(publicErrorMessage(error));
+    }
+    return;
+  }
+
+  if (subcommand === "clear") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const cleared = await queueStore.clear();
+    await interaction.editReply(`Cleared ${cleared} pending item${cleared === 1 ? "" : "s"}.`);
+    return;
+  }
+
+  if (subcommand === "start") {
+    const runner = await queueStore.getRunner();
+    if (runner.running) {
+      await interaction.reply({ content: "The queue is already running.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const stopOnFailure = interaction.options.getBoolean("stop-on-failure") ?? false;
+    await queueStore.startRunner(interaction.user.tag, stopOnFailure);
+    await interaction.reply({
+      content: `Queue started${stopOnFailure ? " (will stop on the first failure)" : ""}.`,
+      flags: MessageFlags.Ephemeral
+    });
+    void advanceQueue(appConfig).catch((error) => {
+      console.error(`Queue runner stopped with an error: ${publicErrorMessage(error)}`);
+    });
+    return;
+  }
+
+  if (subcommand === "stop") {
+    const runner = await queueStore.stopRunner();
+    await interaction.reply({
+      content: runner.running ? "Unable to stop the queue." : "The queue will stop after the current item finishes.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (subcommand === "digest") {
+    await interaction.deferReply();
+    const items = await queueStore.list();
+    const roomId = effectivePrivateRoomId();
+    const digest = formatQueueDigest(items, { guildId: appConfig.discordGuildId, channelId: roomId ?? interaction.channelId });
+    const chunks = splitDiscordMessage(digest);
+    await interaction.editReply(chunks.shift() ?? "Nothing to report.");
+    for (const chunk of chunks) {
+      await interaction.followUp(chunk);
+    }
+    return;
+  }
+}
+
+async function handleScheduleCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === "add") {
+    const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const mode: CodexRequestMode = interaction.options.getString("mode") === "ask" ? "answer" : "action";
+    const spec = interaction.options.getString("spec", true);
+    const taskText = interaction.options.getString("task", true);
+    try {
+      const entry = await scheduleStore.add({ spec, project: project.name, taskText, mode, addedBy: interaction.user.tag });
+      await interaction.reply({
+        content: `Scheduled \`${entry.id}\`: ${entry.spec} on \`${project.name}\`. Next run ${new Date(entry.nextRun).toLocaleString()}.`,
+        flags: MessageFlags.Ephemeral
+      });
+    } catch (error) {
+      await interaction.reply({ content: publicErrorMessage(error), flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+
+  if (subcommand === "list") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await interaction.editReply(formatScheduleList(await scheduleStore.list()));
+    return;
+  }
+
+  if (subcommand === "remove") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const id = interaction.options.getString("id", true);
+    const removed = await scheduleStore.remove(id);
+    await interaction.editReply(removed ? `Removed schedule \`${id}\`.` : `No scheduled task found for \`${id}\`.`);
+    return;
+  }
+
+  if (subcommand === "pause" || subcommand === "resume") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const id = interaction.options.getString("id", true);
+    const updated = await scheduleStore.setEnabled(id, subcommand === "resume");
+    await interaction.editReply(
+      updated ? `Schedule \`${id}\` is now ${updated.enabled ? "enabled" : "paused"}.` : `No scheduled task found for \`${id}\`.`
+    );
+    return;
+  }
+}
+
+async function advanceQueue(appConfig: AppConfig): Promise<void> {
+  if (queueAdvancing) {
+    return;
+  }
+  queueAdvancing = true;
+  try {
+    for (;;) {
+      const runner = await queueStore.getRunner();
+      if (!runner.running) {
+        return;
+      }
+      const item = await queueStore.nextQueued();
+      if (!item) {
+        await finishQueueDrain(appConfig);
+        return;
+      }
+      const channel = await privateRoomChannel();
+      if (!channel) {
+        console.warn("Queue runner paused: the private room is not available.");
+        return;
+      }
+      const project = findProject(appConfig.projects, item.project);
+      if (!project) {
+        await queueStore.markFinished(item.id, { state: "failed", summary: `Unknown project \`${item.project}\`.` });
+        if (runner.stopOnFailure) {
+          await queueStore.stopRunner();
+          return;
+        }
+        continue;
+      }
+      const outcome = await runQueueItem(appConfig, item, project, channel);
+      if (!outcome.ok && runner.stopOnFailure) {
+        await queueStore.stopRunner();
+        return;
+      }
+    }
+  } finally {
+    queueAdvancing = false;
+  }
+}
+
+async function runQueueItem(
+  appConfig: AppConfig,
+  item: QueueItem,
+  project: ProjectEntry,
+  channel: GuildTextBasedChannel
+): Promise<{ ok: boolean }> {
+  let message: Message | undefined;
+  let claimedTaskId = false;
+  try {
+    const result = await runProjectRequest({
+      appConfig,
+      project,
+      text: item.taskText,
+      includePatterns: [],
+      mode: item.mode,
+      requester: item.addedBy,
+      source: "queue",
+      onProgress: async (progress) => {
+        if (!claimedTaskId) {
+          claimedTaskId = true;
+          await queueStore.markRunning(item.id, progress.taskId);
+        }
+        const content = `${formatTaskProgress(progress)}\n\nTrigger: queue item added by ${item.addedBy}.`;
+        const components = [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })];
+        if (!message) {
+          message = await channel.send({ content, components });
+          await queueStore.setMessageId(item.id, message.id);
+        } else {
+          await message.edit({ content, components }).catch(() => undefined);
+        }
+      }
+    });
+    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(project, result.route, item.mode)}`);
+    if (message) {
+      await message
+        .edit({
+          content: chunks.shift() ?? "Task completed without a response.",
+          components: [taskControlRow(result.taskId, { status: "succeeded", mode: item.mode })]
+        })
+        .catch(() => undefined);
+      for (const chunk of chunks) {
+        await channel.send(chunk).catch(() => undefined);
+      }
+    }
+    await queueStore.markFinished(item.id, { state: "done", summary: truncateSummary(result.answer) });
+    return { ok: true };
+  } catch (error) {
+    await queueStore.markFinished(item.id, {
+      state: "failed",
+      summary: publicErrorMessage(error)
+    });
+    return { ok: false };
+  }
+}
+
+async function finishQueueDrain(appConfig: AppConfig): Promise<void> {
+  await queueStore.stopRunner();
+  await queueStore.setPendingDigest(true);
+  await tryPostQueueDigest(appConfig);
+}
+
+async function tryPostQueueDigest(appConfig: AppConfig): Promise<void> {
+  const runner = await queueStore.getRunner();
+  if (!runner.pendingDigest) {
+    return;
+  }
+  const channel = await privateRoomChannel();
+  if (!channel) {
+    return;
+  }
+  const items = await queueStore.list();
+  const digest = formatQueueDigest(items, { guildId: appConfig.discordGuildId, channelId: channel.id });
+  for (const chunk of splitDiscordMessage(digest)) {
+    await channel.send(chunk);
+  }
+  await queueStore.setPendingDigest(false);
+}
+
+async function privateRoomChannel(): Promise<GuildTextBasedChannel | undefined> {
+  const roomId = effectivePrivateRoomId();
+  if (!roomId) {
+    return undefined;
+  }
+  const channel = await client.channels.fetch(roomId).catch(() => null);
+  if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread)) {
+    return undefined;
+  }
+  return channel as GuildTextBasedChannel;
+}
+
+async function tickSchedules(appConfig: AppConfig): Promise<void> {
+  const due = await scheduleStore.due();
+  for (const entry of due) {
+    await runScheduledEntry(appConfig, entry);
+  }
+}
+
+async function runScheduledEntry(appConfig: AppConfig, entry: ScheduleEntry): Promise<void> {
+  const project = findProject(appConfig.projects, entry.project);
+  const channel = await privateRoomChannel();
+  if (!project || !channel) {
+    await scheduleStore.markRun(entry.id, `Skipped: ${!project ? "unknown project" : "private room unavailable"}.`);
+    return;
+  }
+  if (isWriteBlockedBySafeMode(appConfig, entry.mode)) {
+    await scheduleStore.markRun(entry.id, "Skipped: safe mode blocks write-capable scheduled tasks.");
+    return;
+  }
+
+  let message: Message | undefined;
+  try {
+    const result = await runProjectRequest({
+      appConfig,
+      project,
+      text: entry.taskText,
+      includePatterns: [],
+      mode: entry.mode,
+      requester: entry.addedBy,
+      source: `schedule:${entry.id}`,
+      onProgress: async (progress) => {
+        const content = `${formatTaskProgress(progress)}\n\nTrigger: scheduled: ${entry.spec}.`;
+        const components = [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })];
+        if (!message) {
+          message = await channel.send({ content, components });
+        } else {
+          await message.edit({ content, components }).catch(() => undefined);
+        }
+      }
+    });
+    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(project, result.route, entry.mode)}`);
+    if (message) {
+      await message
+        .edit({
+          content: chunks.shift() ?? "Task completed without a response.",
+          components: [taskControlRow(result.taskId, { status: "succeeded", mode: entry.mode })]
+        })
+        .catch(() => undefined);
+      for (const chunk of chunks) {
+        await channel.send(chunk).catch(() => undefined);
+      }
+    }
+    await scheduleStore.markRun(entry.id, truncateSummary(result.answer));
+  } catch (error) {
+    await scheduleStore.markRun(entry.id, `Failed: ${publicErrorMessage(error)}`);
+  }
+}
+
+function truncateSummary(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length <= 200 ? normalized : `${normalized.slice(0, 199)}...`;
 }
 
 async function getWorkStatusMessage(appConfig: AppConfig, requestedProject?: ProjectEntry): Promise<string> {
@@ -5124,7 +5517,7 @@ function isControllerUser(userId: string, appConfig: AppConfig): boolean {
 }
 
 function commandRequiresController(interaction: ChatInputCommandInteraction): boolean {
-  if (interaction.commandName === "do" || interaction.commandName === "run") {
+  if (interaction.commandName === "do" || interaction.commandName === "run" || interaction.commandName === "queue") {
     return true;
   }
   const subcommand = interaction.options.getSubcommand(false);
