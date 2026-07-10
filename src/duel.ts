@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -58,6 +59,12 @@ export interface DuelChangeEvidence {
   text: string;
   fileCount: number;
   includedFileCount: number;
+  /**
+   * Changed sections whose underlying content was replaced by a policy placeholder (ignored/secret
+   * paths, oversized/binary/unreadable untracked files, paths escaping the root). Their content was
+   * never reviewed, so they are subtracted from `includedFileCount` and force incomplete coverage.
+   */
+  omittedFileCount: number;
   truncated: boolean;
   baseRevision?: string;
   headRevision?: string;
@@ -108,7 +115,7 @@ export interface DuelResult {
 export function truncateDiffForDuel(diff: string, budget: DiffBudget = DEFAULT_DUEL_DIFF_BUDGET): Omit<DuelChangeEvidence, "patchHash"> {
   const trimmed = diff.trim();
   if (!trimmed) {
-    return { text: "(no working tree changes against the recorded base revision)", fileCount: 0, includedFileCount: 0, truncated: false };
+    return { text: "(no working tree changes against the recorded base revision)", fileCount: 0, includedFileCount: 0, omittedFileCount: 0, truncated: false };
   }
 
   const chunks = splitDiffIntoFiles(trimmed);
@@ -142,7 +149,9 @@ export function truncateDiffForDuel(diff: string, budget: DiffBudget = DEFAULT_D
     .filter((part): part is string => part !== undefined)
     .join("\n");
 
-  return { text, fileCount: chunks.length, includedFileCount: included.length, truncated };
+  // Policy omission is applied upstream by gatherDuelChangeEvidence, which overrides this count;
+  // budget truncation alone never redacts content, so from here nothing is "omitted".
+  return { text, fileCount: chunks.length, includedFileCount: included.length, omittedFileCount: 0, truncated };
 }
 
 function splitDiffIntoFiles(diff: string): string[] {
@@ -245,6 +254,26 @@ export function parseDuelVerdict(response: string): DuelVerdict {
 
 function normalizeOverall(raw: string): "approve" | "request-changes" {
   return /^approve$/i.test(raw.trim()) ? "approve" : "request-changes";
+}
+
+/**
+ * Coverage honesty: if any reviewed-change content was omitted/redacted by policy, the reviewer only
+ * saw placeholders for those sections, so a clean approval cannot stand. Downgrade approve to
+ * indeterminate (matching the existing verdict semantics) and record why. A non-approve verdict is
+ * already not-clean and is left untouched.
+ */
+export function applyCoverageHonesty(verdict: DuelVerdict, evidence: Pick<DuelChangeEvidence, "omittedFileCount">): DuelVerdict {
+  if (evidence.omittedFileCount <= 0 || verdict.overall !== "approve") {
+    return verdict;
+  }
+  return {
+    overall: "indeterminate",
+    issues: verdict.issues,
+    warnings: [
+      ...verdict.warnings,
+      `${evidence.omittedFileCount} changed file section(s) had their content omitted from review by policy; coverage is incomplete, so the approve verdict is downgraded to indeterminate and must not be treated as clean.`
+    ]
+  };
 }
 
 function parseIssueFields(rest: string, index: number): DuelIssue | undefined {
@@ -450,7 +479,8 @@ export function formatDuelSummary(input: {
 }): string {
   const conceded = input.issues.filter((issue) => issue.status === "conceded").length;
   const disputed = input.issues.filter((issue) => issue.status === "disputed").length;
-  const incomplete = input.evidence.truncated || input.overall === "indeterminate";
+  const omitted = input.evidence.omittedFileCount > 0;
+  const incomplete = input.evidence.truncated || omitted || input.overall === "indeterminate";
 
   const independenceNote =
     input.reviewerIndependence === "same-model"
@@ -464,7 +494,7 @@ export function formatDuelSummary(input: {
       ? "Reviewer verdict: **INDETERMINATE** — the output could not be parsed into a clean, non-contradictory verdict. Treat as UNRESOLVED, not approved."
       : `Reviewer verdict: **${input.overall === "approve" ? "approve" : "request changes"}**${
           input.evidence.truncated ? " (evidence was truncated — this is a partial review, not a clean pass)" : ""
-        }`;
+        }${omitted ? " (some changed content was omitted by policy — this is a partial review, not a clean pass)" : ""}`;
 
   const issuesLine =
     input.issues.length === 0
@@ -479,6 +509,10 @@ export function formatDuelSummary(input: {
     `Snapshot: base \`${shortRevision(input.evidence.baseRevision)}\` -> head \`${shortRevision(input.evidence.headRevision)}\`, patch \`${input.evidence.patchHash.slice(0, 12)}\``,
     `Evidence coverage: ${input.evidence.includedFileCount}/${input.evidence.fileCount} changed section(s) included${
       input.evidence.truncated ? " — TRUNCATED, some changes were not reviewed" : ""
+    }${
+      omitted
+        ? ` — ${input.evidence.omittedFileCount} section(s) had content omitted by policy and were NOT reviewed (incomplete coverage)`
+        : ""
     }`,
     verdictLine,
     issuesLine,
@@ -524,62 +558,89 @@ export async function gatherDuelChangeEvidence(
   budget: DiffBudget = DEFAULT_DUEL_DIFF_BUDGET
 ): Promise<DuelChangeEvidence> {
   const diffArgs = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=all", "-M"];
-  const baseRevision = task.workspaceIsolated ? task.baseBranch : undefined;
+
+  // A duel must be anchored to a trustworthy base revision. A legacy, non-isolated succeeded action
+  // recorded no such base, so the only diff we could produce is "whatever the current working tree
+  // happens to contain" against HEAD — which is not the task's actual changes. Refuse rather than
+  // review an untrustworthy snapshot.
+  const baseRevision = task.workspaceIsolated ? task.baseBranch?.trim() : undefined;
+  if (!baseRevision) {
+    throw new DuelEvidenceError(
+      "This task did not run in an isolated workspace with a recorded base revision, so there is no trustworthy snapshot to review. Refusing to duel-review the current working tree instead of the task's actual changes."
+    );
+  }
 
   const headResult = await git(project.root, ["rev-parse", "HEAD"]);
   const headRevision = headResult.ok ? headResult.stdout.trim() : undefined;
+  if (!headRevision) {
+    throw new DuelEvidenceError("Could not resolve HEAD for the reviewed workspace; refusing to review partial evidence.");
+  }
 
-  const sections: string[] = [];
-
-  // When the task is workspace-isolated, the recorded base and the committed range against it are
-  // required evidence. A missing HEAD or an invalid recorded base must abort the duel; silently
-  // dropping this section would let omitted committed changes be labeled clean.
-  if (baseRevision) {
-    if (!headRevision) {
-      throw new DuelEvidenceError("Could not resolve HEAD for the reviewed workspace; refusing to review partial evidence.");
+  // Committed range against the recorded base is required evidence. An invalid recorded base must
+  // abort the duel; silently dropping this section would let omitted committed changes be labeled clean.
+  const trackedSections: string[] = [];
+  if (baseRevision !== headRevision) {
+    const committed = await git(project.root, ["diff", ...diffArgs, `${baseRevision}..HEAD`]);
+    if (!committed.ok) {
+      throw new DuelEvidenceError(
+        `Could not diff committed changes against recorded base ${shortRevision(baseRevision)}; the recorded base may be invalid or unreachable.`
+      );
     }
-    if (baseRevision !== headRevision) {
-      const committed = await git(project.root, ["diff", ...diffArgs, `${baseRevision}..HEAD`]);
-      if (!committed.ok) {
-        throw new DuelEvidenceError(
-          `Could not diff committed changes against recorded base ${shortRevision(baseRevision)}; the recorded base may be invalid or unreachable.`
-        );
-      }
-      if (committed.stdout.trim()) sections.push(committed.stdout);
-    }
+    if (committed.stdout.trim()) trackedSections.push(committed.stdout);
   }
 
   const staged = await git(project.root, ["diff", "--cached", ...diffArgs]);
   if (!staged.ok) {
     throw new DuelEvidenceError("Could not read staged changes for review; refusing to review partial evidence.");
   }
-  if (staged.stdout.trim()) sections.push(staged.stdout);
+  if (staged.stdout.trim()) trackedSections.push(staged.stdout);
 
   const unstaged = await git(project.root, ["diff", ...diffArgs]);
   if (!unstaged.ok) {
     throw new DuelEvidenceError("Could not read unstaged changes for review; refusing to review partial evidence.");
   }
-  if (unstaged.stdout.trim()) sections.push(unstaged.stdout);
+  if (unstaged.stdout.trim()) trackedSections.push(unstaged.stdout);
 
   const status = await git(project.root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"]);
   if (!status.ok) {
     throw new DuelEvidenceError("Could not read the working-tree status for untracked changes; refusing to review partial evidence.");
   }
   const untracked = parsePorcelainStatus(status.stdout).filter((change) => change.kind === "untracked");
+  const untrackedSections: string[] = [];
+  let untrackedOmitted = 0;
   for (const change of untracked) {
-    sections.push(await syntheticUntrackedDiff(project.root, change.path, budget.maxFileBytes));
+    const synthetic = await syntheticUntrackedDiff(project.root, change.path, budget.maxFileBytes);
+    untrackedSections.push(synthetic.text);
+    if (synthetic.omitted) untrackedOmitted += 1;
   }
 
-  const combined = redactSensitiveText(omitSensitivePaths(sections.join("\n")));
+  const tracked = omitSensitivePaths(trackedSections.join("\n"));
+  const combined = redactSensitiveText([tracked.text, ...untrackedSections].filter((part) => part.trim()).join("\n"));
+  const omittedFileCount = tracked.omittedCount + untrackedOmitted;
+  // The per-section placeholders embed a content-derived SHA-256 digest, so the patch identity
+  // changes with the underlying bytes even for omitted files without ever exposing their content.
   const patchHash = createHash("sha256").update(combined, "utf8").digest("hex");
   const evidence = truncateDiffForDuel(combined, budget);
+  // Omitted sections still appear as placeholders (and are counted by truncation as "included"),
+  // but their content was never reviewed — subtract them so coverage never over-reports.
+  const includedFileCount = Math.max(0, evidence.includedFileCount - omittedFileCount);
 
-  return { ...evidence, ...(baseRevision ? { baseRevision } : {}), ...(headRevision ? { headRevision } : {}), patchHash };
+  return { ...evidence, includedFileCount, omittedFileCount, baseRevision, headRevision, patchHash };
 }
 
-/** Drops diff hunks for files matched by the shared sensitive-path policy before anything is budgeted or sent to a model. */
-function omitSensitivePaths(diff: string): string {
-  return splitDiffIntoFiles(diff.trim())
+/**
+ * Redacts diff hunks for files matched by the shared sensitive-path policy before anything is
+ * budgeted or sent to a model, and reports how many sections were omitted so coverage stays honest.
+ * The placeholder embeds a content-derived digest of the omitted hunk so the patch identity still
+ * changes with the underlying bytes without ever exposing them.
+ */
+function omitSensitivePaths(diff: string): { text: string; omittedCount: number } {
+  const trimmed = diff.trim();
+  if (!trimmed) {
+    return { text: "", omittedCount: 0 };
+  }
+  let omittedCount = 0;
+  const text = splitDiffIntoFiles(trimmed)
     .map((chunk) => {
       const header = chunk.match(/^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/m);
       const candidatePaths = header ? [header[1], header[2]] : [];
@@ -587,43 +648,81 @@ function omitSensitivePaths(diff: string): string {
       if (!sensitive) {
         return chunk;
       }
+      omittedCount += 1;
       const headerLine = chunk.split("\n")[0] ?? chunk;
-      return `${headerLine}\n[omitted: sensitive path excluded from review by policy]`;
+      return `${headerLine}\n[omitted: sensitive path excluded from review by policy; content sha256=${safeContentDigest(chunk)}]`;
     })
     .join("\n");
+  return { text, omittedCount };
 }
 
-async function syntheticUntrackedDiff(root: string, relativePath: string, maxFileBytes: number): Promise<string> {
+/** SHA-256 of the underlying bytes, truncated for compactness. Changes with content, exposes none of it. */
+function safeContentDigest(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex").slice(0, 16);
+}
+
+/** SHA-256 of a file's bytes via a bounded stream, so a redacted file's identity still tracks its content. */
+async function hashFileContent(absolutePath: string): Promise<string | undefined> {
+  try {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(absolutePath)) {
+      hash.update(chunk as Buffer);
+    }
+    return hash.digest("hex").slice(0, 16);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Builds a synthetic diff for one untracked file. Returns `omitted: true` whenever the file's
+ * content is replaced by a placeholder (ignored/secret path, path escaping the root, non-regular,
+ * oversized, binary, or unreadable) so those sections are counted as incomplete coverage. Redacted
+ * files carry a content digest where one can be computed, keeping the patch identity content-sensitive.
+ */
+async function syntheticUntrackedDiff(
+  root: string,
+  relativePath: string,
+  maxFileBytes: number
+): Promise<{ text: string; omitted: boolean }> {
   const header = `diff --git a/${relativePath} b/${relativePath}\nnew file mode 100644`;
+  const absolutePath = path.resolve(root, relativePath);
+
   if (isIgnoredProjectPath(relativePath)) {
-    return `${header}\n--- /dev/null\n+++ [omitted: sensitive path excluded from review by policy]`;
+    const digest = isWithinRoot(absolutePath, root) ? await hashFileContent(absolutePath) : undefined;
+    const digestNote = digest ? `; content sha256=${digest}` : "";
+    return { text: `${header}\n--- /dev/null\n+++ [omitted: sensitive path excluded from review by policy${digestNote}]`, omitted: true };
   }
 
-  const absolutePath = path.resolve(root, relativePath);
   if (!isWithinRoot(absolutePath, root)) {
-    return `${header}\n--- /dev/null\n+++ [omitted: path escapes the project root]`;
+    return { text: `${header}\n--- /dev/null\n+++ [omitted: path escapes the project root]`, omitted: true };
   }
 
   try {
     const stats = await lstat(absolutePath);
     if (!stats.isFile()) {
-      return `${header}\n--- /dev/null\n+++ [omitted: not a regular file]`;
+      return { text: `${header}\n--- /dev/null\n+++ [omitted: not a regular file]`, omitted: true };
     }
     if (stats.size > MAX_UNTRACKED_FILE_READ_BYTES) {
-      return `${header}\n--- /dev/null\n+++ b/${relativePath}\n[omitted: file exceeds the untracked-file read limit]`;
+      const digest = await hashFileContent(absolutePath);
+      const digestNote = digest ? `; content sha256=${digest}` : "";
+      return {
+        text: `${header}\n--- /dev/null\n+++ b/${relativePath}\n[omitted: file exceeds the untracked-file read limit${digestNote}]`,
+        omitted: true
+      };
     }
     const content = await readFile(absolutePath, "utf8");
     if (content.includes("\u0000")) {
-      return `${header}\n--- /dev/null\n+++ b/${relativePath}\n[omitted: binary file]`;
+      return { text: `${header}\n--- /dev/null\n+++ b/${relativePath}\n[omitted: binary file; content sha256=${safeContentDigest(content)}]`, omitted: true };
     }
     const capped = capChunkBytes(content, maxFileBytes);
     const body = capped
       .split("\n")
       .map((line) => `+${line}`)
       .join("\n");
-    return `${header}\n--- /dev/null\n+++ b/${relativePath}\n${body}`;
+    return { text: `${header}\n--- /dev/null\n+++ b/${relativePath}\n${body}`, omitted: false };
   } catch {
-    return `${header}\n--- /dev/null\n+++ [omitted: unable to read this untracked file]`;
+    return { text: `${header}\n--- /dev/null\n+++ [omitted: unable to read this untracked file]`, omitted: true };
   }
 }
 
@@ -665,7 +764,7 @@ export async function runDuelReview(input: RunDuelInput): Promise<DuelResult> {
     ...(reviewerModel.model ? { model: reviewerModel.model } : {}),
     ...(reviewerModel.reasoningEffort ? { reasoningEffort: reviewerModel.reasoningEffort } : {})
   });
-  const reviewerVerdict = parseDuelVerdict(reviewerRaw);
+  const reviewerVerdict = applyCoverageHonesty(parseDuelVerdict(reviewerRaw), input.diff);
 
   if (reviewerVerdict.issues.length === 0) {
     return {

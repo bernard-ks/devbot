@@ -70,7 +70,7 @@ test("startup recovery leaves completed duels and their conversations untouched"
     authorTier: "standard",
     reviewerTier: "deep",
     reviewerIndependence: "independent",
-    evidence: { patchHash: "hash", fileCount: 0, includedFileCount: 0, truncated: false },
+    evidence: { patchHash: "hash", fileCount: 0, includedFileCount: 0, omittedFileCount: 0, truncated: false },
     overall: "approve",
     issues: []
   });

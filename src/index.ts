@@ -3760,6 +3760,7 @@ async function runDuelForTask(
       patchHash: diff.patchHash,
       fileCount: diff.fileCount,
       includedFileCount: diff.includedFileCount,
+      omittedFileCount: diff.omittedFileCount,
       truncated: diff.truncated
     },
     overall: result.reviewerVerdict.overall,

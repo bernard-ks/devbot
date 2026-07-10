@@ -26,7 +26,7 @@ test("start creates a running record; succeed and get round-trip the typed resul
     authorTier: "standard",
     reviewerTier: "deep",
     reviewerIndependence: "independent",
-    evidence: { baseRevision: "abc", headRevision: "def", patchHash: "hash", fileCount: 1, includedFileCount: 1, truncated: false },
+    evidence: { baseRevision: "abc", headRevision: "def", patchHash: "hash", fileCount: 1, includedFileCount: 1, omittedFileCount: 0, truncated: false },
     overall: "request-changes",
     issues: [concededIssue]
   });
@@ -65,7 +65,7 @@ async function succeededStore(): Promise<DuelStore> {
     authorTier: "standard",
     reviewerTier: "deep",
     reviewerIndependence: "independent",
-    evidence: { patchHash: "hash", fileCount: 1, includedFileCount: 1, truncated: false },
+    evidence: { patchHash: "hash", fileCount: 1, includedFileCount: 1, omittedFileCount: 0, truncated: false },
     overall: "request-changes",
     issues: [concededIssue]
   });
@@ -99,7 +99,7 @@ test("interruptRunning marks running duels as failed and returns their ids for r
     authorTier: "standard",
     reviewerTier: "deep",
     reviewerIndependence: "independent",
-    evidence: { patchHash: "hash", fileCount: 0, includedFileCount: 0, truncated: false },
+    evidence: { patchHash: "hash", fileCount: 0, includedFileCount: 0, omittedFileCount: 0, truncated: false },
     overall: "approve",
     issues: []
   });
@@ -132,7 +132,7 @@ test("stored issues are bounded in count and per-field length, not stored verbat
     authorTier: "standard",
     reviewerTier: "deep",
     reviewerIndependence: "independent",
-    evidence: { patchHash: "hash", fileCount: 1, includedFileCount: 1, truncated: false },
+    evidence: { patchHash: "hash", fileCount: 1, includedFileCount: 1, omittedFileCount: 0, truncated: false },
     overall: "request-changes",
     issues: oversized
   });

@@ -13,6 +13,7 @@ export interface DuelEvidenceSummary {
   patchHash: string;
   fileCount: number;
   includedFileCount: number;
+  omittedFileCount: number;
   truncated: boolean;
 }
 

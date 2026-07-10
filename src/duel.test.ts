@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  applyCoverageHonesty,
   buildFixTaskPrompt,
   DuelEvidenceError,
   formatDuelSummary,
@@ -373,11 +374,87 @@ test("evidence gathering treats a missing HEAD in an isolated workspace as termi
   );
 });
 
+test("evidence gathering refuses a legacy non-isolated succeeded action with no trustworthy base revision", async () => {
+  const fixture = await createGitFixture();
+  // Simulate real, reviewable working-tree churn so a naive `git diff HEAD` would have returned a
+  // clean-looking object. The refusal must fire on the missing base, not on an empty diff.
+  await writeFile(path.join(fixture.repo, "tracked.txt"), "unrelated working tree edit\n");
+  const project = fakeProject(fixture.repo);
+
+  await assert.rejects(
+    () => gatherDuelChangeEvidence(project, { workspaceIsolated: false, baseBranch: "main" }),
+    (error: unknown) => error instanceof DuelEvidenceError && /trustworthy snapshot|working tree/i.test((error as Error).message)
+  );
+  // An isolated task with an empty recorded base is equally untrustworthy.
+  await assert.rejects(
+    () => gatherDuelChangeEvidence(project, { workspaceIsolated: true, baseBranch: "   " }),
+    (error: unknown) => error instanceof DuelEvidenceError
+  );
+});
+
+test("an ignored-only change (package-lock.json) is incomplete coverage, never reported as 1/1 clean", async () => {
+  const fixture = await createGitFixture();
+  const baseRevision = await git(fixture.repo, ["rev-parse", "HEAD"]);
+  const project = fakeProject(fixture.repo);
+  const task = { workspaceIsolated: true, baseBranch: baseRevision };
+
+  await writeFile(path.join(fixture.repo, "package-lock.json"), JSON.stringify({ version: "1", deps: ["a"] }) + "\n");
+  const evidence = await gatherDuelChangeEvidence(project, task);
+
+  assert.equal(evidence.fileCount, 1, "the lockfile is one changed section");
+  assert.equal(evidence.omittedFileCount, 1, "its content was omitted by policy");
+  assert.equal(evidence.includedFileCount, 0, "no content was actually reviewed — must not read as 1/1");
+  assert.doesNotMatch(evidence.text, /"deps"/, "omitted lockfile content must never reach the review text");
+  assert.match(evidence.text, /omitted: sensitive path excluded from review by policy/);
+
+  // The summary must not present this as clean/approved even if a reviewer approved the placeholder.
+  const summary = formatDuelSummary(
+    summaryInput({ evidence, overall: "approve", issues: [], skippedRebuttal: true })
+  );
+  assert.match(summary, /Evidence coverage: 0\/1/);
+  assert.match(summary, /incomplete coverage/);
+  assert.doesNotMatch(summary, /No substantive issues found/);
+});
+
+test("different omitted contents produce different patch identities (digest binds bytes, not a constant placeholder)", async () => {
+  const patchHashFor = async (contents: string): Promise<string> => {
+    const fixture = await createGitFixture();
+    const base = await git(fixture.repo, ["rev-parse", "HEAD"]);
+    await writeFile(path.join(fixture.repo, "package-lock.json"), contents);
+    const evidence = await gatherDuelChangeEvidence(fakeProject(fixture.repo), { workspaceIsolated: true, baseBranch: base });
+    return evidence.patchHash;
+  };
+  const hashA = await patchHashFor('{"lock":"A"}\n');
+  const hashB = await patchHashFor('{"lock":"B"}\n');
+  assert.notEqual(hashA, hashB, "an omitted file with different content must not share a patch identity");
+});
+
+test("a mixed visible-plus-ignored change reviews the visible file but counts the ignored one as omitted", async () => {
+  const fixture = await createGitFixture();
+  const baseRevision = await git(fixture.repo, ["rev-parse", "HEAD"]);
+  const project = fakeProject(fixture.repo);
+  const task = { workspaceIsolated: true, baseBranch: baseRevision };
+
+  await writeFile(path.join(fixture.repo, "src.js"), "export const answer = 42;\n");
+  await writeFile(path.join(fixture.repo, "package-lock.json"), '{"lock":"secretish"}\n');
+  await git(fixture.repo, ["add", "src.js", "package-lock.json"]);
+  await git(fixture.repo, ["commit", "-m", "Feature plus lockfile"]);
+
+  const evidence = await gatherDuelChangeEvidence(project, task);
+  assert.equal(evidence.fileCount, 2);
+  assert.equal(evidence.omittedFileCount, 1);
+  assert.equal(evidence.includedFileCount, 1);
+  assert.match(evidence.text, /export const answer = 42/, "the visible change is reviewed");
+  assert.doesNotMatch(evidence.text, /secretish/, "the ignored lockfile content is not");
+  assert.match(evidence.text, /omitted: sensitive path excluded from review by policy; content sha256=/);
+});
+
 function summaryInput(overrides: Partial<Parameters<typeof formatDuelSummary>[0]> = {}): Parameters<typeof formatDuelSummary>[0] {
   const evidence: DuelChangeEvidence = {
     text: "diff",
     fileCount: 2,
     includedFileCount: 2,
+    omittedFileCount: 0,
     truncated: false,
     baseRevision: "aaaabbbbccccdddd",
     headRevision: "eeeeffff00001111",
@@ -410,6 +487,39 @@ test("summary never uses clean/approved language when the evidence was truncated
   const summary = formatDuelSummary(summaryInput({ evidence: truncatedEvidence }));
   assert.match(summary, /TRUNCATED, some changes were not reviewed/);
   assert.match(summary, /partial review, not a clean pass/);
+  assert.doesNotMatch(summary, /No substantive issues found/);
+});
+
+test("coverage honesty downgrades an approve verdict to indeterminate when content was omitted", () => {
+  const verdict = applyCoverageHonesty({ overall: "approve", issues: [], warnings: [] }, { omittedFileCount: 1 });
+  assert.equal(verdict.overall, "indeterminate");
+  assert.ok(verdict.warnings.some((warning) => /omitted from review by policy/.test(warning)));
+});
+
+test("coverage honesty leaves a full-coverage approve untouched and never upgrades a non-approve verdict", () => {
+  const clean = applyCoverageHonesty({ overall: "approve", issues: [], warnings: [] }, { omittedFileCount: 0 });
+  assert.equal(clean.overall, "approve");
+  const changes = applyCoverageHonesty({ overall: "request-changes", issues: [], warnings: [] }, { omittedFileCount: 3 });
+  assert.equal(changes.overall, "request-changes");
+});
+
+test("a duel over evidence with omitted content never resolves to a clean approve", async () => {
+  const evidence: DuelChangeEvidence = {
+    ...truncateDiffForDuel("diff --git a/package-lock.json b/package-lock.json\n[omitted: sensitive path excluded from review by policy; content sha256=deadbeef]"),
+    omittedFileCount: 1,
+    patchHash: "test-hash"
+  };
+  const input = duelInput({ complete: async () => "VERDICT: approve", diff: evidence });
+  const result = await runDuelReview(input);
+  assert.equal(result.reviewerVerdict.overall, "indeterminate");
+  assert.ok(result.warnings.some((warning) => /omitted from review by policy/.test(warning)));
+});
+
+test("summary never uses clean/approved language when a section's content was omitted by policy", () => {
+  const omittedEvidence = { ...summaryInput().evidence, fileCount: 1, includedFileCount: 0, omittedFileCount: 1 };
+  const summary = formatDuelSummary(summaryInput({ evidence: omittedEvidence, overall: "indeterminate" }));
+  assert.match(summary, /Evidence coverage: 0\/1/);
+  assert.match(summary, /incomplete coverage/);
   assert.doesNotMatch(summary, /No substantive issues found/);
 });
 

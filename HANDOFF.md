@@ -355,3 +355,32 @@ What changed relative to the round-1 state:
 - README / product plan / this handoff now describe the stage-1 read-only scope explicitly.
 
 `npm test`: 163/163 green (`npm run build` + `node --test` over `dist`), `git diff --check` clean.
+
+## Review round 5 — coverage honesty for omitted content + refuse untrustworthy base
+
+Rebased onto origin/main `a5ac5ee` (PR #11 merged); HANDOFF took the lane's copy per convention; the
+security.test.ts 20s child-process timeout widening is preserved. Two blocking issues addressed:
+
+1. **Omitted/redacted content was reported as fully reviewed, and different omitted contents shared
+   one patch identity.** A change whose only content was an ignored path (e.g. `package-lock.json`)
+   returned `fileCount: 1, includedFileCount: 1, truncated: false` and could surface as "approved as
+   clean" even though the content was a constant placeholder that was also all that got hashed.
+   - Coverage: `DuelChangeEvidence` gained `omittedFileCount`; every policy placeholder (ignored/secret
+     path, path escaping the root, non-regular, oversized, binary, unreadable) now counts as omitted and
+     is subtracted from `includedFileCount`, so a lockfile-only change reads `0/1`, never `1/1 clean`
+     (`src/duel.ts` `gatherDuelChangeEvidence`/`omitSensitivePaths`/`syntheticUntrackedDiff`).
+   - Verdict: `applyCoverageHonesty` downgrades an `approve` to `indeterminate` whenever any content was
+     omitted, and `runDuelReview` applies it before returning; `formatDuelSummary` treats omission as
+     incomplete coverage and never prints clean/approved language.
+   - Patch identity: placeholders now embed a SHA-256 digest of the underlying bytes (the diff hunk for
+     tracked files, a streamed file hash for untracked ones), so the patch hash changes with content
+     without exposing it (`safeContentDigest`/`hashFileContent`).
+   - Tests (`src/duel.test.ts`): ignored-only `package-lock.json` (asserts `0/1`, not `1/1 clean`),
+     mixed visible+ignored, different-omitted-content patch identities differ, plus verdict/summary
+     coverage-honesty tests.
+2. **Legacy non-isolated succeeded actions with no trustworthy base revision were reviewed anyway.**
+   `gatherDuelChangeEvidence` now refuses (`DuelEvidenceError`) when the task is not workspace-isolated
+   or has no recorded base, instead of diffing whatever the current working tree contains. Test:
+   "evidence gathering refuses a legacy non-isolated succeeded action with no trustworthy base revision".
+
+`npm test`: 311/311 green (`npm run build` + `node --test` over `dist`).
