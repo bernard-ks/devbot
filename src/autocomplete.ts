@@ -1,4 +1,5 @@
 import { configuredCommandNames } from "./command-runner.js";
+import type { MemoryEntry } from "./memory-store.js";
 import type { PeerRecord } from "./peer.js";
 import type { TaskRecord } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
@@ -51,8 +52,31 @@ export function peerChoices(peers: PeerRecord[], focused: string): AutocompleteC
     }));
 }
 
+export function memoryChoices(entries: MemoryEntry[], focused: string): AutocompleteChoice[] {
+  const query = normalize(focused);
+  return entries
+    .filter((entry) => searchableMemoryText(entry).includes(query))
+    .slice(0, 25)
+    .map((entry) => ({
+      name: truncateChoiceLabel(`${entry.id} | ${entry.kind} ${entry.text}`, MAX_CHOICE_NAME_LENGTH),
+      value: entry.id
+    }));
+}
+
 function searchableTaskText(task: TaskRecord): string {
   return `${task.id} ${task.status} ${task.mode} ${task.projectName} ${task.source}`.toLowerCase();
+}
+
+function searchableMemoryText(entry: MemoryEntry): string {
+  return `${entry.id} ${entry.kind} ${entry.source} ${entry.text} ${entry.tags.join(" ")}`.toLowerCase();
+}
+
+/** Discord rejects autocomplete choice names longer than 100 characters. */
+const MAX_CHOICE_NAME_LENGTH = 100;
+
+function truncateChoiceLabel(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 3)}...`;
 }
 
 function normalize(value: string): string {

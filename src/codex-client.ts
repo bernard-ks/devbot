@@ -31,6 +31,7 @@ export interface AnswerOptions {
   reasoningEffort?: string;
   tier?: AgentModelTier;
   contextMode?: RequestContextMode;
+  history?: string;
   signal?: AbortSignal;
   onSpawn?: (pid: number) => void | Promise<void>;
   onExit?: () => void | Promise<void>;
@@ -38,7 +39,7 @@ export interface AnswerOptions {
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
   const mode = options.mode ?? "answer";
-  const prompt = buildPrompt(options.context, options.question, mode, options.contextMode ?? "full");
+  const prompt = buildPrompt(options.context, options.question, mode, options.contextMode ?? "full", options.history);
   return completeCodexPrompt({
     codex: options.codex,
     prompt,
@@ -125,13 +126,15 @@ function buildPrompt(
   context: PackedProjectContext,
   question: string,
   mode: CodexRequestMode,
-  contextMode: RequestContextMode
+  contextMode: RequestContextMode,
+  history?: string
 ): string {
   const contextInstruction = contextMode === "none"
     ? "This request was routed without project context. Do not inspect project files unless the user explicitly asks for project-specific evidence."
     : contextMode === "focused"
       ? "Use the focused preselected snippets first; inspect additional project files only when needed to answer accurately."
       : "Use the supplied broad project context and inspect additional project files when useful.";
+  const historySection = history ? ["", history] : [];
   if (mode === "action") {
     return [
       "You are handling a Discord request for a local developer through a bot.",
@@ -156,6 +159,7 @@ function buildPrompt(
       "<project_context>",
       context.packedText || "No local project files matched the request.",
       "</project_context>",
+      ...historySection,
       "",
       "<developer_request>",
       question,
@@ -180,6 +184,7 @@ function buildPrompt(
     "<project_context>",
     context.packedText || "No local project files matched the request.",
     "</project_context>",
+    ...historySection,
     "",
     "<developer_request>",
     question,
