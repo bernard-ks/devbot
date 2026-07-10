@@ -360,7 +360,7 @@ async function recordAttempt(
         if (Date.now() >= stepDeadline) {
           break;
         }
-        const performed = await performFlowStep(page, step);
+        const performed = await performFlowStep(page, step, allowedOrigins);
         if (performed) {
           stepsPerformed.push(step);
         }
@@ -424,7 +424,46 @@ export function isNavigationHref(href: string): boolean {
   return !/^(?:javascript|data|blob|vbscript):/i.test(value);
 }
 
-async function performFlowStep(page: Page, step: string): Promise<boolean> {
+/**
+ * Resolve an anchor's href against the current page and confirm it is a
+ * same-origin, approved-origin document navigation. Returns the vetted absolute
+ * URL to navigate to, or `undefined` if it must not be followed. `/clip` is a
+ * read-level command: navigating directly to this URL (rather than DOM-clicking
+ * the anchor) means the anchor's own `onclick`/event handlers never run and
+ * cannot mutate application state, while the context route handler still
+ * enforces the approved-origin policy on the resulting request and any redirects.
+ */
+export function vettedNavigationHref(
+  resolvedHref: string,
+  currentUrl: string,
+  allowedOrigins: ReadonlySet<string>
+): string | undefined {
+  let destination: URL;
+  let current: URL;
+  try {
+    current = new URL(currentUrl);
+    destination = new URL(resolvedHref, currentUrl);
+  } catch {
+    return undefined;
+  }
+  if (destination.protocol !== "http:" && destination.protocol !== "https:") {
+    return undefined;
+  }
+  if (destination.origin !== current.origin) {
+    return undefined;
+  }
+  const normalized = destination.toString();
+  return isAllowedScreenshotResource(normalized, allowedOrigins) ? normalized : undefined;
+}
+
+interface NavigationLinkCandidate {
+  index: number;
+  text: string;
+  href: string;
+  resolvedHref: string;
+}
+
+async function performFlowStep(page: Page, step: string, allowedOrigins: ReadonlySet<string>): Promise<boolean> {
   if (/\bscroll\b/i.test(step)) {
     const viewport = page.viewportSize() ?? { width: 1280, height: 720 };
     await page.mouse.wheel(0, Math.round(viewport.height * 0.8));
@@ -432,12 +471,13 @@ async function performFlowStep(page: Page, step: string): Promise<boolean> {
   }
 
   const links = page.locator(CLIP_NAVIGATION_SELECTOR);
-  const candidates = await links.evaluateAll((elements) =>
+  const candidates: NavigationLinkCandidate[] = await links.evaluateAll((elements) =>
     elements
       .map((element, index) => {
         const rect = element.getBoundingClientRect();
         const style = element.ownerDocument.defaultView?.getComputedStyle(element);
         const href = element.getAttribute("href") ?? "";
+        const resolvedHref = (element as unknown as { href?: string }).href ?? "";
         const text = [element.textContent ?? "", element.getAttribute("aria-label") ?? "", element.getAttribute("title") ?? "", href].join(
           " "
         );
@@ -445,14 +485,19 @@ async function performFlowStep(page: Page, step: string): Promise<boolean> {
           index,
           text,
           href,
+          resolvedHref,
           visible: rect.width > 0 && rect.height > 0 && style?.visibility !== "hidden" && style?.display !== "none"
         };
       })
       .filter((candidate) => candidate.visible)
-      .map(({ index, text, href }) => ({ index, text, href }))
+      .map(({ index, text, href, resolvedHref }) => ({ index, text, href, resolvedHref }))
   );
 
-  const target = bestNavigationCandidate(candidates.filter((candidate) => isNavigationHref(candidate.href)), step);
+  const navigable = candidates.filter((candidate) => isNavigationHref(candidate.href));
+  const target = bestNavigationCandidate(
+    navigable.map(({ index, text, href }) => ({ index, text, href })),
+    step
+  );
   if (!target) {
     return false;
   }
@@ -465,11 +510,13 @@ async function performFlowStep(page: Page, step: string): Promise<boolean> {
     return true;
   }
 
-  await links
-    .nth(target.index)
-    .click({ timeout: 5_000 })
-    .catch(() => undefined);
-  await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
+  const resolvedHref = navigable.find((candidate) => candidate.index === target.index)?.resolvedHref ?? "";
+  const destination = vettedNavigationHref(resolvedHref, page.url(), allowedOrigins);
+  if (!destination) {
+    return false;
+  }
+
+  await page.goto(destination, { waitUntil: "networkidle", timeout: 8_000 }).catch(() => undefined);
   return true;
 }
 

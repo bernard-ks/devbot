@@ -13,6 +13,7 @@ import {
   planCompletionProof,
   pushBoundedFrame,
   selectRecentFrames,
+  vettedNavigationHref,
   DISCORD_MAX_ATTACHMENT_BYTES,
   WATCH_MAX_FRAMES
 } from "./project-video.js";
@@ -145,6 +146,25 @@ test("isNavigationHref accepts document links and rejects script-scheme or empty
   assert.equal(isNavigationHref("#"), false);
   assert.equal(isNavigationHref("javascript:doThing()"), false);
   assert.equal(isNavigationHref("data:text/html,hi"), false);
+});
+
+test("vettedNavigationHref resolves same-origin approved links and rejects everything else", () => {
+  const allowed = new Set(["http://127.0.0.1:3000"]);
+  const current = "http://127.0.0.1:3000/dashboard";
+
+  assert.equal(vettedNavigationHref("/settings?token=secret", current, allowed), "http://127.0.0.1:3000/settings?token=secret");
+  assert.equal(vettedNavigationHref("http://127.0.0.1:3000/detail", current, allowed), "http://127.0.0.1:3000/detail");
+
+  // Off-origin (even if loopback) is rejected: not same-origin as the current page.
+  assert.equal(vettedNavigationHref("http://127.0.0.1:4000/detail", current, allowed), undefined);
+  // Approved-origin set that does not include the current origin still fails closed.
+  assert.equal(vettedNavigationHref("/settings", current, new Set(["http://127.0.0.1:4000"])), undefined);
+  // Non-http(s) schemes never navigate.
+  assert.equal(vettedNavigationHref("javascript:steal()", current, allowed), undefined);
+  assert.equal(vettedNavigationHref("data:text/html,hi", current, allowed), undefined);
+  assert.equal(vettedNavigationHref("about:blank", current, allowed), undefined);
+  // Malformed inputs fail closed.
+  assert.equal(vettedNavigationHref("", "not a url", allowed), undefined);
 });
 
 test("safeReportedUrl strips credentials, query, and fragment from reported URLs", () => {

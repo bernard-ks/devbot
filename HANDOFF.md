@@ -82,3 +82,11 @@ Bernard confirmed the three round-1 fixes (isolated skip note, in-flight guard +
 Automatic proof for isolated tasks remains an honest skip; watch/timelapse stays labeled as the source dev server.
 
 `npm test`: 143/143 (133 baseline + 10 new: 4 e2e, 6 unit). `git diff --check` clean. No flake observed this round.
+
+## Review round 3 (maintainer kept changes requested)
+
+Rebased onto current `origin/main` (`45d8833`, PRs #10 security hardening, #16 screenshot-to-fix, #30 branch freshness). Only `HANDOFF.md` conflicted (add/add: main carried the screenshot-to-fix lane's handoff, this lane its own); resolved to this lane's handoff. `src/commands.ts` and `src/index.ts` auto-merged; `/clip`, `/do watch`, `executeDoInteraction`, `startWatchSession`, and `captureCompletionProof` all survive the merge, verified by build + suite.
+
+Bernard confirmed round-2 (origin confinement, opt-in watch, honest isolated skip, URL sanitization, resource limits) and left one blocker:
+
+1. **`/clip` still DOM-clicked anchors, so an anchor's `onclick` could mutate state before navigation.** `performFlowStep` no longer clicks the matched `a[href]`; for a navigation step it now reads the anchor's resolved `href`, vets it through the new exported `vettedNavigationHref(resolvedHref, page.url(), allowedOrigins)` (must be `http(s)`, **same origin as the current page**, and pass `isAllowedScreenshotResource`), and navigates with `page.goto(destination)`. The anchor's own click/`onclick` handlers never fire, so a read-level `/clip` cannot mutate app state through a link; the context route handler (`route.fetch({ maxRedirects: 0 })`) still enforces the approved-origin policy on the resulting request and any redirects. Off-origin, cross-origin, and non-http links fail closed (step skipped, no navigation). Scroll and hover are unchanged; buttons/submit inputs remain out of the candidate set from round 2. Tests: a new e2e test serves a page whose only link carries `onclick="fetch('/mutate',{method:'POST'})"` and requests it; the flow navigates to the link target (`finalUrl` = `/reports`, step reported) while the server records **zero** mutations — proving the handler never ran. A unit test on `vettedNavigationHref` covers same-origin approval, off-origin/cross-origin rejection, non-http scheme rejection, and malformed input.

@@ -104,6 +104,39 @@ function startApprovedServer(offOriginPort: number): Promise<{ server: http.Serv
   });
 }
 
+interface AnchorMutationLog {
+  mutations: number;
+  navigations: string[];
+}
+
+function startAnchorMutationServer(): Promise<{ server: http.Server; port: number; log: AnchorMutationLog }> {
+  const log: AnchorMutationLog = { mutations: 0, navigations: [] };
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (request.method === "POST" && url.pathname === "/mutate") {
+      log.mutations += 1;
+      response.writeHead(200, { "content-type": "text/plain" });
+      response.end("mutated");
+      return;
+    }
+    if (url.pathname === "/reports") {
+      log.navigations.push(url.pathname);
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end("<!doctype html><html><body><h1>Reports overview</h1></body></html>");
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/html" });
+    response.end(`<!doctype html><html><body>
+      <a href="/reports" onclick="fetch('/mutate',{method:'POST'});">Open reports overview</a>
+    </body></html>`);
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ server, port: (server.address() as AddressInfo).port, log });
+    });
+  });
+}
+
 function startHangingServer(): Promise<{ server: http.Server; port: number }> {
   const server = http.createServer((request, response) => {
     if (request.url === "/hang") {
@@ -205,6 +238,28 @@ test("confined contexts close popups, block off-origin sockets, and block servic
       new Promise((resolve) => approved.server.close(resolve)),
       new Promise((resolve) => offOrigin.server.close(resolve))
     ]);
+  }
+});
+
+test("recorded flows navigate anchors without firing their click handlers", async () => {
+  const site = await startAnchorMutationServer();
+  try {
+    const entry = project(`http://127.0.0.1:${site.port}`);
+    const outcome = await recordProjectFlow(entry, "open reports overview");
+
+    assert.equal(outcome.kind, "video");
+    if (outcome.kind !== "video") {
+      return;
+    }
+    // The anchor was navigated (its href was followed) ...
+    assert.equal(outcome.metadata.finalUrl, `http://127.0.0.1:${site.port}/reports`);
+    assert.ok(outcome.metadata.stepsPerformed.some((step) => /reports overview/i.test(step)));
+    assert.deepEqual(site.log.navigations, ["/reports"]);
+    // ... but its onclick handler never ran, so no mutation was issued.
+    assert.equal(site.log.mutations, 0);
+  } finally {
+    site.server.closeAllConnections();
+    await new Promise((resolve) => site.server.close(resolve));
   }
 });
 
