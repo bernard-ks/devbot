@@ -360,7 +360,7 @@ async function verifyIsolatedWorktree(worktree: TaskWorktree): Promise<{ availab
   return { available: true };
 }
 
-function parsePorcelainStatus(output: string): TaskWorktreeChange[] {
+export function parsePorcelainStatus(output: string): TaskWorktreeChange[] {
   const fields = output.split("\0");
   const changes: TaskWorktreeChange[] = [];
   for (let index = 0; index < fields.length - 1; index += 1) {

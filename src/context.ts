@@ -218,11 +218,19 @@ async function walk(
 }
 
 function shouldIgnore(relativePath: string, filename: string): boolean {
+  return isIgnoredProjectPath(relativePath, filename);
+}
+
+/** Shared sensitive-path policy: skip secrets, lockfiles, and build/dependency directories before they reach a model prompt. */
+export function isIgnoredProjectPath(relativePath: string, filename = path.basename(relativePath)): boolean {
   if (IGNORED_FILENAMES.has(filename)) {
     return true;
   }
+  if (/\.(?:key|kdbx|p12|pem|pfx)$/i.test(filename)) {
+    return true;
+  }
 
-  const parts = relativePath.split(path.sep);
+  const parts = relativePath.split(/[\\/]/);
   return parts.some((part) => IGNORED_PATH_PARTS.has(part));
 }
 
