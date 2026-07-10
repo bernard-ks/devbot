@@ -1,10 +1,41 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  hardenPrivateDirectoryPermissions,
+  hardenPrivateFilePermissions,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+  redactSensitiveText
+} from "./security.js";
 
 const INTAKE_RECORD_ID_PATTERN = /^intake-[a-z0-9-]{1,64}$/i;
+const MAX_TEXT_LENGTH = 4_000;
+const MAX_EVIDENCE_ENTRIES = 10;
+const MAX_EVIDENCE_LENGTH = 400;
 
-export type IntakeStatus = "pending" | "confirmed" | "unconfirmed" | "needs-info" | "accepted" | "dismissed";
+export type IntakeStatus =
+  | "incomplete"
+  | "pending"
+  | "confirmed"
+  | "unconfirmed"
+  | "needs-info"
+  | "accepting"
+  | "accepted"
+  | "accept-failed"
+  | "dismissed";
+
+const INTAKE_STATUSES: readonly IntakeStatus[] = [
+  "incomplete",
+  "pending",
+  "confirmed",
+  "unconfirmed",
+  "needs-info",
+  "accepting",
+  "accepted",
+  "accept-failed",
+  "dismissed"
+];
 
 export interface IntakeChannelConfig {
   channelId: string;
@@ -25,6 +56,8 @@ export interface IntakeRecord {
   screenshotUrl?: string;
   duplicateOfId?: string;
   triageMessageId?: string;
+  triageChannelId?: string;
+  followupPromptMessageId?: string;
   acceptedTaskId?: string;
   createdAt: string;
   updatedAt: string;
@@ -42,21 +75,42 @@ export interface AddIntakeRecordInput {
   evidence?: string[];
   screenshotUrl?: string;
   duplicateOfId?: string;
+  followupPromptMessageId?: string;
 }
 
 export interface IntakeUpdate {
   status?: IntakeStatus;
+  text?: string;
+  signature?: string;
+  evidence?: string[];
+  screenshotUrl?: string;
+  duplicateOfId?: string;
   triageMessageId?: string;
+  triageChannelId?: string;
+  followupPromptMessageId?: string;
   acceptedTaskId?: string;
+  clearFollowupPrompt?: boolean;
 }
+
+export type IntakeTransitionResult =
+  | { ok: true; record: IntakeRecord }
+  | { ok: false; record: IntakeRecord };
+
+export interface IntakeRateLimitBucket {
+  userHits: Record<string, number[]>;
+  channelHits: number[];
+}
+
+const EMPTY_RATE_LIMIT_BUCKET: IntakeRateLimitBucket = { userHits: {}, channelHits: [] };
 
 interface IntakeStateFile {
   version: 1;
   channel?: IntakeChannelConfig;
   records: IntakeRecord[];
+  rateLimits: Record<string, IntakeRateLimitBucket>;
 }
 
-const EMPTY_STATE: IntakeStateFile = { version: 1, records: [] };
+const EMPTY_STATE: IntakeStateFile = { version: 1, records: [], rateLimits: {} };
 
 export class IntakeStore {
   private state: IntakeStateFile | undefined;
@@ -95,12 +149,13 @@ export class IntakeStore {
         authorId: input.authorId,
         authorTag: input.authorTag,
         projectName: input.projectName,
-        text: input.text,
+        text: boundText(input.text),
         signature: input.signature,
         status: input.status,
-        evidence: input.evidence ?? [],
+        evidence: boundEvidenceList(input.evidence ?? []),
         ...(input.screenshotUrl ? { screenshotUrl: input.screenshotUrl } : {}),
         ...(input.duplicateOfId ? { duplicateOfId: input.duplicateOfId } : {}),
+        ...(input.followupPromptMessageId ? { followupPromptMessageId: input.followupPromptMessageId } : {}),
         createdAt: now,
         updatedAt: now
       };
@@ -116,11 +171,33 @@ export class IntakeStore {
       if (!record) {
         return undefined;
       }
-      if (patch.status !== undefined) record.status = patch.status;
-      if (patch.triageMessageId !== undefined) record.triageMessageId = patch.triageMessageId;
-      if (patch.acceptedTaskId !== undefined) record.acceptedTaskId = patch.acceptedTaskId;
-      record.updatedAt = new Date().toISOString();
+      applyIntakeUpdate(record, patch);
       return cloneRecord(record);
+    });
+  }
+
+  /**
+   * Compare-and-set status transition: only applies when the record's
+   * current status is one of `allowedFrom`. This is what makes concurrent
+   * button/modal handlers safe — the check and the write happen inside the
+   * same serialized mutation, so two racing "Accept" clicks cannot both win.
+   */
+  async transitionStatus(
+    id: string,
+    allowedFrom: readonly IntakeStatus[],
+    to: IntakeStatus,
+    patch: Omit<IntakeUpdate, "status"> = {}
+  ): Promise<IntakeTransitionResult | undefined> {
+    return this.mutate((state) => {
+      const record = state.records.find((item) => item.id === id);
+      if (!record) {
+        return undefined;
+      }
+      if (!allowedFrom.includes(record.status)) {
+        return { ok: false, record: cloneRecord(record) };
+      }
+      applyIntakeUpdate(record, { ...patch, status: to });
+      return { ok: true, record: cloneRecord(record) };
     });
   }
 
@@ -138,9 +215,31 @@ export class IntakeStore {
     return match ? cloneRecord(match) : undefined;
   }
 
+  /** Finds the open "incomplete" record whose follow-up prompt is `promptMessageId`, used to correlate a reporter's reply without spending another rate-limit slot. */
+  async findByFollowupPrompt(promptMessageId: string): Promise<IntakeRecord | undefined> {
+    const state = await this.readState();
+    const match = state.records.find(
+      (item) => item.status === "incomplete" && item.followupPromptMessageId === promptMessageId
+    );
+    return match ? cloneRecord(match) : undefined;
+  }
+
   async listRecent(limit = 10): Promise<IntakeRecord[]> {
     const state = await this.readState();
     return state.records.slice(0, Math.max(1, Math.min(limit, this.maxRecords))).map(cloneRecord);
+  }
+
+  async getRateLimitState(channelId: string): Promise<IntakeRateLimitBucket> {
+    const state = await this.readState();
+    const bucket = state.rateLimits[channelId];
+    return bucket ? { userHits: { ...bucket.userHits }, channelHits: [...bucket.channelHits] } : { ...EMPTY_RATE_LIMIT_BUCKET };
+  }
+
+  async setRateLimitState(channelId: string, bucket: IntakeRateLimitBucket): Promise<void> {
+    await this.mutate((state) => {
+      state.rateLimits[channelId] = { userHits: { ...bucket.userHits }, channelHits: [...bucket.channelHits] };
+      return undefined;
+    });
   }
 
   private async mutate<T>(mutation: (state: IntakeStateFile) => T): Promise<T> {
@@ -172,13 +271,23 @@ export class IntakeStore {
     }
 
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as Partial<IntakeStateFile>;
+      const raw = await readFile(this.stateFile, "utf8");
+      await hardenPrivateFilePermissions(this.stateFile);
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Intake state must be a JSON object.");
+      }
+      const candidate = parsed as Partial<IntakeStateFile>;
+      if (candidate.version !== undefined && candidate.version !== 1) {
+        throw new Error(`Unsupported intake state version: ${String(candidate.version)}.`);
+      }
       this.state = {
         version: 1,
-        ...(parsed.channel && typeof parsed.channel.channelId === "string" && typeof parsed.channel.projectName === "string"
-          ? { channel: { channelId: parsed.channel.channelId, projectName: parsed.channel.projectName } }
-          : {}),
-        records: Array.isArray(parsed.records) ? parsed.records : []
+        ...(isValidChannelConfig(candidate.channel) ? { channel: candidate.channel } : {}),
+        records: Array.isArray(candidate.records)
+          ? candidate.records.map(normalizeLoadedIntakeRecord).filter((record): record is IntakeRecord => record !== undefined)
+          : [],
+        rateLimits: normalizeLoadedRateLimits(candidate.rateLimits)
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -195,11 +304,45 @@ export class IntakeStore {
       return;
     }
 
-    await mkdir(path.dirname(this.stateFile), { recursive: true });
-    const tempFile = `${this.stateFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`);
+    const directory = path.dirname(this.stateFile);
+    await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    await hardenPrivateDirectoryPermissions(directory);
+    const tempFile = `${this.stateFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE
+    });
     await rename(tempFile, this.stateFile);
+    await hardenPrivateFilePermissions(this.stateFile);
   }
+}
+
+function applyIntakeUpdate(record: IntakeRecord, patch: IntakeUpdate): void {
+  if (patch.status !== undefined) record.status = patch.status;
+  if (patch.text !== undefined) record.text = boundText(patch.text);
+  if (patch.signature !== undefined) record.signature = patch.signature;
+  if (patch.evidence !== undefined) record.evidence = boundEvidenceList(patch.evidence);
+  if (patch.screenshotUrl !== undefined) record.screenshotUrl = patch.screenshotUrl;
+  if (patch.duplicateOfId !== undefined) record.duplicateOfId = patch.duplicateOfId;
+  if (patch.triageMessageId !== undefined) record.triageMessageId = patch.triageMessageId;
+  if (patch.triageChannelId !== undefined) record.triageChannelId = patch.triageChannelId;
+  if (patch.followupPromptMessageId !== undefined) record.followupPromptMessageId = patch.followupPromptMessageId;
+  if (patch.clearFollowupPrompt) delete record.followupPromptMessageId;
+  if (patch.acceptedTaskId !== undefined) record.acceptedTaskId = patch.acceptedTaskId;
+  record.updatedAt = new Date().toISOString();
+}
+
+function boundText(value: string): string {
+  return redactSensitiveText(value).slice(0, MAX_TEXT_LENGTH);
+}
+
+function boundEvidenceList(evidence: string[]): string[] {
+  return evidence
+    .map((line) => redactSensitiveText(line).replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, MAX_EVIDENCE_ENTRIES)
+    .map((line) => (line.length > MAX_EVIDENCE_LENGTH ? `${line.slice(0, MAX_EVIDENCE_LENGTH - 1)}…` : line));
 }
 
 function newIntakeRecordId(): string {
@@ -210,11 +353,104 @@ export function isIntakeRecordId(value: string): boolean {
   return INTAKE_RECORD_ID_PATTERN.test(value);
 }
 
+function isValidChannelConfig(value: unknown): value is IntakeChannelConfig {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<IntakeChannelConfig>;
+  return typeof candidate.channelId === "string" && Boolean(candidate.channelId) && typeof candidate.projectName === "string" && Boolean(candidate.projectName);
+}
+
+function normalizeLoadedIntakeRecord(value: unknown): IntakeRecord | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Partial<IntakeRecord>;
+  if (
+    typeof record.id !== "string" ||
+    !isIntakeRecordId(record.id) ||
+    typeof record.channelId !== "string" ||
+    typeof record.messageId !== "string" ||
+    typeof record.authorId !== "string" ||
+    typeof record.authorTag !== "string" ||
+    typeof record.projectName !== "string" ||
+    typeof record.text !== "string" ||
+    typeof record.signature !== "string"
+  ) {
+    return undefined;
+  }
+
+  const status = INTAKE_STATUSES.includes(record.status as IntakeStatus) ? (record.status as IntakeStatus) : "dismissed";
+  const createdAt = validTimestamp(record.createdAt) ?? new Date(0).toISOString();
+  const updatedAt = validTimestamp(record.updatedAt) ?? createdAt;
+
+  return {
+    id: record.id,
+    channelId: record.channelId,
+    messageId: record.messageId,
+    authorId: record.authorId,
+    authorTag: record.authorTag,
+    projectName: record.projectName,
+    text: boundText(record.text),
+    signature: record.signature,
+    status,
+    evidence: Array.isArray(record.evidence) ? boundEvidenceList(record.evidence.filter((line): line is string => typeof line === "string")) : [],
+    ...(stringValue(record.screenshotUrl) ? { screenshotUrl: stringValue(record.screenshotUrl)! } : {}),
+    ...(stringValue(record.duplicateOfId) ? { duplicateOfId: stringValue(record.duplicateOfId)! } : {}),
+    ...(stringValue(record.triageMessageId) ? { triageMessageId: stringValue(record.triageMessageId)! } : {}),
+    ...(stringValue(record.triageChannelId) ? { triageChannelId: stringValue(record.triageChannelId)! } : {}),
+    ...(stringValue(record.followupPromptMessageId) ? { followupPromptMessageId: stringValue(record.followupPromptMessageId)! } : {}),
+    ...(stringValue(record.acceptedTaskId) ? { acceptedTaskId: stringValue(record.acceptedTaskId)! } : {}),
+    createdAt,
+    updatedAt
+  };
+}
+
+function normalizeLoadedRateLimits(value: unknown): Record<string, IntakeRateLimitBucket> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const result: Record<string, IntakeRateLimitBucket> = {};
+  for (const [channelId, bucket] of Object.entries(value as Record<string, unknown>)) {
+    const normalized = normalizeLoadedRateLimitBucket(bucket);
+    if (normalized) {
+      result[channelId] = normalized;
+    }
+  }
+  return result;
+}
+
+function normalizeLoadedRateLimitBucket(value: unknown): IntakeRateLimitBucket | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Partial<IntakeRateLimitBucket>;
+  const channelHits = Array.isArray(candidate.channelHits) ? candidate.channelHits.filter((entry): entry is number => typeof entry === "number") : [];
+  const userHits: Record<string, number[]> = {};
+  if (candidate.userHits && typeof candidate.userHits === "object" && !Array.isArray(candidate.userHits)) {
+    for (const [userId, timestamps] of Object.entries(candidate.userHits)) {
+      if (Array.isArray(timestamps)) {
+        userHits[userId] = timestamps.filter((entry): entry is number => typeof entry === "number");
+      }
+    }
+  }
+  return { userHits, channelHits };
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function validTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return Number.isNaN(Date.parse(value)) ? undefined : value;
+}
+
 function cloneState(state: IntakeStateFile): IntakeStateFile {
   return {
     version: 1,
     ...(state.channel ? { channel: { ...state.channel } } : {}),
-    records: state.records.map(cloneRecord)
+    records: state.records.map(cloneRecord),
+    rateLimits: Object.fromEntries(
+      Object.entries(state.rateLimits).map(([channelId, bucket]) => [
+        channelId,
+        { userHits: { ...bucket.userHits }, channelHits: [...bucket.channelHits] }
+      ])
+    )
   };
 }
 
