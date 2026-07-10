@@ -30,10 +30,18 @@ export const DEFAULT_GRID_CELL_SIZE = 24;
 export const DEFAULT_CELL_CHANGE_RATIO = 0.12;
 export const DEFAULT_DIFF_ATTACH_THRESHOLD_PERCENT = 0.5;
 
+/**
+ * The comparison canvas is the union of both dimensions, not the smaller
+ * overlap: a page that grew or shrank must show the added/removed strip as
+ * changed, not silently drop it from the comparison.
+ */
 export function commonCanvasSize(a: Size, b: Size): Size {
+  if (a.width <= 0 || a.height <= 0 || b.width <= 0 || b.height <= 0) {
+    return { width: 0, height: 0 };
+  }
   return {
-    width: Math.max(0, Math.min(a.width, b.width)),
-    height: Math.max(0, Math.min(a.height, b.height))
+    width: Math.max(a.width, b.width),
+    height: Math.max(a.height, b.height)
   };
 }
 
@@ -105,18 +113,29 @@ export function clusterChangedCells(
 
 export async function diffImages(beforePng: Buffer, afterPng: Buffer, options: DiffImagesOptions = {}): Promise<DiffResult> {
   const [beforeMeta, afterMeta] = await Promise.all([sharp(beforePng).metadata(), sharp(afterPng).metadata()]);
-  const size = commonCanvasSize(
-    { width: beforeMeta.width ?? 0, height: beforeMeta.height ?? 0 },
-    { width: afterMeta.width ?? 0, height: afterMeta.height ?? 0 }
-  );
+  const beforeSize = { width: beforeMeta.width ?? 0, height: beforeMeta.height ?? 0 };
+  const afterSize = { width: afterMeta.width ?? 0, height: afterMeta.height ?? 0 };
+  const size = commonCanvasSize(beforeSize, afterSize);
 
   if (size.width === 0 || size.height === 0) {
     return { width: 0, height: 0, changedPixelPercent: 0, regions: [] };
   }
 
+  // Pad onto the union canvas instead of stretching to it, so a dimension
+  // change shows up as real added/removed content rather than distorted
+  // pixels; anything outside an image's original bounds is transparent and
+  // therefore always counted as changed below.
   const [beforeRaw, afterRaw] = await Promise.all([
-    sharp(beforePng).resize(size.width, size.height, { fit: "fill" }).ensureAlpha().raw().toBuffer(),
-    sharp(afterPng).resize(size.width, size.height, { fit: "fill" }).ensureAlpha().raw().toBuffer()
+    sharp(beforePng)
+      .resize(size.width, size.height, { fit: "contain", position: "left top", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+      .ensureAlpha()
+      .raw()
+      .toBuffer(),
+    sharp(afterPng)
+      .resize(size.width, size.height, { fit: "contain", position: "left top", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+      .ensureAlpha()
+      .raw()
+      .toBuffer()
   ]);
 
   const pixelThreshold = options.pixelThreshold ?? DEFAULT_PIXEL_THRESHOLD;
@@ -135,16 +154,29 @@ export async function diffImages(beforePng: Buffer, afterPng: Buffer, options: D
     const cellRow = Math.floor(y / cellSize);
     const totalRow = cellTotalCounts[cellRow]!;
     const changedRow = cellChangedCounts[cellRow]!;
+    const outsideBeforeRow = y >= beforeSize.height;
+    const outsideAfterRow = y >= afterSize.height;
     for (let x = 0; x < size.width; x++) {
       const cellCol = Math.floor(x / cellSize);
-      const idx = (y * size.width + x) * 4;
-      const diff =
-        Math.abs(beforeRaw[idx]! - afterRaw[idx]!) +
-        Math.abs(beforeRaw[idx + 1]! - afterRaw[idx + 1]!) +
-        Math.abs(beforeRaw[idx + 2]! - afterRaw[idx + 2]!);
-
       totalRow[cellCol] = (totalRow[cellCol] ?? 0) + 1;
-      if (diff > pixelThreshold) {
+
+      const outsideBefore = outsideBeforeRow || x >= beforeSize.width;
+      const outsideAfter = outsideAfterRow || x >= afterSize.width;
+      let changed: boolean;
+      if (outsideBefore !== outsideAfter) {
+        // Only one image has real content at this position: the canvas grew
+        // or shrank here, which is itself a visible change.
+        changed = true;
+      } else {
+        const idx = (y * size.width + x) * 4;
+        const diff =
+          Math.abs(beforeRaw[idx]! - afterRaw[idx]!) +
+          Math.abs(beforeRaw[idx + 1]! - afterRaw[idx + 1]!) +
+          Math.abs(beforeRaw[idx + 2]! - afterRaw[idx + 2]!);
+        changed = diff > pixelThreshold;
+      }
+
+      if (changed) {
         changedPixels += 1;
         changedRow[cellCol] = (changedRow[cellCol] ?? 0) + 1;
       }
@@ -181,8 +213,14 @@ export async function composeBeforeAfter(before: Buffer, after: Buffer, regions:
   const panelHeight = Math.max(1, Math.round(size.height * scale));
 
   const [beforeResized, afterResized] = await Promise.all([
-    sharp(before).resize(panelWidth, panelHeight, { fit: "fill" }).png().toBuffer(),
-    sharp(after).resize(panelWidth, panelHeight, { fit: "fill" }).png().toBuffer()
+    sharp(before)
+      .resize(panelWidth, panelHeight, { fit: "contain", position: "left top", background: CARD_BACKGROUND })
+      .png()
+      .toBuffer(),
+    sharp(after)
+      .resize(panelWidth, panelHeight, { fit: "contain", position: "left top", background: CARD_BACKGROUND })
+      .png()
+      .toBuffer()
   ]);
 
   const highlightRects = regions

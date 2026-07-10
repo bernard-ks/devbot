@@ -1,33 +1,14 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { captureProjectScreenshot, findProjectWebUrls, type ProjectScreenshot } from "./project-screenshot.js";
+import { captureProjectScreenshot } from "./project-screenshot.js";
+import { hardenPrivateDirectoryPermissions, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "./security.js";
 import { isScreenshotBlocked, screenshotRequiresApproval } from "./safety.js";
 import type { TaskRecord } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
-import { composeBeforeAfter, diffImages, shouldAttachDiffCard } from "./visual-diff.js";
 
 export const DEFAULT_CAPTURE_ROOT = path.resolve(".devbot", "captures");
-
-export interface VisualCaptureSession {
-  before: ProjectScreenshot;
-}
-
-export interface VisualCaptureMetadata {
-  captureBeforeUrl: string;
-  captureBeforeAt: string;
-  captureAfterUrl: string;
-  captureAfterAt: string;
-  captureChangedPercent: number;
-  captureAfterFile: string;
-  captureCardFile?: string;
-}
-
-export interface VisualDiffOutcome {
-  changedPercent: number;
-  cardBuffer?: Buffer;
-  cardFileName?: string;
-  metadata: VisualCaptureMetadata;
-}
+const MAX_RETAINED_CAPTURES = 200;
+const CAPTURE_FILE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,78}\.png$/i;
 
 export function canAutoCaptureProject(project: ProjectEntry): boolean {
   return !isScreenshotBlocked(project) && !screenshotRequiresApproval(project);
@@ -37,83 +18,44 @@ export function captureFileName(taskId: string, suffix: string): string {
   return `${taskId}-${suffix}.png`;
 }
 
-export async function beginVisualCapture(project: ProjectEntry, requestText: string): Promise<VisualCaptureSession | undefined> {
-  if (!canAutoCaptureProject(project)) {
-    return undefined;
-  }
-
-  const urls = await findProjectWebUrls(project);
-  if (urls.length === 0) {
-    return undefined;
-  }
-
-  const before = await captureProjectScreenshot(project, { requestText });
-  return before ? { before } : undefined;
+/** Rejects anything but a plain, extensionless-traversal-free basename before it ever reaches a path.join. */
+export function isSafeCaptureFileName(fileName: string): boolean {
+  return (
+    CAPTURE_FILE_NAME_PATTERN.test(fileName) &&
+    !fileName.includes("..") &&
+    !path.isAbsolute(fileName) &&
+    fileName === path.basename(fileName)
+  );
 }
 
-export async function finishVisualCapture(
-  session: VisualCaptureSession,
-  project: ProjectEntry,
-  taskId: string,
-  captureRoot = DEFAULT_CAPTURE_ROOT
-): Promise<VisualDiffOutcome | undefined> {
-  const after = await captureProjectScreenshot(project, { requestText: session.before.url });
-  if (!after) {
-    return undefined;
-  }
-
-  const diff = await diffImages(session.before.image, after.image);
-  const afterFile = captureFileName(taskId, "after");
-  await saveCaptureImage(afterFile, after.image, captureRoot);
-
-  const metadata: VisualCaptureMetadata = {
-    captureBeforeUrl: session.before.url,
-    captureBeforeAt: session.before.metadata.capturedAt,
-    captureAfterUrl: after.url,
-    captureAfterAt: after.metadata.capturedAt,
-    captureChangedPercent: diff.changedPixelPercent,
-    captureAfterFile: afterFile
-  };
-
-  if (!shouldAttachDiffCard(diff.changedPixelPercent)) {
-    return { changedPercent: diff.changedPixelPercent, metadata };
-  }
-
-  const cardBuffer = await composeBeforeAfter(session.before.image, after.image, diff.regions);
-  const cardFile = captureFileName(taskId, "diff-card");
-  await saveCaptureImage(cardFile, cardBuffer, captureRoot);
-
-  return {
-    changedPercent: diff.changedPixelPercent,
-    cardBuffer,
-    cardFileName: `devbot-visual-diff-${taskId}.png`,
-    metadata: { ...metadata, captureCardFile: cardFile }
-  };
-}
-
-export interface ShipImage {
+export interface ShipCaptureLive {
+  isolated: false;
   image: Buffer;
-  changedPercent?: number;
-  isLiveFallback: boolean;
 }
 
+export interface ShipCaptureUnavailable {
+  isolated: true;
+  branch?: string;
+}
+
+export type ShipImageResult = ShipCaptureLive | ShipCaptureUnavailable;
+
+/**
+ * `/ship` is the only remaining visual-evidence surface (see HANDOFF "Review
+ * round 1"): action tasks always run in an isolated Git worktree
+ * (task-worktree.ts), and Devbot has no managed preview of that isolated
+ * workspace. The project's dev server only ever serves the source checkout,
+ * so screenshotting it for an isolated task would misrepresent someone
+ * else's (or no) change as this task's result. Isolated tasks therefore get
+ * an explicit "unavailable" result instead of a screenshot attempt.
+ */
 export async function resolveShipImage(
   task: TaskRecord,
   project: ProjectEntry,
   captureRoot = DEFAULT_CAPTURE_ROOT
-): Promise<ShipImage | undefined> {
-  if (task.captureCardFile) {
-    const image = await loadCaptureImage(task.captureCardFile, captureRoot);
-    if (image) {
-      return { image, isLiveFallback: false, ...(task.captureChangedPercent !== undefined ? { changedPercent: task.captureChangedPercent } : {}) };
-    }
-  }
-
-  if (task.captureAfterFile) {
-    const image = await loadCaptureImage(task.captureAfterFile, captureRoot);
-    if (image) {
-      return { image, isLiveFallback: false, ...(task.captureChangedPercent !== undefined ? { changedPercent: task.captureChangedPercent } : {}) };
-    }
+): Promise<ShipImageResult | undefined> {
+  if (task.workspaceIsolated) {
+    return { isolated: true, ...(task.branchName ? { branch: task.branchName } : {}) };
   }
 
   if (!canAutoCaptureProject(project)) {
@@ -121,21 +63,57 @@ export async function resolveShipImage(
   }
 
   const live = await captureProjectScreenshot(project, { requestText: task.text }).catch(() => undefined);
-  return live ? { image: live.image, isLiveFallback: true } : undefined;
+  if (!live) {
+    return undefined;
+  }
+
+  await persistShipCapture(task.id, live.image, captureRoot).catch((error) => {
+    console.warn(`Unable to persist ship capture for task ${task.id}: ${(error as Error).message}`);
+  });
+  return { isolated: false, image: live.image };
 }
 
-async function saveCaptureImage(fileName: string, buffer: Buffer, captureRoot: string): Promise<void> {
-  await mkdir(captureRoot, { recursive: true });
+async function persistShipCapture(taskId: string, image: Buffer, captureRoot = DEFAULT_CAPTURE_ROOT): Promise<void> {
+  const fileName = captureFileName(taskId, "ship");
+  if (!isSafeCaptureFileName(fileName)) {
+    return;
+  }
+
+  await mkdir(captureRoot, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+  await hardenPrivateDirectoryPermissions(captureRoot);
   const targetPath = path.join(captureRoot, fileName);
   const tempPath = `${targetPath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-  await writeFile(tempPath, buffer);
+  await writeFile(tempPath, image, { mode: PRIVATE_FILE_MODE });
   await rename(tempPath, targetPath);
+  await pruneCaptures(captureRoot);
 }
 
-async function loadCaptureImage(fileName: string, captureRoot: string): Promise<Buffer | undefined> {
+/** Caps `.devbot/captures` to the most recently written files; captured UI can contain sensitive product data and must not accumulate forever. */
+export async function pruneCaptures(captureRoot = DEFAULT_CAPTURE_ROOT, maxRetained = MAX_RETAINED_CAPTURES): Promise<void> {
+  let entries: string[];
   try {
-    return await readFile(path.join(captureRoot, fileName));
+    entries = await readdir(captureRoot);
   } catch {
-    return undefined;
+    return;
+  }
+
+  const candidates = entries.filter((entry) => isSafeCaptureFileName(entry));
+  const withStats = await Promise.all(
+    candidates.map(async (name) => {
+      try {
+        const info = await stat(path.join(captureRoot, name));
+        return { name, mtimeMs: info.mtimeMs };
+      } catch {
+        return undefined;
+      }
+    })
+  );
+  const sorted = withStats
+    .filter((entry): entry is { name: string; mtimeMs: number } => Boolean(entry))
+    .sort((a, b) => a.mtimeMs - b.mtimeMs);
+
+  const excess = sorted.length - Math.max(0, maxRetained);
+  for (let i = 0; i < excess; i++) {
+    await rm(path.join(captureRoot, sorted[i]!.name), { force: true }).catch(() => undefined);
   }
 }

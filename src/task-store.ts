@@ -60,24 +60,10 @@ export interface TaskRecord {
   startedAt: string;
   updatedAt: string;
   finishedAt?: string;
-  captureBeforeUrl?: string;
-  captureBeforeAt?: string;
-  captureAfterUrl?: string;
-  captureAfterAt?: string;
-  captureChangedPercent?: number;
-  captureAfterFile?: string;
-  captureCardFile?: string;
   captureNote?: string;
 }
 
 export interface TaskCaptureInput {
-  captureBeforeUrl?: string;
-  captureBeforeAt?: string;
-  captureAfterUrl?: string;
-  captureAfterAt?: string;
-  captureChangedPercent?: number;
-  captureAfterFile?: string;
-  captureCardFile?: string;
   captureNote?: string;
 }
 
@@ -337,13 +323,6 @@ export class TaskStore {
 
   async recordCapture(id: string, capture: TaskCaptureInput): Promise<void> {
     await this.update(id, (task) => {
-      if (capture.captureBeforeUrl !== undefined) task.captureBeforeUrl = capture.captureBeforeUrl;
-      if (capture.captureBeforeAt !== undefined) task.captureBeforeAt = capture.captureBeforeAt;
-      if (capture.captureAfterUrl !== undefined) task.captureAfterUrl = capture.captureAfterUrl;
-      if (capture.captureAfterAt !== undefined) task.captureAfterAt = capture.captureAfterAt;
-      if (capture.captureChangedPercent !== undefined) task.captureChangedPercent = capture.captureChangedPercent;
-      if (capture.captureAfterFile !== undefined) task.captureAfterFile = capture.captureAfterFile;
-      if (capture.captureCardFile !== undefined) task.captureCardFile = capture.captureCardFile;
       if (capture.captureNote !== undefined) task.captureNote = capture.captureNote;
     });
   }
@@ -580,10 +559,7 @@ export function formatTaskDetail(task: TaskRecord): string {
     task.changedFiles?.length ? `Changed files: ${task.changedFiles.map((file) => `\`${file}\``).join(", ")}` : undefined,
     task.diffStat ? `Diff: ${task.diffStat}` : undefined,
     task.verification?.length ? ["", "Verification:", ...task.verification.map((item) => `- ${item}`)].join("\n") : undefined,
-    task.captureChangedPercent !== undefined
-      ? `Visual diff: ${task.captureChangedPercent.toFixed(1)}% changed (${task.captureBeforeUrl ?? "?"} → ${task.captureAfterUrl ?? "?"})`
-      : undefined,
-    task.captureNote ? `Visual diff note: ${task.captureNote}` : undefined,
+    task.captureNote ? `Visual proof: ${task.captureNote}` : undefined,
     "",
     "Request:",
     neutralizeMentions(truncate(task.text, 800)),

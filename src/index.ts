@@ -107,7 +107,7 @@ import {
   taskControlRow,
   type TaskControlAction
 } from "./task-controls.js";
-import { beginVisualCapture, finishVisualCapture, resolveShipImage, type VisualCaptureSession } from "./visual-capture.js";
+import { resolveShipImage } from "./visual-capture.js";
 import { composeShipCard } from "./ship-card.js";
 import {
   continuationPrompt,
@@ -1372,7 +1372,6 @@ interface ProjectRequestResult {
   context: PackedProjectContext;
   taskId: string;
   route: RequestRoute;
-  visualDiff?: { changedPercent: number; cardBuffer: Buffer; cardFileName: string };
 }
 
 async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
@@ -1501,7 +1500,6 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       executionProject.metadata.policy.maxContextChars,
       options.contextCharLimit
     );
-    const visualCapturePromise = beginVisualCaptureForRequest(options, task.id);
     const context = contextCharLimit === 0
       ? { project: executionProject, files: [], packedText: "" }
       : await contextService.pack(executionProject, options.text, options.includePatterns, contextCharLimit);
@@ -1515,34 +1513,18 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       route,
       contextFileCount: context.files.length
     });
-    const captureSession = await visualCapturePromise;
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree);
-    }
-    const visualDiff = captureSession
-      ? await finishVisualCapture(captureSession, options.project, task.id).catch(async (error) => {
-          console.warn(`Visual diff after-capture failed for task ${task.id}: ${(error as Error).message}`);
-          await taskStore.recordCapture(task.id, { captureNote: "Before screenshot captured, but the after screenshot failed." });
-          return undefined;
-        })
-      : undefined;
-    if (visualDiff) {
-      // Action tasks now execute in an isolated git worktree (see task-worktree.ts): Codex's edits
-      // land on a review branch, never in options.project.root. The dev server this capture just
-      // hit only serves the source checkout, so it cannot have picked up those edits yet — a 0%
-      // (or noise-level) diff here does NOT mean the task had no visual effect, only that it hasn't
-      // been merged. Keep recording the comparison (it still catches capture/server health issues
-      // and the rare case of a real difference), but always flag the caveat on isolated tasks so
-      // nobody mistakes "no diff shown" for "no change made".
+      // Every action task runs in an isolated Git worktree (task-worktree.ts); Codex's edits land
+      // on a review branch, never in options.project.root. Devbot has no managed preview of that
+      // isolated workspace, so there is no server it could honestly screenshot "after" against —
+      // the source checkout's dev server never reflects this task's changes. Per review, automatic
+      // before/after capture is skipped entirely rather than attaching a diff that would silently
+      // misrepresent someone else's (or no) change as this task's result. `/ship` remains available
+      // as an explicit, on-demand, honestly-captioned surface (visual-capture.ts).
       await taskStore.recordCapture(task.id, {
-        ...visualDiff.metadata,
-        ...(isolatedWorktree
-          ? {
-              captureNote:
-                `Captured against the source checkout's dev server, not the isolated review branch (${isolatedWorktree.branch}) where this task's file changes landed; this comparison won't reflect them until that branch is merged.`
-            }
-          : {})
+        captureNote: `Visual proof unavailable: this task ran on isolated branch \`${isolatedWorktree.branch}\`. Run \`/ship task:${task.id}\` for details, or review the branch directly.`
       });
     }
     const completed = await taskStore.succeed(task.id, {
@@ -1565,10 +1547,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       answer,
       context,
       taskId: task.id,
-      route,
-      ...(visualDiff?.cardBuffer
-        ? { visualDiff: { changedPercent: visualDiff.changedPercent, cardBuffer: visualDiff.cardBuffer, cardFileName: visualDiff.cardFileName ?? "devbot-visual-diff.png" } }
-        : {})
+      route
     };
   } catch (error) {
     if (isolatedWorktree) {
@@ -1651,19 +1630,6 @@ async function recordTaskWorktreeEvidence(
   });
 }
 
-async function beginVisualCaptureForRequest(options: ProjectRequestOptions, taskId: string): Promise<VisualCaptureSession | undefined> {
-  if (options.mode !== "action") {
-    return undefined;
-  }
-  try {
-    return await beginVisualCapture(options.project, options.text);
-  } catch (error) {
-    console.warn(`Visual diff before-capture failed for ${options.project.name}: ${(error as Error).message}`);
-    await taskStore.recordCapture(taskId, { captureNote: "Visual diff capture failed before the task started; continuing without it." });
-    return undefined;
-  }
-}
-
 async function reportTaskProgress(options: ProjectRequestOptions, progress: TaskProgressEvent): Promise<void> {
   if (!options.onProgress) {
     return;
@@ -1698,12 +1664,11 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
       }
     });
     const chunks = splitDiscordMessage(
-      `${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}${visualDiffNote(result)}`
+      `${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`
     );
     await interaction.editReply({
       content: chunks.shift() ?? "Task completed without a response.",
-      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })],
-      files: visualDiffFiles(result)
+      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })]
     });
     for (const chunk of chunks) {
       await interaction.followUp({
@@ -1717,14 +1682,6 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
     }
     console.error(publicErrorMessage(error));
   }
-}
-
-function visualDiffNote(result: ProjectRequestResult): string {
-  return result.visualDiff ? `\n\nVisual diff: ${result.visualDiff.changedPercent.toFixed(1)}% of the page changed.` : "";
-}
-
-function visualDiffFiles(result: ProjectRequestResult): AttachmentBuilder[] {
-  return result.visualDiff ? [new AttachmentBuilder(result.visualDiff.cardBuffer, { name: result.visualDiff.cardFileName })] : [];
 }
 
 interface MessageRequestOptions extends Omit<ProjectRequestOptions, "onProgress"> {
@@ -1747,12 +1704,11 @@ async function executeMessageRequest(options: MessageRequestOptions): Promise<vo
       }
     });
     const chunks = splitDiscordMessage(
-      `${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}${visualDiffNote(result)}`
+      `${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`
     );
     await pending.edit({
       content: chunks.shift() ?? "Task completed without a response.",
-      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })],
-      files: visualDiffFiles(result)
+      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })]
     });
     for (const chunk of chunks) {
       await message.reply(chunk);
@@ -3021,10 +2977,10 @@ async function handleTaskControl(
       return;
     }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const { card, hasScreenshot } = await buildShipCard(project, task);
+    const shipBuild = await buildShipCard(project, task);
     await interaction.editReply({
-      content: shipCardCaption(project, task, hasScreenshot),
-      files: [new AttachmentBuilder(card, { name: `devbot-ship-${task.id}.png` })]
+      content: shipCardCaption(project, task, shipBuild),
+      files: [new AttachmentBuilder(shipBuild.card, { name: `devbot-ship-${task.id}.png` })]
     });
     return;
   }
@@ -3473,28 +3429,42 @@ async function handleShipCommand(interaction: ChatInputCommandInteraction, appCo
 
   const privateReply = hasProjectAudienceRestriction(project);
   await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
-  const { card, hasScreenshot } = await buildShipCard(project, task);
+  const shipBuild = await buildShipCard(project, task);
   await interaction.editReply({
-    content: shipCardCaption(project, task, hasScreenshot),
-    files: [new AttachmentBuilder(card, { name: `devbot-ship-${task.id}.png` })]
+    content: shipCardCaption(project, task, shipBuild),
+    files: [new AttachmentBuilder(shipBuild.card, { name: `devbot-ship-${task.id}.png` })]
   });
 }
 
-async function buildShipCard(project: ProjectEntry, task: TaskRecord): Promise<{ card: Buffer; hasScreenshot: boolean }> {
+interface ShipCardBuild {
+  card: Buffer;
+  hasScreenshot: boolean;
+  isolatedBranch?: string;
+}
+
+async function buildShipCard(project: ProjectEntry, task: TaskRecord): Promise<ShipCardBuild> {
   const source = await resolveShipImage(task, project);
+  const image = source && !source.isolated ? source.image : undefined;
   const card = await composeShipCard({
     projectName: project.name,
     summary: task.text,
-    ...(source ? { image: source.image } : {}),
-    ...(source?.changedPercent !== undefined ? { changedPercent: source.changedPercent } : {})
+    ...(image ? { image } : {})
   });
-  return { card, hasScreenshot: Boolean(source) };
+  return {
+    card,
+    hasScreenshot: Boolean(image),
+    ...(source?.isolated ? { isolatedBranch: source.branch ?? "unknown" } : {})
+  };
 }
 
-function shipCardCaption(project: ProjectEntry, task: TaskRecord, hasScreenshot: boolean): string {
-  return hasScreenshot
-    ? `Ship card for \`${project.name}\` task \`${task.id}\`. Attach and post anywhere.`
-    : `Ship card for \`${project.name}\` task \`${task.id}\`. No screenshot was available for this task, so the card is text-only.`;
+function shipCardCaption(project: ProjectEntry, task: TaskRecord, build: ShipCardBuild): string {
+  const header = `Ship card for \`${project.name}\` task \`${task.id}\`.`;
+  if (build.isolatedBranch) {
+    return `${header} Visual proof unavailable for isolated branch \`${build.isolatedBranch}\`: Devbot has no managed preview of that isolated workspace, so no screenshot was attempted. The card is text-only; review the branch directly.`;
+  }
+  return build.hasScreenshot
+    ? `${header} Attach and post anywhere.`
+    : `${header} No screenshot was available for this task, so the card is text-only.`;
 }
 
 async function handleDevbotCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {

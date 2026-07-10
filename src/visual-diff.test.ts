@@ -9,9 +9,9 @@ import {
   shouldAttachDiffCard
 } from "./visual-diff.js";
 
-test("commonCanvasSize picks the smallest shared dimensions", () => {
-  assert.deepEqual(commonCanvasSize({ width: 100, height: 200 }, { width: 150, height: 150 }), { width: 100, height: 150 });
-  assert.deepEqual(commonCanvasSize({ width: 0, height: 50 }, { width: 80, height: 50 }), { width: 0, height: 50 });
+test("commonCanvasSize picks the union of both dimensions so no content is dropped", () => {
+  assert.deepEqual(commonCanvasSize({ width: 100, height: 200 }, { width: 150, height: 150 }), { width: 150, height: 200 });
+  assert.deepEqual(commonCanvasSize({ width: 0, height: 50 }, { width: 80, height: 50 }), { width: 0, height: 0 });
 });
 
 test("shouldAttachDiffCard applies an inclusive threshold", () => {
@@ -83,6 +83,17 @@ test("diffImages reports no change for identical images", async () => {
   const result = await diffImages(image, image);
   assert.equal(result.changedPixelPercent, 0);
   assert.deepEqual(result.regions, []);
+});
+
+test("diffImages counts a dimension change as a changed region instead of dropping it", async () => {
+  const before = await solidWithSquare(160, 120, { x: 10, y: 10, size: 10 });
+  const after = await solidWithSquare(160, 200, { x: 10, y: 10, size: 10 });
+
+  const result = await diffImages(before, after);
+  assert.equal(result.width, 160);
+  assert.equal(result.height, 200);
+  assert.ok(result.changedPixelPercent > 0, "expected the added strip to count as changed, not be silently cropped away");
+  assert.ok(result.regions.some((region) => region.y >= 120), "expected a changed region covering the newly added height");
 });
 
 test("composeBeforeAfter renders a side-by-side card sized for the source screenshots", async () => {
