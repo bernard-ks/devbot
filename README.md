@@ -135,6 +135,7 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/task retry id:<task-id>`: Retry a saved task with the same project, mode, text, and include patterns.
 - `/task freshness project:<name> limit:<optional>`: Show merged state and behind/ahead counts for saved task branches against the project's local default branch. Branches that are fully merged are marked durably on the task record and flagged as prune-eligible worktrees.
 - `/task sync task:<task-id>`: Rebase one task branch onto the current local default branch inside its isolated worktree. Available to the task requester, the owner, or an approved controller; blocked by safe mode and while the task is still open. The pre-sync tip is preserved under `refs/devbot/backup/<task-id>` first, conflicts abort with the branch restored and the conflicted files reported, and configured validation runs afterwards for controllers with results reported as-is.
+- `/task preview task:<task-id> action:<start|stop|status>`: Start, stop, or inspect a managed dev server for the task's isolated worktree. The server runs only the project's configured `dev`/`preview`/`serve`/`start` preset or an allow-listed package.json script, binds to a loopback origin (`http://127.0.0.1:<ephemeral port>`) on the machine running Devbot, and stops automatically after its TTL. It is not a public tunnel and is reachable only from that machine. Only the task requester, the owner, or an approved controller can manage a preview; safe mode blocks starting one but never stopping it. Missing dependencies fail closed; Devbot does not install them.
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
 - `/dashboard project:<optional>`: Open the personal interactive workspace with project selection, current status, recent work, and native Ask / Change controls.
 - `/inbox project:<optional> limit:<optional>`: Open the ephemeral **Needs Me** inbox for pending proposals and decisions, with review controls and refresh.
@@ -182,7 +183,7 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, and owner-managed setup in `.devbot/setup.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, or `DEVBOT_SETUP_STORE` to use different files; relative paths resolve from the devbot process working directory.
+Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, owner-managed setup in `.devbot/setup.json`, and the running-preview pid ledger in `.devbot/previews.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, `DEVBOT_SETUP_STORE`, or `DEVBOT_PREVIEW_STORE` to use different files; relative paths resolve from the devbot process working directory.
 
 ## Owner Setup And Visibility
 
@@ -221,7 +222,7 @@ Each target project can define optional metadata at `<project>/.devbot/project.j
 }
 ```
 
-Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables write-capable work: `/do`, action-task retries, `/run`, `/task sync`, `/review validate`, and `/review gates`.
+Devbot only runs commands declared in that metadata file. A `dev`, `preview`, `serve`, or `start` preset also serves as the dev command for `/task preview`; without one, Devbot falls back to a package.json script with one of those exact names. `DEVBOT_SAFE_MODE=true` disables write-capable work: `/do`, action-task retries, `/run`, `/task sync`, `/review validate`, `/review gates`, and starting `/task preview` servers (stopping them still works).
 
 Global access can be limited with `ALLOWED_USER_IDS`, `ALLOWED_USERNAMES`, and `ALLOWED_ROLE_IDS`. User IDs are the most stable option. Account usernames are matched case-insensitively; mutable global display names and guild nicknames are intentionally ignored.
 
@@ -246,6 +247,7 @@ The safety boundary is deliberate: peer bots can ask, observe, plan, review, and
 - Retained isolated worktrees are capped at 100 by default so abandoned task branches cannot grow without bound; remove reviewed worktrees before starting more. `/task freshness` and `/task show` detect task branches that are fully merged into the local default branch and mark their worktrees as eligible for that cleanup.
 - `/task sync` rewrites only the isolated task branch, never the source checkout. The pre-sync tip is preserved under an exact-format `refs/devbot/backup/<task-id>` ref before the rebase, conflicts are never auto-resolved, and a conflicted or failed sync restores the branch and reports honestly.
 - Screenshots are limited to configured or detected loopback origins. Redirects and browser subresources are restricted to those approved origins; arbitrary localhost ports, remote hosts, credentials in URLs, and link-local metadata addresses are rejected.
+- Task previews run only a configured project preset or an allow-listed package.json script from the verified isolated worktree, never free-text commands. The child process gets a minimal credential-free environment with an empty temporary home, binds a Devbot-chosen ephemeral loopback port, and is TTL-limited with SIGTERM-then-SIGKILL cleanup. Running previews are tracked in an owner-only pid ledger; after a restart, Devbot signals a recorded pid only when its command line still identifies it as the spawned preview. Previews are never exposed beyond the local machine.
 - Local task, setup, preference, peer, and collaboration state is written owner-only inside owner-only directories. Responses, stored results, errors, command output, and indexed context pass through credential redaction.
 - These controls reduce exposure but do not make untrusted repositories harmless. Keep credentials out of project roots, review isolated changes before applying them, use ID-based Discord allowlists, and leave screenshot policy at `approval` unless a project UI is safe to post.
 

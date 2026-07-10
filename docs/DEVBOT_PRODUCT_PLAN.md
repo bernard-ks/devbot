@@ -89,6 +89,12 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Screenshots wait for two consecutive identical frames (animations/transitions disabled, `prefers-reduced-motion` emulated) before being used, so loading spinners and blinking carets don't get misread as content.
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
+- Managed task workspace previews:
+  - `/task preview` serves a task's verified isolated worktree with the project's configured `dev`/`preview`/`serve`/`start` preset or an allow-listed package.json script; free-text commands are never accepted, and missing dependencies fail closed without installing.
+  - The dev server binds a Devbot-chosen ephemeral port on `127.0.0.1` only. The exact observed origin is recorded and posted to the task's workroom or bound project room. The preview is reachable only from the machine running Devbot; it is not a tunnel and involves no public exposure.
+  - Lifecycle: capacity is reserved before spawning, pending starts are abortable, readiness is bound to the exact managed child (a loopback listener must provably belong to the spawned child's process group before the preview is reported active, so a foreign process that races for the selected port is refused rather than served), previews are TTL-limited with SIGTERM-then-SIGKILL cleanup and observed-exit confirmation plus owned-listener-gone verification on stop, controls carry per-instance opaque IDs that expire when stale, a persisted owner-only pid ledger reconciles orphans after restarts (a recorded pid is signaled only when its command line still identifies it as the spawned preview), and shutdown stops everything.
+  - Access: only the task requester, owner, or an approved controller, with a project access recheck at start and on every control; safe mode blocks starting a preview but never stop or status.
+  - This is the managed preview of `task.workspacePath` that isolated-task evidence work was blocked on; future visual diff, video proof, or authenticated sharing features can consume the exported `TaskPreviewManager` API instead of capturing the unchanged source checkout.
 
 ## Current Constraints
 
@@ -102,6 +108,7 @@ The safety contract is explicit: only the requester or an approved controller ca
 - The audit trail spans Discord messages, local task/collaboration stores, and git history; it is not yet centralized or tamper-evident.
 - The v2 collaboration protocol supports allow-listed discovery and coordination, but transport is still Discord-specific and peer writes remain human-gated.
 - Ambient workroom activity aggregation and the deferred Activity idea 9 are not implemented.
+- Task previews assume an HTTP dev server that honors the provided `PORT`/`HOST` environment; readiness is any HTTP response on the chosen loopback port, one preview runs per task, and restart reconciliation of the pid ledger is POSIX-only.
 
 ## Improvement Themes
 
