@@ -145,3 +145,136 @@ Also adopted bernard's new conventions in this lane:
 suite), confirmed on two consecutive runs (no flake observed in
 `security.test.ts`'s "configured project commands receive an empty temporary
 home" test this time).
+
+## Review round 1
+
+Bernard requested changes twice (initial review plus a follow-up retest on
+`f55faac` that confirmed the `minimalChildEnvironment()` fix and re-listed the
+rest of the acceptance checklist). This round addresses every remaining
+blocking issue and checklist item except the one real end-to-end smoke test,
+which this lane is explicitly barred from adding (see below).
+
+1. **Known-duration attachments bypass the byte limit / unbounded
+   `arrayBuffer()` / no origin or media-type validation.**
+   - `audioGateMessage` (`src/transcribe.ts`) now enforces the byte cap
+     (`MAX_FALLBACK_AUDIO_BYTES`, 20MB) unconditionally instead of only when
+     `durationSeconds` is `null` — a short reported duration no longer
+     exempts an attachment from the size gate.
+   - Added `downloadBoundedAttachment` (`src/transcribe.ts`): fetches with
+     `redirect: "manual"`, re-validates `isAllowedAttachmentUrl` on every hop
+     (including each redirect target) against an allowlist of Discord's own
+     media hosts (`cdn.discordapp.com`, `media.discordapp.net`, https only,
+     no embedded credentials), caps redirects (`MAX_ATTACHMENT_REDIRECTS`),
+     rejects an oversized `content-length` up front, and — this is the actual
+     fix for the unbounded-buffer problem — enforces the same byte cap while
+     streaming the response body chunk by chunk via
+     `response.body.getReader()`, aborting and throwing the moment the
+     running total exceeds the cap, rather than buffering the whole response
+     with `arrayBuffer()` first.
+   - Added `looksLikeAudioBuffer`: checks the first 12 downloaded bytes
+     against magic-byte signatures for Ogg/Opus, WAV, MP3 (ID3 or a raw MPEG
+     frame sync), M4A/MP4 (`ftyp` box), and WebM/Matroska (EBML header).
+     `transcribeAttachment` now downloads via `downloadBoundedAttachment`,
+     rejects anything that fails `looksLikeAudioBuffer` before it ever
+     touches disk or `ffmpeg`, and only then writes the input file.
+   - There was no pre-existing "bounded, origin-checked attachment helper
+     used for images" to reuse in this codebase (the only existing precedent,
+     `project-screenshot.ts`'s `isAllowedScreenshotResource`/`canReach`, only
+     validates reachability of local dev-server URLs, not a byte-capped
+     download) — `downloadBoundedAttachment`/`isAllowedAttachmentUrl` are new,
+     but follow that same origin-allowlist-plus-redirect-revalidation shape.
+   - Test: `src/transcribe.test.ts` — `audioGateMessage enforces the byte cap
+     even when a short duration is reported`, `isAllowedAttachmentUrl only
+     trusts Discord's own media hosts over https`, `looksLikeAudioBuffer
+     recognizes common audio containers and rejects arbitrary bytes`, and six
+     `downloadBoundedAttachment` tests covering host allowlisting, following
+     an in-allowlist redirect vs. rejecting one that leaves it, a redirect
+     cap, an oversized declared `content-length`, and the streaming byte cap
+     with no `content-length` header at all — all via an injected
+     `fetchImpl`, no real network calls.
+
+2. **ffmpeg/whisper retain the real HOME despite the minimal environment
+   fix.** `transcribeAttachment` now `mkdtemp`s a dedicated `runtimeHome`
+   directory (same pattern as `command-runner.ts`'s
+   `runConfiguredProjectCommand`) and sets `childEnvironment.HOME` /
+   `.USERPROFILE` to it before spawning both `ffmpeg` and `whisper`, removing
+   it in the `finally` block alongside the existing temp working directory.
+   Also added a small concurrency cap (`MAX_CONCURRENT_TRANSCRIPTIONS = 2`,
+   mirroring `project-screenshot.ts`'s `MAX_CONCURRENT_SCREENSHOTS` and
+   `codex-client.ts`'s run cap) so a burst of voice notes can't pile up
+   unbounded ffmpeg/whisper child processes.
+   - Test: covered indirectly by the existing `transcribeAttachment` design
+     (no new automated test spawns real ffmpeg/whisper per the lane's "no
+     real audio processing in tests" rule); verify manually per the
+     "Known limitations" note below.
+
+3. **Any allowed viewer can dismiss another user's pending transcript.**
+   Extracted the ownership rule into a new, tested, pure function
+   `canManageVoiceNote` in `src/task-access.ts` (`context.controller ||
+   record.requesterId === context.userId`), mirroring `canAccessTaskRecord`'s
+   existing pattern in the same file. `index.ts`'s `canManageVoiceNote`
+   wrapper now resolves `isControllerUser` and calls it; `handleVoiceControl`
+   checks it before honoring `dismiss` and replies with an ephemeral denial
+   otherwise. `act` was already controller-gated (a strictly stronger check),
+   so "consumption" via Make change was already covered; `ask` is read-only
+   and stays available to any allowed viewer — the transcript is already
+   quoted in the public room reply at ingestion time, so restricting a
+   read-only replay of already-visible text would not add privacy.
+   - Test: `src/task-access.test.ts` — `canManageVoiceNote restricts a
+     pending transcript to its requester or an approved controller`.
+
+4. **State directory not hardened / no schema validation / transcripts not
+   redacted before persistence or Discord output.** `src/voice-store.ts` now
+   matches `task-store.ts`'s hardening exactly: `save()` creates the
+   containing directory with `PRIVATE_DIRECTORY_MODE` and calls
+   `hardenPrivateDirectoryPermissions`, and writes the state file with
+   `PRIVATE_FILE_MODE` (was a bare `0o600` literal). `load()` calls
+   `hardenPrivateFilePermissions` after reading and now runs every loaded
+   note through `normalizeLoadedVoiceNote`, which rejects non-object entries,
+   entries with an invalid/unsafe `id` (via the existing `isVoiceNoteId`),
+   missing/wrong-typed string fields, and falls back to the epoch for an
+   unparsable `createdAt` — malformed or unsafe records are dropped instead
+   of trusted. Both `create()` and `normalizeLoadedVoiceNote` now run the
+   transcript through `redactSensitiveText` before it's stored, and
+   `maybeHandleVoiceMessage` in `index.ts` was switched to display
+   `record.transcript` (the redacted, stored copy) for both the quoted reply
+   preview and the full-text `transcript.txt` attachment, instead of the raw
+   `transcript` variable — so redaction actually reaches Discord output, not
+   just the on-disk copy.
+   - Test: `src/voice-store.test.ts` — `voice store hardens the state file
+     and its containing directory to owner-only permissions` (asserts
+     `0o600`/`0o700` via `stat`), `voice store redacts secret-shaped text
+     before persisting and rejects a corrupt state file`, and `voice store
+     drops malformed or unsafe entries when loading legacy state`.
+
+5. **Feature enabled by default with no real end-to-end smoke test.**
+   `src/config.ts`: `voice.enabled` now defaults to `false`
+   (`parseBoolean(process.env.DEVBOT_VOICE_ENABLED, false)`); the owner must
+   set `DEVBOT_VOICE_ENABLED=true` to opt in, matching how `DEVBOT_SAFE_MODE`
+   and other safety-relevant toggles in this codebase are env-only (there is
+   no wizard UI for those either). `/setup doctor`'s existing "Voice notes"
+   section already names that exact env var when the feature is off, so the
+   owner is told how to opt in and can then confirm ffmpeg/whisper/model
+   detection before ever sending a real voice note. Updated `.env.example`,
+   `README.md`, and `docs/DEVBOT_PRODUCT_PLAN.md` to describe voice as
+   opt-in/off-by-default.
+   - **Not done, deliberately:** the acceptance checklist also asks for "a
+     real Discord-to-whisper-to-Ask/Make-change smoke test." This lane's
+     instructions explicitly forbid starting the bot against Discord or
+     doing any real audio/ffmpeg/whisper processing in automated tests, so
+     no such test was added. The default-off change plus the existing manual
+     verification steps above (which already walk through installing
+     ffmpeg/whisper.cpp, running `/setup doctor`, and testing the full
+     Ask/Make change/Dismiss flow with a real voice message) are offered as
+     the substitute the review anticipates ("Keep voice handling opt-in
+     until setup can verify ... on the supported platform") — this still
+     needs a human to actually run that manual pass once before flipping the
+     env var on in a real deployment.
+
+Oversized/redirected attachment test coverage requested in the acceptance
+checklist is in `src/transcribe.test.ts` (see issue 1 above).
+
+`npm test`: 158/158 passing (was 145; +13 new tests). One rerun was needed —
+`security.test.ts`'s "configured project commands receive an empty temporary
+home" failed once under load and passed clean on the immediate rerun, matching
+the pre-existing known flake, not a regression from this round's changes.
