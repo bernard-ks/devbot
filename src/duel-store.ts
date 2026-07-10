@@ -6,15 +6,6 @@ import type { DuelVerdictOverall, ReviewerIndependence, ResolvedDuelIssue } from
 import { hardenPrivateDirectoryPermissions, hardenPrivateFilePermissions, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "./security.js";
 
 export type DuelRunStatus = "running" | "succeeded" | "failed" | "canceled";
-export type DuelAcceptanceState = "none" | "claimed" | "completed" | "failed";
-
-export interface DuelAcceptance {
-  state: DuelAcceptanceState;
-  actor?: string;
-  taskId?: string;
-  note?: string;
-  updatedAt: string;
-}
 
 export interface DuelEvidenceSummary {
   baseRevision?: string;
@@ -38,7 +29,6 @@ export interface DuelRecord {
   issues: ResolvedDuelIssue[];
   dismissed: boolean;
   dismissedBy?: string;
-  acceptance: DuelAcceptance;
   error?: string;
   createdAt: string;
   updatedAt: string;
@@ -81,7 +71,6 @@ export class DuelStore {
         status: "running",
         issues: [],
         dismissed: false,
-        acceptance: { state: "none", updatedAt: now },
         createdAt: now,
         updatedAt: now
       };
@@ -131,50 +120,12 @@ export class DuelStore {
     return record ? cloneRecord(record) : undefined;
   }
 
-  /** Atomically claims acceptance so two concurrent modal submissions cannot both proceed to
-   *  create a fix task: only the caller that flips acceptance.state from none/failed to
-   *  "claimed" gets `claimed: true`; the loser sees the current (already-claimed) state. */
-  async claimAcceptance(id: string, actor: string): Promise<{ claimed: boolean; record: DuelRecord | undefined }> {
-    let claimed = false;
-    const record = await this.update(id, (record, now) => {
-      if (record.status !== "succeeded" || record.dismissed) return;
-      if (!record.issues.some((issue) => issue.status === "conceded")) return;
-      if (record.acceptance.state !== "none" && record.acceptance.state !== "failed") return;
-      claimed = true;
-      record.acceptance = { state: "claimed", actor, updatedAt: now };
-      record.updatedAt = now;
-    });
-    return { claimed, record };
-  }
-
-  async completeAcceptance(id: string, taskId: string): Promise<DuelRecord | undefined> {
-    return this.update(id, (record, now) => {
-      if (record.acceptance.state !== "claimed") return;
-      record.acceptance = { ...record.acceptance, state: "completed", taskId, updatedAt: now };
-      record.updatedAt = now;
-    });
-  }
-
-  /** Marks a claimed acceptance as failed-retryable (e.g. workspace resolution or task creation
-   *  failed) so a later retry can claim it again instead of it being permanently stuck accepted
-   *  with no resulting task. */
-  async failAcceptance(id: string, note: string): Promise<DuelRecord | undefined> {
-    return this.update(id, (record, now) => {
-      if (record.acceptance.state !== "claimed") return;
-      record.acceptance = {
-        state: "failed",
-        ...(record.acceptance.actor ? { actor: record.acceptance.actor } : {}),
-        note: note.slice(0, 800),
-        updatedAt: now
-      };
-      record.updatedAt = now;
-    });
-  }
-
+  /** Atomic compare-and-set: only the first dismissal of a succeeded duel gets `dismissed: true`;
+   *  duplicate submissions see the already-dismissed record. */
   async dismiss(id: string, actor: string): Promise<{ dismissed: boolean; record: DuelRecord | undefined }> {
     let dismissed = false;
     const record = await this.update(id, (record, now) => {
-      if (record.dismissed || record.acceptance.state === "claimed" || record.acceptance.state === "completed") return;
+      if (record.dismissed || record.status !== "succeeded") return;
       dismissed = true;
       record.dismissed = true;
       record.dismissedBy = actor;
@@ -242,7 +193,7 @@ export class DuelStore {
       if (parsed.version !== undefined && parsed.version !== 1) {
         throw new Error(`Unsupported duel state version: ${String(parsed.version)}.`);
       }
-      this.state = { version: 1, duels: Array.isArray(parsed.duels) ? (parsed.duels as DuelRecord[]) : [] };
+      this.state = { version: 1, duels: Array.isArray(parsed.duels) ? parsed.duels.filter(isValidDuelRecord) : [] };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw new Error(`Unable to read duel state at ${this.stateFile}: ${(error as Error).message}`, { cause: error });
@@ -277,6 +228,36 @@ function boundIssues(issues: ResolvedDuelIssue[]): ResolvedDuelIssue[] {
   }));
 }
 
+const RUN_STATUSES: DuelRunStatus[] = ["running", "succeeded", "failed", "canceled"];
+
+/** Fail closed on persisted state: records that no longer match the typed schema are dropped on
+ *  load rather than trusted, so a tampered or corrupted state file cannot smuggle in an
+ *  unexpected shape. */
+function isValidDuelRecord(candidate: unknown): candidate is DuelRecord {
+  if (typeof candidate !== "object" || candidate === null) {
+    return false;
+  }
+  const record = candidate as Record<string, unknown>;
+  return (
+    typeof record.id === "string" &&
+    typeof record.taskId === "string" &&
+    typeof record.projectName === "string" &&
+    RUN_STATUSES.includes(record.status as DuelRunStatus) &&
+    typeof record.dismissed === "boolean" &&
+    Array.isArray(record.issues) &&
+    record.issues.every(
+      (issue) =>
+        typeof issue === "object" &&
+        issue !== null &&
+        typeof (issue as Record<string, unknown>).claim === "string" &&
+        typeof (issue as Record<string, unknown>).authorNote === "string" &&
+        ["conceded", "disputed"].includes((issue as Record<string, unknown>).status as string)
+    ) &&
+    typeof record.createdAt === "string" &&
+    typeof record.updatedAt === "string"
+  );
+}
+
 function cloneRecord(record: DuelRecord): DuelRecord {
-  return { ...record, issues: record.issues.map((issue) => ({ ...issue })), acceptance: { ...record.acceptance } };
+  return { ...record, issues: record.issues.map((issue) => ({ ...issue })) };
 }
