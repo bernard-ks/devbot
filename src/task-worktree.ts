@@ -214,6 +214,46 @@ export async function createTaskWorktree(options: CreateTaskWorktreeOptions): Pr
   };
 }
 
+export interface ResumeTaskWorktreeOptions {
+  sourcePath: string;
+  worktreePath: string;
+  branch: string;
+  baseRevision: string;
+}
+
+/**
+ * Re-adopts an isolated worktree preserved from an interrupted task. The path
+ * must still be the registered worktree for the expected branch of the same
+ * source repository; anything else is rejected without being modified.
+ */
+export async function resumeTaskWorktree(options: ResumeTaskWorktreeOptions): Promise<CreateTaskWorktreeResult> {
+  const sourceRoot = await gitPath(path.resolve(options.sourcePath), ["rev-parse", "--show-toplevel"]);
+  if (!sourceRoot.ok) {
+    return unavailable("not_a_git_repository", `Cannot resume this task because ${options.sourcePath} is not a Git repository.`);
+  }
+  const unsafeConfig = await configuredGitExecutionHelpers(path.resolve(sourceRoot.stdout.trim()));
+  if (unsafeConfig === undefined) {
+    return unavailable("git_worktree_unavailable", "Cannot inspect the repository's local Git configuration safely.");
+  }
+  if (unsafeConfig.length > 0) {
+    return unavailable(
+      "unsafe_git_config",
+      "The preserved worktree cannot be resumed because the repository config now defines a clean, smudge, or process filter that Git could execute."
+    );
+  }
+  const worktree: TaskWorktree = {
+    sourcePath: path.resolve(sourceRoot.stdout.trim()),
+    path: path.resolve(options.worktreePath),
+    branch: options.branch,
+    baseRevision: options.baseRevision
+  };
+  const verified = await verifyIsolatedWorktree(worktree);
+  if (!verified.available) {
+    return verified;
+  }
+  return { available: true, worktree };
+}
+
 /** Returns Git status and bounded staged/unstaged patch evidence for one isolated worktree. */
 export async function inspectTaskWorktree(
   worktree: TaskWorktree,

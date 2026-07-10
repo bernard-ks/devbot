@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canAccessTaskRecord, isTaskListVisible, taskSyncRefusal } from "./task-access.js";
+import { canAccessTaskRecord, isTaskListVisible, taskRetryRefusal, taskSyncRefusal } from "./task-access.js";
 import type { TaskRecord } from "./task-store.js";
 
 test("workroom tasks are limited to their requester and project-authorized controllers", () => {
@@ -54,6 +54,27 @@ test("safe mode, missing branch evidence, and open tasks refuse branch sync", ()
   );
   assert.equal(taskSyncRefusal({ ...task, status: "running" }, context), "task-active");
   assert.equal(taskSyncRefusal({ ...task, status: "awaiting-approval" }, context), "task-active");
+});
+
+test("a write-task requester whose controller access was revoked cannot retry it", () => {
+  const base = { globalAllowed: true, projectAllowed: true, controller: false, requester: true };
+  assert.equal(taskRetryRefusal({ ...base, interrupted: true, writeCapable: true }), "needs-controller");
+  assert.equal(taskRetryRefusal({ ...base, interrupted: false, writeCapable: true }), "needs-controller");
+  assert.equal(taskRetryRefusal({ ...base, interrupted: true, writeCapable: true, controller: true }), undefined);
+});
+
+test("requester-only retry recovery is limited to read-only interrupted work", () => {
+  const requester = { globalAllowed: true, projectAllowed: true, controller: false, requester: true, writeCapable: false };
+  assert.equal(taskRetryRefusal({ ...requester, interrupted: true }), undefined);
+  assert.equal(taskRetryRefusal({ ...requester, requester: false, interrupted: true }), "needs-requester-or-controller");
+  assert.equal(taskRetryRefusal({ ...requester, interrupted: false }), undefined);
+});
+
+test("retry re-checks current global and project authorization", () => {
+  const controller = { interrupted: true, writeCapable: true, controller: true, requester: true };
+  assert.equal(taskRetryRefusal({ ...controller, globalAllowed: false, projectAllowed: true }), "not-allowed");
+  assert.equal(taskRetryRefusal({ ...controller, globalAllowed: true, projectAllowed: false }), "not-project");
+  assert.equal(taskRetryRefusal({ ...controller, globalAllowed: true, projectAllowed: true }), undefined);
 });
 
 function record(overrides: Partial<TaskRecord>): TaskRecord {
