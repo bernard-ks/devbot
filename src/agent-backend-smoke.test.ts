@@ -173,3 +173,44 @@ test("smoke: cancellation aborts a running child", { skip: isWindows }, async ()
   setTimeout(() => controller.abort(), 250);
   await assert.rejects(run, /canceled/);
 });
+
+test("smoke: repeated temp-dir creation failures release the run slot and do not reduce capacity", { skip: isWindows }, async () => {
+  setActiveBackendId("codex");
+  const savedTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+  const missingTmp = path.join(shimDir, "does-not-exist", "nested");
+  // Force mkdtemp(join(tmpdir(), ...)) to fail with ENOENT by pointing the temp
+  // root at a directory that does not exist.
+  process.env.TMPDIR = missingTmp;
+  process.env.TMP = missingTmp;
+  process.env.TEMP = missingTmp;
+  try {
+    // More consecutive failures than the concurrency limit (4). If a failed run
+    // leaked its slot, the fifth acquisition would block on the queue forever
+    // instead of rejecting, so this loop would hang.
+    for (let i = 0; i < 6; i += 1) {
+      await assert.rejects(
+        completeCodexPrompt({ codex: shimCodex, prompt: `temp failure ${i}`, cwd: shimDir }),
+        /ENOENT|no such file|scandir|mkdtemp/i
+      );
+    }
+  } finally {
+    restoreEnvKey("TMPDIR", savedTmp.TMPDIR);
+    restoreEnvKey("TMP", savedTmp.TMP);
+    restoreEnvKey("TEMP", savedTmp.TEMP);
+  }
+
+  // Capacity is intact: the next valid request runs.
+  const answer = await completeCodexPrompt({ codex: shimCodex, prompt: "after temp failures", cwd: shimDir });
+  assert.equal(answer, "codex-echo:after temp failures");
+
+  // And all four concurrent slots plus queued overflow are still usable.
+  const answers = await Promise.all(
+    Array.from({ length: 5 }, (_, i) =>
+      completeCodexPrompt({ codex: shimCodex, prompt: `parallel ${i}`, cwd: shimDir })
+    )
+  );
+  assert.deepEqual(
+    answers,
+    Array.from({ length: 5 }, (_, i) => `codex-echo:parallel ${i}`)
+  );
+});
