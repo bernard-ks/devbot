@@ -124,6 +124,9 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/setup repo action:<add|remove|default> name:<name> path:<required for add>`: Register a local project root or select the default used when a command omits `project`.
 - `/setup project-room action:<bind|remove> project:<name> channel:<optional>`: Bind or remove a private ambient room for one project. The selected channel must be private, and every visible member must satisfy both the Devbot and project allowlists.
 - `/setup room name:<optional>`: Create or resync the private Devbot room. It uses a deny-by-default text channel when Devbot can manage channels, otherwise it adopts or creates an invite-only private thread.
+- `/intake set channel:<channel> project:<name>`: Owner-only. Designate a public channel where anyone can report bugs; devbot attempts a read-only repro against `project` and posts a triage card to the private room. Off by default.
+- `/intake off`: Owner-only. Disable community bug intake.
+- `/intake status`: Owner-only. Show the current intake channel, project, and recent reports.
 - `/projects`: List configured projects.
 - `/status project:<optional> question:<optional> image:<optional>`: Show a decision-ready brief with confirmed Devbot tasks, task phase, external Codex runs, activity-unknown app sessions, repository evidence, visible blockers or risks, and the best next step. Add a question for a deeper read-only inspection, and set `image:true` to attach a live project UI screenshot when a local web app is detected.
 - `/snip project:<optional> target:<text>`: Attach a live project UI screenshot by opening the running app and navigating visible UI controls from the target text. Explicit paths and local URLs are also supported.
@@ -189,6 +192,21 @@ Task history is stored locally in `.devbot/tasks.json` by default. Per-user proj
 `DEVBOT_OWNER_USER_ID` is the immutable bootstrap authority for `/setup`; it cannot be changed from Discord. Once `/setup room` creates the private room, normal slash commands and mentions are accepted only there. A managed text channel denies `ViewChannel` to `@everyone`; the no-`Manage Channels` fallback uses private-thread membership. Both grant access to effective ID-based viewers, controllers, the owner, the bot itself, and allow-listed peer bots. This is the layer that controls who can actually see Devbot messages. Ordinary messages previously posted in other Discord channels cannot be retroactively hidden.
 
 Environment allowlists and static project maps remain bootstrap inputs. Discord setup augments them and never edits `.env`. Removing a user or repo from setup does not remove an equivalent entry still present in `.env`, `PROJECTS_JSON`, or `config/projects.json`.
+
+The one deliberate exception to "private room only" is the community bug-intake channel described below: the owner can designate a single public channel where unapproved users may trigger a strictly read-only report pipeline. Everywhere else, the deny-by-default access model is unchanged.
+
+## Community Bug Intake
+
+`/intake set channel:<channel> project:<name>` turns a public channel into a triage pipeline so a community, not just approved teammates, can report bugs. It is off by default and owner-only to configure.
+
+- Per-user and channel-wide rate limits (2 reports/hour/user, 10 reports/hour/channel) apply before anything else; over-limit messages get a quiet reaction, not a reply.
+- Devbot reacts 👀, then asks a cheap read-only model call whether the message has enough detail (what/where/expected). Incomplete reports get one polite templated reply asking for the missing specifics; nothing further happens until the reporter adds detail.
+- Complete reports get a read-only repro attempt: local project context is ranked against the report, a running dev server is screenshotted with console/network diagnostics when relevant, and a read-only Codex session judges whether the code and evidence support the report (`confirmed`, `unconfirmed`, or `needs-info`). This path never runs write-capable Codex work.
+- A triage card — reporter, the report text (always treated as untrusted data, never instructions), status, evidence, and a link to the original message — is posted only to the private room, with **Accept as task** (opens a pre-filled `/do`-equivalent modal), **Ask reporter** (posts a templated follow-up in the intake channel), and **Dismiss** buttons. All three are owner/controller-gated.
+- The reporter sees exactly one public reply: a "logged for triage" acknowledgment, with status when confirmed.
+- Reports are linked to likely duplicates by a normalized error string or route, noted on the triage card.
+
+Community intake records live in `.devbot/intake.json`; set `DEVBOT_INTAKE_STORE` to use a different file.
 
 ## Project Metadata
 

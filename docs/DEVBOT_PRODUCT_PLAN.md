@@ -89,6 +89,14 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Screenshots wait for two consecutive identical frames (animations/transitions disabled, `prefers-reduced-motion` emulated) before being used, so loading spinners and blinking carets don't get misread as content.
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
+- Community bug intake:
+  - `/intake set|off|status` (owner-only) designates a single public channel as a triage pipeline, off by default.
+  - Per-user and channel-wide hourly rate limits gate every report before any model call.
+  - A cheap read-only classification call rejects incomplete reports with a templated request for missing specifics.
+  - Complete reports get a strictly read-only repro attempt (ranked project context, optional dev-server screenshot with console/network evidence, read-only Codex judgment); no action-mode call site is reachable from this path.
+  - Reporter text is always treated as untrusted data in every model prompt, never as instructions.
+  - Evidence-backed triage cards post only to the private room with owner/controller-gated Accept-as-task, Ask-reporter, and Dismiss buttons; the public channel gets one acknowledgment reply.
+  - Likely-duplicate reports are linked by normalized error string or route.
 
 ## Current Constraints
 
