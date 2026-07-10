@@ -108,14 +108,25 @@ import {
   type TaskWorktree
 } from "./task-worktree.js";
 import {
+  parsePreviewControl,
   parseTaskControl,
+  previewControlRow,
   taskActionMatchesState,
   taskActionRows,
   taskControlRow,
+  type PreviewButtonAction,
   type TaskControlAction
 } from "./task-controls.js";
 import { isolatedVisualProofNote, resolveShipImage } from "./visual-capture.js";
 import { composeShipCard } from "./ship-card.js";
+import {
+  authorizeTaskPreview,
+  formatPreviewInstance,
+  resolvePreviewCommand,
+  TaskPreviewManager,
+  type PreviewControlAction,
+  type PreviewInstance
+} from "./task-preview.js";
 import {
   continuationPrompt,
   formatTaskProgress,
@@ -194,6 +205,8 @@ setActiveBackendId(process.env.DEVBOT_AGENT_BACKEND?.trim() || setupStore.snapsh
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
+const previewLedgerFile = process.env.DEVBOT_PREVIEW_STORE?.trim();
+const previewManager = new TaskPreviewManager(previewLedgerFile ? { ledgerFile: previewLedgerFile } : {});
 const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
@@ -223,6 +236,13 @@ client.once("clientReady", async () => {
     }
   } catch (error) {
     console.warn(`Unable to recover interrupted tasks: ${publicErrorMessage(error)}`);
+  }
+  try {
+    for (const note of await previewManager.reconcile()) {
+      console.log(`Preview reconciliation: ${note}`);
+    }
+  } catch (error) {
+    console.warn(`Unable to reconcile preview processes: ${publicErrorMessage(error)}`);
   }
   if (config.autoDeployCommands && client.application) {
     try {
@@ -281,6 +301,19 @@ client.once("clientReady", async () => {
 
 process.once("exit", () => clearRuntimeLock(runtimePidFile));
 
+for (const shutdownSignal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(shutdownSignal, () => {
+    void previewManager
+      .stopAll("shutdown")
+      .catch((error) => console.warn(`Unable to stop previews during shutdown: ${publicErrorMessage(error)}`))
+      .finally(() => {
+        void Promise.resolve(client.destroy())
+          .catch(() => undefined)
+          .finally(() => process.exit(shutdownSignal === "SIGINT" ? 130 : 143));
+      });
+  });
+}
+
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isAutocomplete()) {
@@ -326,6 +359,18 @@ client.on("interactionCreate", async (interaction) => {
           return;
         }
         await handleSetupWizardButton(interaction, config, setupAction);
+        return;
+      }
+      const previewControl = parsePreviewControl(interaction.customId);
+      if (previewControl) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handlePreviewControlButton(interaction, config, previewControl.action, previewControl.previewId);
         return;
       }
       const taskControl = parseTaskControl(interaction.customId);
@@ -2827,6 +2872,11 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     return;
   }
 
+  if (subcommand === "preview") {
+    await handleTaskPreviewCommand(interaction, appConfig);
+    return;
+  }
+
   if (subcommand === "stale") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const minutes = interaction.options.getInteger("minutes") ?? 30;
@@ -2964,6 +3014,151 @@ async function appendTaskSyncEvidence(taskId: string, lines: string[]): Promise<
 
 function shortSha(value: string): string {
   return value.slice(0, 10);
+}
+
+async function handleTaskPreviewCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const taskId = interaction.options.getString("task", true);
+  const action = (interaction.options.getString("action") ?? "start") as PreviewControlAction;
+  const task = await taskStore.get(taskId);
+  if (!task || !canAccessTask(interaction, task, appConfig)) {
+    await interaction.editReply(`No accessible saved task found for \`${taskId}\`.`);
+    return;
+  }
+  const project = findProject(appConfig.projects, task.projectName);
+  if (!project) {
+    await interaction.editReply(`The project for task \`${task.id}\` is no longer configured.`);
+    return;
+  }
+  const authorization = authorizeTaskPreview(action, task, previewAccessContext(interaction, project, appConfig));
+  if (!authorization.allowed) {
+    await interaction.editReply(authorization.message);
+    return;
+  }
+
+  if (action === "status") {
+    const instances = previewManager.list(task.id);
+    await interaction.editReply(
+      instances.length
+        ? instances.map(formatPreviewInstance).join("\n\n")
+        : `No preview has been started for task \`${task.id}\` since Devbot last started.`
+    );
+    return;
+  }
+
+  if (action === "stop") {
+    const open = latestOpenPreview(task.id);
+    if (!open) {
+      await interaction.editReply(`No running preview was found for task \`${task.id}\`.`);
+      return;
+    }
+    const stopped = await previewManager.stop(open.id, "requested");
+    await interaction.editReply(stopped.instance ? formatPreviewInstance(stopped.instance) : stopped.ok ? "Preview stopped." : stopped.message);
+    return;
+  }
+
+  if (!task.workspaceIsolated || !task.workspacePath || !task.branchName || !task.baseBranch) {
+    await interaction.editReply(`Task \`${task.id}\` has no recorded isolated workspace, so there is nothing to preview.`);
+    return;
+  }
+  const inspection = await inspectTaskWorktree(
+    { sourcePath: project.root, path: task.workspacePath, branch: task.branchName, baseRevision: task.baseBranch },
+    0
+  );
+  if (!inspection.available) {
+    await interaction.editReply(`Cannot preview task \`${task.id}\`: ${inspection.message}`);
+    return;
+  }
+  const resolved = await resolvePreviewCommand(project, task.workspacePath);
+  if (!resolved.ok) {
+    await interaction.editReply(resolved.message);
+    return;
+  }
+  const result = await previewManager.start({
+    taskId: task.id,
+    projectName: project.name,
+    branch: task.branchName,
+    workspacePath: task.workspacePath,
+    command: resolved.command
+  });
+  if (!result.ok) {
+    await interaction.editReply(result.instance ? `${result.message}\n\n${formatPreviewInstance(result.instance)}` : result.message);
+    return;
+  }
+  const publishNote = await publishPreviewCard(task, project, result.instance);
+  await interaction.editReply({
+    content: [formatPreviewInstance(result.instance), publishNote].filter(Boolean).join("\n\n"),
+    components: [previewControlRow(result.instance.id)]
+  });
+}
+
+async function handlePreviewControlButton(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: PreviewButtonAction,
+  previewId: string
+): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const instance = previewManager.status(previewId);
+  if (!instance) {
+    await interaction.editReply("That preview control has expired.");
+    return;
+  }
+  const task = await taskStore.get(instance.taskId);
+  const project = task ? findProject(appConfig.projects, task.projectName) : undefined;
+  if (!task || !project || !canAccessTask(interaction, task, appConfig)) {
+    await interaction.editReply("That preview's task is unavailable to you.");
+    return;
+  }
+  const authorization = authorizeTaskPreview(action, task, previewAccessContext(interaction, project, appConfig));
+  if (!authorization.allowed) {
+    await interaction.editReply(authorization.message);
+    return;
+  }
+  if (action === "status") {
+    await interaction.editReply(formatPreviewInstance(instance));
+    return;
+  }
+  const stopped = await previewManager.stop(previewId, "requested");
+  await interaction.editReply(stopped.instance ? formatPreviewInstance(stopped.instance) : stopped.ok ? "Preview stopped." : stopped.message);
+}
+
+function previewAccessContext(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  project: ProjectEntry,
+  appConfig: AppConfig
+): { userId: string; controller: boolean; projectAllowed: boolean; safeMode: boolean } {
+  return {
+    userId: interaction.user.id,
+    controller: isControllerUser(interaction.user.id, appConfig),
+    projectAllowed: isAllowedForProject(interaction, project),
+    safeMode: appConfig.safeMode
+  };
+}
+
+function latestOpenPreview(taskId: string): PreviewInstance | undefined {
+  return previewManager
+    .list(taskId)
+    .filter((instance) => instance.state === "pending" || instance.state === "active" || instance.state === "stopping")
+    .at(-1);
+}
+
+async function publishPreviewCard(task: TaskRecord, project: ProjectEntry, instance: PreviewInstance): Promise<string | undefined> {
+  const channelId = task.threadId ?? setupStore.snapshot().projectRoomIds[project.name];
+  if (!channelId) {
+    return "No task workroom or bound project room exists, so the preview details stay in this private reply.";
+  }
+  try {
+    const channel = await client.channels.fetch(channelId);
+    await sendToTextChannel(channel, {
+      content: formatPreviewInstance(instance),
+      components: [previewControlRow(instance.id)],
+      allowedMentions: { parse: [] }
+    });
+    return `Preview details were posted to <#${channelId}>.`;
+  } catch (error) {
+    return `The preview is running, but its card could not be posted to <#${channelId}>: ${publicErrorMessage(error)}. Use the controls in this reply.`;
+  }
 }
 
 async function handleTaskControl(

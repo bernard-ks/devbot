@@ -215,6 +215,23 @@ const commandBuilders = [
     )
     .addSubcommand((subcommand) =>
       subcommand
+        .setName("preview")
+        .setDescription("Start, stop, or inspect a loopback-only dev server for a task's isolated workspace.")
+        .addStringOption((option) => option.setName("task").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
+        .addStringOption((option) =>
+          option
+            .setName("action")
+            .setDescription("Preview action; defaults to start.")
+            .setRequired(false)
+            .addChoices(
+              { name: "start", value: "start" },
+              { name: "stop", value: "stop" },
+              { name: "status", value: "status" }
+            )
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
         .setName("stale")
         .setDescription("List running tasks older than the selected threshold.")
         .addIntegerOption((option) =>

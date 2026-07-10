@@ -1,4 +1,5 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+import { isPreviewId } from "./task-preview.js";
 import { isTaskId, type TaskRecord, type TaskStatus } from "./task-store.js";
 
 export type TaskControlAction =
@@ -107,6 +108,26 @@ export function parseTaskControl(customId: string): { action: TaskControlAction;
     return undefined;
   }
   return { action: match[1] as TaskControlAction, taskId: match[2] };
+}
+
+export type PreviewButtonAction = "stop" | "status";
+
+export function previewControlRow(previewId: string): ActionRowBuilder<ButtonBuilder> {
+  if (!isPreviewId(previewId)) {
+    throw new Error("Preview ID cannot be encoded in a Discord control.");
+  }
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`devbot:preview-control:stop:${previewId}`).setLabel("Stop preview").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`devbot:preview-control:status:${previewId}`).setLabel("Preview status").setStyle(ButtonStyle.Secondary)
+  );
+}
+
+export function parsePreviewControl(customId: string): { action: PreviewButtonAction; previewId: string } | undefined {
+  const match = /^devbot:preview-control:(stop|status):(.+)$/.exec(customId);
+  if (!match?.[1] || !match[2] || !isPreviewId(match[2])) {
+    return undefined;
+  }
+  return { action: match[1] as PreviewButtonAction, previewId: match[2] };
 }
 
 function button(action: TaskControlAction, taskId: string, label: string, style: ButtonStyle): ButtonBuilder {
