@@ -29,7 +29,7 @@ interface PrivateTaskControlOptions {
 export function taskHasRestorableCheckpoint(task: TaskRecord): boolean {
   return (
     task.mode === "action" &&
-    (task.status === "succeeded" || task.status === "failed") &&
+    (task.status === "succeeded" || task.status === "failed" || task.status === "canceled") &&
     Boolean(task.checkpointRef) &&
     !task.reverted
   );

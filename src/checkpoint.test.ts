@@ -515,3 +515,92 @@ test("end-to-end: checkpoint, mutate, and Undo an isolated task worktree without
     await rm(root, { force: true, recursive: true });
   }
 });
+
+test("end-to-end: a canceled mid-write task stays undo-eligible and restores its isolated worktree without touching the source checkout", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-cp-cancel-"));
+  const sourceRepo = path.join(root, "source");
+  try {
+    await git(root, ["init", "-q", "-b", "main", "source"]);
+    await git(sourceRepo, ["config", "user.name", "Devbot Test"]);
+    await git(sourceRepo, ["config", "user.email", "devbot-test@example.invalid"]);
+    await write(sourceRepo, "tracked.txt", "original\n");
+    await git(sourceRepo, ["add", "-A"]);
+    await git(sourceRepo, ["commit", "-qm", "seed"]);
+    const sourceHeadBefore = await git(sourceRepo, ["rev-parse", "HEAD"]);
+
+    const created = await createTaskWorktree({
+      sourcePath: sourceRepo,
+      taskName: "task-cancel-undo",
+      worktreeRoot: path.join(root, "worktrees")
+    });
+    assert.equal(created.available, true);
+    if (!created.available) return;
+    const worktree = created.worktree;
+
+    const stateFile = path.join(root, "tasks.json");
+    const store = new TaskStore(stateFile);
+    const task = await store.start({
+      source: "test",
+      mode: "action",
+      projectName: "demo",
+      requester: "tester",
+      text: "isolated write that gets canceled"
+    });
+    await store.setWorkspace(task.id, {
+      workspacePath: worktree.path,
+      branchName: worktree.branch,
+      baseBranch: worktree.baseRevision,
+      isolated: true
+    });
+
+    // The checkpoint is taken before the write-capable run starts.
+    const checkpoint = await createCheckpoint(worktree.path, task.id);
+    await store.attachCheckpoint(task.id, {
+      ref: checkpoint.ref,
+      headSha: checkpoint.headSha,
+      branch: checkpoint.branch,
+      createdAt: checkpoint.createdAt
+    });
+
+    // The worker leaves partial writes in the isolated worktree, then the run is
+    // canceled. This mirrors the cancel path: the task is marked canceled and its
+    // exact post-cancel tree is recorded once the worker has stopped.
+    await write(worktree.path, "tracked.txt", "half-written by canceled agent\n");
+    await write(worktree.path, "scratch.txt", "partial artifact\n");
+    await store.cancel(task.id, "Canceled by user request.");
+    const postCancelTree = await hashWorkingTree(worktree.path);
+    await store.recordPostTaskTree(task.id, postCancelTree);
+
+    // A canceled action task with a recorded post-task tree must be undo-eligible,
+    // including after a bot restart (fresh TaskStore over the same state file).
+    const reloaded = new TaskStore(stateFile);
+    const savedTask = await reloaded.get(task.id);
+    assert.ok(savedTask);
+    assert.equal(savedTask?.status, "canceled");
+    assert.equal(savedTask?.checkpointPostTaskTree, postCancelTree);
+    assert.equal(taskHasRestorableCheckpoint(savedTask!), true);
+    assert.equal(savedTask?.workspaceIsolated, true);
+    assert.equal(savedTask?.workspacePath, worktree.path);
+
+    const workspaceRoot = savedTask!.workspacePath!;
+    const summary = await restoreCheckpoint(workspaceRoot, savedTask!.checkpointRef!, {
+      expectedHeadSha: savedTask!.checkpointHeadSha ?? "",
+      expectedBranch: savedTask!.checkpointBranch ?? "HEAD",
+      expectedPostTaskTree: savedTask!.checkpointPostTaskTree!
+    });
+    await reloaded.markReverted(task.id);
+
+    assert.deepEqual(summary.restored.sort(), ["tracked.txt"]);
+    assert.deepEqual(summary.deleted.sort(), ["scratch.txt"]);
+    assert.equal(await readFile(path.join(workspaceRoot, "tracked.txt"), "utf8"), "original\n");
+    assert.equal(existsSync(path.join(workspaceRoot, "scratch.txt")), false);
+    assert.equal(taskHasRestorableCheckpoint((await reloaded.get(task.id))!), false);
+
+    // Undo restores only the isolated worktree; the source checkout is untouched.
+    assert.equal(await git(sourceRepo, ["rev-parse", "HEAD"]), sourceHeadBefore);
+    assert.equal(await git(sourceRepo, ["status", "--porcelain"]), "");
+    assert.equal(await readFile(path.join(sourceRepo, "tracked.txt"), "utf8"), "original\n");
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});

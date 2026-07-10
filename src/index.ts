@@ -1647,6 +1647,13 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     }
     if (controller.signal.aborted) {
       await taskStore.cancel(task.id, "Canceled by user request.");
+      // The worker has already stopped: runCodex only rejects once the child has
+      // closed (or been force-killed), so the isolated worktree is now quiescent.
+      // Snapshot its exact post-cancel tree so a canceled action task's partial
+      // writes stay undo-eligible under the same drift guard as succeed/fail.
+      if (options.mode === "action") {
+        await recordPostTaskCheckpointTree(executionProject, task.id);
+      }
       await reportTaskProgress(options, {
         ...progressBase,
         phase: "canceled",
@@ -2918,7 +2925,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
       await interaction.editReply(
         task.reverted
           ? `Task \`${id}\` was already undone.`
-          : `Task \`${id}\` has no restorable rollback checkpoint (only completed or failed write-capable tasks can be undone).`
+          : `Task \`${id}\` has no restorable rollback checkpoint (only completed, failed, or canceled write-capable tasks can be undone).`
       );
       return;
     }
