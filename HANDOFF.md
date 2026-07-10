@@ -87,3 +87,51 @@ Appended as new commits on top of the reviewed branch; existing commits were not
 - gemini and opencode remain **experimental** and are only wired for `/do` (action) after the fail-closed answer refusal; they still need a real-CLI smoke test for action/cancellation/timeout/output parsing before promotion. No real third-party CLI is spawned in tests.
 - claude `--strict-mcp-config` blocks ambient MCP/plugin extensions, but the CLI has no flag to fully ignore `~/.claude/settings.json`; in `plan`/read-only answer mode this cannot grant writes, and action mode stays scoped to the project dir. Documented rather than assumed.
 - `npm test` → **133 pass / 0 fail** (rerun once: the first run's single failure was the known flaky child-process timeout in `security.test.ts`, green on rerun).
+
+# Lane I — Opt-in preview tunnels
+
+## What was built
+
+Owner-only, default-off public preview tunnels via `cloudflared`, turning a detected local dev server into an expiring `https://*.trycloudflare.com` link.
+
+- **`src/tunnel.ts`** — pure/injectable core:
+  - `findCloudflaredPath()`: scans `PATH` for a `cloudflared` binary (no process spawn; pure `fs.accessSync` check), returns the install hint when absent.
+  - `clampTtlMinutes()`: default 15, min 1, max 60.
+  - `parseTunnelUrl()`: extracts `https://*.trycloudflare.com` from cloudflared stdout/stderr chunks.
+  - `startCloudflaredTunnel()`: spawns via an injected `TunnelSpawnFn`, races stdout/stderr for the URL against a 20s timeout, rejects (and kills the child) on timeout or early exit.
+  - `previewGateReason()`: pure gating decision — `"no-owner" | "not-owner" | "disabled" | undefined`.
+  - `findRunningProjectPort()`: reuses `findProjectWebUrls` (existing project-screenshot.ts detection) then probes each URL for reachability (injectable prober) before returning a port — refuses when nothing is running.
+  - `TunnelManager`: in-memory registry enforcing **one active tunnel per project**, TTL-based auto-kill (injectable scheduler), unexpected-exit cleanup, `stop()`, `stopAll()` (for shutdown), and `attachMessage()` to remember the Discord message to edit on expiry.
+- **`src/tunnel-ui.ts`** — Discord-facing formatting: share message (URL + `<t:...:R>` expiry + exposure warning + Stop now button), expired message (strikethrough/dead-linked URL + reason), disabled/no-owner/not-owner/no-server/no-binary copy, status list, and `parseTunnelControl`/`tunnelControlRow` for the Stop button's `devbot:preview-control:stop:<project>` custom ID.
+- **Gating, wired in `src/index.ts`:**
+  - New config `previewTunnelsEnabled` (in `AppConfig`/`SetupState`), **default `false`**, settable only via `/setup preview action:<enable|disable>` (owner-only, since all `/setup` is owner-gated already).
+  - `/preview share|stop|status` is refused unless the requester is literally the configured owner (`DEVBOT_OWNER_USER_ID`), even for controllers — this is stricter than the general `isAllowed()` check used by most commands. All three subcommands are refused while the feature flag is off (a deliberate call: the brief said "share" must be owner-only; I made the whole `/preview` surface owner-only + flag-gated since exposing a local dev server is the single most sensitive capability in this bot).
+  - `/preview share` additionally refuses without a detected `cloudflared` binary and without a reachable local dev server for the project (via `findRunningProjectPort`), and refuses a second tunnel for a project already active.
+  - The Stop now button on the share message, and `/preview stop`, both call `TunnelManager.stop()` and edit the message to the expired/dead-linked state.
+  - TTL expiry and unexpected `cloudflared` exit both auto-kill the child and edit the Discord message via the same `editTunnelMessageExpired()` path.
+  - Added `SIGINT`/`SIGTERM` handlers (none previously existed for the main bot process — only `setup-app.ts`'s separate wizard process had them) that call `tunnelManager.stopAll()` and mark every active tunnel's message as expired before exiting.
+- **Never started a real tunnel anywhere.** All tests inject a fake `TunnelSpawnFn` built on `node:events.EventEmitter`; `cloudflared` detection tests inject a fake PATH/executable-check function. The real `spawn` from `node:child_process` and `findCloudflaredPath()` are only wired in `index.ts`, never exercised by tests.
+
+## Files touched
+
+- New: `src/tunnel.ts`, `src/tunnel-ui.ts`, `src/tunnel.test.ts`, `src/tunnel-ui.test.ts`
+- Modified: `src/index.ts` (command dispatch, button dispatch, `/setup preview`, shutdown hooks, `handlePreviewCommand`/`handlePreviewStopButton`/`editTunnelMessageExpired`), `src/commands.ts` (`/preview` + `/setup preview` slash definitions), `src/setup-store.ts` (`previewTunnelsEnabled` field + `setPreviewTunnelsEnabled()`), `src/runtime-setup.ts` (`applySetupState` now copies the flag onto `AppConfig`), `src/types.ts`, `src/config.ts` (default `false`), `src/setup-store.test.ts` (updated fixtures + the `/setup` subcommand-name assertion for the new `preview` subcommand), `README.md`, `docs/DEVBOT_PRODUCT_PLAN.md`.
+
+## How to verify manually in Discord
+
+1. Install `cloudflared` locally (`brew install cloudflared`) and start a local dev server for a configured project (e.g. `npm run dev` on port 3000).
+2. As the owner: `/setup preview action:enable`.
+3. `/preview share project:<name> minutes:5` — expect a public message with the tunnel URL, `<t:...:R>` expiry, exposure warning, and a **Stop now** button. Click the link to confirm it reaches the local dev server.
+4. Click **Stop now** (or run `/preview stop`) — the message should edit to a dead-linked, struck-through URL.
+5. Start another and let the TTL elapse (use a 1-minute TTL to test quickly) — confirm the child process is gone (`ps aux | grep cloudflared`) and the message auto-edits to expired.
+6. Try `/preview share` as a non-owner controller — expect a refusal even though they can use `/do`/`/ask`.
+7. Try `/preview share` while disabled, without `cloudflared` on PATH, and without a running dev server — each should refuse with a clear message.
+8. Kill the bot process (Ctrl-C) while a tunnel is active — confirm the `cloudflared` child is also killed (no orphaned process) and the Discord message updates to expired.
+
+## Known limitations / risks
+
+- Tunnel state (`TunnelManager`) is **in-memory only** — a bot restart does not recover or re-attach to any previously running `cloudflared` process (there also wouldn't be one, since `SIGINT`/`SIGTERM` kill it first; an unclean crash, e.g. `SIGKILL`, could theoretically leave an orphaned `cloudflared` process that Devbot no longer tracks — a manual `pkill cloudflared` would be the recovery path). This mirrors the existing "active process tracking is in memory" constraint already documented for Codex work tracking.
+- `findRunningProjectPort()` reuses `findProjectWebUrls()`, which includes both configured `frontendUrl` entries and `ps`-detected dev servers; it then live-probes each with a 3s `fetch` timeout to confirm something is actually listening before considering it "running."
+- The Stop button and `/preview stop`/`status` are gated by `isOwner`, not the `previewTunnelsEnabled` flag — stopping/inspecting a tunnel is intentionally allowed even if the flag was flipped off mid-session, so an owner can always kill an already-running tunnel.
+- No project-level policy hook (e.g. `screenshotPolicy`-style per-project allow/deny) was added for preview tunnels; the feature is gated only at the global owner+flag level, per the brief's "owner-only, everything default-off" framing rather than the per-project audience model used for screenshots/commands.
+- No repo instruction-shaped content was found in files touched by this lane.

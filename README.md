@@ -124,6 +124,10 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/setup repo action:<add|remove|default> name:<name> path:<required for add>`: Register a local project root or select the default used when a command omits `project`.
 - `/setup project-room action:<bind|remove> project:<name> channel:<optional>`: Bind or remove a private ambient room for one project. The selected channel must be private, and every visible member must satisfy both the Devbot and project allowlists.
 - `/setup room name:<optional>`: Create or resync the private Devbot room. It uses a deny-by-default text channel when Devbot can manage channels, otherwise it adopts or creates an invite-only private thread.
+- `/setup preview action:<enable|disable>`: Turn owner-only public preview tunnels on or off. Off by default.
+- `/preview share project:<optional> minutes:<optional 1-60>`: Owner-only. Detect a running local dev server for the project and start an expiring `cloudflared` preview tunnel (default 15 minutes), posting the public URL, an expiry countdown, and a Stop now button. Refuses when preview tunnels are disabled, `cloudflared` is missing, or no dev server is running.
+- `/preview stop project:<optional>`: Owner-only. Stop an active preview tunnel early.
+- `/preview status`: Owner-only. List active preview tunnels and their expiry.
 - `/projects`: List configured projects.
 - `/status project:<optional> question:<optional> image:<optional>`: Show a decision-ready brief with confirmed Devbot tasks, task phase, external Codex runs, activity-unknown app sessions, repository evidence, visible blockers or risks, and the best next step. Add a question for a deeper read-only inspection, and set `image:true` to attach a live project UI screenshot when a local web app is detected.
 - `/snip project:<optional> target:<text>`: Attach a live project UI screenshot by opening the running app and navigating visible UI controls from the target text. Explicit paths and local URLs are also supported.

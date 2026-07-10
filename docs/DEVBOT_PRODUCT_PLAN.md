@@ -89,6 +89,10 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Screenshots wait for two consecutive identical frames (animations/transitions disabled, `prefers-reduced-motion` emulated) before being used, so loading spinners and blinking carets don't get misread as content.
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
+- Opt-in preview tunnels:
+  - `/preview share` turns a detected running local dev server into a public `cloudflared` preview link, owner-only and off by default until enabled with `/setup preview`.
+  - Tunnels auto-expire (default 15, max 60 minutes), can be stopped early with `/preview stop` or a message button, and are always killed on Devbot shutdown.
+  - Refuses to start without the owner, the feature flag, the `cloudflared` binary, or a detected local dev server.
 
 ## Current Constraints
 
