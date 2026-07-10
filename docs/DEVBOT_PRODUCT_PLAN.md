@@ -78,12 +78,14 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Detects local Codex app/CLI sessions whose working directory belongs to a configured project.
   - Separates confirmed external runs from open app sessions whose activity cannot be known.
   - Reports sanitized repository evidence without leaking process IDs or command prompts.
-- Voice note to task:
+- Voice note to task (opt-in, `DEVBOT_VOICE_ENABLED=true`, off by default until smoke-tested end to end):
   - Detects Discord voice messages and regular audio-file attachments (ogg/opus/mp3/m4a/wav) from authorized users in the private room.
-  - Transcribes locally with ffmpeg (16kHz mono conversion) and whisper.cpp (`whisper-cli`/`whisper-cpp`/`main`, model auto-discovered or configured), never sending audio anywhere over the network.
-  - Enforces a 5-minute audio cap and a 120s transcription timeout, and always cleans up temporary files.
+  - Downloads attachments only from the allowed Discord media hosts (checked on every redirect hop), enforces a byte cap while streaming regardless of reported duration, and verifies the downloaded bytes actually look like audio (magic-byte check) before handing them to ffmpeg.
+  - Transcribes locally with ffmpeg (16kHz mono conversion) and whisper.cpp (`whisper-cli`/`whisper-cpp`/`main`, model auto-discovered or configured) under a minimal child environment and an isolated temporary HOME, never sending audio anywhere over the network.
+  - Enforces a 5-minute audio cap, a 120s transcription timeout, and a concurrency cap on simultaneous transcriptions, and always cleans up temporary files.
   - Degrades to a concise setup message when ffmpeg, whisper.cpp, or a model is missing, with no crash or retry loop.
-  - Replies with the transcript (attached as a `.txt` file when long) and restart-stable Ask / Make change / Dismiss controls; Make change reuses the workspace confirmation modal before running write-capable work.
+  - Replies with the redacted transcript (attached as a `.txt` file when long) and restart-stable Ask / Make change / Dismiss controls; Make change reuses the workspace confirmation modal before running write-capable work, and Dismiss is restricted to the original requester or an approved controller.
+  - Transcripts are redacted for known secret patterns before being persisted or shown in Discord, and the on-disk store validates its schema and hardens file/directory permissions the same way the task store does.
   - `/setup doctor` reports ffmpeg/whisper.cpp/model detection in a dedicated voice section.
 - UI screenshot support:
   - Detects running local web dev servers such as Next, Vite, React Scripts, Astro, and Nuxt.
