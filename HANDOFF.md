@@ -1,5 +1,17 @@
 # Lane K — Community Bug Intake
 
+## Rebase status
+
+Rebased onto 85e2530 (origin/main: "Merge pull request #15 from bernard-ks/codex/ambient-workrooms", which merged dd0af6b "Add ambient Discord workrooms and security hardening").
+
+- Conflicts: `src/commands.ts` (import line only — merged `ApplicationCommandType`/`ContextMenuCommandBuilder` from ours with `ChannelType` from theirs into one import) and `src/index.ts` (auto-merged cleanly by git; verified by hand — see below). No other files conflicted; `.env.example`, `README.md`, `docs/DEVBOT_PRODUCT_PLAN.md`, `HANDOFF.md` all applied without markers.
+- Invariants re-verified against the merged tree:
+  1. Read-only intake flow: `handleIntakeMessage` still calls `answerWithProjectContext` with a hardcoded `mode: "answer"` literal, twice (grep `mode:` inside that function — 2 hits, both `"answer"`). The only `mode: "action"` reachable from intake is in `handleIntakeAcceptModal`, fired only from the owner/controller-gated Accept button. Whole-file grep for `mode: "action"` shows exactly 3 hits: `/do` (slash command), `createAmbientProposal` (bernard's ambient/natural-intent path, itself a proposal awaiting approval, not a direct write), and `handleIntakeAcceptModal`.
+  2. Intake channel claims first: in the rebased `messageCreate` handler (src/index.ts:512), the intake-channel check (`intakeStore.snapshot()` / `handleIntakeMessage`) sits immediately after the bot-author filter and returns before bernard's `mentionsBot`/`threadTask`/`isAllowedMessage`/ambient-proposal logic ever runs. Confirmed there is only one `messageCreate` listener in the file. This means even if an intake channel were coincidentally also configured as a project's ambient workroom, intake handling wins and the ambient/natural-intent flow never sees the message.
+  3. Screenshot hardening: intake's screenshot call (`captureProjectScreenshot(project, { requestText: message.content })`) is the same shared function bernard hardened with SSRF origin allowlists — no separate/bypassing code path was introduced for intake.
+  4. Discord-facing errors: the outer `messageCreate` try/catch (which is what would surface any uncaught intake error to Discord) already replies via `` `Error: ${publicErrorMessage(error)}` ``. Internal intake failure paths (classification/screenshot/repro-assessment/triage-card-post failures) are caught locally and only `console.warn`'d server-side — they are never echoed to Discord, so no separate remediation was needed there.
+- `npm run build` and `npm test` both green (134/134) across two consecutive runs; the known-flaky `security.test.ts` "configured project commands receive an empty temporary home" case passed both times, no flake observed this round.
+
 ## What was built
 
 A public-channel bug intake pipeline that lets a community (not just approved teammates) file bug reports, which devbot triages with a strictly read-only repro attempt before ever reaching the owner.
