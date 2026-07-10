@@ -503,6 +503,62 @@ const commandBuilders = [
         )
     ),
   new SlashCommandBuilder()
+    .setName("sentinel")
+    .setDescription("Owner/controller-only regression watch for a project's dev server and fast checks.")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("on")
+        .setDescription("Enable the regression sentinel for a project.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("off")
+        .setDescription("Disable the regression sentinel for a project.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("status")
+        .setDescription("Show sentinel watches and their current state for a project.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("interval")
+        .setDescription("Set the sentinel check interval in seconds, minimum 30.")
+        .addIntegerOption((option) =>
+          option.setName("seconds").setDescription("Interval in seconds, minimum 30.").setRequired(true).setMinValue(30)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("watch")
+        .setDescription("Add or remove an extra watched URL path.")
+        .addStringOption((option) =>
+          option
+            .setName("action")
+            .setDescription("Whether to add or remove the watch path.")
+            .setRequired(true)
+            .addChoices({ name: "add", value: "add" }, { name: "remove", value: "remove" })
+        )
+        .addStringOption((option) =>
+          option.setName("path").setDescription("URL path such as /admin, or a full http(s) URL.").setRequired(true)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+    ),
+  new SlashCommandBuilder()
     .setName("refresh")
     .setDescription("Refresh the indexed context for a project.")
     .addStringOption((option) =>

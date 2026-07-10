@@ -69,7 +69,7 @@ import {
 import { parseMentionRequest, parseStatusRequest, statusDetailQuestion, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natural-intent.js";
-import { captureProjectScreenshot, type ProjectScreenshot } from "./project-screenshot.js";
+import { captureProjectScreenshot, findProjectWebUrls, type ProjectScreenshot } from "./project-screenshot.js";
 import { configuredCommandNames, formatProjectCommandResult, runConfiguredProjectCommand } from "./command-runner.js";
 import { syncCommandsIfChanged } from "./command-sync.js";
 import { commandDefinitions } from "./commands.js";
@@ -149,6 +149,17 @@ import {
   type ProjectWorkSnapshot
 } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
+import { checkCommand, checkUrl, recentCommits, SentinelManager, type SentinelEvent } from "./sentinel.js";
+import { SentinelStore } from "./sentinel-store.js";
+import {
+  formatSentinelStatus,
+  parseSentinelControl,
+  sentinelAlertContent,
+  sentinelAlertRow,
+  sentinelFixTaskPrompt,
+  sentinelRecoveryNote,
+  type SentinelButtonAction
+} from "./sentinel-ui.js";
 import { applySetupState, captureBootstrapConfig, isSetupController } from "./runtime-setup.js";
 import { clearRuntimeLock, markRuntimeRunning, runtimeLockPath } from "./runtime-lock.js";
 import { SetupStore, type SetupState, type SetupUserPermission } from "./setup-store.js";
@@ -198,6 +209,18 @@ const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_S
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
+const sentinelStore = new SentinelStore(process.env.DEVBOT_SENTINEL_STORE?.trim() || undefined);
+const sentinelManager = new SentinelManager(
+  config.projects,
+  sentinelStore,
+  {
+    discoverUrls: findProjectWebUrls,
+    checkUrlFn: (url) => checkUrl(url),
+    checkCommandFn: (project, commandName) => checkCommand(project, commandName),
+    now: () => new Date()
+  },
+  (event) => handleSentinelEvent(event)
+);
 const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
 const activeWorkroomActions = new Set<string>();
@@ -277,9 +300,15 @@ client.once("clientReady", async () => {
       console.warn(`Unable to synchronize the workspace launcher: ${publicErrorMessage(error)}`);
     });
   }
+  if (verifiedPrivateRoomId) {
+    await sentinelManager.startEnabled().catch((error) => {
+      console.warn(`Unable to start sentinel watchers: ${(error as Error).message}`);
+    });
+  }
 });
 
 process.once("exit", () => clearRuntimeLock(runtimePidFile));
+process.once("exit", () => sentinelManager.stopAll());
 
 client.on("interactionCreate", async (interaction) => {
   try {
@@ -350,6 +379,18 @@ client.on("interactionCreate", async (interaction) => {
           return;
         }
         await handleScreenshotFixControl(interaction, config, screenshotFixControl.action, screenshotFixControl.id);
+        return;
+      }
+      const sentinelControl = parseSentinelControl(interaction.customId);
+      if (sentinelControl) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleSentinelButton(interaction, config, sentinelControl.action, sentinelControl.projectName, sentinelControl.watchId);
         return;
       }
       if (!parseWorkroomButton(interaction.customId)) {
@@ -778,6 +819,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
 
   if (interaction.commandName === "lab") {
     await handleLabCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "sentinel") {
+    await handleSentinelCommand(interaction, appConfig);
     return;
   }
 
@@ -3430,6 +3476,172 @@ async function handleDashboardCommand(interaction: ChatInputCommandInteraction, 
   await interaction.editReply(await buildWorkspacePanel(interaction, appConfig, project));
 }
 
+async function handleSentinelCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const subcommand = interaction.options.getSubcommand(true);
+  const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
+  if (!(await ensureProjectAccess(interaction, project))) {
+    return;
+  }
+
+  if (subcommand === "on") {
+    const watchConfig = await sentinelManager.setEnabled(project.name, true);
+    await interaction.reply({
+      content: `Sentinel enabled for \`${project.name}\` (checking every ${watchConfig.intervalSeconds}s).`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (subcommand === "off") {
+    await sentinelManager.setEnabled(project.name, false);
+    await interaction.reply({ content: `Sentinel disabled for \`${project.name}\`.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (subcommand === "interval") {
+    const seconds = interaction.options.getInteger("seconds", true);
+    const watchConfig = await sentinelManager.setIntervalSeconds(project.name, seconds);
+    await interaction.reply({
+      content: `Sentinel interval for \`${project.name}\` set to ${watchConfig.intervalSeconds}s.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (subcommand === "watch") {
+    const action = interaction.options.getString("action", true);
+    const watchPath = interaction.options.getString("path", true);
+    const watchConfig =
+      action === "add"
+        ? await sentinelStore.addWatchPath(project.name, watchPath)
+        : await sentinelStore.removeWatchPath(project.name, watchPath);
+    await interaction.reply({
+      content: `Sentinel watch paths for \`${project.name}\`: ${watchConfig.manualPaths.length > 0 ? watchConfig.manualPaths.join(", ") : "(none)"}.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  const watchConfig = await sentinelStore.getProjectConfig(project.name);
+  const watches = await sentinelStore.listProjectWatches(project.name);
+  await interaction.reply({ content: formatSentinelStatus(project.name, watchConfig, watches), flags: MessageFlags.Ephemeral });
+}
+
+async function handleSentinelButton(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: SentinelButtonAction,
+  projectName: string,
+  watchId: string
+): Promise<void> {
+  const project = findProject(appConfig.projects, projectName);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!isControllerUser(interaction.user.id, appConfig)) {
+    await interaction.reply({
+      content: "Only the owner or an approved controller can use sentinel actions.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  const watch = await sentinelStore.getWatchState(projectName, watchId);
+  if (!watch) {
+    await interaction.reply({ content: "That sentinel watch is no longer tracked.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (action === "mute") {
+    const until = new Date(Date.now() + 60 * 60 * 1_000).toISOString();
+    await sentinelStore.muteWatch(projectName, watchId, until);
+    await interaction.reply({ content: `Muted \`${watch.target}\` alerts for one hour.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (isWriteBlockedBySafeMode(appConfig, "action")) {
+    await interaction.reply({ content: safeModeActionMessage("Sentinel Fix it"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await runTaskActionOnce(interaction, `sentinel-fix:${projectName}:${watchId}`, async () => {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await executeInteractionRequest({
+      interaction,
+      appConfig,
+      project,
+      text: sentinelFixTaskPrompt(watch),
+      includePatterns: [],
+      mode: "action",
+      requester: interaction.user.tag,
+      source: `button:sentinel-fix:${watchId}`,
+      ephemeral: true,
+      dedupeKey: `sentinel-fix:${projectName}:${watchId}:${watch.lastCheckAt ?? "unknown"}`
+    });
+  });
+}
+
+async function handleSentinelEvent(event: SentinelEvent): Promise<void> {
+  const project = config.projects.find((item) => item.name === event.projectName);
+  const roomId = effectivePrivateRoomId();
+  if (!project || !roomId) {
+    return;
+  }
+
+  if (event.event === "alert") {
+    const commits = await recentCommits(project);
+    const screenshot =
+      event.target.kind === "url"
+        ? await captureProjectScreenshot(project, { requestText: event.target.target }).catch(() => undefined)
+        : undefined;
+    const content = sentinelAlertContent({
+      projectName: project.name,
+      watch: event.state,
+      recentCommits: commits,
+      ...(screenshot ? { consoleErrors: screenshot.metadata.consoleErrors } : {})
+    });
+    try {
+      const channel = await client.channels.fetch(roomId);
+      const sent = (await sendToTextChannel(channel, {
+        content,
+        components: [sentinelAlertRow(project.name, event.target.id)],
+        ...(screenshot ? { files: [new AttachmentBuilder(screenshot.image, { name: screenshot.fileName })] } : {}),
+        allowedMentions: { parse: [] }
+      })) as { id?: string } | undefined;
+      if (sent?.id) {
+        await sentinelStore.saveWatchState(project.name, event.target.id, {
+          ...event.state,
+          alertMessageId: sent.id,
+          alertChannelId: roomId
+        });
+      }
+    } catch (error) {
+      console.warn(`Unable to post sentinel alert for ${project.name}: ${(error as Error).message}`);
+    }
+    return;
+  }
+
+  const alertMessageId = event.previousState.alertMessageId;
+  const alertChannelId = event.previousState.alertChannelId;
+  if (!alertMessageId || !alertChannelId) {
+    return;
+  }
+  try {
+    const channel = await client.channels.fetch(alertChannelId);
+    const fetchable = channel as { messages?: { fetch?: (id: string) => Promise<Message> } } | null;
+    const message = await fetchable?.messages?.fetch?.(alertMessageId);
+    if (!message) {
+      return;
+    }
+    await message.edit({
+      content: `${message.content}\n\n${sentinelRecoveryNote(event.state.lastOkAt ?? new Date().toISOString(), event.state)}`,
+      components: []
+    });
+  } catch (error) {
+    console.warn(`Unable to edit sentinel alert message ${alertMessageId}: ${(error as Error).message}`);
+  }
+}
+
 async function handleRunCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
   const privateReply = hasProjectAudienceRestriction(project);
@@ -5684,6 +5896,9 @@ function commandRequiresController(interaction: ChatInputCommandInteraction): bo
   }
   if (interaction.commandName === "task") {
     return subcommand === "cancel" || subcommand === "retry";
+  }
+  if (interaction.commandName === "sentinel") {
+    return subcommand !== "status";
   }
   return interaction.commandName === "lab" && (subcommand === "approve" || subcommand === "bossfight");
 }
