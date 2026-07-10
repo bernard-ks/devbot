@@ -136,6 +136,9 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/task freshness project:<name> limit:<optional>`: Show merged state and behind/ahead counts for saved task branches against the project's local default branch. Branches that are fully merged are marked durably on the task record and flagged as prune-eligible worktrees.
 - `/task sync task:<task-id>`: Rebase one task branch onto the current local default branch inside its isolated worktree. Available to the task requester, the owner, or an approved controller; blocked by safe mode and while the task is still open. The pre-sync tip is preserved under `refs/devbot/backup/<task-id>` first, conflicts abort with the branch restored and the conflicted files reported, and configured validation runs afterwards for controllers with results reported as-is.
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
+- `/audit recent project:<optional> limit:<optional>`: List recent records from the local tamper-evident audit ledger. Owner and controllers only; project-scoped records are rechecked against current project access.
+- `/audit show seq:<number>`: Show one audit ledger record by sequence number, subject to the same access checks.
+- `/audit verify`: Walk the full audit hash chain across rotated files and report OK or the exact first divergence point.
 - `/dashboard project:<optional>`: Open the personal interactive workspace with project selection, current status, recent work, and native Ask / Change controls.
 - `/inbox project:<optional> limit:<optional>`: Open the ephemeral **Needs Me** inbox for pending proposals and decisions, with review controls and refresh.
 - `/run command:<name> project:<optional>`: Run a configured command from `<project>/.devbot/project.json`, using the selected default project when omitted.
@@ -182,7 +185,7 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, and owner-managed setup in `.devbot/setup.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, or `DEVBOT_SETUP_STORE` to use different files; relative paths resolve from the devbot process working directory.
+Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, owner-managed setup in `.devbot/setup.json`, and the tamper-evident audit ledger in `.devbot/audit/`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, `DEVBOT_SETUP_STORE`, or `DEVBOT_AUDIT_LEDGER` to use different locations; relative paths resolve from the devbot process working directory.
 
 ## Owner Setup And Visibility
 
@@ -248,6 +251,25 @@ The safety boundary is deliberate: peer bots can ask, observe, plan, review, and
 - Screenshots are limited to configured or detected loopback origins. Redirects and browser subresources are restricted to those approved origins; arbitrary localhost ports, remote hosts, credentials in URLs, and link-local metadata addresses are rejected.
 - Local task, setup, preference, peer, and collaboration state is written owner-only inside owner-only directories. Responses, stored results, errors, command output, and indexed context pass through credential redaction.
 - These controls reduce exposure but do not make untrusted repositories harmless. Keep credentials out of project roots, review isolated changes before applying them, use ID-based Discord allowlists, and leave screenshot policy at `approval` unless a project UI is safe to post.
+
+## Audit Ledger
+
+Devbot keeps a centralized, append-only audit ledger of consequential local events: task lifecycle transitions (proposed, approved, started, completed, failed, canceled), approval decisions with the deciding actor, configured project command executions (`/run`, `/review validate`, `/review gates`, `/lab approve` actions), owner setup changes (viewers, controllers, peers, repositories, rooms), and workroom decisions.
+
+How it works:
+
+- Records are hash-chained JSON lines in `.devbot/audit/ledger-NNNNNN.jsonl`. Each record carries `{version, seq, timestamp, type, actor, subject, project, summary, prevHash, hash}`, where `hash` is SHA-256 over the canonical serialization including `prevHash`. Appends use `O_APPEND` with an fsync per record, and integrity is enforced on read: each append is a single small write, a torn tail after a crash is detected and reported rather than silently repaired, and the ledger is never rewritten in place.
+- Files rotate at a bounded size and the chain continues across files, so `/audit verify` spans rotations. Total retention is capped by pruning the oldest files; verification then anchors at the first retained record and says so.
+- After every append, the current head `{seq, hash}` is also written to `.devbot/audit/head.json`. This anchor catches tail truncation and rollbacks of the chain files that a chain walk alone cannot see. If the chain head ever diverges from the anchor, Devbot refuses further appends until the divergence is investigated, so the evidence is not papered over by later writes.
+- Every payload passes credential redaction before hashing and persisting, summaries are bounded, and the directory and files are owner-only (0700/0600). The ledger is not a secret store and must never become one.
+- Ledger append failures never block the primary action; they are logged, surfaced by `/setup doctor` (which verifies the chain), and visible in `/audit verify`.
+- `/audit` is restricted to the owner and approved controllers, and project-scoped records are rechecked against current project access before display.
+
+Honest threat model — tamper-evident, not tamper-proof:
+
+- The hash chain detects any modification, insertion, or deletion by something that does not rewrite every subsequent record, and the head anchor additionally detects truncation of the tail. This is effective against partial edits, accidents, crashes, and casual tampering.
+- A local attacker with full write access to the ledger directory can rewrite the entire chain and the anchor consistently and leave no evidence inside the ledger itself. Both live under the same local permissions, so the anchor does not protect against that attacker either. There is no signing key or remote witness. If you need integrity against a root-level or same-user attacker, ship the head hash somewhere they cannot write (another machine, a peer Devbot message, or even the Discord room) and compare it against `/audit verify` output.
+- The ledger records what this Devbot process did through its stores and commands. Events from other tools, the standalone `npm run setup` console (which runs before the bot), and direct file edits are out of its sight. Safe mode is fixed by `DEVBOT_SAFE_MODE` at startup, so there is no runtime toggle to record; the active state appears in startup logs, `/devbot capabilities`, and `/lab safety`.
 
 ## Project Context Behavior
 
