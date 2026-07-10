@@ -222,7 +222,7 @@ const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || u
 const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
 const sentinelStore = new SentinelStore(process.env.DEVBOT_SENTINEL_STORE?.trim() || undefined);
 const sentinelManager = new SentinelManager(
-  config.projects,
+  () => config.projects,
   sentinelStore,
   {
     discoverUrls: findProjectWebUrls,
@@ -3507,6 +3507,22 @@ async function handleSentinelCommand(interaction: ChatInputCommandInteraction, a
   }
 
   if (subcommand === "on") {
+    // An unattended cycle can only attribute the enabling actor by user id, so it
+    // authorizes solely against `policy.allowedUsers` (or an open project). If this
+    // actor reaches the project only through a role/username grant, every cycle
+    // would fail authorization and the poller would run yet never check anything.
+    // Reject enablement here rather than reporting a success that can never hold.
+    if (!userAuthorizedForProjectPolicy(interaction.user.id, project.metadata.policy)) {
+      await interaction.reply({
+        content:
+          `Sentinel cannot be enabled for \`${project.name}\`: your access is granted only by role or username, ` +
+          `which an unattended background cycle cannot resolve, so every cycle would fail authorization. ` +
+          `Add your Discord user id to this project's \`.devbot/project.json\` \`policy.allowedUsers\` ` +
+          `(or remove the allowlist) and try again.`,
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
     const watchConfig = await sentinelManager.setEnabled(project.name, true, interaction.user.id);
     await interaction.reply({
       content: `Sentinel enabled for \`${project.name}\` (checking every ${watchConfig.intervalSeconds}s).`,
@@ -3671,10 +3687,9 @@ async function resolveSentinelAlertRoomId(project: ProjectEntry): Promise<string
  * removed, runs no checks until a current controller re-enables it.
  */
 function sentinelCycleAuthorized(project: ProjectEntry, watchConfig: SentinelProjectConfig): boolean {
-  const current = config.projects.find((candidate) => candidate.name === project.name);
-  if (!current) {
-    return false;
-  }
+  // `project` is the object the manager freshly resolved from live config for
+  // this cycle; authorization runs against that same object so discovery,
+  // authorization, and execution never diverge.
   // Require an attributable enabling actor: legacy records without one fail closed.
   if (!watchConfig.enabledBy) {
     return false;
@@ -3685,7 +3700,7 @@ function sentinelCycleAuthorized(project: ProjectEntry, watchConfig: SentinelPro
   }
   // ...and must still be authorized under the project's CURRENT .devbot policy.
   // A controller removed from this project's allowlist stops running its cycles.
-  if (!userAuthorizedForProjectPolicy(watchConfig.enabledBy, current.metadata.policy)) {
+  if (!userAuthorizedForProjectPolicy(watchConfig.enabledBy, project.metadata.policy)) {
     return false;
   }
   return true;

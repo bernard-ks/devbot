@@ -429,15 +429,24 @@ export class SentinelManager {
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly cycling = new Set<string>();
 
+  /**
+   * `resolveProjects` returns the CURRENT project list from live configuration.
+   * The manager never caches project objects: runtime `/setup` changes replace
+   * `config.projects` with freshly-loaded entries (e.g. a same-name project
+   * re-rooted from `/old/repo` to `/new/repo`), and every cycle must resolve its
+   * project by name from that live list so discovery, authorization, and
+   * execution all run against the same up-to-date object — or refuse the cycle
+   * if the project no longer exists.
+   */
   constructor(
-    private readonly projects: ProjectEntry[],
+    private readonly resolveProjects: () => readonly ProjectEntry[],
     private readonly store: SentinelStore,
     private readonly deps: SentinelDeps,
     private readonly onEvent: (event: SentinelEvent) => Promise<void>
   ) {}
 
   async startEnabled(): Promise<void> {
-    for (const project of this.projects) {
+    for (const project of this.resolveProjects()) {
       const config = await this.store.getProjectConfig(project.name);
       if (config.enabled) {
         this.schedule(project.name, config.intervalSeconds);
@@ -484,7 +493,10 @@ export class SentinelManager {
     }
     this.cycling.add(projectName);
     try {
-      const project = this.projects.find((item) => item.name === projectName);
+      // Resolve the project fresh from live config on every cycle. If a runtime
+      // setup change removed it, refuse the cycle rather than running against a
+      // stale captured object.
+      const project = this.resolveProjects().find((item) => item.name === projectName);
       const config = await this.store.getProjectConfig(projectName);
       if (!project || !config.enabled) {
         return [];

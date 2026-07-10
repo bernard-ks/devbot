@@ -402,6 +402,30 @@ test("project-policy removal mid-schedule de-authorizes the enabling controller"
   );
 });
 
+test("/sentinel on enable-time gate rejects a role/username-only grant that no cycle could satisfy", () => {
+  // handleSentinelCommand's `on` branch enables only when
+  // userAuthorizedForProjectPolicy(actorId, policy) holds — the same predicate
+  // every unattended cycle authorizes against. A project that grants this actor
+  // solely by role or username (never by allowedUsers) is rejected at enable
+  // time, so `/sentinel on` cannot report success when every cycle must fail.
+  const roleOnly = fakeProject().metadata.policy;
+  roleOnly.allowedUsers = [];
+  roleOnly.allowedUsernames = ["controller-name"];
+  roleOnly.allowedRoles = ["role-1"];
+  assert.equal(
+    userAuthorizedForProjectPolicy("controller-1", roleOnly),
+    false,
+    "a role/username-only grant is rejected at enable time"
+  );
+
+  const byId = fakeProject().metadata.policy;
+  byId.allowedUsers = ["controller-1"];
+  assert.equal(userAuthorizedForProjectPolicy("controller-1", byId), true, "an explicit allowedUsers grant enables");
+
+  const open = fakeProject().metadata.policy;
+  assert.equal(userAuthorizedForProjectPolicy("controller-1", open), true, "an open project enables");
+});
+
 test("SentinelManager.runCycle stops when project policy removes the enabling controller", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-policy-"));
   const store = new SentinelStore(path.join(root, "sentinel.json"));
@@ -411,7 +435,7 @@ test("SentinelManager.runCycle stops when project policy removes the enabling co
 
   let urlChecks = 0;
   const manager = new SentinelManager(
-    [project],
+    () => [project],
     store,
     {
       discoverUrls: async () => ["http://127.0.0.1:4000"],
@@ -466,7 +490,7 @@ test("SentinelManager.runCycle debounces a flap into one alert and one recovery 
   const events: Array<"alert" | "recovery"> = [];
 
   const manager = new SentinelManager(
-    [project],
+    () => [project],
     store,
     {
       discoverUrls: async () => ["http://127.0.0.1:4000"],
@@ -497,7 +521,7 @@ test("SentinelManager.runCycle passes the project's approved origins and expecte
   let seenOrigins: ReadonlySet<string> | undefined;
   let seenIsExpectedStatus: ((status: number) => boolean) | undefined;
   const manager = new SentinelManager(
-    [project],
+    () => [project],
     store,
     {
       discoverUrls: async () => ["http://127.0.0.1:4000"],
@@ -539,7 +563,7 @@ test("SentinelManager suppresses alert delivery while a watch is muted", async (
 
   const events: string[] = [];
   const manager = new SentinelManager(
-    [project],
+    () => [project],
     store,
     {
       discoverUrls: async () => ["http://127.0.0.1:4000"],
@@ -571,7 +595,7 @@ test("SentinelManager.runCycle never overlaps checks for the same project", asyn
   let inFlight = 0;
   let maxInFlight = 0;
   const manager = new SentinelManager(
-    [project],
+    () => [project],
     store,
     {
       discoverUrls: async () => ["http://127.0.0.1:4000"],
@@ -606,7 +630,7 @@ test("SentinelManager.runCycle skips every check when the cycle is no longer aut
   let authorized = true;
   const events: string[] = [];
   const manager = new SentinelManager(
-    [project],
+    () => [project],
     store,
     {
       discoverUrls: async () => ["http://127.0.0.1:4000"],
@@ -640,6 +664,140 @@ test("SentinelManager.runCycle skips every check when the cycle is no longer aut
   assert.ok(authorizedUrlChecks > 0, "checks run while authorized");
   assert.equal(urlChecks, authorizedUrlChecks, "no URL fetch runs once the actor is de-authorized");
   assert.equal(commandChecks, 0, "no command runs once the actor is de-authorized");
+  manager.stopAll();
+});
+
+test("SentinelManager.runCycle re-roots a same-name project mid-schedule and never runs against the stale root", async () => {
+  // Bernard's reproduction: a same-name project changes root from /old/repo to
+  // /new/repo while the watcher is scheduled. The manager must resolve the live
+  // project every cycle so discovery, authorization, and execution all run
+  // against the new root — never the object captured when it was first scheduled.
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-reroot-"));
+  const store = new SentinelStore(path.join(root, "sentinel.json"));
+
+  const oldProject = fakeProject();
+  oldProject.root = "/old/repo";
+  const newProject = fakeProject();
+  newProject.root = "/new/repo";
+
+  // The live config list, exactly as index.ts's `() => config.projects` reads it;
+  // a runtime `/setup` change replaces the array with a freshly-loaded entry.
+  let live: ProjectEntry[] = [oldProject];
+  await store.setEnabled("demo", true, "controller-1");
+  await store.setFastCommand("demo", "test");
+
+  const discoveredRoots: string[] = [];
+  const commandRoots: string[] = [];
+  const authorizedRoots: string[] = [];
+  const manager = new SentinelManager(
+    () => live,
+    store,
+    {
+      discoverUrls: async (project) => {
+        discoveredRoots.push(project.root);
+        return ["http://127.0.0.1:4000"];
+      },
+      checkUrlFn: async () => ok(),
+      checkCommandFn: async (project) => {
+        commandRoots.push(project.root);
+        return ok();
+      },
+      now: () => new Date(),
+      authorizeCycle: (project) => {
+        authorizedRoots.push(project.root);
+        // Authorization must receive the same freshly-resolved object as discovery/execution.
+        assert.equal(project.root, live[0]!.root, "authorization runs against the live project object");
+        return true;
+      }
+    },
+    async () => undefined
+  );
+
+  await manager.runCycle("demo");
+  assert.deepEqual(discoveredRoots, ["/old/repo"], "the first cycle discovers against the original root");
+  assert.deepEqual(commandRoots, ["/old/repo"], "the first cycle executes against the original root");
+
+  // Runtime setup re-roots the same-name project mid-schedule.
+  live = [newProject];
+  await manager.runCycle("demo");
+  assert.deepEqual(discoveredRoots, ["/old/repo", "/new/repo"], "the next cycle discovers against the NEW root");
+  assert.deepEqual(commandRoots, ["/old/repo", "/new/repo"], "the next cycle executes against the NEW root");
+  assert.deepEqual(authorizedRoots, ["/old/repo", "/new/repo"], "authorization tracked the re-root in lockstep");
+  assert.ok(!discoveredRoots.slice(1).includes("/old/repo"), "the stale root is never discovered again after re-rooting");
+  assert.ok(!commandRoots.slice(1).includes("/old/repo"), "the stale root is never executed against after re-rooting");
+  manager.stopAll();
+});
+
+test("SentinelManager.runCycle refuses a cycle once the project is removed from live config (remove race)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-remove-"));
+  const store = new SentinelStore(path.join(root, "sentinel.json"));
+  const project = fakeProject();
+  let live: ProjectEntry[] = [project];
+  await store.setEnabled(project.name, true, "controller-1");
+
+  let urlChecks = 0;
+  const manager = new SentinelManager(
+    () => live,
+    store,
+    {
+      discoverUrls: async () => ["http://127.0.0.1:4000"],
+      checkUrlFn: async () => {
+        urlChecks += 1;
+        return ok();
+      },
+      checkCommandFn: async () => ok(),
+      now: () => new Date(),
+      authorizeCycle: () => true
+    },
+    async () => undefined
+  );
+
+  await manager.runCycle(project.name);
+  const checksWhilePresent = urlChecks;
+  assert.ok(checksWhilePresent > 0, "checks run while the project exists in live config");
+
+  // A runtime setup change removes the project entirely.
+  live = [];
+  await manager.runCycle(project.name);
+  assert.equal(urlChecks, checksWhilePresent, "a removed project runs no checks — the cycle is refused, not run against a stale object");
+  manager.stopAll();
+});
+
+test("SentinelManager.startEnabled schedules from the live project list, not a captured one (add race)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-add-"));
+  const store = new SentinelStore(path.join(root, "sentinel.json"));
+  const added = fakeProject();
+  added.root = "/added/repo";
+  // The project is absent when the manager is constructed and only added later,
+  // exactly as a runtime `/setup repo` add mutates `config.projects`.
+  let live: ProjectEntry[] = [];
+  await store.setEnabled(added.name, true, "controller-1");
+
+  const discoveredRoots: string[] = [];
+  const manager = new SentinelManager(
+    () => live,
+    store,
+    {
+      discoverUrls: async (project) => {
+        discoveredRoots.push(project.root);
+        return ["http://127.0.0.1:4000"];
+      },
+      checkUrlFn: async () => ok(),
+      checkCommandFn: async () => ok(),
+      now: () => new Date(),
+      authorizeCycle: () => true
+    },
+    async () => undefined
+  );
+
+  // A cycle before the project is added is refused (nothing to resolve).
+  await manager.runCycle(added.name);
+  assert.deepEqual(discoveredRoots, [], "a cycle for an as-yet-unadded project is refused");
+
+  // The project is added to live config, then a cycle resolves it fresh.
+  live = [added];
+  await manager.runCycle(added.name);
+  assert.deepEqual(discoveredRoots, ["/added/repo"], "once added, the cycle discovers against the newly-added project's root");
   manager.stopAll();
 });
 
