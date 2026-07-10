@@ -10,6 +10,23 @@ const commandBuilders = [
     .addSubcommand((subcommand) => subcommand.setName("show").setDescription("Show the current private Devbot configuration."))
     .addSubcommand((subcommand) =>
       subcommand
+        .setName("backend")
+        .setDescription("Show detected coding-agent backends and choose the active one.")
+        .addStringOption((option) =>
+          option
+            .setName("id")
+            .setDescription("Backend to activate; omit to just list detected backends.")
+            .setRequired(false)
+            .addChoices(
+              { name: "codex", value: "codex" },
+              { name: "claude", value: "claude" },
+              { name: "gemini", value: "gemini" },
+              { name: "opencode", value: "opencode" }
+            )
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
         .setName("user")
         .setDescription("Add or remove a viewer or controller.")
         .addStringOption((option) =>
