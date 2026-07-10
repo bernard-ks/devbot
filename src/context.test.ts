@@ -819,6 +819,32 @@ test("task controls keep task IDs behind state-aware public and private actions"
   ).flatMap((row) => row.toJSON().components);
   assert.deepEqual(safeModeRecovery.map((component) => "label" in component ? component.label : undefined), ["Adjust request", "Retry"]);
   assert.equal(safeModeRecovery.every((component) => "disabled" in component && component.disabled), true);
+
+  const checkpointedAction = {
+    ...succeededAnswer,
+    id: "task-undo",
+    mode: "action",
+    checkpointRef: "refs/devbot/checkpoints/task-undo",
+    checkpointHeadSha: "abc123",
+    checkpointBranch: "main"
+  };
+  const controllerLabels = taskActionRows(checkpointedAction, { canControl: true, safeMode: false, hasChecks: false })
+    .flatMap((row) => row.toJSON().components)
+    .map((component) => ("label" in component ? component.label : undefined));
+  assert.equal(controllerLabels.includes("Undo"), true);
+
+  const viewerLabels = taskActionRows(checkpointedAction, { canControl: false, safeMode: false, hasChecks: false })
+    .flatMap((row) => row.toJSON().components)
+    .map((component) => ("label" in component ? component.label : undefined));
+  assert.equal(viewerLabels.includes("Undo"), false);
+
+  assert.equal(taskActionMatchesState("undo", checkpointedAction), true);
+  assert.equal(taskActionMatchesState("undo-confirm", checkpointedAction), true);
+  assert.equal(taskActionMatchesState("undo", { ...checkpointedAction, reverted: true }), false);
+  assert.equal(taskActionMatchesState("undo", succeededAnswer), false);
+  assert.equal(taskActionMatchesState("undo", { ...checkpointedAction, status: "failed" }), true);
+  assert.deepEqual(parseTaskControl("devbot:task-control:undo:task-abc"), { action: "undo", taskId: "task-abc" });
+  assert.deepEqual(parseTaskControl("devbot:task-control:undo-confirm:task-abc"), { action: "undo-confirm", taskId: "task-abc" });
 });
 
 test("ship control is offered to controllers on completed action tasks but never on answer tasks", () => {

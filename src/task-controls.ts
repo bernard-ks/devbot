@@ -11,7 +11,9 @@ export type TaskControlAction =
   | "promote"
   | "validate"
   | "adjust"
-  | "ship";
+  | "ship"
+  | "undo"
+  | "undo-confirm";
 
 interface PublicTaskControlOptions {
   status?: TaskStatus;
@@ -22,6 +24,15 @@ interface PrivateTaskControlOptions {
   canControl: boolean;
   safeMode: boolean;
   hasChecks: boolean;
+}
+
+export function taskHasRestorableCheckpoint(task: TaskRecord): boolean {
+  return (
+    task.mode === "action" &&
+    (task.status === "succeeded" || task.status === "failed") &&
+    Boolean(task.checkpointRef) &&
+    !task.reverted
+  );
 }
 
 export function taskControlRow(
@@ -76,9 +87,19 @@ export function taskActionRows(
     }
   }
 
+  if (options.canControl && taskHasRestorableCheckpoint(task)) {
+    buttons.push(button("undo", task.id, "Undo", ButtonStyle.Danger));
+  }
+
   return buttons.length > 0
     ? [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons.slice(0, 5))]
     : [];
+}
+
+export function undoConfirmRow(taskId: string): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    button("undo-confirm", taskId, "Confirm undo", ButtonStyle.Danger)
+  );
 }
 
 export function taskActionMatchesState(action: TaskControlAction, task: TaskRecord): boolean {
@@ -98,11 +119,14 @@ export function taskActionMatchesState(action: TaskControlAction, task: TaskReco
   if (action === "promote") {
     return task.status === "succeeded" && mode === "answer";
   }
+  if (action === "undo" || action === "undo-confirm") {
+    return taskHasRestorableCheckpoint(task);
+  }
   return task.status === "succeeded" && mode === "action";
 }
 
 export function parseTaskControl(customId: string): { action: TaskControlAction; taskId: string } | undefined {
-  const match = /^devbot:task-control:(details|actions|followup|review|retry|cancel|promote|validate|adjust|ship):(.+)$/i.exec(customId);
+  const match = /^devbot:task-control:(details|actions|followup|review|retry|cancel|promote|validate|adjust|ship|undo-confirm|undo):(.+)$/i.exec(customId);
   if (!match?.[1] || !match[2] || !isTaskId(match[2])) {
     return undefined;
   }

@@ -57,6 +57,12 @@ export interface TaskRecord {
   routeSource?: string;
   resultPreview?: string;
   error?: string;
+  checkpointRef?: string;
+  checkpointHeadSha?: string;
+  checkpointBranch?: string;
+  checkpointCreatedAt?: string;
+  reverted?: boolean;
+  revertedAt?: string;
   startedAt: string;
   updatedAt: string;
   finishedAt?: string;
@@ -65,6 +71,13 @@ export interface TaskRecord {
 
 export interface TaskCaptureInput {
   captureNote?: string;
+}
+
+export interface TaskCheckpoint {
+  ref: string;
+  headSha: string;
+  branch: string;
+  createdAt: string;
 }
 
 export interface StartTaskInput {
@@ -325,6 +338,26 @@ export class TaskStore {
     await this.update(id, (task) => {
       if (capture.captureNote !== undefined) task.captureNote = capture.captureNote;
     });
+  }
+
+  async attachCheckpoint(id: string, checkpoint: TaskCheckpoint): Promise<void> {
+    await this.update(id, (task) => {
+      task.checkpointRef = checkpoint.ref;
+      task.checkpointHeadSha = checkpoint.headSha;
+      task.checkpointBranch = checkpoint.branch;
+      task.checkpointCreatedAt = checkpoint.createdAt;
+      task.reverted = false;
+    });
+  }
+
+  async markReverted(id: string): Promise<TaskRecord | undefined> {
+    let result: TaskRecord | undefined;
+    await this.update(id, (task, now) => {
+      task.reverted = true;
+      task.revertedAt = now;
+      result = task;
+    });
+    return result ? { ...result, includePatterns: [...result.includePatterns] } : undefined;
   }
 
   async cancel(id: string, reason = "Canceled by user request."): Promise<TaskRecord | undefined> {
