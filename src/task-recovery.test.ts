@@ -10,10 +10,11 @@ import {
   interruptionNote,
   reconcileInterruptedTasks,
   terminateOrphanedChild,
-  type InterruptedTaskNotice
+  type InterruptedTaskNotice,
+  type OrphanTerminationOutcome
 } from "./task-recovery.js";
 import { TaskStore } from "./task-store.js";
-import { interruptedTaskNoticeRow, parseTaskControl, taskActionMatchesState } from "./task-controls.js";
+import { interruptedTaskNoticeRow, parseTaskControl, taskActionMatchesState, taskActionRows } from "./task-controls.js";
 import { createTaskWorktree, resumeTaskWorktree } from "./task-worktree.js";
 
 const posixOnly = process.platform === "win32" ? { skip: "requires POSIX process identity" } : {};
@@ -218,6 +219,141 @@ test("an unconfirmed hard kill keeps the execution record and reports unverified
   assert.equal(recovered?.status, "interrupted");
   assert.match(recovered?.error ?? "", /exit could not be confirmed/);
   assert.equal(/stopped with an observed exit/.test(recovered?.error ?? ""), false);
+});
+
+test("a durable record whose hard kill stays unconfirmed is reconciled again on the next restart", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-recovery-tworestart-"));
+  const taskFile = path.join(root, "tasks.json");
+  const ledgerFile = path.join(root, "executions.json");
+
+  const store = new TaskStore(taskFile);
+  const task = await store.start({
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    requesterId: "42",
+    text: "still writing"
+  });
+  const ledger = new ExecutionLedger(ledgerFile);
+  await ledger.record({
+    taskId: task.id,
+    projectName: "demo",
+    mode: "action",
+    requester: "tester",
+    startedAt: task.startedAt
+  });
+  await ledger.setChild(task.id, { pid: 987654, startedAt: "Mon Jan  1 00:00:00 2001", command: "node" });
+
+  const outcomes: OrphanTerminationOutcome[] = ["kill-unconfirmed", "already-exited"];
+  let terminateCalls = 0;
+  const terminate = async (): Promise<OrphanTerminationOutcome> => {
+    const outcome = outcomes[terminateCalls] ?? "already-exited";
+    terminateCalls += 1;
+    return outcome;
+  };
+
+  // First restart: the worker's exit is unconfirmed, so the record survives and
+  // the task is held with cleanup pending rather than cleared as stale.
+  const first = await reconcileInterruptedTasks({
+    ledger: new ExecutionLedger(ledgerFile),
+    tasks: new TaskStore(taskFile),
+    terminate
+  });
+  assert.equal(terminateCalls, 1);
+  assert.equal(first.interruptedTasks, 1);
+  assert.equal(first.orphansStopped, 0);
+  assert.equal(first.staleRecordsCleared, 0);
+  const afterFirst = await new ExecutionLedger(ledgerFile).listActive();
+  assert.equal(afterFirst.length, 1);
+  assert.equal(afterFirst[0]?.taskId, task.id);
+  const heldTask = await new TaskStore(taskFile).get(task.id);
+  assert.equal(heldTask?.status, "interrupted");
+  assert.equal(heldTask?.cleanupPending, true);
+
+  // Second restart: the task is no longer running, but the retained record must
+  // still be reconciled and termination retried until the exit is observed.
+  const second = await reconcileInterruptedTasks({
+    ledger: new ExecutionLedger(ledgerFile),
+    tasks: new TaskStore(taskFile),
+    terminate
+  });
+  assert.equal(terminateCalls, 2);
+  assert.equal(second.interruptedTasks, 0);
+  const afterSecond = await new ExecutionLedger(ledgerFile).listActive();
+  assert.equal(afterSecond.length, 0);
+  const clearedTask = await new TaskStore(taskFile).get(task.id);
+  assert.equal(clearedTask?.status, "interrupted");
+  assert.notEqual(clearedTask?.cleanupPending, true);
+});
+
+test("retry is refused while an interrupted task's worker cleanup is unconfirmed", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-recovery-orphanretry-"));
+  const taskFile = path.join(root, "tasks.json");
+  const ledgerFile = path.join(root, "executions.json");
+
+  const store = new TaskStore(taskFile);
+  const task = await store.start({
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    requesterId: "42",
+    text: "still writing"
+  });
+  const ledger = new ExecutionLedger(ledgerFile);
+  await ledger.record({
+    taskId: task.id,
+    projectName: "demo",
+    mode: "action",
+    requester: "tester",
+    startedAt: task.startedAt
+  });
+  await ledger.setChild(task.id, { pid: 987654, startedAt: "Mon Jan  1 00:00:00 2001", command: "node" });
+
+  await reconcileInterruptedTasks({
+    ledger: new ExecutionLedger(ledgerFile),
+    tasks: new TaskStore(taskFile),
+    terminate: async () => "kill-unconfirmed"
+  });
+
+  const pending = await new TaskStore(taskFile).get(task.id);
+  assert.ok(pending);
+  assert.equal(pending?.status, "interrupted");
+  assert.equal(pending?.cleanupPending, true);
+
+  // The orphaned worker may still be alive, so retry/resume must be refused
+  // while dismiss stays available.
+  assert.equal(taskActionMatchesState("retry", pending!), false);
+  assert.equal(taskActionMatchesState("dismiss", pending!), true);
+
+  const controlButtons = taskActionRows(pending!, {
+    canControl: true,
+    safeMode: false,
+    hasChecks: false,
+    canRecover: true
+  })
+    .flatMap((row) => row.components)
+    .map((component) => component.toJSON() as { custom_id: string; disabled?: boolean });
+  const retryControl = controlButtons.find((component) => component.custom_id.includes(":retry:"));
+  assert.ok(retryControl, "the retry control should be present but refused, not silently missing");
+  assert.equal(retryControl?.disabled, true);
+
+  const noticeRetry = interruptedTaskNoticeRow(task.id, { mode: "action", safeMode: false, cleanupPending: true }).components
+    .map((component) => component.toJSON() as { custom_id: string; disabled?: boolean })
+    .find((component) => component.custom_id.includes(":retry:"));
+  assert.equal(noticeRetry?.disabled, true);
+
+  // Once cleanup is confirmed on a later restart the record clears and retry is
+  // authorized again.
+  await reconcileInterruptedTasks({
+    ledger: new ExecutionLedger(ledgerFile),
+    tasks: new TaskStore(taskFile),
+    terminate: async () => "already-exited"
+  });
+  const confirmed = await new TaskStore(taskFile).get(task.id);
+  assert.notEqual(confirmed?.cleanupPending, true);
+  assert.equal(taskActionMatchesState("retry", confirmed!), true);
 });
 
 test("a child that survives the post-SIGKILL wait is reported unconfirmed, not killed", posixOnly, async () => {

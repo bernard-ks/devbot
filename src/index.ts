@@ -1772,7 +1772,7 @@ async function announceInterruptedTask(task: TaskRecord): Promise<void> {
   }
   await message.edit({
     content: formatInterruptedTaskNotice(task),
-    components: [interruptedTaskNoticeRow(task.id, { mode: task.mode, safeMode: config.safeMode })],
+    components: [interruptedTaskNoticeRow(task.id, { mode: task.mode, safeMode: config.safeMode, cleanupPending: task.cleanupPending === true })],
     allowedMentions: { parse: [] }
   });
 }
@@ -3145,6 +3145,15 @@ async function handleTaskControl(
     return;
   }
 
+  if ((action === "retry") && task.status === "interrupted" && task.cleanupPending) {
+    await interaction.reply({
+      content:
+        "This interrupted task can't be retried yet: Devbot couldn't confirm the previous run's worker process exited, so retrying now could run a second worker against the same workspace. It becomes retryable once cleanup is confirmed on a restart.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
   if (!taskActionMatchesState(action, task)) {
     await interaction.reply({
       content: `That action is not available while this task is ${task.status}. Open Actions to see the current choices.`,
@@ -3370,7 +3379,7 @@ function taskRetryRefusalMessage(refusal: TaskRetryRefusal): string {
 }
 
 function resumeWorkspaceForRetry(task: TaskRecord): Pick<ProjectRequestOptions, "resumeWorkspace"> | undefined {
-  if (task.status !== "interrupted" || task.mode !== "action" || !task.workspaceIsolated) {
+  if (task.status !== "interrupted" || task.mode !== "action" || !task.workspaceIsolated || task.cleanupPending) {
     return undefined;
   }
   if (!task.workspacePath || !task.branchName || !task.baseBranch) {

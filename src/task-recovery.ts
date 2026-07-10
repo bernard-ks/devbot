@@ -308,6 +308,7 @@ export async function terminateOrphanedChild(
 export interface RecoveryTaskStore {
   listRunning(): Promise<TaskRecord[]>;
   interrupt(id: string, note: string): Promise<TaskRecord | undefined>;
+  setCleanupPending(id: string, pending: boolean): Promise<TaskRecord | undefined>;
 }
 
 export interface InterruptedTaskNotice {
@@ -334,10 +335,15 @@ export interface ReconcileSummary {
 }
 
 /**
- * Startup reconciliation: every task the previous runtime left running is
- * marked interrupted with an honest account of what is known, any orphaned
- * child of ours is stopped with an observed exit, and stale ledger records are
- * cleared. Model work is never re-attached or resumed automatically.
+ * Startup reconciliation. Every task the previous runtime left running is marked
+ * interrupted with an honest account of what is known. Every retained execution
+ * record is reconciled until its worker's exit is observed, regardless of the
+ * task's current status: a record kept from an earlier restart because its hard
+ * kill was unconfirmed is retried here even though the task no longer appears in
+ * listRunning(). A durable record is only cleared once there is nothing left to
+ * clean up (no worker, or a worker whose exit is now observed); while cleanup
+ * stays unconfirmed the task's retry/resume controls remain refused. Model work
+ * is never re-attached or resumed automatically.
  */
 export async function reconcileInterruptedTasks(options: ReconcileOptions): Promise<ReconcileSummary> {
   const log = options.log ?? (() => undefined);
@@ -353,7 +359,7 @@ export async function reconcileInterruptedTasks(options: ReconcileOptions): Prom
 
   const recordsByTask = new Map(records.map((record) => [record.taskId, record]));
   const running = await options.tasks.listRunning();
-  const retainedRecords = new Set<string>();
+  const runningById = new Map(running.map((task) => [task.id, task]));
   const summary: ReconcileSummary = {
     interruptedTasks: 0,
     orphansStopped: 0,
@@ -362,52 +368,62 @@ export async function reconcileInterruptedTasks(options: ReconcileOptions): Prom
     ...(issues.quarantinedTo ? { quarantinedTo: issues.quarantinedTo } : {})
   };
 
-  for (const task of running) {
-    if (options.isActive?.(task.id)) {
-      log(`Task ${task.id} is already active in this runtime; skipping restart reconciliation for it.`);
+  // Reconcile the union of currently-running tasks and every retained record, so
+  // a record whose task was already marked interrupted on an earlier restart is
+  // still driven to an observed worker exit rather than cleared as stale.
+  const taskIds = new Set<string>([...runningById.keys(), ...recordsByTask.keys()]);
+
+  for (const taskId of taskIds) {
+    if (options.isActive?.(taskId)) {
+      log(`Task ${taskId} is already active in this runtime; skipping restart reconciliation for it.`);
       continue;
     }
-    const record = recordsByTask.get(task.id);
+    const record = recordsByTask.get(taskId);
+    const runningTask = runningById.get(taskId);
+
     let childOutcome: OrphanTerminationOutcome | "no-child" = "no-child";
     if (record?.child) {
       try {
         childOutcome = await terminate(record.child);
       } catch (error) {
         childOutcome = "unverifiable";
-        log(`Unable to stop the recorded child of task ${task.id}: ${(error as Error).message}`);
+        log(`Unable to stop the recorded child of task ${taskId}: ${(error as Error).message}`);
       }
       if (childOutcome === "terminated" || childOutcome === "killed") {
         summary.orphansStopped += 1;
       }
-      if (!childExitObserved(childOutcome)) {
-        retainedRecords.add(task.id);
-        log(`Kept the durable record of task ${task.id}; its worker exit was not observed (${childOutcome}).`);
-      }
     }
-    const interrupted = await options.tasks.interrupt(task.id, interruptionNote(record, childOutcome));
-    if (!interrupted) {
-      continue;
-    }
-    summary.interruptedTasks += 1;
-    if (options.notify) {
-      try {
-        await options.notify({ task: interrupted, ...(record ? { record } : {}), childOutcome });
-      } catch (error) {
-        log(`Unable to announce the interruption of task ${task.id}: ${(error as Error).message}`);
-      }
-    }
-  }
+    const exitObserved = childExitObserved(childOutcome);
 
-  for (const record of records) {
-    if (options.isActive?.(record.taskId)) {
-      continue;
+    if (runningTask) {
+      const interrupted = await options.tasks.interrupt(taskId, interruptionNote(record, childOutcome));
+      if (interrupted) {
+        summary.interruptedTasks += 1;
+        if (options.notify) {
+          try {
+            await options.notify({ task: interrupted, ...(record ? { record } : {}), childOutcome });
+          } catch (error) {
+            log(`Unable to announce the interruption of task ${taskId}: ${(error as Error).message}`);
+          }
+        }
+      }
     }
-    if (retainedRecords.has(record.taskId)) {
-      continue;
+
+    // Fail closed: while a recorded worker's exit is unconfirmed the task's
+    // cleanup stays pending so retry/resume are refused; clear it once observed.
+    if (record?.child) {
+      await options.tasks.setCleanupPending(taskId, !exitObserved);
     }
-    await options.ledger.clear(record.taskId);
-    if (!running.some((task) => task.id === record.taskId)) {
-      summary.staleRecordsCleared += 1;
+
+    if (record) {
+      if (!record.child || exitObserved) {
+        await options.ledger.clear(taskId);
+        if (!runningById.has(taskId)) {
+          summary.staleRecordsCleared += 1;
+        }
+      } else {
+        log(`Kept the durable record of task ${taskId}; its worker exit was not observed (${childOutcome}).`);
+      }
     }
   }
 

@@ -80,7 +80,8 @@ export function taskActionRows(
 
   if (task.status === "interrupted" && (options.canRecover ?? options.canControl)) {
     const blockedBySafeMode = mode === "action" && options.safeMode;
-    buttons.push(button("retry", task.id, "Retry", ButtonStyle.Primary).setDisabled(blockedBySafeMode));
+    const retryBlocked = blockedBySafeMode || Boolean(task.cleanupPending);
+    buttons.push(button("retry", task.id, "Retry", ButtonStyle.Primary).setDisabled(retryBlocked));
     buttons.push(button("dismiss", task.id, "Dismiss", ButtonStyle.Secondary));
   }
 
@@ -91,9 +92,10 @@ export function taskActionRows(
 
 export function interruptedTaskNoticeRow(
   taskId: string,
-  options: { mode?: string; safeMode: boolean }
+  options: { mode?: string; safeMode: boolean; cleanupPending?: boolean }
 ): ActionRowBuilder<ButtonBuilder> {
-  const retryBlocked = (options.mode ?? "answer") === "action" && options.safeMode;
+  const retryBlocked =
+    ((options.mode ?? "answer") === "action" && options.safeMode) || Boolean(options.cleanupPending);
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     button("retry", taskId, "Retry", ButtonStyle.Primary).setDisabled(retryBlocked),
     button("dismiss", taskId, "Dismiss", ButtonStyle.Secondary),
@@ -113,6 +115,9 @@ export function taskActionMatchesState(action: TaskControlAction, task: TaskReco
     return task.status === "failed" || task.status === "canceled";
   }
   if (action === "retry") {
+    if (task.status === "interrupted" && task.cleanupPending) {
+      return false;
+    }
     return task.status === "failed" || task.status === "canceled" || task.status === "interrupted";
   }
   if (action === "dismiss") {

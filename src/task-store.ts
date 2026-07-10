@@ -61,6 +61,7 @@ export interface TaskRecord {
   updatedAt: string;
   finishedAt?: string;
   captureNote?: string;
+  cleanupPending?: boolean;
 }
 
 export interface TaskCaptureInput {
@@ -369,9 +370,31 @@ export class TaskStore {
       task.error = redactSensitiveText(`Interrupted work dismissed by ${actor}.`);
       task.finishedAt = now;
       delete task.attention;
+      delete task.cleanupPending;
       dismissed = cloneTask(task);
     });
     return dismissed;
+  }
+
+  /**
+   * Records whether an interrupted task's previous worker process is still being
+   * cleaned up. While cleanup is pending the task's exit is unconfirmed, so retry
+   * and workspace resume stay refused to avoid a second concurrent writer.
+   */
+  async setCleanupPending(id: string, pending: boolean): Promise<TaskRecord | undefined> {
+    let updated: TaskRecord | undefined;
+    await this.update(id, (task) => {
+      if (task.status !== "interrupted") {
+        return;
+      }
+      if (pending) {
+        task.cleanupPending = true;
+      } else {
+        delete task.cleanupPending;
+      }
+      updated = cloneTask(task);
+    });
+    return updated;
   }
 
   async listRunning(): Promise<TaskRecord[]> {
@@ -695,6 +718,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
     ...(stringValue(task.resultPreview) ? { resultPreview: stringValue(task.resultPreview)! } : {}),
     ...(stringValue(task.error) ? { error: stringValue(task.error)! } : {}),
     ...(stringValue(task.captureNote) ? { captureNote: stringValue(task.captureNote)! } : {}),
+    ...(task.cleanupPending === true ? { cleanupPending: true } : {}),
     startedAt,
     updatedAt: validTimestamp(task.updatedAt) ?? startedAt,
     ...(validTimestamp(task.finishedAt) ? { finishedAt: validTimestamp(task.finishedAt)! } : {})
