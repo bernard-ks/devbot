@@ -618,6 +618,115 @@ test("TunnelManager keeps the ledger record when a kill never confirms, so the n
   assert.deepEqual(released, []);
 });
 
+test("TunnelManager completes deferred cleanup when the child exits in the gap after the final kill wait gives up", async () => {
+  // Deterministic reproduction of the reviewed race: the child exits in the
+  // window between the last kill wait resolving false and cleanup being
+  // attached. With the exit observation attached before any signal, the exit is
+  // never missed, so cleanup still finishes. Injected timers make the grace
+  // waits fire on demand instead of by wall clock.
+  const scheduled: Array<{ fn: () => void; ms: number }> = [];
+  const spawnFn: TunnelSpawnFn = () => fakeChild({ killBehavior: "ignore-all" });
+  const { manager, homesRemoved } = makeManager(
+    {
+      killGraceMs: 10,
+      scheduleTimeout: (fn, ms) => {
+        scheduled.push({ fn, ms });
+        return scheduled.length - 1;
+      },
+      clearScheduledTimeout: () => {}
+    },
+    spawnFn
+  );
+  const expireReasons: string[] = [];
+  const pending = manager.reserve(reserveInput({ projectName: "web" }));
+  const tunnel = await launchAndReportUrl(
+    manager,
+    pending.id,
+    (_tunnel, reason) => { expireReasons.push(reason); },
+    "https://web.trycloudflare.com"
+  );
+  const child = lastSpawnedChild;
+  const graceTimers = () => scheduled.filter((entry) => entry.ms === 10);
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const stopPromise = manager.stop(tunnel.id, "stop");
+    await sleep(0); // SIGTERM sent; its grace timer is now scheduled.
+    graceTimers()[0]?.fn(); // SIGTERM grace times out -> resolves false.
+    await sleep(0); // SIGKILL sent; its grace timer is now scheduled.
+    graceTimers()[1]?.fn(); // SIGKILL grace times out -> resolves false.
+    child?.emitExit(0); // Child exits IN THE GAP, before deferred cleanup is attached.
+    const stopped = await stopPromise;
+    assert.equal(stopped?.exitConfirmed, false);
+    assert.deepEqual(child?.killSignals, ["SIGTERM", "SIGKILL"]);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  await sleep(0);
+  // The gap exit is honoured: the tunnel is untracked, the project slot freed,
+  // the isolated home removed, and expiry fired with the original stop reason.
+  assert.equal(manager.get(tunnel.id), undefined);
+  assert.equal(manager.hasActiveForProject("web"), false);
+  assert.equal(homesRemoved.length, 1);
+  assert.deepEqual(expireReasons, ["stop"]);
+});
+
+test("TunnelManager defers isolated-home removal during a launch abort until a resistant child's exit is observed", async () => {
+  const child = fakeChild({ killBehavior: "ignore-all" });
+  const spawnFn: TunnelSpawnFn = () => child;
+  const { manager, homesRemoved } = makeManager({ killGraceMs: 10 }, spawnFn);
+  const pending = manager.reserve(reserveInput({ projectName: "web" }));
+  const launchPromise = manager.launch(pending.id, () => {});
+  await sleep(0); // createHome + spawn done; launch now awaits the URL.
+  manager.cancelPending(pending.id); // Abort the reservation mid-launch.
+  child.emitStdout("https://web.trycloudflare.com\n"); // URL arrives; launch resumes into its abort path.
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await assert.rejects(launchPromise, /cancelled before it finished starting/);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  // A resistant child that ignores SIGTERM/SIGKILL was never confirmed dead, so
+  // its isolated home must not be removed while it may still be serving.
+  assert.deepEqual(child.killSignals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(homesRemoved.length, 0);
+  assert.equal(manager.hasActiveForProject("web"), false);
+
+  child.emitExit(0); // The resistant child finally exits.
+  await sleep(0);
+  assert.equal(homesRemoved.length, 1); // Home removed only once the exit is observed.
+});
+
+test("TunnelManager fails closed and tears down when the process ledger cannot record the tunnel", async () => {
+  const released: string[] = [];
+  const ledger = {
+    record: async () => {
+      throw new Error("disk full");
+    },
+    release: async (id: string) => {
+      released.push(id);
+    }
+  };
+  const { manager, homesRemoved } = makeManager({ processLedger: ledger });
+  const pending = manager.reserve(reserveInput({ projectName: "web" }));
+
+  // The record is awaited before the URL is ever waited on, so launch rejects
+  // outright without exposing anything.
+  await assert.rejects(manager.launch(pending.id, () => {}), /refusing to expose it/);
+
+  // Nothing is exposed or tracked, the child is killed, its home is removed, and
+  // no release runs because no durable record was ever written.
+  assert.equal(manager.hasActiveForProject("web"), false);
+  assert.equal(homesRemoved.length, 1);
+  assert.equal(lastSpawnedChild?.killed, true);
+  assert.deepEqual(released, []);
+});
+
 let lastSpawnedChild: FakeChild | undefined;
 let nextFakePid = 40_000;
 

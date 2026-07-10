@@ -61,6 +61,36 @@ export interface TunnelStopOutcome {
   exitConfirmed: boolean;
 }
 
+/**
+ * A single observation of a child's `exit`, attached the instant the child is
+ * available and BEFORE any signal is ever sent to it. `exited` is a durable
+ * promise and `hasExited()` its synchronous mirror. Because the listener is in
+ * place before signalling, an exit that lands in the narrow window between a
+ * kill wait giving up and a caller attaching cleanup is never missed: `.then()`
+ * still fires on an already-resolved promise, so cleanup is never skipped.
+ */
+export interface ExitObservation {
+  readonly exited: Promise<void>;
+  hasExited(): boolean;
+}
+
+export function observeChildExit(child: TunnelChildProcess): ExitObservation {
+  let exited = false;
+  let markExited!: () => void;
+  const exitedPromise = new Promise<void>((resolve) => {
+    markExited = resolve;
+  });
+  child.on("exit", () => {
+    if (exited) return;
+    exited = true;
+    markExited();
+  });
+  return {
+    exited: exitedPromise,
+    hasExited: () => exited
+  };
+}
+
 export interface TunnelReadableLike {
   on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
 }
@@ -498,6 +528,7 @@ interface TrackedPending extends TrackedBase {
   state: "pending";
   aborted: boolean;
   child?: TunnelChildProcess;
+  exitObservation?: ExitObservation;
   homeDir?: string;
   pendingTimer: unknown;
   onPendingExpire: (pending: PendingTunnel, reason: PendingExpireReason) => void;
@@ -509,6 +540,7 @@ interface TrackedActive extends TrackedBase {
   startedAt: string;
   expiresAt: string;
   child: TunnelChildProcess;
+  exitObservation: ExitObservation;
   homeDir: string;
   ttlTimer: unknown;
   onExpire: (tunnel: ActiveTunnel, reason: TunnelExpireReason) => void;
@@ -639,9 +671,10 @@ export class TunnelManager {
     tracked.aborted = true;
     this.tunnels.delete(id);
     this.clearScheduled(tracked.pendingTimer);
-    if (tracked.child) {
-      tracked.child.kill("SIGTERM");
-    }
+    // A spawned-but-not-yet-active child (cancel mid-launch) is owned by
+    // launch(), which observes its exit before removing the isolated home or
+    // releasing its ledger record. Do not signal or tear it down here without
+    // observing that exit — that is exactly the fail-open the review flagged.
     tracked.onPendingExpire(toPendingTunnel(tracked), reason);
   }
 
@@ -669,10 +702,28 @@ export class TunnelManager {
     // instead of only after the wait settles on its own.
     const child = this.deps.spawnFn(cloudflaredPath, ["tunnel", "--url", tracked.origin], env);
     tracked.child = child;
-    this.recordChildProcess(tracked.id, tracked.origin, child);
+    // Observe the exit before any signal is ever sent — this single observation
+    // is shared by every teardown path below, closing the gap where an exit
+    // could land between a kill wait giving up and a listener being attached.
+    const exitObservation = observeChildExit(child);
+    tracked.exitObservation = exitObservation;
+
+    // Durably record the process for orphan reconciliation and fail closed if
+    // it cannot be persisted: nothing is exposed until the ledger write
+    // resolves. An unrecorded public tunnel that a crash could orphan must
+    // never be published.
+    try {
+      await this.recordChildProcess(tracked.id, tracked.origin, child, exitObservation);
+    } catch (error) {
+      this.tunnels.delete(id);
+      await this.abortLaunchedChild(child, exitObservation, homeDir);
+      throw new Error(
+        `Could not durably record the preview tunnel for orphan tracking; refusing to expose it. (${(error as Error).message})`
+      );
+    }
+
     if (tracked.aborted) {
-      child.kill("SIGTERM");
-      await this.removeHomeSafely(homeDir);
+      await this.abortLaunchedChild(child, exitObservation, homeDir);
       throw new Error("The preview tunnel was cancelled before it finished starting.");
     }
 
@@ -681,13 +732,12 @@ export class TunnelManager {
       url = await waitForTunnelUrl(child, this.deps.urlTimeoutMs);
     } catch (error) {
       this.tunnels.delete(id);
-      await this.removeHomeSafely(homeDir);
+      await this.abortLaunchedChild(child, exitObservation, homeDir);
       throw error;
     }
 
     if (this.tunnels.get(id) !== tracked || tracked.aborted) {
-      child.kill("SIGTERM");
-      await this.removeHomeSafely(homeDir);
+      await this.abortLaunchedChild(child, exitObservation, homeDir);
       throw new Error("The preview tunnel was cancelled before it finished starting.");
     }
 
@@ -710,6 +760,7 @@ export class TunnelManager {
       startedAt: now.toISOString(),
       expiresAt: expiresAt.toISOString(),
       child,
+      exitObservation,
       homeDir,
       ttlTimer: undefined,
       onExpire
@@ -718,7 +769,7 @@ export class TunnelManager {
       void this.expire(id, "ttl", false);
     }, tracked.ttlMinutes * 60_000);
 
-    child.on("exit", () => {
+    void exitObservation.exited.then(() => {
       if (this.tunnels.get(id) === active) {
         // The child has already exited; there is nothing left to signal.
         void this.expire(id, "process-exit", true);
@@ -779,7 +830,7 @@ export class TunnelManager {
     // If the child is already confirmed gone (a real "exit" event fired), it
     // will never emit another one — signalling and waiting here would just
     // stall for the full grace period for no reason.
-    if (alreadyExited || (await this.killWithEscalation(tracked.child))) {
+    if (alreadyExited || (await this.killWithEscalation(tracked.child, tracked.exitObservation))) {
       await this.completeCleanup(tracked, reason);
       return { tunnel: toActiveTunnel(tracked), exitConfirmed: true };
     }
@@ -793,7 +844,7 @@ export class TunnelManager {
     console.warn(
       `cloudflared for preview tunnel ${tracked.projectName} (${tracked.id}) did not confirm exit after SIGTERM/SIGKILL; it stays tracked and reported as not stopped until its process exit is observed.`
     );
-    this.armDeferredCleanup(tracked, reason);
+    this.deferCleanupUntilExit(tracked, reason);
     return { tunnel: toActiveTunnel(tracked), exitConfirmed: false };
   }
 
@@ -808,17 +859,42 @@ export class TunnelManager {
   }
 
   /**
-   * Waits for a resistant child's eventual exit and only then completes the
-   * deferred cleanup for a tunnel whose kill never confirmed.
+   * Completes the deferred cleanup once a resistant child (kill never confirmed)
+   * eventually exits. Chains off the single exit observation attached before any
+   * signal was sent, so an exit that already landed in the gap between the kill
+   * wait giving up and this call is still honoured — `.then()` fires on an
+   * already-resolved promise — instead of being missed by a listener attached
+   * too late.
    */
-  private armDeferredCleanup(tracked: TrackedActive, reason: TunnelExpireReason): void {
+  private deferCleanupUntilExit(tracked: TrackedActive, reason: TunnelExpireReason): void {
     if (tracked.deferredCleanupArmed) {
       return;
     }
     tracked.deferredCleanupArmed = true;
-    tracked.child.on("exit", () => {
-      void this.completeCleanup(tracked, reason);
-    });
+    void tracked.exitObservation.exited.then(() => this.completeCleanup(tracked, reason));
+  }
+
+  /**
+   * Tears down a child that was spawned but must not become an active tunnel
+   * (launch aborted, cancelled, or failed to record). The isolated home is only
+   * removed once the child's exit is observed: a resistant child that ignores
+   * SIGTERM/SIGKILL keeps its home until it is really gone, so state is never
+   * deleted out from under a process that may still be serving the origin. Its
+   * ledger record (if any) is likewise released only on the observed exit.
+   */
+  private async abortLaunchedChild(
+    child: TunnelChildProcess,
+    observation: ExitObservation,
+    homeDir: string | undefined
+  ): Promise<void> {
+    if (await this.killWithEscalation(child, observation)) {
+      await this.removeHomeSafely(homeDir);
+      return;
+    }
+    console.warn(
+      "cloudflared for an aborted preview tunnel did not confirm exit after SIGTERM/SIGKILL; its isolated home is retained until the process exit is observed."
+    );
+    void observation.exited.then(() => this.removeHomeSafely(homeDir));
   }
 
   /** Stops or cancels whatever tunnel (pending or active) is tracked for a project. */
@@ -862,12 +938,15 @@ export class TunnelManager {
     return results;
   }
 
-  private async killWithEscalation(child: TunnelChildProcess): Promise<boolean> {
-    const graceMs = this.deps.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
-    if (await this.waitForExit(child, graceMs, () => child.kill("SIGTERM"))) {
+  private async killWithEscalation(child: TunnelChildProcess, observation: ExitObservation): Promise<boolean> {
+    if (observation.hasExited()) {
       return true;
     }
-    return this.waitForExit(child, graceMs, () => {
+    const graceMs = this.deps.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+    if (await this.awaitExitOrTimeout(observation, graceMs, () => child.kill("SIGTERM"))) {
+      return true;
+    }
+    return this.awaitExitOrTimeout(observation, graceMs, () => {
       try {
         child.kill("SIGKILL");
       } catch {
@@ -876,7 +955,16 @@ export class TunnelManager {
     });
   }
 
-  private waitForExit(child: TunnelChildProcess, timeoutMs: number, act: () => void): Promise<boolean> {
+  /**
+   * Sends a signal and races the child's single exit observation against a grace
+   * timeout. Because the observation was attached before any signal was ever
+   * sent, an exit that fires the instant the timeout resolves false is still
+   * recorded on the observation, so no caller downstream can miss it.
+   */
+  private awaitExitOrTimeout(observation: ExitObservation, timeoutMs: number, act: () => void): Promise<boolean> {
+    if (observation.hasExited()) {
+      return Promise.resolve(true);
+    }
     const schedule = this.deps.scheduleTimeout ?? defaultSchedule;
     const clear = this.deps.clearScheduledTimeout ?? defaultClear;
     return new Promise((resolve) => {
@@ -886,7 +974,7 @@ export class TunnelManager {
         settled = true;
         resolve(false);
       }, timeoutMs);
-      child.on("exit", () => {
+      void observation.exited.then(() => {
         if (settled) return;
         settled = true;
         clear(timer);
@@ -897,20 +985,29 @@ export class TunnelManager {
   }
 
   /**
-   * Records the spawned pid so a restart can reconcile orphans, and releases
-   * the record only once a real exit is observed: a kill that never confirms
-   * keeps its entry, so the next startup still knows to hunt it down.
+   * Durably records the spawned pid so a restart can reconcile orphans, and
+   * releases the record only once a real exit is observed: a kill that never
+   * confirms keeps its entry, so the next startup still knows to hunt it down.
+   * Awaited by launch() before the tunnel is exposed; it throws (so launch fails
+   * closed) if the record cannot be written, or if the child reports no pid and
+   * therefore cannot be tracked at all.
    */
-  private recordChildProcess(id: string, origin: string, child: TunnelChildProcess): void {
+  private async recordChildProcess(
+    id: string,
+    origin: string,
+    child: TunnelChildProcess,
+    observation: ExitObservation
+  ): Promise<void> {
     const ledger = this.deps.processLedger;
-    if (!ledger || typeof child.pid !== "number") {
+    if (!ledger) {
       return;
     }
+    if (typeof child.pid !== "number") {
+      throw new Error("cloudflared did not report a process id");
+    }
     const createdAt = (this.deps.now?.() ?? new Date()).toISOString();
-    void ledger
-      .record({ id, pid: child.pid, origin, createdAt })
-      .catch((error: unknown) => console.warn(`Unable to record preview tunnel process ${id}: ${(error as Error).message}`));
-    child.on("exit", () => {
+    await ledger.record({ id, pid: child.pid, origin, createdAt });
+    void observation.exited.then(() => {
       void ledger
         .release(id)
         .catch((error: unknown) => console.warn(`Unable to release preview tunnel process record ${id}: ${(error as Error).message}`));
