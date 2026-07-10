@@ -1,0 +1,862 @@
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import {
+  hardenPrivateDirectoryPermissions,
+  hardenPrivateFilePermissions,
+  minimalChildEnvironment,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+  redactSensitiveText
+} from "./security.js";
+import type { TaskRecord } from "./task-store.js";
+import type { ProjectEntry } from "./types.js";
+
+const PREVIEW_ID_PATTERN = /^prv-[a-f0-9]{12}$/;
+const PREVIEW_COMMAND_NAMES = ["dev", "preview", "serve", "start"] as const;
+const PACKAGE_SCRIPT_NAME_PATTERN = /^[a-z0-9:_-]{1,64}$/i;
+const DEFAULT_LEDGER_FILE = path.resolve(".devbot", "previews.json");
+const DEFAULT_MAX_PREVIEWS = 3;
+const DEFAULT_TTL_MS = 30 * 60_000;
+const DEFAULT_READY_TIMEOUT_MS = 60_000;
+const DEFAULT_POLL_INTERVAL_MS = 250;
+const DEFAULT_SIGKILL_DELAY_MS = 8_000;
+const DEFAULT_EXIT_WAIT_MS = 12_000;
+const MAX_OUTPUT_TAIL_CHARS = 1_500;
+const MAX_FINISHED_INSTANCES = 20;
+
+export type PreviewState = "pending" | "active" | "stopping" | "stopped" | "failed";
+export type PreviewStopReason = "requested" | "expired" | "shutdown";
+export type PreviewControlAction = "start" | "stop" | "status";
+
+export interface PreviewCommand {
+  source: "preset" | "package-script";
+  name: string;
+  command: string;
+}
+
+export interface PreviewInstance {
+  id: string;
+  taskId: string;
+  projectName: string;
+  branch: string | undefined;
+  workspacePath: string;
+  command: PreviewCommand;
+  origin: string;
+  port: number;
+  pid: number | undefined;
+  state: PreviewState;
+  startedAt: string;
+  expiresAt: string;
+  stopReason?: PreviewStopReason;
+  escalatedToSigkill?: boolean;
+  message?: string;
+}
+
+export interface StartPreviewInput {
+  taskId: string;
+  projectName: string;
+  branch?: string;
+  workspacePath: string;
+  command: PreviewCommand;
+}
+
+export type StartPreviewResult =
+  | { ok: true; instance: PreviewInstance }
+  | { ok: false; message: string; instance?: PreviewInstance };
+
+export type StopPreviewResult =
+  | { ok: true; instance: PreviewInstance }
+  | { ok: false; message: string; instance?: PreviewInstance };
+
+export type ResolvePreviewCommandResult =
+  | { ok: true; command: PreviewCommand }
+  | { ok: false; message: string };
+
+export interface PreviewAccessContext {
+  userId: string;
+  controller: boolean;
+  projectAllowed: boolean;
+  safeMode: boolean;
+}
+
+export interface TaskPreviewManagerOptions {
+  ledgerFile?: string;
+  maxPreviews?: number;
+  ttlMs?: number;
+  readyTimeoutMs?: number;
+  pollIntervalMs?: number;
+  sigkillDelayMs?: number;
+  exitWaitMs?: number;
+  shell?: string;
+}
+
+interface ManagedPreview {
+  snapshot: PreviewInstance;
+  child?: ChildProcess;
+  tempHome?: string;
+  outputTail: string;
+  aborted: boolean;
+  exitObserved: boolean;
+  exitPromise?: Promise<void>;
+  ttlTimer?: NodeJS.Timeout;
+  killTimer?: NodeJS.Timeout;
+}
+
+interface PreviewLedgerEntry {
+  id: string;
+  taskId: string;
+  projectName: string;
+  workspacePath: string;
+  command: string;
+  marker: string;
+  port: number;
+  origin: string;
+  pid?: number;
+  createdAt: string;
+  expiresAt: string;
+}
+
+interface PreviewLedgerFile {
+  version: 1;
+  previews: PreviewLedgerEntry[];
+}
+
+const execFileAsync = promisify(execFile);
+
+export function isPreviewId(value: string): boolean {
+  return PREVIEW_ID_PATTERN.test(value);
+}
+
+/**
+ * Central authorization for every preview control. Previews expose a running
+ * project command, so start/stop/status all require project access and the
+ * task requester or an approved controller. Safe mode blocks only starting
+ * (it spawns a project command); stop and status always stay available.
+ */
+export function authorizeTaskPreview(
+  action: PreviewControlAction,
+  task: Pick<TaskRecord, "id" | "requesterId">,
+  context: PreviewAccessContext
+): { allowed: true } | { allowed: false; message: string } {
+  if (!context.projectAllowed) {
+    return { allowed: false, message: "You are not allowed to use this task's project." };
+  }
+  if (!context.controller && (!task.requesterId || task.requesterId !== context.userId)) {
+    return {
+      allowed: false,
+      message: "Only the task requester, the owner, or an approved controller can manage this task's preview."
+    };
+  }
+  if (action === "start" && context.safeMode) {
+    return {
+      allowed: false,
+      message: [
+        "Safe mode is on, so starting a preview is blocked because it runs a project command.",
+        "`/task preview action:stop` and `action:status` still work.",
+        "Set `DEVBOT_SAFE_MODE=false` and restart devbot to allow previews."
+      ].join("\n")
+    };
+  }
+  return { allowed: true };
+}
+
+/**
+ * Resolves the only commands a preview may run: a `dev`/`preview`/`serve`/`start`
+ * preset from the project's `.devbot/project.json`, or `npm run <script>` for an
+ * allow-listed script declared in the workspace package.json. Free-text commands
+ * are never accepted, and missing dependencies fail closed without installing.
+ */
+export async function resolvePreviewCommand(
+  project: ProjectEntry,
+  workspacePath: string
+): Promise<ResolvePreviewCommandResult> {
+  for (const name of PREVIEW_COMMAND_NAMES) {
+    const preset = project.metadata.commands.presets[name];
+    if (preset) {
+      return { ok: true, command: { source: "preset", name, command: preset } };
+    }
+  }
+
+  const scripts = await readPackageScripts(workspacePath);
+  if (scripts) {
+    const scriptName = PREVIEW_COMMAND_NAMES.find(
+      (name) => typeof scripts[name] === "string" && (scripts[name] as string).trim() && PACKAGE_SCRIPT_NAME_PATTERN.test(name)
+    );
+    if (scriptName) {
+      if (!(await directoryExists(path.join(workspacePath, "node_modules")))) {
+        return {
+          ok: false,
+          message: [
+            `The task workspace declares an npm \`${scriptName}\` script but has no installed dependencies (node_modules is missing).`,
+            "Install dependencies in the task workspace yourself before starting a preview; Devbot does not install them."
+          ].join("\n")
+        };
+      }
+      return { ok: true, command: { source: "package-script", name: scriptName, command: `npm run ${scriptName}` } };
+    }
+  }
+
+  return {
+    ok: false,
+    message: [
+      "No preview command is configured for this project.",
+      "Add a `dev`, `preview`, `serve`, or `start` preset to `.devbot/project.json`, or declare one of those scripts in package.json."
+    ].join("\n")
+  };
+}
+
+/**
+ * Runs loopback-only dev servers from isolated task worktrees.
+ *
+ * This is the managed-preview surface other evidence features (visual diff,
+ * video proof, authenticated tunnels) are expected to build on: call
+ * `start()` with a task workspace and a command from `resolvePreviewCommand`,
+ * read the exact observed origin from the returned instance, and release it
+ * with `stop()`. Origins are always `http://127.0.0.1:<ephemeral port>`; the
+ * manager never binds or forwards anything non-loopback.
+ */
+export class TaskPreviewManager {
+  private readonly instances = new Map<string, ManagedPreview>();
+  private readonly ledgerFile: string;
+  private readonly maxPreviews: number;
+  private readonly ttlMs: number;
+  private readonly readyTimeoutMs: number;
+  private readonly pollIntervalMs: number;
+  private readonly sigkillDelayMs: number;
+  private readonly exitWaitMs: number;
+  private readonly shell: string;
+  private ledger: PreviewLedgerFile | undefined;
+  private ledgerTail: Promise<void> = Promise.resolve();
+  private shuttingDown = false;
+
+  constructor(options: TaskPreviewManagerOptions = {}) {
+    this.ledgerFile = path.resolve(options.ledgerFile ?? DEFAULT_LEDGER_FILE);
+    this.maxPreviews = Math.max(1, Math.floor(options.maxPreviews ?? DEFAULT_MAX_PREVIEWS));
+    this.ttlMs = Math.max(1_000, Math.floor(options.ttlMs ?? DEFAULT_TTL_MS));
+    this.readyTimeoutMs = Math.max(1_000, Math.floor(options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS));
+    this.pollIntervalMs = Math.max(20, Math.floor(options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS));
+    this.sigkillDelayMs = Math.max(50, Math.floor(options.sigkillDelayMs ?? DEFAULT_SIGKILL_DELAY_MS));
+    this.exitWaitMs = Math.max(this.sigkillDelayMs + 1_000, Math.floor(options.exitWaitMs ?? DEFAULT_EXIT_WAIT_MS));
+    this.shell = options.shell ?? (process.platform === "win32" ? process.env.COMSPEC ?? "cmd.exe" : "/bin/sh");
+  }
+
+  async start(input: StartPreviewInput): Promise<StartPreviewResult> {
+    if (this.shuttingDown) {
+      return { ok: false, message: "Devbot is shutting down; no new previews can start." };
+    }
+
+    const existing = this.findOpenForTask(input.taskId);
+    if (existing) {
+      return {
+        ok: false,
+        message: `Task \`${input.taskId}\` already has an open preview (${existing.snapshot.state}). Stop it before starting another.`,
+        instance: cloneInstance(existing.snapshot)
+      };
+    }
+    if (this.openCount() >= this.maxPreviews) {
+      return {
+        ok: false,
+        message: `The preview limit (${this.maxPreviews}) has been reached. Stop an existing preview before starting another.`
+      };
+    }
+    if (!(await directoryExists(input.workspacePath))) {
+      return {
+        ok: false,
+        message: `The isolated task workspace no longer exists at \`${input.workspacePath}\`, so there is nothing to preview.`
+      };
+    }
+
+    const id = newPreviewId();
+    const startedAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + this.ttlMs).toISOString();
+    const managed: ManagedPreview = {
+      snapshot: {
+        id,
+        taskId: input.taskId,
+        projectName: input.projectName,
+        branch: input.branch,
+        workspacePath: input.workspacePath,
+        command: input.command,
+        origin: "",
+        port: 0,
+        pid: undefined,
+        state: "pending",
+        startedAt,
+        expiresAt
+      },
+      outputTail: "",
+      aborted: false,
+      exitObserved: false
+    };
+    this.instances.set(id, managed);
+
+    try {
+      const port = await reserveLoopbackPort();
+      const origin = `http://127.0.0.1:${port}`;
+      managed.snapshot.port = port;
+      managed.snapshot.origin = origin;
+      managed.tempHome = await mkdtemp(path.join(tmpdir(), "devbot-preview-home-"));
+
+      await this.writeLedgerEntry(managed);
+      if (managed.aborted) {
+        await this.finalize(managed, "stopped", managed.snapshot.message);
+      } else {
+        this.spawnPreviewProcess(managed);
+        if (managed.snapshot.pid !== undefined) {
+          await this.writeLedgerEntry(managed);
+        }
+        if (managed.aborted) {
+          this.terminate(managed);
+          await this.awaitExit(managed);
+        } else {
+          await this.waitForReady(managed);
+        }
+      }
+    } catch (error) {
+      await this.finalize(managed, "failed", `The preview could not start: ${redactSensitiveText((error as Error).message)}`);
+    }
+
+    const snapshot = cloneInstance(managed.snapshot);
+    if (snapshot.state === "active") {
+      return { ok: true, instance: snapshot };
+    }
+    return {
+      ok: false,
+      message: snapshot.message ?? `The preview did not become ready (state: ${snapshot.state}).`,
+      instance: snapshot
+    };
+  }
+
+  async stop(id: string, reason: PreviewStopReason): Promise<StopPreviewResult> {
+    const managed = this.instances.get(id);
+    if (!managed) {
+      return { ok: false, message: "That preview is no longer tracked; the control has expired." };
+    }
+    const state = managed.snapshot.state;
+    if (state === "stopped" || state === "failed") {
+      return { ok: true, instance: cloneInstance(managed.snapshot) };
+    }
+    if (state === "stopping") {
+      await this.awaitExit(managed);
+      return this.reportStopOutcome(managed);
+    }
+
+    managed.aborted = true;
+    if (state === "pending") {
+      managed.snapshot.message = "The preview was stopped before it became ready.";
+    }
+    managed.snapshot.state = "stopping";
+    managed.snapshot.stopReason = reason;
+    if (!managed.child) {
+      await this.awaitFinalized(managed);
+      return this.reportStopOutcome(managed);
+    }
+    this.terminate(managed);
+    await this.awaitExit(managed);
+    return this.reportStopOutcome(managed);
+  }
+
+  status(id: string): PreviewInstance | undefined {
+    const managed = this.instances.get(id);
+    return managed ? cloneInstance(managed.snapshot) : undefined;
+  }
+
+  list(taskId?: string): PreviewInstance[] {
+    return [...this.instances.values()]
+      .filter((managed) => !taskId || managed.snapshot.taskId === taskId)
+      .map((managed) => cloneInstance(managed.snapshot));
+  }
+
+  async stopAll(reason: PreviewStopReason): Promise<void> {
+    this.shuttingDown = reason === "shutdown";
+    const open = [...this.instances.values()].filter((managed) =>
+      managed.snapshot.state === "pending" || managed.snapshot.state === "active" || managed.snapshot.state === "stopping"
+    );
+    await Promise.all(open.map((managed) => this.stop(managed.snapshot.id, reason).catch(() => undefined)));
+  }
+
+  /**
+   * Reconciles the persisted pid ledger after a restart. A recorded pid is
+   * signaled only when its current command line still identifies it as the
+   * spawned preview (per-instance marker or the exact recorded command);
+   * anything else is left untouched and dropped from the ledger.
+   */
+  async reconcile(): Promise<string[]> {
+    const notes: string[] = [];
+    const ledger = await this.loadLedger();
+    if (ledger.previews.length === 0) {
+      return notes;
+    }
+    if (process.platform === "win32") {
+      notes.push("Preview reconciliation is unsupported on Windows; clearing the ledger without signaling.");
+      await this.mutateLedger((state) => {
+        state.previews = [];
+      });
+      return notes;
+    }
+
+    for (const entry of [...ledger.previews]) {
+      if (entry.pid === undefined) {
+        notes.push(`Preview ${entry.id} has no recorded pid; dropped without signaling.`);
+      } else {
+        const commandLine = await processCommandLine(entry.pid);
+        if (commandLine === undefined) {
+          notes.push(`Preview ${entry.id} (pid ${entry.pid}) already exited.`);
+        } else if (commandLine.includes(entry.marker) || commandLine.includes(entry.command)) {
+          const gone = await this.killOrphan(entry.pid);
+          if (gone) {
+            notes.push(`Stopped orphaned preview ${entry.id} (pid ${entry.pid}) for task ${entry.taskId}.`);
+          } else {
+            notes.push(`Could not confirm exit of orphaned preview ${entry.id} (pid ${entry.pid}); keeping its ledger entry.`);
+            continue;
+          }
+        } else {
+          notes.push(`Pid ${entry.pid} no longer belongs to preview ${entry.id}; left untouched.`);
+        }
+      }
+      await this.mutateLedger((state) => {
+        state.previews = state.previews.filter((candidate) => candidate.id !== entry.id);
+      });
+    }
+    return notes;
+  }
+
+  private openCount(): number {
+    return [...this.instances.values()].filter((managed) =>
+      managed.snapshot.state === "pending" || managed.snapshot.state === "active" || managed.snapshot.state === "stopping"
+    ).length;
+  }
+
+  private findOpenForTask(taskId: string): ManagedPreview | undefined {
+    return [...this.instances.values()].find((managed) =>
+      managed.snapshot.taskId === taskId &&
+      (managed.snapshot.state === "pending" || managed.snapshot.state === "active" || managed.snapshot.state === "stopping")
+    );
+  }
+
+  private spawnPreviewProcess(managed: ManagedPreview): void {
+    const environment = minimalChildEnvironment();
+    environment.HOME = managed.tempHome;
+    environment.USERPROFILE = managed.tempHome;
+    environment.PORT = String(managed.snapshot.port);
+    environment.HOST = "127.0.0.1";
+
+    const shellArguments = process.platform === "win32"
+      ? ["/d", "/s", "/c", managed.snapshot.command.command]
+      : ["-c", managed.snapshot.command.command, previewMarker(managed.snapshot.id)];
+    const child = spawn(this.shell, shellArguments, {
+      cwd: managed.snapshot.workspacePath,
+      env: environment,
+      detached: process.platform !== "win32",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    managed.child = child;
+    managed.snapshot.pid = child.pid;
+
+    const appendOutput = (chunk: Buffer) => {
+      managed.outputTail = `${managed.outputTail}${chunk.toString("utf8")}`.slice(-MAX_OUTPUT_TAIL_CHARS);
+    };
+    child.stdout?.on("data", appendOutput);
+    child.stderr?.on("data", appendOutput);
+
+    managed.exitPromise = new Promise((resolve) => {
+      let settled = false;
+      const settle = (message?: string) => {
+        if (settled) return;
+        settled = true;
+        managed.exitObserved = true;
+        void this.onChildGone(managed, message).finally(resolve);
+      };
+      child.once("error", (error) => settle(`The preview command could not run: ${redactSensitiveText(error.message)}`));
+      child.once("exit", () => settle());
+    });
+  }
+
+  private async waitForReady(managed: ManagedPreview): Promise<void> {
+    const deadline = Date.now() + this.readyTimeoutMs;
+    while (Date.now() < deadline) {
+      if (managed.aborted || managed.snapshot.state !== "pending") {
+        await this.awaitExit(managed);
+        return;
+      }
+      if (managed.exitObserved) {
+        return;
+      }
+      if (await respondsOnLoopback(managed.snapshot.port)) {
+        if (managed.aborted || managed.exitObserved || managed.snapshot.state !== "pending") {
+          return;
+        }
+        managed.snapshot.state = "active";
+        managed.snapshot.expiresAt = new Date(Date.now() + this.ttlMs).toISOString();
+        managed.ttlTimer = setTimeout(() => {
+          void this.stop(managed.snapshot.id, "expired").catch(() => undefined);
+        }, this.ttlMs);
+        managed.ttlTimer.unref();
+        return;
+      }
+      await sleep(this.pollIntervalMs);
+    }
+
+    managed.aborted = true;
+    managed.snapshot.state = "stopping";
+    this.terminate(managed);
+    await this.awaitExit(managed);
+    managed.snapshot.state = "failed";
+    managed.snapshot.message = withOutputTail(
+      `The preview did not respond on its loopback origin within ${Math.round(this.readyTimeoutMs / 1000)}s and was stopped.`,
+      managed.outputTail
+    );
+  }
+
+  private terminate(managed: ManagedPreview): void {
+    const pid = managed.snapshot.pid;
+    if (pid === undefined || managed.exitObserved) {
+      return;
+    }
+    signalPreviewProcess(pid, "SIGTERM");
+    managed.killTimer = setTimeout(() => {
+      if (!managed.exitObserved) {
+        managed.snapshot.escalatedToSigkill = true;
+        signalPreviewProcess(pid, "SIGKILL");
+      }
+    }, this.sigkillDelayMs);
+    managed.killTimer.unref();
+  }
+
+  private async awaitFinalized(managed: ManagedPreview): Promise<void> {
+    const deadline = Date.now() + this.exitWaitMs;
+    while (Date.now() < deadline) {
+      const state = managed.snapshot.state;
+      if (state === "stopped" || state === "failed") return;
+      await sleep(this.pollIntervalMs);
+    }
+    managed.snapshot.message = "The preview did not confirm it stopped in time.";
+  }
+
+  private async awaitExit(managed: ManagedPreview): Promise<void> {
+    if (!managed.exitPromise) {
+      await this.finalize(managed, managed.aborted ? "stopped" : "failed", managed.snapshot.message);
+      return;
+    }
+    const timeout = sleep(this.exitWaitMs).then(() => "timeout" as const);
+    const exited = managed.exitPromise.then(() => "exited" as const);
+    if ((await Promise.race([exited, timeout])) === "timeout") {
+      managed.snapshot.message = withOutputTail(
+        `The preview process (pid ${managed.snapshot.pid ?? "unknown"}) did not exit after SIGTERM and SIGKILL; its ledger entry is kept for the next restart.`,
+        managed.outputTail
+      );
+    }
+  }
+
+  private async onChildGone(managed: ManagedPreview, message?: string): Promise<void> {
+    if (managed.killTimer) clearTimeout(managed.killTimer);
+    const state = managed.snapshot.state;
+    if (state === "stopping" || managed.aborted) {
+      await this.finalize(managed, "stopped", message ?? managed.snapshot.message);
+      return;
+    }
+    if (state === "pending") {
+      await this.finalize(
+        managed,
+        "failed",
+        message ?? withOutputTail("The preview command exited before it started serving.", managed.outputTail)
+      );
+      return;
+    }
+    await this.finalize(
+      managed,
+      "failed",
+      message ?? withOutputTail("The preview process exited unexpectedly.", managed.outputTail)
+    );
+  }
+
+  private async finalize(managed: ManagedPreview, state: "stopped" | "failed", message?: string): Promise<void> {
+    if (managed.ttlTimer) clearTimeout(managed.ttlTimer);
+    if (managed.killTimer) clearTimeout(managed.killTimer);
+    managed.snapshot.state = state;
+    if (message) {
+      managed.snapshot.message = redactSensitiveText(message);
+    }
+    await this.mutateLedger((ledger) => {
+      ledger.previews = ledger.previews.filter((entry) => entry.id !== managed.snapshot.id);
+    }).catch(() => undefined);
+    if (managed.tempHome) {
+      await rm(managed.tempHome, { force: true, recursive: true }).catch(() => undefined);
+      delete managed.tempHome;
+    }
+    this.pruneFinished();
+  }
+
+  private reportStopOutcome(managed: ManagedPreview): StopPreviewResult {
+    if (!managed.exitObserved && managed.snapshot.pid !== undefined) {
+      return {
+        ok: false,
+        message: managed.snapshot.message ?? "The preview process has not confirmed its exit yet.",
+        instance: cloneInstance(managed.snapshot)
+      };
+    }
+    return { ok: true, instance: cloneInstance(managed.snapshot) };
+  }
+
+  private async killOrphan(pid: number): Promise<boolean> {
+    signalPreviewProcess(pid, "SIGTERM");
+    const deadline = Date.now() + this.exitWaitMs;
+    let escalated = false;
+    const killAt = Date.now() + this.sigkillDelayMs;
+    while (Date.now() < deadline) {
+      if (!processExists(pid)) {
+        return true;
+      }
+      if (!escalated && Date.now() >= killAt) {
+        escalated = true;
+        signalPreviewProcess(pid, "SIGKILL");
+      }
+      await sleep(this.pollIntervalMs);
+    }
+    return !processExists(pid);
+  }
+
+  private pruneFinished(): void {
+    const finished = [...this.instances.values()].filter(
+      (managed) => managed.snapshot.state === "stopped" || managed.snapshot.state === "failed"
+    );
+    for (const managed of finished.slice(0, Math.max(0, finished.length - MAX_FINISHED_INSTANCES))) {
+      this.instances.delete(managed.snapshot.id);
+    }
+  }
+
+  private async writeLedgerEntry(managed: ManagedPreview): Promise<void> {
+    await this.mutateLedger((ledger) => {
+      const entry: PreviewLedgerEntry = {
+        id: managed.snapshot.id,
+        taskId: managed.snapshot.taskId,
+        projectName: managed.snapshot.projectName,
+        workspacePath: managed.snapshot.workspacePath,
+        command: managed.snapshot.command.command,
+        marker: previewMarker(managed.snapshot.id),
+        port: managed.snapshot.port,
+        origin: managed.snapshot.origin,
+        ...(managed.snapshot.pid !== undefined ? { pid: managed.snapshot.pid } : {}),
+        createdAt: managed.snapshot.startedAt,
+        expiresAt: managed.snapshot.expiresAt
+      };
+      ledger.previews = [...ledger.previews.filter((candidate) => candidate.id !== entry.id), entry];
+    });
+  }
+
+  private async mutateLedger(mutation: (ledger: PreviewLedgerFile) => void): Promise<void> {
+    const operation = this.ledgerTail.then(async () => {
+      const ledger = await this.loadLedger();
+      mutation(ledger);
+      await this.saveLedger(ledger);
+    });
+    this.ledgerTail = operation.catch(() => undefined);
+    await operation;
+  }
+
+  private async loadLedger(): Promise<PreviewLedgerFile> {
+    if (this.ledger) {
+      return this.ledger;
+    }
+    try {
+      const parsed = JSON.parse(await readFile(this.ledgerFile, "utf8")) as unknown;
+      await hardenPrivateFilePermissions(this.ledgerFile);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Preview state must be a JSON object.");
+      }
+      const raw = parsed as { version?: unknown; previews?: unknown };
+      if (raw.version !== undefined && raw.version !== 1) {
+        throw new Error(`Unsupported preview state version: ${String(raw.version)}.`);
+      }
+      this.ledger = {
+        version: 1,
+        previews: Array.isArray(raw.previews)
+          ? raw.previews.map(normalizeLedgerEntry).filter((entry): entry is PreviewLedgerEntry => entry !== undefined)
+          : []
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`Unable to read preview state at ${this.ledgerFile}: ${(error as Error).message}`, { cause: error });
+      }
+      this.ledger = { version: 1, previews: [] };
+    }
+    return this.ledger;
+  }
+
+  private async saveLedger(ledger: PreviewLedgerFile): Promise<void> {
+    const directory = path.dirname(this.ledgerFile);
+    await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    await hardenPrivateDirectoryPermissions(directory);
+    const tempFile = `${this.ledgerFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(tempFile, `${JSON.stringify(ledger, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE
+    });
+    await rename(tempFile, this.ledgerFile);
+  }
+}
+
+export function formatPreviewInstance(instance: PreviewInstance): string {
+  return [
+    `Preview \`${instance.id}\` for task \`${instance.taskId}\` on \`${instance.projectName}\`: ${instance.state}.`,
+    instance.branch ? `Branch: \`${instance.branch}\` (isolated worktree)` : undefined,
+    instance.state === "active" ? `Origin: <${instance.origin}> (loopback only, this machine)` : undefined,
+    instance.state === "active" ? `Expires: ${new Date(instance.expiresAt).toLocaleString("en-US", { dateStyle: "short", timeStyle: "short" })}` : undefined,
+    `Command: \`${redactSensitiveText(instance.command.command).replace(/`/g, "'")}\` (${instance.command.source} \`${instance.command.name}\`)`,
+    instance.escalatedToSigkill ? "The process ignored SIGTERM and required SIGKILL." : undefined,
+    instance.message
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n");
+}
+
+function normalizeLedgerEntry(value: unknown): PreviewLedgerEntry | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const entry = value as Partial<PreviewLedgerEntry>;
+  if (
+    typeof entry.id !== "string" ||
+    !isPreviewId(entry.id) ||
+    typeof entry.taskId !== "string" ||
+    typeof entry.projectName !== "string" ||
+    typeof entry.workspacePath !== "string" ||
+    typeof entry.command !== "string" ||
+    typeof entry.marker !== "string" ||
+    typeof entry.port !== "number" ||
+    !Number.isInteger(entry.port) ||
+    entry.port <= 0 ||
+    entry.port > 65_535 ||
+    typeof entry.origin !== "string"
+  ) {
+    return undefined;
+  }
+  const pid = typeof entry.pid === "number" && Number.isSafeInteger(entry.pid) && entry.pid > 0 ? entry.pid : undefined;
+  return {
+    id: entry.id,
+    taskId: entry.taskId,
+    projectName: entry.projectName,
+    workspacePath: entry.workspacePath,
+    command: entry.command,
+    marker: entry.marker,
+    port: entry.port,
+    origin: entry.origin,
+    ...(pid !== undefined ? { pid } : {}),
+    createdAt: typeof entry.createdAt === "string" ? entry.createdAt : new Date(0).toISOString(),
+    expiresAt: typeof entry.expiresAt === "string" ? entry.expiresAt : new Date(0).toISOString()
+  };
+}
+
+function previewMarker(id: string): string {
+  return `devbot-preview-${id}`;
+}
+
+function newPreviewId(): string {
+  return `prv-${randomBytes(6).toString("hex")}`;
+}
+
+function cloneInstance(instance: PreviewInstance): PreviewInstance {
+  return { ...instance, command: { ...instance.command } };
+}
+
+async function reserveLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("Unable to reserve a loopback port.")));
+        return;
+      }
+      const port = address.port;
+      server.close((error) => (error ? reject(error) : resolve(port)));
+    });
+  });
+}
+
+async function respondsOnLoopback(port: number): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1_000);
+  try {
+    await fetch(`http://127.0.0.1:${port}/`, { method: "GET", redirect: "manual", signal: controller.signal });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function signalPreviewProcess(pid: number, signal: NodeJS.Signals): void {
+  try {
+    if (process.platform === "win32") {
+      process.kill(pid, signal);
+    } else {
+      process.kill(-pid, signal);
+    }
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Process already exited.
+    }
+  }
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function processCommandLine(pid: number): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "command="], {
+      env: minimalChildEnvironment(),
+      maxBuffer: 1_000_000,
+      timeout: 10_000
+    });
+    const commandLine = stdout.trim();
+    return commandLine || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readPackageScripts(workspacePath: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(path.join(workspacePath, "package.json"), "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const scripts = (parsed as { scripts?: unknown }).scripts;
+    if (!scripts || typeof scripts !== "object" || Array.isArray(scripts)) return undefined;
+    return scripts as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+async function directoryExists(candidate: string): Promise<boolean> {
+  try {
+    return (await lstat(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function withOutputTail(message: string, outputTail: string): string {
+  const tail = redactSensitiveText(outputTail.trim());
+  return tail ? `${message}\nRecent output:\n${tail.slice(-600)}` : message;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
