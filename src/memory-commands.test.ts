@@ -28,7 +28,7 @@ const viewerActor = actor("viewer");
 const peerActor = actor("peer-bot");
 const strangerActor = actor("stranger", { projectAllowed: false });
 
-async function seed(store: MemoryStore, project: { root: string }): Promise<{ decision: MemoryEntry; workroomOutcome: MemoryEntry }> {
+async function seed(store: MemoryStore, project: { root: string; name: string }): Promise<{ decision: MemoryEntry; workroomOutcome: MemoryEntry }> {
   const decision = await store.add(project, {
     kind: "decision",
     text: "Use the waterfall renderer for terrain.",

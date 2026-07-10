@@ -21,12 +21,20 @@ export type MemoryTrust = "trusted" | "untrusted";
 export type MemoryAccessContext = TaskAccessContext;
 
 /**
+ * The project a memory operation targets. `root` locates the store file; `name`
+ * is the canonical project identity migration checks a vouching task against, so
+ * legacy authority from one project can never import memory into another.
+ */
+export type MemoryProject = Pick<ProjectEntry, "root" | "name">;
+
+/**
  * Minimal read-only view of the authoritative task record used to recover the
  * access scope of a legacy memory entry that predates the scope/requester
  * fields. `projectName` carries the task's project identity so a recovery can
- * confirm the vouching task belongs to a concrete project before its scope is
- * trusted. Structurally satisfied by TaskStore so the concrete store can be
- * passed straight in without a circular import.
+ * confirm the vouching task belongs to the SAME project being migrated before
+ * its scope is trusted; a task owned by another project cannot import memory
+ * across the boundary. Structurally satisfied by TaskStore so the concrete store
+ * can be passed straight in without a circular import.
  */
 export interface LegacyTaskAuthority extends AccessScopedRecord {
   projectName?: string;
@@ -116,7 +124,7 @@ export class MemoryStore {
     return file;
   }
 
-  async add(project: Pick<ProjectEntry, "root">, input: AddMemoryInput): Promise<MemoryEntry> {
+  async add(project: MemoryProject, input: AddMemoryInput): Promise<MemoryEntry> {
     const entry = buildEntry(input);
 
     await this.mutate(project, (state) => {
@@ -128,7 +136,7 @@ export class MemoryStore {
     return entry;
   }
 
-  async list(project: Pick<ProjectEntry, "root">, options: ListMemoryOptions): Promise<MemoryEntry[]> {
+  async list(project: MemoryProject, options: ListMemoryOptions): Promise<MemoryEntry[]> {
     const entries = (await this.readAll(project)).filter((entry) => canAccessScopedRecord(entry, options.access));
     const filtered = options.kind ? entries.filter((entry) => entry.kind === options.kind) : entries;
     const limit = clampLimit(options.limit);
@@ -136,26 +144,26 @@ export class MemoryStore {
   }
 
   /** Looks up a single entry by ID, honoring the same access rule as list/search/recall. */
-  async get(project: Pick<ProjectEntry, "root">, id: string, access: MemoryAccessContext): Promise<MemoryEntry | undefined> {
+  async get(project: MemoryProject, id: string, access: MemoryAccessContext): Promise<MemoryEntry | undefined> {
     const entries = await this.readAll(project);
     const entry = entries.find((item) => item.id === id);
     return entry && canAccessScopedRecord(entry, access) ? entry : undefined;
   }
 
-  async search(project: Pick<ProjectEntry, "root">, query: string, access: MemoryAccessContext, limit = 10): Promise<MemoryEntry[]> {
+  async search(project: MemoryProject, query: string, access: MemoryAccessContext, limit = 10): Promise<MemoryEntry[]> {
     const entries = (await this.readAll(project)).filter((entry) => canAccessScopedRecord(entry, access));
     return selectRelevantMemories(entries, query, limit);
   }
 
   /** Entries eligible to be recalled verbatim into a model prompt: access-checked, active, and controller-authored/promoted. */
-  async recallFor(project: Pick<ProjectEntry, "root">, requestText: string, access: MemoryAccessContext): Promise<MemoryEntry[]> {
+  async recallFor(project: MemoryProject, requestText: string, access: MemoryAccessContext): Promise<MemoryEntry[]> {
     const entries = (await this.readAll(project)).filter(
       (entry) => canAccessScopedRecord(entry, access) && entry.status === "active" && entry.trust === "trusted"
     );
     return selectRelevantMemories(entries, requestText);
   }
 
-  async forget(project: Pick<ProjectEntry, "root">, id: string): Promise<boolean> {
+  async forget(project: MemoryProject, id: string): Promise<boolean> {
     let removed = false;
     await this.mutate(project, (state) => ({
       entries: state.entries.filter((entry) => {
@@ -171,7 +179,7 @@ export class MemoryStore {
   }
 
   /** Marks an automatically captured outcome as human-approved so it becomes eligible for prompt recall. */
-  async promote(project: Pick<ProjectEntry, "root">, id: string): Promise<MemoryEntry | undefined> {
+  async promote(project: MemoryProject, id: string): Promise<MemoryEntry | undefined> {
     let promoted: MemoryEntry | undefined;
     await this.mutate(project, (state) => ({
       entries: state.entries.map((entry) => {
@@ -184,7 +192,7 @@ export class MemoryStore {
     return promoted;
   }
 
-  async count(project: Pick<ProjectEntry, "root">): Promise<number> {
+  async count(project: MemoryProject): Promise<number> {
     return (await this.readAll(project)).length;
   }
 
@@ -194,11 +202,11 @@ export class MemoryStore {
     await rm(file, { force: true });
   }
 
-  private async readAll(project: Pick<ProjectEntry, "root">): Promise<MemoryEntry[]> {
+  private async readAll(project: MemoryProject): Promise<MemoryEntry[]> {
     return (await this.readState(project)).entries;
   }
 
-  private async readState(project: Pick<ProjectEntry, "root">): Promise<MemoryFileState> {
+  private async readState(project: MemoryProject): Promise<MemoryFileState> {
     const file = await this.fileFor(project);
     await this.ensureLegacyMigrated(project, file);
     return this.readStateFromFile(file);
@@ -222,7 +230,7 @@ export class MemoryStore {
     return parseJsonl(raw);
   }
 
-  private async ensureLegacyMigrated(project: Pick<ProjectEntry, "root">, file: string): Promise<void> {
+  private async ensureLegacyMigrated(project: MemoryProject, file: string): Promise<void> {
     let migration = this.legacyMigrations.get(file);
     if (!migration) {
       migration = this.migrateLegacyProjectMemory(project, file).catch((error: unknown) => {
@@ -239,12 +247,14 @@ export class MemoryStore {
    * the stray file so it can never be committed to the target repository or read
    * from the project root. Records fail closed: a legacy entry without a
    * trustworthy access scope is only imported when its scope and requester can
-   * be recovered from the authoritative task record; everything else is
-   * quarantined rather than widened to project visibility. Migrated entries keep
-   * their untrusted-by-default state so they are never auto-recalled without
-   * promotion. Symlinked or oversized legacy files are left alone.
+   * be recovered from the authoritative task record AND that task belongs to the
+   * SAME project being migrated; everything else — including a legacy file under
+   * project A that cites a project-B task — is quarantined rather than widened to
+   * project visibility. Migrated entries keep their untrusted-by-default state so
+   * they are never auto-recalled without promotion. Symlinked or oversized legacy
+   * files are left alone.
    */
-  private async migrateLegacyProjectMemory(project: Pick<ProjectEntry, "root">, centralFile: string): Promise<void> {
+  private async migrateLegacyProjectMemory(project: MemoryProject, centralFile: string): Promise<void> {
     const legacyDirectory = path.join(project.root, ".devbot");
     const legacyFile = path.join(legacyDirectory, "memory.jsonl");
     const directoryStats = await lstat(legacyDirectory).catch(() => undefined);
@@ -259,7 +269,7 @@ export class MemoryStore {
       throw new Error(`legacy memory file exceeds the ${this.maxFileBytes}-byte budget; leaving it in place`);
     }
 
-    const legacy = await this.parseLegacyState(await readFileRejectingSymlinks(legacyFile));
+    const legacy = await this.parseLegacyState(await readFileRejectingSymlinks(legacyFile), project.name);
     const current = await this.readStateFromFile(centralFile);
     const knownIds = new Set(current.entries.map((entry) => entry.id));
     const merged: MemoryFileState = {
@@ -271,8 +281,8 @@ export class MemoryStore {
     await rmdir(legacyDirectory).catch(() => undefined);
   }
 
-  /** Parses a legacy JSONL file, resolving each record's scope fail-closed; unresolvable lines are quarantined. */
-  private async parseLegacyState(raw: string): Promise<MemoryFileState> {
+  /** Parses a legacy JSONL file, resolving each record's scope fail-closed against the migrating project's identity; unresolvable lines are quarantined. */
+  private async parseLegacyState(raw: string, projectIdentity: string): Promise<MemoryFileState> {
     const entries: MemoryEntry[] = [];
     const quarantined: string[] = [];
     for (const line of raw.split("\n")) {
@@ -289,7 +299,7 @@ export class MemoryStore {
         continue;
       }
 
-      const entry = await this.normalizeLegacyEntry(parsed);
+      const entry = await this.normalizeLegacyEntry(parsed, projectIdentity);
       if (entry) {
         entries.push(entry);
       } else {
@@ -299,11 +309,11 @@ export class MemoryStore {
     return { entries, quarantined };
   }
 
-  /** Normalizes a legacy record, recovering an untrustworthy scope from the task record or returning undefined to quarantine. */
-  private async normalizeLegacyEntry(value: unknown): Promise<MemoryEntry | undefined> {
+  /** Normalizes a legacy record, recovering an untrustworthy scope from a same-project task record or returning undefined to quarantine. */
+  private async normalizeLegacyEntry(value: unknown, projectIdentity: string): Promise<MemoryEntry | undefined> {
     const core = normalizeEntryCore(value);
     if (!core) return undefined;
-    const scope = await this.resolveLegacyScope(core);
+    const scope = await this.resolveLegacyScope(core, projectIdentity);
     return scope ? assembleEntry(core, scope) : undefined;
   }
 
@@ -313,13 +323,14 @@ export class MemoryStore {
    * is self-authoritative and is honored as written. A scopeless record has
    * unknown confidentiality: it is recovered ONLY from the authoritative task
    * record, and only when that task itself supplies an explicit, valid scope
-   * (or internal marker) tied to a concrete project identity. The mere
-   * existence of a task is not authority; a task that is itself scopeless and
-   * not internal — the state TaskStore legitimately preserves on legacy reload
-   * — cannot vouch for anything, so unknown-on-both-sides fails closed. Returns
+   * (or internal marker) AND is owned by the SAME project being migrated. The
+   * mere existence of a task is not authority; a task that is itself scopeless
+   * and not internal — the state TaskStore legitimately preserves on legacy
+   * reload — cannot vouch for anything, and neither can a task belonging to a
+   * different project, so a cross-project citation fails closed. Returns
    * undefined when no trustworthy basis exists, forcing the caller to quarantine.
    */
-  private async resolveLegacyScope(core: EntryCore): Promise<ScopeDecision | undefined> {
+  private async resolveLegacyScope(core: EntryCore, projectIdentity: string): Promise<ScopeDecision | undefined> {
     if (core.claimedScope !== undefined || core.claimedInternal) {
       if (core.claimedScope === "workroom" || core.claimedInternal) {
         return {
@@ -335,7 +346,7 @@ export class MemoryStore {
       ? await this.taskLookup.get(core.taskId).catch(() => undefined)
       : undefined;
 
-    if (!taskSuppliesTrustworthyScope(task)) {
+    if (!taskVouchesForProject(task, projectIdentity)) {
       return undefined;
     }
 
@@ -351,7 +362,7 @@ export class MemoryStore {
   }
 
   private async mutate(
-    project: Pick<ProjectEntry, "root">,
+    project: MemoryProject,
     mutation: (state: MemoryFileState) => MemoryFileState
   ): Promise<void> {
     const file = await this.fileFor(project);
@@ -463,17 +474,27 @@ function boundedField(value: string): string {
 
 /**
  * A task record may only vouch for a scopeless legacy memory entry when it is a
- * complete authority: it carries a concrete project identity AND it declares an
- * explicit access scope or is marked internal. A task that is itself scopeless
- * and not internal supplies no trustworthy scope, so it cannot lift a memory
- * entry out of quarantine.
+ * complete authority for the project being migrated: it carries a project
+ * identity that MATCHES that project AND it declares an explicit access scope or
+ * is marked internal. A task that is itself scopeless and not internal supplies
+ * no trustworthy scope, and a task owned by a different project supplies no
+ * authority here at all, so neither can lift a memory entry out of quarantine.
  */
-function taskSuppliesTrustworthyScope(
-  task: LegacyTaskAuthority | undefined
+function taskVouchesForProject(
+  task: LegacyTaskAuthority | undefined,
+  projectIdentity: string
 ): task is LegacyTaskAuthority {
   if (!task) return false;
   if (typeof task.projectName !== "string" || !task.projectName.trim()) return false;
+  if (!sameProjectIdentity(task.projectName, projectIdentity)) return false;
   return task.accessScope === "project" || task.accessScope === "workroom" || task.internal === true;
+}
+
+/** Case- and whitespace-insensitive equality of two project identities; an empty identity never matches, failing closed. */
+function sameProjectIdentity(a: string, b: string): boolean {
+  const left = a.trim().toLowerCase();
+  const right = b.trim().toLowerCase();
+  return left.length > 0 && left === right;
 }
 
 function pruneEntries(entries: MemoryEntry[], maxOutcomes: number, maxTotalEntries: number): MemoryEntry[] {

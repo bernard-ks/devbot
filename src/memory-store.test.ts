@@ -13,9 +13,9 @@ import {
 } from "./memory-store.js";
 import { TaskStore } from "./task-store.js";
 
-async function tempProject(): Promise<{ root: string }> {
+async function tempProject(name = "demo"): Promise<{ root: string; name: string }> {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-memory-project-"));
-  return { root };
+  return { root, name };
 }
 
 async function tempStoreRoot(): Promise<string> {
@@ -791,5 +791,67 @@ test("legacy migration quarantines a scopeless outcome whose task also lacks a s
   }
   const health = await checkMemoryStoreHealth(project, store.root);
   assert.equal(health.quarantinedCount, 1, "the double-scopeless outcome is quarantined, not imported as project memory");
+  await assert.rejects(() => stat(legacyFile), "the legacy file is still retired");
+});
+
+test("legacy migration quarantines a project-A entry vouched for by a project-B task, refusing cross-project import", async () => {
+  const project = await tempProject("project-a");
+  const legacyDirectory = path.join(project.root, ".devbot");
+  const legacyFile = path.join(legacyDirectory, "memory.jsonl");
+  await mkdir(legacyDirectory, { recursive: true });
+  const secret = {
+    id: "mem-secret-ddd",
+    kind: "outcome",
+    text: "succeeded: private project-B outcome smuggled into project A.",
+    source: "task",
+    taskId: "task-project-b",
+    author: "tom",
+    createdAt: "2026-06-01T00:00:00.000Z",
+    tags: []
+  };
+  await writeFile(legacyFile, `${JSON.stringify(secret)}\n`, "utf8");
+
+  // The cited task is a complete authority — explicit workroom scope and a
+  // requester id — but it belongs to a DIFFERENT project (project-b). Its
+  // authority is confined to its own project and cannot import memory into
+  // project-a, so the entry must fail closed and be quarantined.
+  const taskStateFile = path.join(await tempStoreRoot(), "tasks.json");
+  await writeFile(
+    taskStateFile,
+    JSON.stringify({
+      version: 1,
+      tasks: [
+        {
+          id: "task-project-b",
+          status: "succeeded",
+          source: "discord",
+          mode: "action",
+          projectName: "project-b",
+          requester: "tom",
+          text: "rotate project B staging credentials",
+          includePatterns: [],
+          accessScope: "workroom",
+          requesterId: "requester",
+          startedAt: "2026-06-01T00:00:00.000Z",
+          updatedAt: "2026-06-01T00:00:00.000Z"
+        }
+      ]
+    }),
+    "utf8"
+  );
+  const taskStore = new TaskStore(taskStateFile);
+  const store = new MemoryStore(await tempStoreRoot(), undefined, undefined, undefined, taskStore);
+
+  for (const viewer of [owner, controller, requester, otherViewer, peer]) {
+    const listed = await store.list(project, { access: viewer });
+    assert.ok(
+      !listed.some((entry) => entry.id === secret.id),
+      "a project-B task must not make its outcome listable to any project-A viewer"
+    );
+    const recalled = await store.recallFor(project, "private project-B outcome smuggled into project A", viewer);
+    assert.ok(!recalled.some((entry) => entry.id === secret.id), "a cross-project entry must never be recallable");
+  }
+  const health = await checkMemoryStoreHealth(project, store.root);
+  assert.equal(health.quarantinedCount, 1, "the cross-project entry is quarantined, not imported");
   await assert.rejects(() => stat(legacyFile), "the legacy file is still retired");
 });
