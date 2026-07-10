@@ -8,7 +8,18 @@ The everyday model is intentionally small:
 - **Do:** approve a proposal, use the private task workroom, or use `/do` for an intentional project change.
 - **Check:** use `/status` to see what is happening.
 
-Devbot uses your signed-in local Codex CLI or app session and does not need a separate OpenAI API key or hosted Devbot backend. Selected project context is handled through that Codex session; Discord messages still travel through Discord.
+Devbot uses your signed-in local Codex CLI or app session and does not need a separate OpenAI API key or hosted Devbot backend. Selected project context is handled through that session; Discord messages still travel through Discord.
+
+## Works with your agent
+
+Devbot is the Discord front-end for whichever coding agent you already run locally. The executor is pluggable, so the same Ask / Do / Check workflow drives any of these command-line agents:
+
+- **Codex CLI** (`codex`) — the default and reference backend; behavior is unchanged from earlier releases.
+- **Claude Code** (`claude`) — read-only answers run in `plan` permission mode; `/do` actions run in `acceptEdits` mode scoped to the project directory.
+- **Gemini CLI** (`gemini`) — answers use the default mode; actions use auto-accept. Marked experimental until its flags are verified on your machine.
+- **opencode** (`opencode`) — runs prompts through `opencode run`. Marked experimental.
+
+Devbot picks a backend in this order: the `DEVBOT_AGENT_BACKEND` environment variable, then the `/setup backend` choice, then the first agent detected on your `PATH` (codex, claude, gemini, opencode). Read-only "answer" mode and write-capable "action" mode map to each CLI's real sandbox/permission flags, and the Luna / Terra / Sol tiers map to a backend's own fast / balanced / deep model whenever you configure one (for example `DEVBOT_CLAUDE_DEEP_MODEL`). Run `/setup backend` to see detected agents and versions, or `/setup doctor` for the full readiness view. Backends whose flags could not be verified are surfaced as experimental.
 
 ## One-Command Setup
 

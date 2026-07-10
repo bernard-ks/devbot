@@ -31,7 +31,8 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Discord application creation and bot-token retrieval remain the only required Developer Portal step.
 - Discord slash commands:
   - `/setup wizard` provides resumable owner setup for viewers, controllers, peer bots, a private room, and runtime project roots.
-  - `/setup doctor` diagnoses the complete local and Discord setup path.
+  - `/setup doctor` diagnoses the complete local and Discord setup path, including detected coding-agent backends.
+  - `/setup backend` lists detected coding agents with versions and selects the active one.
   - `/projects` lists configured local projects.
   - `/status` reports a decision-ready brief: confirmed bot work and phases, external runs, activity-unknown app sessions, repository evidence, risks, and a recommended next step.
   - `/status image:true` can attach a live local UI screenshot when a web dev server is detected.
@@ -60,6 +61,11 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Ignores dependency/build folders and common secret files.
   - Redacts secret-looking values from indexed text.
   - Ranks local files against the user request before building the Codex prompt.
+- Bring-your-own coding-agent backends:
+  - Pluggable executor runs on Codex CLI, Claude Code, Gemini CLI, or opencode — whichever is installed.
+  - Selection order is `DEVBOT_AGENT_BACKEND`, then the `/setup backend` choice, then the first agent detected on PATH (codex, claude, gemini, opencode).
+  - Codex remains the default and reference backend with unchanged flags; unverified backends are surfaced as experimental.
+  - Read-only answer and write-capable action modes map to each CLI's real sandbox/permission flags, and Luna / Terra / Sol tiers map to a backend's own model when configured.
 - Local Codex execution:
   - Uses the installed Codex CLI/app session instead of OpenAI API keys.
   - Supports read-only answer mode and workspace-write action mode.
@@ -287,7 +293,7 @@ MVP multi-bot flow:
 - Add bot capability passports and evidence-backed trust levels.
 - Add an experiment arena that compares isolated implementations and independent evaluation.
 - Add provenance-backed team memory and cross-repository contract negotiation.
-- Add adapters for coding agents beyond the local Codex runtime.
+- Add adapters for coding agents beyond the local Codex runtime. Delivered as pluggable Codex, Claude Code, Gemini CLI, and opencode backends; future work is deeper per-backend model routing and richer sandbox mapping.
 
 ## Near-Term Backlog
 
