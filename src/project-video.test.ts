@@ -5,7 +5,9 @@ import {
   computeGifPageLayout,
   decideSizeCap,
   deriveFlowSteps,
+  isolatedProofNote,
   isUiRelatedTask,
+  pushBoundedFrame,
   selectRecentFrames,
   DISCORD_MAX_ATTACHMENT_BYTES,
   WATCH_MAX_FRAMES
@@ -59,6 +61,37 @@ test("selectRecentFrames keeps only the most recent frames up to the cap", () =>
 test("selectRecentFrames returns everything when under the cap", () => {
   const frames = [1, 2, 3];
   assert.deepEqual(selectRecentFrames(frames), frames);
+});
+
+test("pushBoundedFrame keeps the buffer capped at the frame limit as frames arrive", () => {
+  const frames: number[] = [];
+  for (let index = 0; index < WATCH_MAX_FRAMES + 8; index += 1) {
+    pushBoundedFrame(frames, index);
+    assert.ok(frames.length <= WATCH_MAX_FRAMES);
+  }
+  assert.equal(frames.length, WATCH_MAX_FRAMES);
+  assert.deepEqual(frames, Array.from({ length: WATCH_MAX_FRAMES }, (_, i) => i + 8));
+});
+
+test("pushBoundedFrame respects a custom cap and mutates in place", () => {
+  const frames: string[] = [];
+  const returned = pushBoundedFrame(frames, "a", 2);
+  pushBoundedFrame(frames, "b", 2);
+  pushBoundedFrame(frames, "c", 2);
+  assert.equal(returned, frames);
+  assert.deepEqual(frames, ["b", "c"]);
+});
+
+test("isolatedProofNote is honest that the recording would show unchanged source and points to /clip", () => {
+  const withBranch = isolatedProofNote("devbot/task-123");
+  assert.match(withBranch, /isolated worktree/i);
+  assert.match(withBranch, /not served by the running dev server/i);
+  assert.match(withBranch, /devbot\/task-123/);
+  assert.match(withBranch, /\/clip/);
+
+  const withoutBranch = isolatedProofNote();
+  assert.match(withoutBranch, /isolated worktree/i);
+  assert.doesNotMatch(withoutBranch, /branch/i);
 });
 
 test("computeGifPageLayout stacks frames vertically and caps pages at the max", () => {

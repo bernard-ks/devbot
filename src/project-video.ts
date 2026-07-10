@@ -8,6 +8,7 @@ import {
   bestNavigationCandidate,
   canReach,
   findProjectWebUrls,
+  isAllowedScreenshotResource,
   projectScreenshotOrigins,
   sanitizeFilePart
 } from "./project-screenshot.js";
@@ -119,6 +120,11 @@ function looksActionable(phrase: string): boolean {
   return /\b(click|open|go to|navigate|scroll|type|select|submit|toggle|expand|press|tap|view|show)\b/i.test(phrase) || phrase.split(/\s+/).length <= 6;
 }
 
+export function isolatedProofNote(branch?: string): string {
+  const branchPart = branch ? ` (branch \`${branch}\`)` : "";
+  return `Proof capture skipped: this action ran in an isolated worktree${branchPart} whose changes are not served by the running dev server, so a recording would show the unchanged source app. Run \`/clip\` after the change is merged to record the live UI.`;
+}
+
 export function isUiRelatedTask(taskText: string, changedFiles: string[]): boolean {
   if (UI_TEXT_PATTERN.test(taskText)) {
     return true;
@@ -133,6 +139,14 @@ const UI_DIR_PATTERN = /(^|\/)(components?|pages?|views?|screens?|widgets?|style
 
 export function selectRecentFrames<T>(frames: T[], maxFrames = WATCH_MAX_FRAMES): T[] {
   return frames.length <= maxFrames ? frames : frames.slice(frames.length - maxFrames);
+}
+
+export function pushBoundedFrame<T>(frames: T[], frame: T, maxFrames = WATCH_MAX_FRAMES): T[] {
+  frames.push(frame);
+  if (frames.length > maxFrames) {
+    frames.splice(0, frames.length - maxFrames);
+  }
+  return frames;
 }
 
 export interface GifPageLayout {
@@ -232,6 +246,13 @@ async function recordAttempt(
     try {
       const context = await browser.newContext({ viewport: size, recordVideo: { dir: videoDir, size } });
       const page = await context.newPage();
+      await page.route("**/*", async (route) => {
+        if (isAllowedScreenshotResource(route.request().url(), allowedOrigins)) {
+          await route.continue();
+        } else {
+          await route.abort("blockedbyclient");
+        }
+      });
       const consoleErrors: string[] = [];
       page.on("console", (message) => {
         if (message.type() === "error") {
@@ -240,6 +261,10 @@ async function recordAttempt(
       });
 
       await page.goto(startUrl, { waitUntil: "networkidle", timeout: 20_000 });
+      if (!isAllowedScreenshotResource(page.url(), allowedOrigins)) {
+        await context.close();
+        continue;
+      }
       await page.waitForTimeout(CLIP_STEP_DWELL_MS);
 
       const stepsPerformed: string[] = [];
@@ -251,6 +276,9 @@ async function recordAttempt(
         const performed = await performFlowStep(page, step);
         if (performed) {
           stepsPerformed.push(step);
+        }
+        if (!isAllowedScreenshotResource(page.url(), allowedOrigins)) {
+          break;
         }
         await page.waitForTimeout(CLIP_STEP_DWELL_MS);
       }

@@ -466,7 +466,7 @@ export function projectScreenshotOrigins(project: ProjectEntry, projectUrls: rea
   );
 }
 
-function isAllowedScreenshotResource(value: string, allowedOrigins: ReadonlySet<string>): boolean {
+export function isAllowedScreenshotResource(value: string, allowedOrigins: ReadonlySet<string>): boolean {
   try {
     const url = new URL(value);
     if (url.protocol === "data:" || url.protocol === "blob:" || url.protocol === "about:") return true;
