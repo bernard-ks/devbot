@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { minimalChildEnvironment } from "./security.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -258,12 +259,17 @@ export async function transcribeAttachment(options: TranscribeAttachmentOptions)
     }
     await writeFile(inputPath, Buffer.from(await response.arrayBuffer()));
 
+    const childEnvironment = minimalChildEnvironment();
     const wavPath = path.join(tempDir, "audio.wav");
-    await execFileAsync(options.ffmpegBin, ffmpegArgs(inputPath, wavPath), { timeout: FFMPEG_TIMEOUT_MS });
+    await execFileAsync(options.ffmpegBin, ffmpegArgs(inputPath, wavPath), {
+      timeout: FFMPEG_TIMEOUT_MS,
+      env: childEnvironment
+    });
 
     const outputBase = path.join(tempDir, "transcript");
     await execFileAsync(options.whisperBin, whisperArgs(options.modelPath, wavPath, outputBase), {
-      timeout: WHISPER_TIMEOUT_MS
+      timeout: WHISPER_TIMEOUT_MS,
+      env: childEnvironment
     });
 
     const transcript = await readFile(`${outputBase}.txt`, "utf8");
