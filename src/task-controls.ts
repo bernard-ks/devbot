@@ -87,7 +87,7 @@ export function taskActionRows(
     }
   }
 
-  if (options.canControl && taskHasRestorableCheckpoint(task)) {
+  if (options.canControl && !options.safeMode && taskHasRestorableCheckpoint(task)) {
     buttons.push(button("undo", task.id, "Undo", ButtonStyle.Danger));
   }
 

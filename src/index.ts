@@ -87,6 +87,7 @@ import {
   createCheckpoint,
   diffSinceCheckpoint,
   formatCheckpointChanges,
+  hashWorkingTree,
   pruneCheckpoints,
   restoreCheckpoint,
   RollbackRefusedError
@@ -1630,6 +1631,9 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       }
       throw new Error(current?.error ?? `Task stopped while ${current?.status ?? "unavailable"}.`);
     }
+    if (options.mode === "action") {
+      await recordPostTaskCheckpointTree(executionProject, task.id);
+    }
     return {
       answer,
       context,
@@ -1651,6 +1655,9 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       });
     } else {
       await taskStore.fail(task.id, error);
+      if (options.mode === "action") {
+        await recordPostTaskCheckpointTree(executionProject, task.id);
+      }
       await reportTaskProgress(options, {
         ...progressBase,
         phase: "failed",
@@ -1739,10 +1746,28 @@ async function ensureRollbackCheckpoint(project: ProjectEntry, taskId: string): 
   }
 }
 
+/**
+ * Captures the exact post-task working-tree hash so Undo can later refuse on
+ * any drift (edit, add, or delete) instead of trusting file mtimes. Silently
+ * skipped when the task never got a checkpoint (mode wasn't action, or
+ * `ensureRollbackCheckpoint` never ran); if hashing fails, the field is left
+ * unset and Undo refuses closed rather than allowing an unverified restore.
+ */
+async function recordPostTaskCheckpointTree(project: ProjectEntry, taskId: string): Promise<void> {
+  const task = await taskStore.get(taskId);
+  if (!task?.checkpointRef) return;
+  try {
+    const tree = await hashWorkingTree(project.root);
+    await taskStore.recordPostTaskTree(taskId, tree);
+  } catch {
+    // Leave checkpointPostTaskTree unset; Undo refuses for this task until a human reconciles.
+  }
+}
+
 function formatRollbackRefusal(error: RollbackRefusedError): string {
   const lines = [`Undo refused: ${error.message}`];
-  if (error.reason === "newer-changes" && error.details.length > 0) {
-    lines.push("", "Files edited after the task finished:", codeBlock(error.details.join("\n")));
+  if (error.reason === "workspace-changed" && error.details.length > 0) {
+    lines.push("", "Files changed since the task finished:", codeBlock(error.details.join("\n")));
   }
   return lines.join("\n");
 }
@@ -2875,6 +2900,10 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
 
   if (subcommand === "undo") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    if (appConfig.safeMode) {
+      await interaction.editReply(safeModeActionMessage("/task undo"));
+      return;
+    }
     const id = interaction.options.getString("id", true);
     const task = await taskStore.get(id);
     if (!task || !allowedProjectNames.has(task.projectName)) {
@@ -2893,13 +2922,19 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
       );
       return;
     }
+    if (!task.checkpointPostTaskTree) {
+      await interaction.editReply(
+        `Undo refused: Devbot cannot verify \`${id}\`'s workspace state right after the task finished, so restoring could clobber other changes. Manual review is needed.`
+      );
+      return;
+    }
     const project = mustFindProject(appConfig.projects, task.projectName);
     try {
       const workspaceProject = await projectForTaskWorkspace(project, task);
       const summary = await restoreCheckpoint(workspaceProject.root, task.checkpointRef, {
         expectedHeadSha: task.checkpointHeadSha ?? "",
         expectedBranch: task.checkpointBranch ?? "HEAD",
-        ...(task.finishedAt ? { guardMs: Date.parse(task.finishedAt) } : {})
+        expectedPostTaskTree: task.checkpointPostTaskTree
       });
       await taskStore.markReverted(task.id);
       await interaction.editReply(
@@ -3197,12 +3232,24 @@ async function handleTaskControl(
       await interaction.reply({ content: "Only the owner or an approved controller can undo write-capable work.", flags: MessageFlags.Ephemeral });
       return;
     }
+    if (appConfig.safeMode) {
+      await interaction.reply({ content: safeModeActionMessage("Undo"), flags: MessageFlags.Ephemeral });
+      return;
+    }
     if (!task.checkpointRef) {
       await interaction.reply({ content: "This task has no rollback checkpoint to restore.", flags: MessageFlags.Ephemeral });
       return;
     }
     if (task.reverted) {
       await interaction.reply({ content: "This task's changes were already undone.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const checkpointPostTaskTree = task.checkpointPostTaskTree;
+    if (!checkpointPostTaskTree) {
+      await interaction.reply({
+        content: "Undo refused: Devbot cannot verify this task's workspace state right after it finished, so restoring could clobber other changes. Manual review is needed.",
+        flags: MessageFlags.Ephemeral
+      });
       return;
     }
 
@@ -3228,7 +3275,7 @@ async function handleTaskControl(
           "Changes that will be reverted:",
           codeBlock(formatCheckpointChanges(changes)),
           "",
-          "Undo refuses automatically if the branch or HEAD moved, or if any of these files were edited after the task finished."
+          "Undo refuses automatically if the branch or HEAD moved, or if the workspace no longer matches its state right after the task finished."
         ].join("\n"),
         components: [undoConfirmRow(task.id)]
       });
@@ -3242,7 +3289,7 @@ async function handleTaskControl(
         const summary = await restoreCheckpoint(workspaceProject.root, task.checkpointRef!, {
           expectedHeadSha: task.checkpointHeadSha ?? "",
           expectedBranch: task.checkpointBranch ?? "HEAD",
-          ...(task.finishedAt ? { guardMs: Date.parse(task.finishedAt) } : {})
+          expectedPostTaskTree: checkpointPostTaskTree
         });
         await taskStore.markReverted(task.id);
         await interaction.editReply(
