@@ -5000,12 +5000,6 @@ function isAllowed(
   if (isOwner(interaction.user.id, appConfig)) {
     return true;
   }
-  const hasUserAllowList = appConfig.allowedUserIds.size > 0;
-  const hasUsernameAllowList = appConfig.allowedUsernames.size > 0;
-  const hasRoleAllowList = appConfig.allowedRoleIds.size > 0;
-  if (!hasUserAllowList && !hasUsernameAllowList && !hasRoleAllowList) {
-    return true;
-  }
 
   if (appConfig.allowedUserIds.has(interaction.user.id)) {
     return true;
@@ -5092,12 +5086,6 @@ function isAllowedMessage(message: Message, appConfig: AppConfig): boolean {
     return false;
   }
   if (isOwner(message.author.id, appConfig)) {
-    return true;
-  }
-  const hasUserAllowList = appConfig.allowedUserIds.size > 0;
-  const hasUsernameAllowList = appConfig.allowedUsernames.size > 0;
-  const hasRoleAllowList = appConfig.allowedRoleIds.size > 0;
-  if (!hasUserAllowList && !hasUsernameAllowList && !hasRoleAllowList) {
     return true;
   }
 

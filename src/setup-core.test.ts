@@ -12,13 +12,15 @@ import {
 import { renderSetupPage } from "./setup-page.js";
 
 test("setup page uses the dark theme and exposes the guided controls", () => {
-  const html = renderSetupPage("session-token");
+  const html = renderSetupPage("session-token", "test-nonce");
   assert.match(html, /<meta name="color-scheme" content="dark">/);
   assert.match(html, /--canvas: #0d0f13/);
   assert.match(html, /id="choose-folder"/);
   assert.match(html, /Open workspace/);
   assert.match(html, /Make change/);
   assert.doesNotMatch(html, /content="light"/);
+  assert.match(html, /<style nonce="test-nonce">/);
+  assert.match(html, /<script nonce="test-nonce">/);
 });
 
 test("Discord install URL requests the bot command scope and private-room permissions", () => {

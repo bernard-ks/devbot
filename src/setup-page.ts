@@ -1,4 +1,4 @@
-export function renderSetupPage(sessionToken: string): string {
+export function renderSetupPage(sessionToken: string, nonce: string): string {
   const encodedSession = JSON.stringify(sessionToken);
   return `<!doctype html>
 <html lang="en">
@@ -7,7 +7,7 @@ export function renderSetupPage(sessionToken: string): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Devbot Setup</title>
-  <style>
+  <style nonce="${nonce}">
     :root {
       color-scheme: dark;
       --ink: #f4f6f8;
@@ -249,7 +249,7 @@ export function renderSetupPage(sessionToken: string): string {
   </main>
   <footer>Bound to 127.0.0.1 for this setup session.</footer>
 
-  <script>
+  <script nonce="${nonce}">
     const sessionToken = ${encodedSession};
     const state = { identity: null, guilds: [], finished: false };
     const byId = (id) => document.getElementById(id);
