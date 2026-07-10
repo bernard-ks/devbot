@@ -95,8 +95,9 @@ import {
   type DuelChangeEvidence,
   type DuelResult
 } from "./duel.js";
-import { DuelStore } from "./duel-store.js";
+import { DuelStore, type DuelRecord, type DuelSnapshotRecord } from "./duel-store.js";
 import { reconcileInterruptedDuels } from "./duel-recovery.js";
+import { captureDuelSnapshot, cleanupDuelSnapshotRefs, deleteDuelSnapshotRef, verifyDuelSnapshot } from "./duel-snapshot.js";
 import { duelDecisionRow, isBoundDuelControl, parseDuelControl, type ParsedDuelControl } from "./duel-ui.js";
 import {
   commandRequiresApproval,
@@ -1465,6 +1466,7 @@ interface ProjectRequestOptions {
   parentTaskId?: string;
   dedupeKey?: string;
   existingTaskId?: string;
+  worktreeBaseRef?: string;
   requesterId?: string;
   accessScope?: "project" | "workroom";
   internal?: boolean;
@@ -1533,7 +1535,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       const isolated = await createTaskWorktree({
         sourcePath: options.project.root,
         taskName: task.id,
-        baseRef: "HEAD"
+        baseRef: options.worktreeBaseRef ?? "HEAD"
       });
       await ensureRequestStillActive();
       if (isolated.available) {
@@ -3700,6 +3702,7 @@ async function handleDuelControl(interaction: ButtonInteraction, appConfig: AppC
     }
     await collabStore.decide({ conversationId: conversation.id, outcome: "deny", actor: interaction.user.tag, note: "Dismissed the duel findings." });
     await collabStore.close(conversation.id, interaction.user.tag);
+    await deleteDuelSnapshotRef(duelProject.root, conversation.id);
     await interaction.reply({ content: "Dismissed the duel findings and closed the duel.", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -3710,9 +3713,13 @@ async function handleDuelControl(interaction: ButtonInteraction, appConfig: AppC
     return;
   }
 
+  if (parsed.action === "accept") {
+    await handleDuelAccept(interaction, appConfig, duelProject, conversation, duel, conceded);
+    return;
+  }
+
   await interaction.reply({
     content: [
-      "Devbot does not create write tasks from duel findings in this stage: the reviewed snapshot cannot yet be reproduced safely for a fix task.",
       "Copy this prompt into a `/do` task (or your own session) to fix the conceded issues:",
       "```",
       buildDuelFixTaskPrompt(conversation.brief ?? "", conceded).slice(0, 1_800),
@@ -3720,6 +3727,147 @@ async function handleDuelControl(interaction: ButtonInteraction, appConfig: AppC
     ].join("\n"),
     flags: MessageFlags.Ephemeral
   });
+}
+
+/**
+ * "Accept & fix": atomically claims acceptance on the durable duel record, seeds a fresh
+ * isolated worktree from the pinned reviewed snapshot (never the source checkout or the original
+ * task worktree), creates the fix task through the normal task path with the conceded issues as
+ * input, and marks the duel accepted only after the fix task exists durably. Every failure path
+ * releases the claim as failed-retryable.
+ */
+async function handleDuelAccept(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  duelProject: ProjectEntry,
+  conversation: { id: string; threadId?: string; brief?: string },
+  duel: DuelRecord,
+  conceded: DuelRecord["issues"]
+): Promise<void> {
+  if (isWriteBlockedBySafeMode(appConfig, "action")) {
+    await interaction.reply({ content: safeModeActionMessage("duel fix tasks"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (duel.fix?.status === "accepted") {
+    await interaction.reply({
+      content: `This duel was already accepted; fix task \`${duel.fix.taskId ?? "unknown"}\` was created for it.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  const fallbackPrompt = [
+    "Copy this prompt into a `/do` task (or your own session) to fix the conceded issues:",
+    "```",
+    buildDuelFixTaskPrompt(conversation.brief ?? "", conceded).slice(0, 1_800),
+    "```"
+  ].join("\n");
+  if (!duel.snapshot || !(await verifyDuelSnapshot(duelProject.root, duel.snapshot))) {
+    await interaction.reply({
+      content: [
+        "The reviewed snapshot for this duel is missing or no longer matches its recorded identity, so Devbot cannot safely seed a fix task from the exact reviewed state.",
+        fallbackPrompt
+      ].join("\n"),
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  // Coverage-honesty gate (re-checked at claim time): if any reviewed-change content was omitted
+  // from review by policy, the verdict is not clean/complete, so an automated fix must not be
+  // seeded from it. Fail closed if the recorded coverage is missing or incomplete.
+  if (!duel.evidence || duel.evidence.omittedFileCount > 0) {
+    await interaction.reply({
+      content: [
+        "This duel's review had incomplete coverage — some changed content was omitted from review by policy — so its verdict is not clean enough to seed an automated fix. Fix the conceded issues manually instead.",
+        fallbackPrompt
+      ].join("\n"),
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  const { claimed } = await duelStore.claimAccept(conversation.id, interaction.user.tag);
+  if (!claimed) {
+    await interaction.reply({ content: "This duel's acceptance is already in progress or decided.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const sourceTask = await taskStore.get(duel.taskId);
+  let fixTaskId: string | undefined;
+  try {
+    fixTaskId = await executeInteractionRequest({
+      interaction,
+      appConfig,
+      project: duelProject,
+      text: buildDuelFixTaskPrompt(conversation.brief ?? "", conceded),
+      includePatterns: [],
+      mode: "action",
+      requester: interaction.user.tag,
+      requesterId: interaction.user.id,
+      ...(sourceTask?.accessScope ? { accessScope: sourceTask.accessScope } : {}),
+      source: `duel:accept:${conversation.id}`,
+      ephemeral: true,
+      parentTaskId: duel.taskId,
+      dedupeKey: `duel-accept:${conversation.id}`,
+      worktreeBaseRef: duel.snapshot.commit
+    });
+  } catch (error) {
+    await duelStore.failAccept(conversation.id, publicErrorMessage(error));
+    await interaction
+      .editReply(`The fix task could not be started: ${publicErrorMessage(error)}\nThe acceptance claim was released, so Accept & fix can be retried.`)
+      .catch(() => undefined);
+    return;
+  }
+  if (!fixTaskId) {
+    await duelStore.failAccept(conversation.id, "The fix task was not durably created.");
+    await interaction
+      .editReply("The fix task was not durably created. The acceptance claim was released, so Accept & fix can be retried.")
+      .catch(() => undefined);
+    return;
+  }
+
+  await duelStore.completeAccept(conversation.id, fixTaskId);
+  await collabStore.decide({
+    conversationId: conversation.id,
+    outcome: "approve",
+    actor: interaction.user.tag,
+    note: `Accepted the conceded issues; fix task ${fixTaskId} was seeded from the reviewed snapshot.`
+  });
+  await collabStore.close(conversation.id, interaction.user.tag);
+  if (conversation.threadId) {
+    const thread = await client.channels.fetch(conversation.threadId).catch(() => undefined);
+    if (thread?.isTextBased()) {
+      await sendToTextChannel(thread, {
+        content: `Accept & fix: task \`${fixTaskId}\` was seeded from the reviewed snapshot \`${duel.snapshot.commit.slice(0, 12)}\` in an isolated worktree.`,
+        allowedMentions: { parse: [] }
+      }).catch(() => undefined);
+    }
+  }
+  await cleanupProjectDuelSnapshotRefs(duelProject);
+}
+
+/** Snapshot-ref retention: keep only refs for retained, still-actionable duels of this project;
+ *  everything pruned, dismissed, accepted, or malformed is deleted, with a bounded total. */
+async function cleanupProjectDuelSnapshotRefs(project: ProjectEntry): Promise<void> {
+  try {
+    const records = await duelStore.list();
+    const keep = new Set(
+      records
+        .filter(
+          (record) =>
+            record.projectName === project.name &&
+            record.snapshot !== undefined &&
+            record.status === "succeeded" &&
+            !record.dismissed &&
+            record.fix?.status !== "accepted" &&
+            record.issues.some((issue) => issue.status === "conceded")
+        )
+        .map((record) => record.id)
+    );
+    await cleanupDuelSnapshotRefs(project.root, keep);
+  } catch (error) {
+    console.warn(`Unable to clean up duel snapshot refs for ${project.name}: ${publicErrorMessage(error)}`);
+  }
 }
 
 async function runDuelForTask(
@@ -3733,9 +3881,23 @@ async function runDuelForTask(
 
   let diff: DuelChangeEvidence;
   let result: DuelResult;
+  let snapshot: DuelSnapshotRecord | undefined;
+  let snapshotWarning: string | undefined;
   try {
     const diffProject = await projectForTaskWorkspace(project, task);
     diff = await gatherDuelChangeEvidence(diffProject, task);
+    const captured = await captureDuelSnapshot(diffProject.root, conversation.id);
+    if (captured.ok) {
+      const recheck = await gatherDuelChangeEvidence(diffProject, task);
+      if (recheck.patchHash === diff.patchHash) {
+        snapshot = captured.snapshot;
+      } else {
+        snapshotWarning = "The working tree changed while evidence was being captured, so the reviewed snapshot could not be pinned; Accept & fix is unavailable.";
+        await deleteDuelSnapshotRef(project.root, conversation.id);
+      }
+    } else {
+      snapshotWarning = `The reviewed snapshot could not be captured (${captured.message}), so Accept & fix is unavailable.`;
+    }
     result = await runDuelReview({
       routing: appConfig.routing,
       task,
@@ -3746,6 +3908,7 @@ async function runDuelForTask(
     });
   } catch (error) {
     await duelStore.fail(conversation.id, error);
+    await deleteDuelSnapshotRef(project.root, conversation.id).catch(() => undefined);
     await collabStore.close(conversation.id, "devbot").catch(() => undefined);
     throw error;
   }
@@ -3763,6 +3926,7 @@ async function runDuelForTask(
       omittedFileCount: diff.omittedFileCount,
       truncated: diff.truncated
     },
+    ...(snapshot ? { snapshot } : {}),
     overall: result.reviewerVerdict.overall,
     issues: result.issues
   });
@@ -3778,16 +3942,26 @@ async function runDuelForTask(
     overall: result.reviewerVerdict.overall,
     issues: result.issues,
     skippedRebuttal: result.skippedRebuttal,
-    warnings: result.warnings
+    warnings: [...result.warnings, ...(snapshotWarning ? [snapshotWarning] : [])]
   });
   const issuesText = formatDuelIssues(result.issues);
   const fullContent = [summary, issuesText ? `\n${issuesText}` : undefined].filter((line): line is string => line !== undefined).join("\n");
-  const decisionRow = result.issues.some((issue) => issue.status === "conceded") ? [duelDecisionRow(conversation.id)] : [];
+  const hasConceded = result.issues.some((issue) => issue.status === "conceded");
+  // "Accept & fix" is offered only while the reviewed snapshot still resolves to the exact
+  // recorded commit and tree, and only when coverage was complete: if any changed content was
+  // omitted from review by policy, the verdict is downgraded/not-clean, so seeding an automated
+  // fix from that review would trust content the reviewer never saw. Keep the read-only fallback.
+  const coverageComplete = diff.omittedFileCount === 0;
+  const acceptAndFix = snapshot !== undefined && hasConceded && coverageComplete && (await verifyDuelSnapshot(project.root, snapshot));
+  const decisionRow = hasConceded ? [duelDecisionRow(conversation.id, { acceptAndFix })] : [];
   if (decisionRow.length === 0) {
     // Nothing is actionable, so the duel is terminal: close its conversation immediately instead
-    // of leaving it counting against the open-collaboration limit forever.
+    // of leaving it counting against the open-collaboration limit forever, and drop its
+    // now-unneeded snapshot ref.
     await collabStore.close(conversation.id, "devbot");
+    await deleteDuelSnapshotRef(project.root, conversation.id);
   }
+  await cleanupProjectDuelSnapshotRefs(project);
 
   const thread = conversation.threadId ? await client.channels.fetch(conversation.threadId).catch(() => undefined) : undefined;
   if (thread?.isTextBased()) {

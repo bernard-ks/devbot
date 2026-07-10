@@ -384,3 +384,57 @@ security.test.ts 20s child-process timeout widening is preserved. Two blocking i
    "evidence gathering refuses a legacy non-isolated succeeded action with no trustworthy base revision".
 
 `npm test`: 311/311 green (`npm run build` + `node --test` over `dist`).
+
+## Stage 2 — "Accept & fix" from the reproducible reviewed snapshot
+
+This stacked branch (`claude/duel-accept-fix`) lands stage 2, implementing exactly the two
+preconditions review round 1 set for re-adding a write control, and nothing beyond them.
+
+**Snapshot capture at duel time (`src/duel-snapshot.ts`, new).** Immediately after evidence is
+gathered, the exact reviewed working state is pinned as a real git commit under a hidden,
+exact-format-validated ref `refs/devbot/duels/<duel-id>`. The capture uses hardened git
+(`execFile` + `hardenedGitArguments()`/`hardenedGitEnvironment()`) with a temporary
+`GIT_INDEX_FILE` overlay: `read-tree HEAD`, stage the same change set the evidence covers
+(committed history via the HEAD parent, plus staged/unstaged/renamed/deleted and bounded
+untracked files, honoring `isIgnoredProjectPath()` sensitive-path exclusions), then
+`write-tree`/`commit-tree`/`update-ref`. The working tree and real index are never touched. The
+ref, commit, and tree hashes are recorded in the durable duel record; the capture is bound to
+the already-recorded evidence by re-gathering and comparing the patch hash, and discarded if the
+tree moved in between. Because task worktrees are linked worktrees, the ref is shared with the
+source repository and survives worktree removal.
+
+**Gated control.** The **Accept & fix** button renders only when a snapshot was recorded, at
+least one issue was conceded, and `verifyDuelSnapshot()` confirms the ref still resolves to the
+exact recorded commit and tree — and the same verification runs again at claim time. When the
+snapshot is missing or stale the duel keeps the stage-1 behavior: copyable fix prompt plus a
+truthful explanation, and dismissal.
+
+**Atomic, auditable acceptance (`DuelStore` + `handleDuelAccept`).** Acceptance is a
+compare-and-set claim on the durable duel record (`accepting`, exactly one winner under
+concurrent submissions; a `failed-retryable` claim can be re-claimed). The winner seeds a fresh
+isolated per-task worktree from the snapshot commit — never the source checkout, never the
+original task worktree — by passing `worktreeBaseRef` through the normal
+`executeInteractionRequest()`/`runProjectRequest()` task path with the conceded issues as the
+task text. The duel is marked `accepted` with the resulting task ID persisted only after the fix
+task exists durably; every failure path releases the claim as `failed-retryable`, and interrupted
+claims are released on restart next to interrupted duels. Dismiss refuses while an acceptance is
+in flight or recorded. Controller status, project policy (`isAllowedForProject`), and the
+thread/control-message binding are re-checked at claim time, safe mode blocks acceptance
+outright, replies stay ephemeral, and the thread audit line is mention-safe.
+
+**Ref lifecycle.** Snapshot refs are deleted when a duel ends with nothing conceded, fails, is
+dismissed, or is accepted, and `cleanupDuelSnapshotRefs()` prunes refs for records evicted from
+`DuelStore` retention plus anything malformed under the prefix, with a bounded survivor count.
+
+**Tests.** `src/duel-snapshot.test.ts` (new) includes the end-to-end case review round 1 asked
+for verbatim: in a temp repo, task A's isolated worktree creates an *untracked* file, the duel
+snapshot pins it, a fix worktree seeded from the snapshot commit sees and modifies it, and the
+source checkout stays clean throughout (the original task worktree also stays untouched). Plus:
+capture coverage (committed/staged/unstaged/untracked, sensitive `.env` excluded, oversized
+untracked excluded, working tree unmutated), ref-format validation, verify fail-closed on
+missing/moved/tree-mismatched refs and malformed identities, and retention cleanup with the
+bounded survivor count. `src/duel-store.test.ts` adds the CAS race (two concurrent claims → one
+winner), failed acceptance → `failed-retryable` + re-claimable + never `accepted`, accepted
+records keeping their task ID immutably, dismiss-vs-accept exclusion, restart release, and
+snapshot/fix schema validation on load. `src/duel-ui.test.ts` covers the accept control encoding
+and the row with/without the verified-snapshot gate.
