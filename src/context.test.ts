@@ -737,6 +737,18 @@ test("command schema exposes help and autocomplete for high-friction options", (
   const approve = lab?.options?.find((option) => option.name === "approve");
   assert.ok(approve?.options?.some((option) => option.name === "action"));
   assert.ok(approve?.options?.some((option) => option.name === "commands"));
+
+  const remember = commands.find((command) => command.name === "remember");
+  assert.ok(remember?.options?.some((option) => option.name === "text"));
+  const rememberProject = remember?.options?.find((option) => option.name === "project");
+  assert.equal(rememberProject?.autocomplete, true);
+
+  const memory = commands.find((command) => command.name === "memory");
+  const forget = memory?.options?.find((option) => option.name === "forget");
+  const forgetId = forget?.options?.find((option) => option.name === "id");
+  assert.equal(forgetId?.autocomplete, true);
+  assert.ok(memory?.options?.some((option) => option.name === "list"));
+  assert.ok(memory?.options?.some((option) => option.name === "search"));
 });
 
 test("workroom controls encode IDs and follow lifecycle state", () => {

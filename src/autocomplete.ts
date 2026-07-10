@@ -1,4 +1,5 @@
 import { configuredCommandNames } from "./command-runner.js";
+import type { MemoryEntry } from "./memory-store.js";
 import type { PeerRecord } from "./peer.js";
 import type { TaskRecord } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
@@ -51,8 +52,29 @@ export function peerChoices(peers: PeerRecord[], focused: string): AutocompleteC
     }));
 }
 
+export function memoryChoices(entries: MemoryEntry[], focused: string): AutocompleteChoice[] {
+  const query = normalize(focused);
+  return entries
+    .filter((entry) => searchableMemoryText(entry).includes(query))
+    .slice(0, 25)
+    .map((entry) => ({
+      name: `${entry.id} | ${entry.kind} ${truncateChoiceLabel(entry.text)}`,
+      value: entry.id
+    }));
+}
+
 function searchableTaskText(task: TaskRecord): string {
   return `${task.id} ${task.status} ${task.mode} ${task.projectName} ${task.source}`.toLowerCase();
+}
+
+function searchableMemoryText(entry: MemoryEntry): string {
+  return `${entry.id} ${entry.kind} ${entry.source} ${entry.text} ${entry.tags.join(" ")}`.toLowerCase();
+}
+
+function truncateChoiceLabel(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  const maxLength = 60;
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 1)}...`;
 }
 
 function normalize(value: string): string {
