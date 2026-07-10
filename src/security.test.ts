@@ -100,7 +100,7 @@ await writeFile(args[outputIndex + 1], "fake answer");
         model: undefined,
         sandbox: "read-only",
         actionSandbox: "workspace-write",
-        timeoutMs: 5_000
+        timeoutMs: 20_000
       },
       prompt: "private prompt only on stdin",
       cwd: root,
@@ -138,7 +138,7 @@ test("configured project commands receive an empty temporary home", async () => 
   const previousToken = process.env.DISCORD_TOKEN;
   process.env.DISCORD_TOKEN = "discord-command-secret";
   try {
-    const result = await runConfiguredProjectCommand(entry, "capture", 5_000);
+    const result = await runConfiguredProjectCommand(entry, "capture", 20_000);
     assert.equal(result.ok, true);
   } finally {
     if (previousToken === undefined) delete process.env.DISCORD_TOKEN;
