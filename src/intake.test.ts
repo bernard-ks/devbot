@@ -5,22 +5,29 @@ import path from "node:path";
 import test from "node:test";
 import { parseIntakeAcceptModal, parseIntakeControl, intakeAcceptModal, intakeControlRow } from "./intake-controls.js";
 import { IntakeStore } from "./intake-store.js";
+import { isAllowedByProjectPolicy } from "./access.js";
 import {
+  applyIntakeRateLimit,
+  attachmentsUnsupportedNote,
   boundEvidence,
   buildReproQuestion,
   buildTriageCard,
   checkIntakeRateLimit,
+  chooseIntakeDeliveryRoom,
   classifyIntakeReport,
   createConcurrencyLimiter,
   emptyIntakeRateLimitState,
   INTAKE_CHANNEL_LIMIT,
+  INTAKE_TRIGGER_PREFIX,
   INTAKE_USER_LIMIT,
+  INTAKE_USER_WINDOW_MS,
   isIntakeRecordOpen,
   loggedForTriageReply,
   mergeIntakeFollowup,
   missingInfoReply,
   normalizeReportSignature,
   OPEN_INTAKE_STATUSES,
+  parseIntakeTrigger,
   parseReproResponse,
   pruneTimestamps,
   recordedWithoutDeliveryReply,
@@ -107,12 +114,20 @@ test("missingInfoReply renders a fixed template driven by parsed gaps", () => {
   assert.match(fallback, /what happened, where it happens, and what you expected instead/);
 });
 
-test("repro prompt marks reporter content as untrusted and forbids write claims", () => {
-  const question = buildReproQuestion("the checkout page crashes", ["Console error: TypeError at checkout.ts:42"]);
+test("repro prompt marks reporter content as untrusted, embeds only preselected snippets, and forbids any tool or file access", () => {
+  const question = buildReproQuestion(
+    "the checkout page crashes",
+    ["Console error: TypeError at checkout.ts:42"],
+    "--- FILE: src/checkout.ts (900 bytes) ---\nexport function checkout() {}"
+  );
   assert.match(question, /BEGIN UNTRUSTED REPORT DATA/);
-  assert.match(question, /read-only inspection/i);
+  assert.match(question, /outside the project directory/i);
+  assert.match(question, /Do not read, list, or search any files/i);
   assert.match(question, /Do not propose edits/i);
   assert.match(question, /TypeError at checkout.ts:42/);
+  assert.match(question, /FILE: src\/checkout\.ts/);
+  const empty = buildReproQuestion("the checkout page crashes", [], "");
+  assert.match(empty, /No project snippets matched the report/);
 });
 
 test("repro response parsing tolerates format drift", () => {
@@ -415,3 +430,117 @@ function makeRecord(overrides: Partial<IntakeRecord> = {}): IntakeRecord {
     ...overrides
   };
 }
+
+test("parseIntakeTrigger only fires on the explicit prefix, never on ordinary chatter", () => {
+  assert.equal(parseIntakeTrigger("what's everyone playing tonight?"), undefined);
+  assert.equal(parseIntakeTrigger("I found a bug on the checkout page"), undefined);
+  assert.equal(parseIntakeTrigger("!bugsy is my username"), undefined);
+  assert.equal(parseIntakeTrigger(`${INTAKE_TRIGGER_PREFIX} checkout crashes on submit`), "checkout crashes on submit");
+  assert.equal(parseIntakeTrigger("!BUG: checkout crashes on submit"), "checkout crashes on submit");
+  assert.equal(parseIntakeTrigger("!bug"), "");
+});
+
+test("applyIntakeRateLimit never extends a lockout for attempts made while already limited", () => {
+  const start = Date.now();
+  let state = emptyIntakeRateLimitState();
+  for (let i = 0; i < INTAKE_USER_LIMIT; i += 1) {
+    const allowed = applyIntakeRateLimit(state, "user-1", start);
+    assert.equal(allowed.limited, false);
+    state = allowed.state;
+  }
+
+  const halfway = start + INTAKE_USER_WINDOW_MS / 2;
+  const whileLimited = applyIntakeRateLimit(state, "user-1", halfway);
+  assert.equal(whileLimited.limited, true);
+  assert.deepEqual(whileLimited.state, state, "a limited attempt must not be recorded");
+
+  const afterWindow = start + INTAKE_USER_WINDOW_MS + 1;
+  const recovered = applyIntakeRateLimit(whileLimited.state, "user-1", afterWindow);
+  assert.equal(recovered.limited, false, "the lockout must end when the original window expires");
+});
+
+test("attachmentsUnsupportedNote is a fixed template with no reporter-controlled content", () => {
+  assert.equal(attachmentsUnsupportedNote(), attachmentsUnsupportedNote());
+  assert.match(attachmentsUnsupportedNote(), /not processed/);
+});
+
+test("chooseIntakeDeliveryRoom never leaks a scoped project's evidence to the global private room", () => {
+  assert.equal(
+    chooseIntakeDeliveryRoom({ boundRoomId: "room-1", boundRoomVerified: true, audienceRestricted: true, privateRoomId: "private-1" }),
+    "room-1"
+  );
+  assert.equal(
+    chooseIntakeDeliveryRoom({ boundRoomId: "room-1", boundRoomVerified: false, audienceRestricted: true, privateRoomId: "private-1" }),
+    undefined,
+    "an unverified bound room must not fall back to the private room"
+  );
+  assert.equal(
+    chooseIntakeDeliveryRoom({ boundRoomVerified: false, audienceRestricted: true, privateRoomId: "private-1" }),
+    undefined,
+    "a scoped project with no bound room must deliver nowhere"
+  );
+  assert.equal(
+    chooseIntakeDeliveryRoom({ boundRoomVerified: false, audienceRestricted: false, privateRoomId: "private-1" }),
+    "private-1"
+  );
+  assert.equal(chooseIntakeDeliveryRoom({ boundRoomVerified: false, audienceRestricted: false }), undefined);
+});
+
+test("project .devbot allowlist exclusion blocks intake acceptance even for a global controller", () => {
+  const policy = { allowedUsers: ["user-allowed"], allowedUsernames: [], allowedRoles: ["role-allowed"] };
+  const excludedController = { userId: "user-controller", nameSource: { username: "controller" }, roleIds: [] };
+  assert.equal(isAllowedByProjectPolicy(policy, excludedController), false);
+
+  assert.equal(isAllowedByProjectPolicy(policy, { userId: "user-allowed", nameSource: {}, roleIds: [] }), true);
+  assert.equal(isAllowedByProjectPolicy(policy, { userId: "user-other", nameSource: {}, roleIds: ["role-allowed"] }), true);
+
+  const usernamePolicy = { allowedUsers: [], allowedUsernames: ["trusted"], allowedRoles: [] };
+  assert.equal(isAllowedByProjectPolicy(usernamePolicy, { userId: "u", nameSource: { username: "trusted" }, roleIds: [] }), true);
+  assert.equal(isAllowedByProjectPolicy(usernamePolicy, { userId: "u", nameSource: { username: "attacker" }, roleIds: [] }), false);
+
+  const openPolicy = { allowedUsers: [], allowedUsernames: [], allowedRoles: [] };
+  assert.equal(isAllowedByProjectPolicy(openPolicy, excludedController), true);
+});
+
+test("intake store lists undelivered reports for safe redelivery and drops them once delivered", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-intake-undelivered-"));
+  const store = new IntakeStore(path.join(root, "intake.json"));
+  const undelivered = await store.addRecord({
+    channelId: "channel-1",
+    messageId: "msg-1",
+    authorId: "author-1",
+    authorTag: "author#0001",
+    projectName: "web-app",
+    text: "checkout crashes",
+    signature: "route:/checkout",
+    status: "confirmed"
+  });
+  const delivered = await store.addRecord({
+    channelId: "channel-1",
+    messageId: "msg-2",
+    authorId: "author-2",
+    authorTag: "author#0002",
+    projectName: "web-app",
+    text: "login broken",
+    signature: "route:/login",
+    status: "unconfirmed"
+  });
+  await store.updateRecord(delivered.id, { triageMessageId: "triage-1", triageChannelId: "room-1" });
+  await store.addRecord({
+    channelId: "channel-1",
+    messageId: "msg-3",
+    authorId: "author-3",
+    authorTag: "author#0003",
+    projectName: "web-app",
+    text: "it's broken",
+    signature: "text:it's broken",
+    status: "incomplete"
+  });
+
+  const statuses = ["pending", "confirmed", "unconfirmed", "needs-info"] as const;
+  const pending = await store.listUndelivered(statuses);
+  assert.deepEqual(pending.map((record) => record.id), [undelivered.id]);
+
+  await store.updateRecord(undelivered.id, { triageMessageId: "triage-2", triageChannelId: "room-1" });
+  assert.deepEqual(await store.listUndelivered(statuses), []);
+});

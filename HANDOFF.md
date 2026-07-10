@@ -205,3 +205,41 @@ description of that flake. `npx tsc -p tsconfig.json --noEmit` is clean.
 `src/intake-controls.ts`, or `src/project-screenshot.ts` — the fixes for issues 1 and 4 are call-site
 changes (stop passing reporter text into shared, already-hardened machinery; cap context size)
 rather than changes to that shared machinery itself.
+
+## Review round 1 — second pass (gap closure)
+
+A second pass over the same review found four places where the first pass fell short of the
+review's own acceptance terms, plus test coverage the review explicitly asked for:
+
+1. **Repro assessment no longer has repository access (review item 4).** The first pass capped the
+   packed context but still ran Codex via `answerWithProjectContext` with `cwd: project.root` and a
+   prompt inviting file inspection — read-only prevents writes, not reads. The repro call now uses
+   `completeCodexPrompt` directly in a freshly created empty temp directory outside the project,
+   with a prompt (`buildReproQuestion`) that embeds only the bounded preselected snippets and
+   redacted evidence and forbids any file or tool access. The project root path is never revealed
+   to the model.
+2. **Lockouts no longer extend while limited (review item 10).** The first pass recorded every
+   attempt, including attempts made while already rate-limited, which extended the lockout
+   indefinitely for a persistent poster. `applyIntakeRateLimit` (new, in `src/intake.ts`) records
+   an attempt only when it is allowed; limited attempts leave the persisted state untouched.
+3. **Explicit trigger (review closing note).** Intake now fires only on messages starting with
+   `!bug` (`parseIntakeTrigger`) or on a correlated reply to Devbot's own follow-up prompt.
+   Ordinary conversation in the intake channel is ignored, gets no reaction, and spends no quota.
+4. **Attachments get a graceful, documented answer (review closing note).** Attachment support is
+   explicitly not implemented (would need CDN origin validation, byte limits, MIME sniffing,
+   redirect denial); a report carrying attachments now receives a fixed
+   `attachmentsUnsupportedNote()` line, and README/product plan document image-only reports as
+   unsupported.
+5. **Delivery retry (review item 9).** Undelivered triage cards (persisted as records without a
+   `triageMessageId`) are redelivered by `retryUndeliveredIntakeCards` at startup and on the next
+   `/intake set`; redelivery is idempotent because a successful post persists the triage message id.
+6. **Authorization/routing failure modes are now unit-tested.** The project-policy decision moved
+   to `isAllowedByProjectPolicy` in `src/access.ts` (index.ts keeps a thin interaction adapter), and
+   the delivery-room decision to `chooseIntakeDeliveryRoom` in `src/intake.ts`, so the exact guards
+   used by the intake buttons/modals and card delivery are covered: `.devbot` allowlist exclusion
+   blocks a global controller, a scoped project without a verified bound room delivers nowhere
+   (never the global private room), limited attempts never extend a lockout, and undelivered
+   records are listed for redelivery and dropped once delivered.
+
+**Verification:** `npm test` — 151/151 green (+6 tests); `npm run build` and
+`npx tsc -p tsconfig.json --noEmit` clean; `git diff --check` clean.
