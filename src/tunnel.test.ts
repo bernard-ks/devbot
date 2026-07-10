@@ -127,7 +127,7 @@ test("findRunningProjectOrigin independently re-validates candidates, ignoring a
     async () => urls
   );
   assert.deepEqual(origin, { origin: "https://127.0.0.1:8443", port: 8443 });
-  assert.equal(probed.includes("https://example.com/app"), false);
+  assert.deepEqual(probed, ["http://127.0.0.1:3000", "https://127.0.0.1:8443"]);
 });
 
 test("findRunningProjectOrigin returns undefined when nothing validated is reachable", async () => {
