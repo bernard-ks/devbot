@@ -13,6 +13,8 @@ export interface ImageAttachmentInput {
 }
 
 export const MAX_IMAGE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+export const MAX_IMAGE_ATTACHMENTS_PER_MESSAGE = 4;
+export const MAX_TOTAL_ATTACHMENT_BYTES = 16 * 1024 * 1024;
 
 const SUPPORTED_IMAGE_EXTENSIONS: ReadonlyMap<string, string> = new Map([
   ["image/png", ".png"],
@@ -21,14 +23,29 @@ const SUPPORTED_IMAGE_EXTENSIONS: ReadonlyMap<string, string> = new Map([
   ["image/webp", ".webp"]
 ]);
 
+/** Discord's own CDN hosts for message-attachment bytes. Nothing else is fetched. */
+const ALLOWED_ATTACHMENT_HOSTS: ReadonlySet<string> = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
+
 function normalizedContentType(contentType: string | null | undefined): string {
   return (contentType ?? "").toLowerCase().split(";")[0]?.trim() ?? "";
+}
+
+export function isAllowedAttachmentOrigin(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && ALLOWED_ATTACHMENT_HOSTS.has(parsed.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
 }
 
 export function isSupportedImageAttachment(
   attachment: ImageAttachmentInput,
   maxBytes: number = MAX_IMAGE_ATTACHMENT_BYTES
 ): boolean {
+  if (!isAllowedAttachmentOrigin(attachment.url)) {
+    return false;
+  }
   if (!SUPPORTED_IMAGE_EXTENSIONS.has(normalizedContentType(attachment.contentType))) {
     return false;
   }
@@ -37,9 +54,20 @@ export function isSupportedImageAttachment(
 
 export function filterImageAttachments(
   attachments: ImageAttachmentInput[],
-  maxBytes: number = MAX_IMAGE_ATTACHMENT_BYTES
+  maxBytes: number = MAX_IMAGE_ATTACHMENT_BYTES,
+  maxCount: number = MAX_IMAGE_ATTACHMENTS_PER_MESSAGE,
+  maxTotalBytes: number = MAX_TOTAL_ATTACHMENT_BYTES
 ): ImageAttachmentInput[] {
-  return attachments.filter((attachment) => isSupportedImageAttachment(attachment, maxBytes));
+  const supported = attachments.filter((attachment) => isSupportedImageAttachment(attachment, maxBytes));
+  const kept: ImageAttachmentInput[] = [];
+  let totalBytes = 0;
+  for (const attachment of supported) {
+    if (kept.length >= maxCount) break;
+    if (totalBytes + attachment.size > maxTotalBytes) break;
+    kept.push(attachment);
+    totalBytes += attachment.size;
+  }
+  return kept;
 }
 
 export async function withTempImageDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -51,20 +79,108 @@ export async function withTempImageDir<T>(fn: (dir: string) => Promise<T>): Prom
   }
 }
 
-export type AttachmentFetcher = (url: string) => Promise<Response>;
+export type AttachmentFetcher = (url: string, init?: RequestInit) => Promise<Response>;
+
+const MAX_ATTACHMENT_REDIRECTS = 5;
+
+const IMAGE_SIGNATURES: ReadonlyArray<{ extension: string; matches: (buffer: Buffer) => boolean }> = [
+  {
+    extension: ".png",
+    matches: (buffer) =>
+      buffer.length >= 8 &&
+      buffer[0] === 0x89 &&
+      buffer[1] === 0x50 &&
+      buffer[2] === 0x4e &&
+      buffer[3] === 0x47 &&
+      buffer[4] === 0x0d &&
+      buffer[5] === 0x0a &&
+      buffer[6] === 0x1a &&
+      buffer[7] === 0x0a
+  },
+  {
+    extension: ".jpg",
+    matches: (buffer) => buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff
+  },
+  {
+    extension: ".webp",
+    matches: (buffer) =>
+      buffer.length >= 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP"
+  }
+];
+
+export function detectImageExtension(buffer: Buffer): string | undefined {
+  return IMAGE_SIGNATURES.find((signature) => signature.matches(buffer))?.extension;
+}
+
+async function fetchFromAllowedOrigin(
+  url: string,
+  fetchImpl: AttachmentFetcher,
+  redirectsLeft: number = MAX_ATTACHMENT_REDIRECTS
+): Promise<Response> {
+  if (!isAllowedAttachmentOrigin(url)) {
+    throw new Error("Attachment URL is not from an allowed Discord media origin.");
+  }
+  const response = await fetchImpl(url, { redirect: "manual" });
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.get("location");
+    if (!location) {
+      throw new Error("Attachment redirected without a location header.");
+    }
+    if (redirectsLeft <= 0) {
+      throw new Error("Attachment redirected too many times.");
+    }
+    const nextUrl = new URL(location, url).toString();
+    if (!isAllowedAttachmentOrigin(nextUrl)) {
+      throw new Error("Attachment redirected outside the allowed Discord media origins.");
+    }
+    return fetchFromAllowedOrigin(nextUrl, fetchImpl, redirectsLeft - 1);
+  }
+  return response;
+}
+
+async function readCappedBytes(response: Response, maxBytes: number): Promise<Buffer> {
+  const body = response.body;
+  if (!body) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength > maxBytes) {
+      throw new Error("Attachment exceeded the maximum allowed size while downloading.");
+    }
+    return buffer;
+  }
+
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel("Attachment exceeded the maximum allowed size.").catch(() => undefined);
+      throw new Error("Attachment exceeded the maximum allowed size while downloading.");
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks);
+}
 
 export async function downloadImageAttachment(
   attachment: ImageAttachmentInput,
   destDir: string,
   index: number,
-  fetchImpl: AttachmentFetcher = fetch
+  fetchImpl: AttachmentFetcher = fetch,
+  maxBytes: number = MAX_IMAGE_ATTACHMENT_BYTES
 ): Promise<string> {
-  const response = await fetchImpl(attachment.url);
+  const response = await fetchFromAllowedOrigin(attachment.url, fetchImpl);
   if (!response.ok) {
     throw new Error(`Unable to download attachment ${attachment.name}: HTTP ${response.status}`);
   }
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const extension = SUPPORTED_IMAGE_EXTENSIONS.get(normalizedContentType(attachment.contentType)) ?? ".bin";
+  const buffer = await readCappedBytes(response, maxBytes);
+  const extension = detectImageExtension(buffer);
+  if (!extension) {
+    throw new Error(`Attachment ${attachment.name} is not a recognized image format.`);
+  }
   const filePath = path.join(destDir, `image-${index}${extension}`);
   await writeFile(filePath, buffer);
   return filePath;
