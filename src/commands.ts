@@ -1,4 +1,4 @@
-import { ApplicationCommandType, ContextMenuCommandBuilder, SlashCommandBuilder } from "discord.js";
+import { ApplicationCommandType, ChannelType, ContextMenuCommandBuilder, SlashCommandBuilder } from "discord.js";
 
 const commandBuilders = [
   new SlashCommandBuilder().setName("projects").setDescription("List configured local projects."),
@@ -104,6 +104,26 @@ const commandBuilders = [
           option.setName("channel").setDescription("Discord channel to use when binding the project room.").setRequired(false)
         )
     ),
+  new SlashCommandBuilder()
+    .setName("intake")
+    .setDescription("Owner-only: configure the public community bug-intake channel.")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("set")
+        .setDescription("Designate a public channel where community members can report bugs.")
+        .addChannelOption((option) =>
+          option
+            .setName("channel")
+            .setDescription("Public channel devbot will read reports from.")
+            .setRequired(true)
+            .addChannelTypes(ChannelType.GuildText)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Project used for repro attempts.").setRequired(true).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) => subcommand.setName("off").setDescription("Disable community bug intake."))
+    .addSubcommand((subcommand) => subcommand.setName("status").setDescription("Show the intake channel and recent reports.")),
   new SlashCommandBuilder()
     .setName("status")
     .setDescription("Show current work, blockers, repository evidence, and the best next step.")

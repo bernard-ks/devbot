@@ -124,6 +124,32 @@ import {
   type TaskModalAction,
   type TaskProgressEvent
 } from "./task-ui.js";
+import {
+  intakeAcceptModal,
+  intakeControlRow,
+  parseIntakeAcceptModal,
+  parseIntakeControl,
+  type IntakeControlAction
+} from "./intake-controls.js";
+import {
+  askReporterFollowup,
+  buildClassificationQuestion,
+  buildReproQuestion,
+  buildTriageCard,
+  checkIntakeRateLimit,
+  emptyIntakeRateLimitState,
+  INTAKE_CHANNEL_LIMIT,
+  INTAKE_USER_LIMIT,
+  loggedForTriageReply,
+  missingInfoReply,
+  normalizeReportSignature,
+  parseClassificationResponse,
+  parseReproResponse,
+  recordIntakeAttempt,
+  type IntakeReproStatus,
+  type IntakeRateLimitState
+} from "./intake.js";
+import { IntakeStore, type IntakeChannelConfig, type IntakeRecord } from "./intake-store.js";
 import { UserPreferenceStore } from "./user-preferences.js";
 import {
   buildFixTaskPrompt,
@@ -198,6 +224,8 @@ const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_S
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
+const intakeStore = new IntakeStore(process.env.DEVBOT_INTAKE_STORE?.trim() || undefined);
+const intakeRateLimits = new Map<string, IntakeRateLimitState>();
 const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
 const activeWorkroomActions = new Set<string>();
@@ -352,6 +380,21 @@ client.on("interactionCreate", async (interaction) => {
         await handleScreenshotFixControl(interaction, config, screenshotFixControl.action, screenshotFixControl.id);
         return;
       }
+      const intakeControl = parseIntakeControl(interaction.customId);
+      if (intakeControl) {
+        if (!isControllerUser(interaction.user.id, config)) {
+          await interaction.reply({
+            content: "Only the owner or an approved controller can act on intake reports.",
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleIntakeButton(interaction, config, intakeControl.action, intakeControl.recordId);
+        return;
+      }
       if (!parseWorkroomButton(interaction.customId)) {
         return;
       }
@@ -440,6 +483,21 @@ client.on("interactionCreate", async (interaction) => {
         await handleTaskModal(interaction, config, taskModal.action, taskModal.taskId);
         return;
       }
+      const intakeModal = parseIntakeAcceptModal(interaction.customId);
+      if (intakeModal) {
+        if (!isControllerUser(interaction.user.id, config)) {
+          await interaction.reply({
+            content: "Only the owner or an approved controller can accept intake reports.",
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleIntakeAcceptModal(interaction, config, intakeModal.recordId);
+        return;
+      }
       const setupAction = parseSetupWizardAction(interaction.customId);
       if (!setupAction) {
         return;
@@ -483,6 +541,22 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === "intake") {
+      if (!config.ownerUserId) {
+        await interaction.reply({
+          content: "Devbot has no configured owner. Set `DEVBOT_OWNER_USER_ID` locally, restart, then run `/setup wizard`.",
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+      if (!isOwner(interaction.user.id, config)) {
+        await interaction.reply({ content: "Only the configured Devbot owner can run `/intake`.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await handleIntakeCommand(interaction, config);
+      return;
+    }
+
     if (!isAllowed(interaction, config)) {
       await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
       return;
@@ -506,6 +580,12 @@ client.on("messageCreate", async (message) => {
 
     if (message.author.bot) {
       await maybeHandlePeerMessage(message, config);
+      return;
+    }
+
+    const intakeState = await intakeStore.snapshot();
+    if (intakeState.channel && message.channelId === intakeState.channel.channelId) {
+      await handleIntakeMessage(message, config, intakeState.channel);
       return;
     }
 
@@ -5540,6 +5620,293 @@ function getBotRoleMentionIds(message: Message, botUsername: string): string[] {
   return message.mentions.roles
     .filter((role) => role.name.toLowerCase() === normalizedBotName)
     .map((role) => role.id);
+}
+
+async function handleIntakeCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === "off") {
+    await intakeStore.disable();
+    await interaction.editReply("Community bug intake is now off.");
+    return;
+  }
+
+  if (subcommand === "status") {
+    await interaction.editReply(await formatIntakeStatus());
+    return;
+  }
+
+  const channel = interaction.options.getChannel("channel", true);
+  const projectName = interaction.options.getString("project", true);
+  const project = findProject(appConfig.projects, projectName);
+  if (!project) {
+    await interaction.editReply(`Unknown project: \`${projectName}\`.`);
+    return;
+  }
+  if (channel.type !== ChannelType.GuildText) {
+    await interaction.editReply("Choose a standard text channel for the intake channel.");
+    return;
+  }
+
+  await intakeStore.setChannel(channel.id, project.name);
+  await interaction.editReply(
+    [
+      `Community bug intake is on in <#${channel.id}> for project \`${project.name}\`.`,
+      `Rate limits: ${INTAKE_USER_LIMIT} reports/hour per user, ${INTAKE_CHANNEL_LIMIT} reports/hour channel-wide.`,
+      "Complete reports get a read-only repro attempt, then a triage card in this private room."
+    ].join("\n")
+  );
+}
+
+async function formatIntakeStatus(): Promise<string> {
+  const state = await intakeStore.snapshot();
+  if (!state.channel) {
+    return "Community bug intake is off. Run `/intake set` to designate a channel and project.";
+  }
+  const recent = await intakeStore.listRecent(5);
+  const lines = [
+    `Community bug intake is on in <#${state.channel.channelId}> for project \`${state.channel.projectName}\`.`,
+    `Rate limits: ${INTAKE_USER_LIMIT} reports/hour per user, ${INTAKE_CHANNEL_LIMIT} reports/hour channel-wide.`
+  ];
+  if (recent.length > 0) {
+    lines.push(
+      "",
+      "Recent reports:",
+      recent.map((record) => `- \`${record.id}\` ${record.status} by ${record.authorTag}: ${truncateForLog(record.text)}`).join("\n")
+    );
+  }
+  return lines.join("\n");
+}
+
+async function handleIntakeMessage(message: Message, appConfig: AppConfig, channel: IntakeChannelConfig): Promise<void> {
+  const project = findProject(appConfig.projects, channel.projectName);
+  if (!project) {
+    console.warn(`Intake channel is configured for unknown project \`${channel.projectName}\`.`);
+    return;
+  }
+
+  const now = Date.now();
+  const limitState = intakeRateLimits.get(message.channelId) ?? emptyIntakeRateLimitState();
+  const check = checkIntakeRateLimit(limitState, message.author.id, now);
+  intakeRateLimits.set(message.channelId, recordIntakeAttempt(limitState, message.author.id, now));
+  if (check.limited) {
+    await message.react("⏳").catch(() => undefined);
+    return;
+  }
+
+  await message.react("👀").catch(() => undefined);
+
+  let classification;
+  try {
+    const raw = await answerWithProjectContext({
+      codex: appConfig.codex,
+      question: buildClassificationQuestion(message.content),
+      context: { project, files: [], packedText: "" },
+      mode: "answer",
+      contextMode: "none"
+    });
+    classification = parseClassificationResponse(raw);
+  } catch (error) {
+    console.warn(`Intake classification failed: ${(error as Error).message}`);
+    return;
+  }
+
+  if (!classification.complete) {
+    await message.reply(missingInfoReply(classification.missing)).catch(() => undefined);
+    return;
+  }
+
+  const signature = normalizeReportSignature(message.content);
+  const duplicate = await intakeStore.findRecentBySignature(signature);
+
+  let screenshot: ProjectScreenshot | undefined;
+  try {
+    screenshot = await captureProjectScreenshot(project, { requestText: message.content });
+  } catch (error) {
+    console.warn(`Intake screenshot capture failed: ${(error as Error).message}`);
+  }
+
+  const evidence: string[] = [];
+  if (screenshot) {
+    evidence.push(`Screenshot captured at ${screenshot.url}`);
+    for (const line of screenshot.metadata.consoleErrors) evidence.push(`Console error: ${line}`);
+    for (const line of screenshot.metadata.failedRequests) evidence.push(`Failed request: ${line}`);
+    for (const line of screenshot.metadata.badResponses) evidence.push(`Bad response: ${line}`);
+  }
+
+  let assessment: { status: IntakeReproStatus; evidence: string };
+  try {
+    const packed = await contextService.pack(project, message.content);
+    const raw = await answerWithProjectContext({
+      codex: appConfig.codex,
+      question: buildReproQuestion(message.content, evidence),
+      context: packed,
+      mode: "answer",
+      contextMode: "focused"
+    });
+    assessment = parseReproResponse(raw);
+  } catch (error) {
+    console.warn(`Intake repro assessment failed: ${(error as Error).message}`);
+    assessment = { status: "needs-info", evidence: "Automated repro assessment failed to run." };
+  }
+
+  const record = await intakeStore.addRecord({
+    channelId: message.channelId,
+    messageId: message.id,
+    authorId: message.author.id,
+    authorTag: message.author.tag,
+    projectName: project.name,
+    text: message.content,
+    signature,
+    status: assessment.status,
+    evidence: [...evidence, assessment.evidence],
+    ...(screenshot ? { screenshotUrl: screenshot.url } : {}),
+    ...(duplicate ? { duplicateOfId: duplicate.id } : {})
+  });
+
+  await message.reply(loggedForTriageReply(assessment.status)).catch(() => undefined);
+  await postIntakeTriageCard(record, duplicate, message, screenshot);
+}
+
+async function postIntakeTriageCard(
+  record: IntakeRecord,
+  duplicate: IntakeRecord | undefined,
+  sourceMessage: Message,
+  screenshot: ProjectScreenshot | undefined
+): Promise<void> {
+  const privateChannelId = effectivePrivateRoomId();
+  if (!privateChannelId) {
+    return;
+  }
+  const channel = await client.channels.fetch(privateChannelId).catch(() => undefined);
+  if (!channel) {
+    return;
+  }
+  const payload: { content: string; components: unknown[]; allowedMentions: { parse: [] }; files?: AttachmentBuilder[] } = {
+    content: buildTriageCard({ record, ...(duplicate ? { duplicateOf: duplicate } : {}), messageUrl: sourceMessage.url }),
+    components: [intakeControlRow(record.id)],
+    allowedMentions: { parse: [] }
+  };
+  if (screenshot) {
+    payload.files = [new AttachmentBuilder(screenshot.image, { name: screenshot.fileName })];
+  }
+  const sent = (await sendToTextChannel(channel, payload).catch((error) => {
+    console.warn(`Unable to post intake triage card: ${(error as Error).message}`);
+    return undefined;
+  })) as { id?: string } | undefined;
+  if (sent?.id) {
+    await intakeStore.updateRecord(record.id, { triageMessageId: sent.id });
+  }
+}
+
+async function refreshIntakeCard(record: IntakeRecord): Promise<void> {
+  const privateChannelId = effectivePrivateRoomId();
+  if (!privateChannelId || !record.triageMessageId) {
+    return;
+  }
+  try {
+    const channel = await client.channels.fetch(privateChannelId);
+    if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread)) {
+      return;
+    }
+    const room = channel as GuildTextBasedChannel;
+    const message = await room.messages.fetch(record.triageMessageId);
+    const duplicate = record.duplicateOfId ? await intakeStore.get(record.duplicateOfId) : undefined;
+    const messageUrl = `https://discord.com/channels/${message.guildId ?? "@me"}/${record.channelId}/${record.messageId}`;
+    await message.edit({
+      content: buildTriageCard({ record, ...(duplicate ? { duplicateOf: duplicate } : {}), messageUrl }),
+      components: record.status === "dismissed" || record.status === "accepted" ? [] : [intakeControlRow(record.id)]
+    });
+  } catch (error) {
+    console.warn(`Unable to refresh intake triage card: ${(error as Error).message}`);
+  }
+}
+
+async function handleIntakeButton(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: IntakeControlAction,
+  recordId: string
+): Promise<void> {
+  const record = await intakeStore.get(recordId);
+  if (!record) {
+    await interaction.reply({ content: "This intake report is no longer in the local store.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (action === "accept") {
+    if (record.status === "dismissed" || record.status === "accepted") {
+      await interaction.reply({ content: `This report is already ${record.status}.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!findProject(appConfig.projects, record.projectName)) {
+      await interaction.reply({ content: `Project \`${record.projectName}\` is no longer configured.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.showModal(intakeAcceptModal(record));
+    return;
+  }
+
+  if (action === "ask") {
+    await interaction.deferUpdate();
+    const channel = await client.channels.fetch(record.channelId).catch(() => undefined);
+    if (channel) {
+      await sendToTextChannel(channel, {
+        content: askReporterFollowup(record.authorId),
+        allowedMentions: { parse: ["users"] }
+      }).catch((error) => console.warn(`Unable to post intake follow-up: ${(error as Error).message}`));
+    }
+    await interaction.followUp({ content: "Posted a follow-up request in the intake channel.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferUpdate();
+  if (record.status !== "dismissed" && record.status !== "accepted") {
+    const updated = await intakeStore.updateRecord(recordId, { status: "dismissed" });
+    if (updated) {
+      await refreshIntakeCard(updated);
+    }
+  }
+  await interaction.followUp({ content: "Dismissed.", flags: MessageFlags.Ephemeral });
+}
+
+async function handleIntakeAcceptModal(interaction: ModalSubmitInteraction, appConfig: AppConfig, recordId: string): Promise<void> {
+  const record = await intakeStore.get(recordId);
+  if (!record) {
+    await interaction.reply({ content: "This intake report is no longer in the local store.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, record.projectName);
+  if (!project) {
+    await interaction.reply({ content: `Project \`${record.projectName}\` is no longer configured.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (record.status === "dismissed" || record.status === "accepted") {
+    await interaction.reply({ content: `This report is already ${record.status}.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (isWriteBlockedBySafeMode(appConfig, "action")) {
+    await interaction.reply({ content: safeModeActionMessage("intake Accept as task"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const task = interaction.fields.getTextInputValue("task").trim();
+  const updated = await intakeStore.updateRecord(recordId, { status: "accepted" });
+  if (updated) {
+    await refreshIntakeCard(updated);
+  }
+  await executeInteractionRequest({
+    interaction,
+    appConfig,
+    project,
+    text: task,
+    includePatterns: [],
+    mode: "action",
+    requester: interaction.user.tag,
+    source: `intake:accept:${record.id}`,
+    ephemeral: false
+  });
 }
 
 async function ensureProjectAccess(interaction: ChatInputCommandInteraction, project: ProjectEntry): Promise<boolean> {
