@@ -143,6 +143,40 @@ process.exit(7);
   assert.equal(exitCalls, 1);
 });
 
+test("slow exit bookkeeping cannot turn an already-observed successful close into a timeout", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-slow-exit-bookkeeping-"));
+  const fakeCodex = path.join(root, "fake-codex.mjs");
+  await writeFile(
+    fakeCodex,
+    `#!/usr/bin/env node
+import { writeFile } from "node:fs/promises";
+for await (const _chunk of process.stdin) {}
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("--output-last-message");
+if (outputIndex >= 0) await writeFile(args[outputIndex + 1], "finished before deadline");
+`
+  );
+  await chmod(fakeCodex, 0o700);
+
+  const answer = await completeCodexPrompt({
+    codex: {
+      bin: fakeCodex,
+      model: undefined,
+      sandbox: "read-only",
+      actionSandbox: "workspace-write",
+      timeoutMs: 200
+    },
+    prompt: "finish quickly",
+    cwd: root,
+    sandbox: "read-only",
+    skipGitRepoCheck: true,
+    onExit: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+  });
+  assert.equal(answer, "finished before deadline");
+});
+
 async function waitForExit(pid: number, timeoutMs = 4_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {

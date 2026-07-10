@@ -338,6 +338,7 @@ function runSpec(
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let closeObserved = false;
     let terminationError: Error | undefined;
     let terminationFallback: NodeJS.Timeout | undefined;
 
@@ -356,6 +357,14 @@ function runSpec(
     });
     child.on("error", (error) => finish(error));
     child.on("close", (code) => {
+      closeObserved = true;
+      // The worker is finished. Freeze execution-time accounting before any
+      // potentially slow durable bookkeeping so a successful near-deadline run
+      // cannot be relabeled as a timeout after its close was observed.
+      clearTimeout(timer);
+      if (terminationFallback) clearTimeout(terminationFallback);
+      signal?.removeEventListener("abort", abort);
+      const observedTerminationError = terminationError;
       void (async () => {
         try {
           await onExit?.();
@@ -363,8 +372,8 @@ function runSpec(
           // Exit bookkeeping is recovery metadata. Its caller retains the
           // existing worker record on failure, so the retry gate stays closed.
         }
-        if (terminationError) {
-          finish(terminationError);
+        if (observedTerminationError) {
+          finish(observedTerminationError);
           return;
         }
         if (code === 0) {
@@ -420,7 +429,7 @@ function runSpec(
     })();
 
     function requestTermination(error: Error): void {
-      if (settled || terminationError) return;
+      if (settled || closeObserved || terminationError) return;
       terminationError = error;
       terminateChild(child.pid);
       terminationFallback = setTimeout(() => finish(error), 5_000);
