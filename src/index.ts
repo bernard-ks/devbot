@@ -1347,6 +1347,8 @@ interface ProjectRequestOptions {
   displayText?: string;
   signal?: AbortSignal;
   onProgress?: (progress: TaskProgressEvent) => Promise<void>;
+  /** Fires once the task record is durably created, before any work that can fail. Used to consume a caller-owned pending record only after there is something to retry against. */
+  onTaskStarted?: (taskId: string) => Promise<void>;
 }
 
 interface ProjectRequestResult {
@@ -1379,6 +1381,13 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
         ...(options.threadId ? { threadId: options.threadId } : {}),
         ...(options.agentRoles?.length ? { agentRoles: options.agentRoles } : {})
       });
+  if (options.onTaskStarted) {
+    try {
+      await options.onTaskStarted(task.id);
+    } catch (error) {
+      console.warn(`Unable to run the post-start hook for task ${task.id}: ${publicErrorMessage(error)}`);
+    }
+  }
   const controller = new AbortController();
   const abortFromParent = (): void => controller.abort(options.signal?.reason);
   if (options.signal?.aborted) abortFromParent();
@@ -2814,13 +2823,23 @@ async function handleScreenshotFixControl(
     return;
   }
 
+  const isRequester = record.requesterId === interaction.user.id;
+  const isController = isControllerUser(interaction.user.id, appConfig);
+
   if (action === "dismiss") {
+    if (!isRequester && !isController) {
+      await interaction.reply({
+        content: "Only the person who reported this screenshot, or an approved controller, can dismiss it.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
     await screenshotFixStore.remove(id);
     await interaction.update({ content: "Dismissed.", components: [] });
     return;
   }
 
-  if (!isControllerUser(interaction.user.id, appConfig)) {
+  if (!isController) {
     await interaction.reply({
       content: "You have view access, but only the owner or an approved controller can start write-capable work.",
       flags: MessageFlags.Ephemeral
@@ -2834,7 +2853,6 @@ async function handleScreenshotFixControl(
 
   await runTaskActionOnce(interaction, `snap-fix:${id}`, async () => {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    await screenshotFixStore.remove(id);
     await executeInteractionRequest({
       interaction,
       appConfig,
@@ -2845,7 +2863,10 @@ async function handleScreenshotFixControl(
       requester: interaction.user.tag,
       source: `button:snap-fix:${id}`,
       ephemeral: true,
-      dedupeKey: `snap-fix:${id}`
+      dedupeKey: `snap-fix:${id}`,
+      onTaskStarted: async () => {
+        await screenshotFixStore.remove(id);
+      }
     });
   });
 }
