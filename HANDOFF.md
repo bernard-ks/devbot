@@ -101,3 +101,45 @@ disputed / withdrawn) surfaces to the owner in a dedicated Discord thread.
   back-to-back for a `deep`/Sol-tier reviewer; the slash command and button both defer the reply
   immediately and the thread/summary land once both rounds finish, so Discord's interaction timeout
   should not be hit, but this is slower than every other single-round command in devbot today.
+
+## Rebased onto 85e2530
+
+Rebased onto `origin/main` at `85e2530` ("Add ambient Discord workrooms and security hardening",
+`dd0af6b`), which landed isolated per-task git worktrees (`src/task-worktree.ts`), a hardened
+`codex-client.ts` (stdin prompts, isolated env, redaction, concurrency limits), and
+`security.ts`/`publicErrorMessage()`. Only conflict was the import block at the top of
+`src/index.ts` (both sides added imports); resolved by keeping both.
+
+Semantic fix required beyond the textual merge: `runDuelForTask` was still gathering diff evidence
+and setting the reviewer's `cwd` from the raw `project` passed in. With isolated task worktrees, a
+completed action task's actual changes live in `task.workspacePath`, not the source checkout, so
+the duel would review a diff with nothing in it (or the wrong code). Fixed by resolving the diff
+target through bernard's existing `projectForTaskWorkspace(project, task)` helper (same one
+`review.ts`'s packet/validate paths already use) before calling `gatherDuelChangeEvidence` and
+before building `runDuelReview`'s `projectRoot`:
+
+```ts
+const diffProject = await projectForTaskWorkspace(project, task);
+const diff = await gatherDuelChangeEvidence(diffProject);
+const result = await runDuelReview({
+  ...,
+  projectRoot: diffProject.root,
+  diff,
+  ...
+});
+```
+
+The original (non-resolved) `project` is still used for `startLabConversation`/`recordDuelResult`
+since those need the registered project's identity/metadata, not the ephemeral worktree path.
+
+No changes were needed for the other two carryover requirements: `duel.ts` already imports
+`completeCodexPrompt` from `./codex-client.js`, so the reviewer and rebuttal rounds automatically
+run through the merged, hardened client (stdin prompt delivery, isolated temp `$HOME`, credential
+redaction) with no code change on this side. Discord-facing errors from every duel entry point
+(`/review duel`, the Duel review button, the Accept & fix modal) already funnel through the
+top-level `interactionCreate` `try/catch` → `replyWithError`, which already calls
+`publicErrorMessage()` — the duel handlers never format raw `error.message` themselves.
+
+`npm test`: 134/134 passing after rebase (includes the previously-flagged flaky
+`security.test.ts` case "configured project commands receive an empty temporary home" — passed
+clean on the first run, no rerun needed).
