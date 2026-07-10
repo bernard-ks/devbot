@@ -18,6 +18,7 @@ export interface SetupState {
   privateChannelId?: string;
   workspaceMessageId?: string;
   agentBackendId?: string;
+  previewTunnelsEnabled: boolean;
 }
 
 const EMPTY_SETUP: SetupState = {
@@ -26,7 +27,8 @@ const EMPTY_SETUP: SetupState = {
   controllerUserIds: [],
   peerBotIds: [],
   repositories: {},
-  projectRoomIds: {}
+  projectRoomIds: {},
+  previewTunnelsEnabled: false
 };
 
 export class SetupStore {
@@ -141,6 +143,13 @@ export class SetupStore {
     });
   }
 
+  setPreviewTunnelsEnabled(enabled: boolean): Promise<SetupState> {
+    return this.mutate((state) => {
+      state.previewTunnelsEnabled = enabled;
+      return cloneSetup(state);
+    });
+  }
+
   private mutate<T>(change: (draft: SetupState) => T): Promise<T> {
     const run = this.mutationQueue.then(async () => {
       const draft = cloneSetup(this.state);
@@ -178,6 +187,7 @@ function loadSetupState(filePath: string): SetupState {
     peerBotIds: stringList(raw.peerBotIds),
     repositories: stringRecord(raw.repositories),
     projectRoomIds: projectRoomIdRecord(raw.projectRoomIds),
+    previewTunnelsEnabled: raw.previewTunnelsEnabled === true,
     ...(typeof raw.defaultProjectName === "string" && raw.defaultProjectName.trim()
       ? { defaultProjectName: normalizeProjectName(raw.defaultProjectName) }
       : {}),
@@ -247,6 +257,7 @@ function cloneSetup(state: SetupState): SetupState {
     peerBotIds: [...state.peerBotIds],
     repositories: { ...state.repositories },
     projectRoomIds: { ...state.projectRoomIds },
+    previewTunnelsEnabled: state.previewTunnelsEnabled,
     ...(state.defaultProjectName ? { defaultProjectName: state.defaultProjectName } : {}),
     ...(state.privateChannelId ? { privateChannelId: state.privateChannelId } : {}),
     ...(state.workspaceMessageId ? { workspaceMessageId: state.workspaceMessageId } : {}),

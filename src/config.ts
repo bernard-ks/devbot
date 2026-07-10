@@ -33,7 +33,8 @@ export function loadConfig(): AppConfig {
     peerBotIds: csvSet(process.env.PEER_BOT_IDS),
     coordinationChannelId: process.env.COORDINATION_CHANNEL_ID?.trim() || undefined,
     projects,
-    scanner: DEFAULT_SCANNER
+    scanner: DEFAULT_SCANNER,
+    previewTunnelsEnabled: false
   };
 }
 

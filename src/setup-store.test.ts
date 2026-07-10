@@ -109,13 +109,15 @@ test("runtime setup merges bootstrap and managed access while selecting a defaul
     repositories: { second: "/tmp/second" },
     projectRoomIds: {},
     defaultProjectName: "second",
-    privateChannelId: "private-room"
+    privateChannelId: "private-room",
+    previewTunnelsEnabled: true
   };
 
   applySetupState(config, bootstrap, state);
   assert.deepEqual([...config.allowedUserIds].sort(), ["bootstrap-user", "controller", "owner", "viewer"]);
   assert.deepEqual([...config.peerBotIds].sort(), ["bootstrap-peer", "peer"]);
   assert.equal(config.coordinationChannelId, "private-room");
+  assert.equal(config.previewTunnelsEnabled, true);
   assert.equal(config.projects.find((item) => item.isDefault)?.name, "second");
   assert.equal(isSetupController(state, config.ownerUserId, "owner"), true);
   assert.equal(isSetupController(state, config.ownerUserId, "controller"), true);
@@ -146,7 +148,8 @@ test("slash schema exposes owner setup and optional default-project commands", (
     "devbot",
     "repo",
     "room",
-    "project-room"
+    "project-room",
+    "preview"
   ]);
   assert.equal(ask?.options?.find((option) => option.name === "project")?.required, false);
   assert.equal(doCommand?.options?.find((option) => option.name === "project")?.required, false);
@@ -163,7 +166,8 @@ test("setup wizard renders resumable readiness and native controls", () => {
     controllerUserIds: [],
     peerBotIds: [],
     repositories: {},
-    projectRoomIds: {}
+    projectRoomIds: {},
+    previewTunnelsEnabled: false
   };
   const incomplete = setupWizardView(emptyState, config, undefined);
   const incompleteRows = incomplete.components.map((row) => row.toJSON());
@@ -218,7 +222,8 @@ function appConfig(projects: ProjectEntry[]): AppConfig {
     peerBotIds: new Set(["bootstrap-peer"]),
     coordinationChannelId: "bootstrap-room",
     projects,
-    scanner: { maxIndexedFileBytes: 1, maxSnippetCharsPerFile: 1, maxPackedContextChars: 1, maxRankedFiles: 1 }
+    scanner: { maxIndexedFileBytes: 1, maxSnippetCharsPerFile: 1, maxPackedContextChars: 1, maxRankedFiles: 1 },
+    previewTunnelsEnabled: false
   };
 }
 

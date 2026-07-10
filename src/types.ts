@@ -24,6 +24,7 @@ export interface AppConfig {
   coordinationChannelId: string | undefined;
   projects: ProjectEntry[];
   scanner: ScannerConfig;
+  previewTunnelsEnabled: boolean;
 }
 
 export interface BotIdentity {
