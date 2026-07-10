@@ -107,6 +107,42 @@ if (outputIndex >= 0) await writeFile(args[outputIndex + 1], "fake answer");
   assert.throws(() => process.kill(workerPid!, 0));
 });
 
+test("observed close invokes exit bookkeeping even when the worker exits nonzero", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-exit-bookkeeping-"));
+  const fakeCodex = path.join(root, "fake-codex.mjs");
+  await writeFile(
+    fakeCodex,
+    `#!/usr/bin/env node
+for await (const _chunk of process.stdin) {}
+process.stderr.write("intentional failure");
+process.exit(7);
+`
+  );
+  await chmod(fakeCodex, 0o700);
+
+  let exitCalls = 0;
+  await assert.rejects(
+    completeCodexPrompt({
+      codex: {
+        bin: fakeCodex,
+        model: undefined,
+        sandbox: "read-only",
+        actionSandbox: "workspace-write",
+        timeoutMs: 5_000
+      },
+      prompt: "consume then fail",
+      cwd: root,
+      sandbox: "read-only",
+      skipGitRepoCheck: true,
+      onExit: async () => {
+        exitCalls += 1;
+      }
+    }),
+    /Agent exited with code 7/
+  );
+  assert.equal(exitCalls, 1);
+});
+
 async function waitForExit(pid: number, timeoutMs = 4_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {

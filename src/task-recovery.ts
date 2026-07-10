@@ -611,11 +611,9 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   try {
     process.kill(-pid, signal);
   } catch {
-    try {
-      process.kill(pid, signal);
-    } catch {
-      // Process already exited.
-    }
+    // A detached worker is its process-group leader. Never fall back to the
+    // positive pid after a failed group signal: the group may have vanished
+    // and that numeric pid may already belong to an unrelated process.
   }
 }
 

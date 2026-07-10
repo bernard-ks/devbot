@@ -33,6 +33,7 @@ export interface AnswerOptions {
   contextMode?: RequestContextMode;
   signal?: AbortSignal;
   onSpawn?: (pid: number) => void | Promise<void>;
+  onExit?: () => void | Promise<void>;
 }
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
@@ -48,7 +49,8 @@ export async function answerWithProjectContext(options: AnswerOptions): Promise<
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     ...(options.tier ? { tier: options.tier } : {}),
     ...(options.signal ? { signal: options.signal } : {}),
-    ...(options.onSpawn ? { onSpawn: options.onSpawn } : {})
+    ...(options.onSpawn ? { onSpawn: options.onSpawn } : {}),
+    ...(options.onExit ? { onExit: options.onExit } : {})
   });
 }
 
@@ -66,6 +68,7 @@ export interface CompleteCodexOptions {
   imagePaths?: string[];
   signal?: AbortSignal;
   onSpawn?: (pid: number) => void | Promise<void>;
+  onExit?: () => void | Promise<void>;
 }
 
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
@@ -107,7 +110,7 @@ export async function completeCodexPrompt(options: CompleteCodexOptions): Promis
           );
         }
       }
-      const output = await runBackend(spec, options.signal, options.onSpawn);
+      const output = await runBackend(spec, options.signal, options.onSpawn, options.onExit);
       const answer = redactSensitiveText(output.trim());
       return answer || `${backend.displayName} did not produce a final text answer.`;
     } finally {
@@ -309,9 +312,10 @@ export function parseLocateResponse(raw: string): LocatedError {
 async function runBackend(
   spec: SpawnSpec,
   signal?: AbortSignal,
-  onSpawn?: (pid: number) => void | Promise<void>
+  onSpawn?: (pid: number) => void | Promise<void>,
+  onExit?: () => void | Promise<void>
 ): Promise<string> {
-  const stdout = await runSpec(spec, signal, onSpawn);
+  const stdout = await runSpec(spec, signal, onSpawn, onExit);
   if (spec.outputFile) {
     return (await readFile(spec.outputFile, "utf8")).trim();
   }
@@ -321,7 +325,8 @@ async function runBackend(
 function runSpec(
   spec: SpawnSpec,
   signal?: AbortSignal,
-  onSpawn?: (pid: number) => void | Promise<void>
+  onSpawn?: (pid: number) => void | Promise<void>,
+  onExit?: () => void | Promise<void>
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(spec.bin, spec.args, {
@@ -351,16 +356,24 @@ function runSpec(
     });
     child.on("error", (error) => finish(error));
     child.on("close", (code) => {
-      if (terminationError) {
-        finish(terminationError);
-        return;
-      }
-      if (code === 0) {
-        finish();
-        return;
-      }
+      void (async () => {
+        try {
+          await onExit?.();
+        } catch {
+          // Exit bookkeeping is recovery metadata. Its caller retains the
+          // existing worker record on failure, so the retry gate stays closed.
+        }
+        if (terminationError) {
+          finish(terminationError);
+          return;
+        }
+        if (code === 0) {
+          finish();
+          return;
+        }
 
-      finish(new Error(`Agent exited with code ${code}.\n${trimProcessOutput(stderr || stdout)}`));
+        finish(new Error(`Agent exited with code ${code}.\n${trimProcessOutput(stderr || stdout)}`));
+      })();
     });
     if (spec.stdin !== undefined && child.stdin) {
       child.stdin.on("error", (error) => {

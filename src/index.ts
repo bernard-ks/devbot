@@ -1655,11 +1655,16 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     // withholds stdin until recordExecutionChild atomically persists the exact
     // child identity and advances the phase to running-codex.
     await executionLedger.setPhase(task.id, "spawning-worker");
-    const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal, recordExecutionChild(task.id));
-    // runCodex resolves only after the leader's close event. Persist that fact
-    // before terminal settlement; on Windows this is what distinguishes a safe
-    // no-child record from an interrupted worker whose identity cannot be read.
-    await recordExecutionState(task.id, executionLedger.setPhase(task.id, "worker-exited"));
+    const answer = await runCodex(
+      options.appConfig,
+      options.text,
+      context,
+      options.mode,
+      route,
+      controller.signal,
+      recordExecutionChild(task.id),
+      recordExecutionExit(task.id)
+    );
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree, true, workspaceNotes);
       // Every action task runs in an isolated Git worktree (task-worktree.ts); Codex's edits land
@@ -1790,6 +1795,16 @@ async function settleExecutionRecordSafely(taskId: string): Promise<void> {
     // reconcile it and the ledger-derived retry gate remains closed.
     console.warn(`Unable to settle the execution ledger for ${taskId}: ${publicErrorMessage(error)}`);
   }
+}
+
+function recordExecutionExit(taskId: string): () => Promise<void> {
+  return async () => {
+    // The close event is authoritative for the leader even when it exits
+    // nonzero. Persist it independently of runCodex's success value, then reap
+    // any same-group descendants before the caller sees completion.
+    await recordExecutionState(taskId, executionLedger.setPhase(taskId, "worker-exited"));
+    await settleExecutionRecordSafely(taskId);
+  };
 }
 
 async function rememberTaskMessage(taskId: string, channelId: string, messageId: string): Promise<void> {
@@ -5616,7 +5631,8 @@ async function runCodex(
   mode: CodexRequestMode,
   route: RequestRoute,
   signal?: AbortSignal,
-  onSpawn?: (pid: number) => void | Promise<void>
+  onSpawn?: (pid: number) => void | Promise<void>,
+  onExit?: () => void | Promise<void>
 ): Promise<string> {
   return answerWithProjectContext({
     codex: appConfig.codex,
@@ -5628,7 +5644,8 @@ async function runCodex(
     tier: route.tier,
     contextMode: route.contextMode,
     ...(signal ? { signal } : {}),
-    ...(onSpawn ? { onSpawn } : {})
+    ...(onSpawn ? { onSpawn } : {}),
+    ...(onExit ? { onExit } : {})
   });
 }
 
