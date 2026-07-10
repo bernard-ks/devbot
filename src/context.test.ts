@@ -701,6 +701,7 @@ test("autocomplete helpers suggest projects commands tasks and peers", () => {
   const longId = `mem-${"a".repeat(60)}`;
   const memoryEntry = {
     schemaVersion: 1 as const,
+    projectName: "demo",
     id: longId,
     kind: "decision" as const,
     text: `Adopt the new renderer. ${"context ".repeat(30)}`,

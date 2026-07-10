@@ -48,6 +48,7 @@ export const MEMORY_SCHEMA_VERSION = 1;
 
 export interface MemoryEntry {
   schemaVersion: 1;
+  projectName: string;
   id: string;
   kind: MemoryKind;
   text: string;
@@ -117,7 +118,7 @@ export class MemoryStore {
     this.root = path.resolve(storeRoot);
   }
 
-  async fileFor(project: Pick<ProjectEntry, "root">): Promise<string> {
+  async fileFor(project: MemoryProject): Promise<string> {
     const key = await canonicalProjectKey(project);
     const file = path.join(this.root, `${key}.jsonl`);
     assertWithinStoreRoot(this.root, file);
@@ -125,7 +126,7 @@ export class MemoryStore {
   }
 
   async add(project: MemoryProject, input: AddMemoryInput): Promise<MemoryEntry> {
-    const entry = buildEntry(input);
+    const entry = buildEntry(project, input);
 
     await this.mutate(project, (state) => {
       const nextEntries = pruneEntries([...state.entries, entry], this.maxOutcomes, this.maxTotalEntries);
@@ -197,7 +198,7 @@ export class MemoryStore {
   }
 
   /** Deletes the project's entire memory file. Used when a repository is removed from setup. */
-  async purgeProject(project: Pick<ProjectEntry, "root">): Promise<void> {
+  async purgeProject(project: MemoryProject): Promise<void> {
     const file = await this.fileFor(project);
     await rm(file, { force: true });
   }
@@ -209,10 +210,10 @@ export class MemoryStore {
   private async readState(project: MemoryProject): Promise<MemoryFileState> {
     const file = await this.fileFor(project);
     await this.ensureLegacyMigrated(project, file);
-    return this.readStateFromFile(file);
+    return this.readStateFromFile(file, project.name);
   }
 
-  private async readStateFromFile(file: string): Promise<MemoryFileState> {
+  private async readStateFromFile(file: string, projectIdentity: string): Promise<MemoryFileState> {
     let raw: string;
     try {
       raw = await readFileRejectingSymlinks(file);
@@ -227,7 +228,7 @@ export class MemoryStore {
       throw new Error(`Unable to read memory store at ${file}: ${(error as Error).message}`, { cause: error });
     }
     await hardenPrivateFilePermissions(file);
-    return parseJsonl(raw);
+    return parseJsonl(raw, projectIdentity);
   }
 
   private async ensureLegacyMigrated(project: MemoryProject, file: string): Promise<void> {
@@ -270,7 +271,7 @@ export class MemoryStore {
     }
 
     const legacy = await this.parseLegacyState(await readFileRejectingSymlinks(legacyFile), project.name);
-    const current = await this.readStateFromFile(centralFile);
+    const current = await this.readStateFromFile(centralFile, project.name);
     const knownIds = new Set(current.entries.map((entry) => entry.id));
     const merged: MemoryFileState = {
       entries: [...current.entries, ...legacy.entries.filter((entry) => !knownIds.has(entry.id))],
@@ -313,8 +314,15 @@ export class MemoryStore {
   private async normalizeLegacyEntry(value: unknown, projectIdentity: string): Promise<MemoryEntry | undefined> {
     const core = normalizeEntryCore(value);
     if (!core) return undefined;
+    if (core.claimedProjectName && !sameProjectIdentity(core.claimedProjectName, projectIdentity)) return undefined;
+    if (!core.claimedProjectName) {
+      const task = core.taskId && this.taskLookup
+        ? await this.taskLookup.get(core.taskId).catch(() => undefined)
+        : undefined;
+      if (!taskVouchesForProject(task, projectIdentity)) return undefined;
+    }
     const scope = await this.resolveLegacyScope(core, projectIdentity);
-    return scope ? assembleEntry(core, scope) : undefined;
+    return scope ? assembleEntry(core, scope, projectIdentity) : undefined;
   }
 
   /**
@@ -387,7 +395,7 @@ export interface MemoryStoreHealth {
 }
 
 export async function checkMemoryStoreHealth(
-  project: Pick<ProjectEntry, "root">,
+  project: MemoryProject,
   storeRoot: string = DEFAULT_MEMORY_STORE_ROOT
 ): Promise<MemoryStoreHealth> {
   const key = await canonicalProjectKey(project);
@@ -396,7 +404,7 @@ export async function checkMemoryStoreHealth(
   let quarantinedCount = 0;
   try {
     const raw = await readFileRejectingSymlinks(file);
-    quarantinedCount = parseJsonl(raw).quarantined.length;
+    quarantinedCount = parseJsonl(raw, project.name).quarantined.length;
   } catch (error) {
     readable = (error as NodeJS.ErrnoException).code === "ENOENT";
   }
@@ -433,7 +441,7 @@ function formatMemoryLine(entry: MemoryEntry): string {
   return `- \`${entry.id}\` [${formatTime(entry.createdAt)}] ${entry.kind}/${entry.source}: ${truncate(redactSensitiveText(entry.text), 200)}${task}${tags}${state}`;
 }
 
-function buildEntry(input: AddMemoryInput): MemoryEntry {
+function buildEntry(project: MemoryProject, input: AddMemoryInput): MemoryEntry {
   const text = redactSensitiveText(input.text.trim());
   if (!text) {
     throw new Error("Memory text cannot be empty.");
@@ -450,6 +458,7 @@ function buildEntry(input: AddMemoryInput): MemoryEntry {
 
   return {
     schemaVersion: MEMORY_SCHEMA_VERSION,
+    projectName: normalizeProjectIdentity(project.name),
     id: newMemoryId(),
     kind: input.kind,
     text,
@@ -492,9 +501,17 @@ function taskVouchesForProject(
 
 /** Case- and whitespace-insensitive equality of two project identities; an empty identity never matches, failing closed. */
 function sameProjectIdentity(a: string, b: string): boolean {
-  const left = a.trim().toLowerCase();
-  const right = b.trim().toLowerCase();
+  const left = a.trim().toLowerCase().slice(0, MAX_ID_FIELD_LENGTH);
+  const right = b.trim().toLowerCase().slice(0, MAX_ID_FIELD_LENGTH);
   return left.length > 0 && left === right;
+}
+
+function normalizeProjectIdentity(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    throw new Error("Project memory requires a non-empty project name.");
+  }
+  return normalized.slice(0, MAX_ID_FIELD_LENGTH);
 }
 
 function pruneEntries(entries: MemoryEntry[], maxOutcomes: number, maxTotalEntries: number): MemoryEntry[] {
@@ -592,13 +609,18 @@ function assertWithinStoreRoot(root: string, file: string): void {
   }
 }
 
-async function canonicalProjectKey(project: Pick<ProjectEntry, "root">): Promise<string> {
+async function canonicalProjectKey(project: MemoryProject): Promise<string> {
   const resolved = await realpath(project.root).catch(() => path.resolve(project.root));
-  return createHash("sha256").update(resolved).digest("hex").slice(0, 40);
+  return createHash("sha256")
+    .update(resolved)
+    .update("\0")
+    .update(normalizeProjectIdentity(project.name))
+    .digest("hex")
+    .slice(0, 40);
 }
 
 /** Parses the JSONL memory file into valid entries plus quarantined raw lines that failed schema validation. */
-function parseJsonl(raw: string): MemoryFileState {
+function parseJsonl(raw: string, projectIdentity: string): MemoryFileState {
   const entries: MemoryEntry[] = [];
   const quarantined: string[] = [];
   for (const line of raw.split("\n")) {
@@ -615,7 +637,7 @@ function parseJsonl(raw: string): MemoryFileState {
       continue;
     }
 
-    const entry = normalizeStoredEntry(parsed);
+    const entry = normalizeStoredEntry(parsed, projectIdentity);
     if (entry) {
       entries.push(entry);
     } else {
@@ -628,6 +650,7 @@ function parseJsonl(raw: string): MemoryFileState {
 /** Everything a validated memory record carries except its final access scope, plus the record's own (untrusted) scope claim. */
 interface EntryCore {
   schemaVersion: 1;
+  claimedProjectName?: string;
   id: string;
   kind: MemoryKind;
   text: string;
@@ -657,14 +680,21 @@ interface ScopeDecision {
  * access scope fails closed: it is quarantined rather than defaulted to project
  * visibility, so an unrelated viewer can never read a scope that was never set.
  */
-function normalizeStoredEntry(value: unknown): MemoryEntry | undefined {
+function normalizeStoredEntry(value: unknown, projectIdentity: string): MemoryEntry | undefined {
   const core = normalizeEntryCore(value);
-  if (!core || core.claimedScope === undefined) return undefined;
+  if (
+    !core ||
+    core.claimedScope === undefined ||
+    !core.claimedProjectName ||
+    !sameProjectIdentity(core.claimedProjectName, projectIdentity)
+  ) {
+    return undefined;
+  }
   return assembleEntry(core, {
     accessScope: core.claimedScope,
     ...(core.claimedRequesterId ? { requesterId: core.claimedRequesterId } : {}),
     ...(core.claimedInternal ? { internal: true } : {})
-  });
+  }, projectIdentity);
 }
 
 /** Validates every field except the access-scope decision, which the caller finalizes (fail-closed for stored reads, recovered for legacy migration). */
@@ -705,6 +735,7 @@ function normalizeEntryCore(value: unknown): EntryCore | undefined {
 
   return {
     schemaVersion: MEMORY_SCHEMA_VERSION,
+    ...(stringValue(raw.projectName) ? { claimedProjectName: normalizeProjectIdentity(stringValue(raw.projectName)!) } : {}),
     id: raw.id,
     kind: raw.kind as MemoryKind,
     text,
@@ -724,9 +755,10 @@ function normalizeEntryCore(value: unknown): EntryCore | undefined {
 }
 
 /** Builds a MemoryEntry from a validated core and a finalized scope decision. */
-function assembleEntry(core: EntryCore, scope: ScopeDecision): MemoryEntry {
+function assembleEntry(core: EntryCore, scope: ScopeDecision, projectIdentity: string): MemoryEntry {
   return {
     schemaVersion: MEMORY_SCHEMA_VERSION,
+    projectName: normalizeProjectIdentity(projectIdentity),
     id: core.id,
     kind: core.kind,
     text: core.text,

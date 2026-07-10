@@ -6,6 +6,7 @@ import type { MemoryEntry } from "./memory-store.js";
 function entry(overrides: Partial<MemoryEntry>): MemoryEntry {
   return {
     schemaVersion: 1,
+    projectName: "demo",
     id: "mem-1",
     kind: "decision",
     text: "Chose SQLite for local storage.",

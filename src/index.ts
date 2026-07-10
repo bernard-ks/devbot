@@ -995,7 +995,7 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
       const state = await setupStore.removeRepository(name);
       contextService.invalidate(name);
       applySetupState(appConfig, bootstrapConfig, state);
-      await memoryStore.purgeProject({ root: managed }).catch((error: unknown) => {
+      await memoryStore.purgeProject({ root: managed, name }).catch((error: unknown) => {
         console.warn(`Unable to purge project memory for removed repository \`${name}\`: ${(error as Error).message}`);
       });
       await interaction.editReply(`Removed setup-managed repository \`${name}\`.`);

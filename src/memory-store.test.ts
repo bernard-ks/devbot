@@ -45,6 +45,67 @@ test("memory store persists entries under a central Devbot-owned store, not the 
   await assert.rejects(() => stat(projectDevbotFile));
 });
 
+test("same-root project aliases have isolated files and reject entries bound to another project identity", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-memory-shared-root-"));
+  const privateProject = { root, name: "private-a" };
+  const publicAlias = { root, name: "public-alias" };
+  const store = new MemoryStore(await tempStoreRoot());
+
+  const privateEntry = await store.add(privateProject, {
+    kind: "decision",
+    text: "Private launch secret uses the midnight window.",
+    source: "manual",
+    author: "owner"
+  });
+  assert.equal(privateEntry.projectName, "private-a");
+
+  const privateFile = await store.fileFor(privateProject);
+  const publicFile = await store.fileFor(publicAlias);
+  assert.notEqual(privateFile, publicFile, "project name must participate in the central store namespace");
+
+  assert.deepEqual(await store.list(publicAlias, { access: otherViewer }), []);
+  assert.deepEqual(await store.search(publicAlias, "launch secret", otherViewer), []);
+  assert.deepEqual(await store.recallFor(publicAlias, "when is the launch window", otherViewer), []);
+  assert.equal(await store.get(publicAlias, privateEntry.id, otherViewer), undefined);
+
+  // Even copying a valid private-project record into the alias file cannot
+  // cross the identity boundary: persisted projectName is validated on read.
+  await mkdir(path.dirname(publicFile), { recursive: true });
+  await writeFile(publicFile, await readFile(privateFile, "utf8"), "utf8");
+  assert.deepEqual(await store.list(publicAlias, { access: otherViewer }), []);
+  assert.deepEqual(await store.search(publicAlias, "launch secret", otherViewer), []);
+  assert.deepEqual(await store.recallFor(publicAlias, "when is the launch window", otherViewer), []);
+  assert.equal(await store.get(publicAlias, privateEntry.id, otherViewer), undefined);
+  assert.equal((await checkMemoryStoreHealth(publicAlias, store.root)).quarantinedCount, 1);
+});
+
+test("same-root aliases cannot claim a legacy checkout entry that has no project identity", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-memory-shared-legacy-"));
+  const privateProject = { root, name: "private-a" };
+  const publicAlias = { root, name: "public-alias" };
+  const legacyDirectory = path.join(root, ".devbot");
+  await mkdir(legacyDirectory, { recursive: true });
+  await writeFile(
+    path.join(legacyDirectory, "memory.jsonl"),
+    `${JSON.stringify({
+      id: "mem-alias-legacy",
+      kind: "decision",
+      text: "Private legacy launch secret.",
+      source: "manual",
+      author: "owner",
+      createdAt: new Date().toISOString(),
+      tags: [],
+      accessScope: "project"
+    })}\n`,
+    "utf8"
+  );
+
+  const store = new MemoryStore(await tempStoreRoot());
+  assert.deepEqual(await store.list(publicAlias, { access: otherViewer }), []);
+  assert.equal((await checkMemoryStoreHealth(publicAlias, store.root)).quarantinedCount, 1);
+  assert.deepEqual(await store.list(privateProject, { access: owner }), []);
+});
+
 test("memory store file and directory use owner-only permissions", { skip: process.platform === "win32" }, async () => {
   const project = await tempProject();
   const storeRoot = await tempStoreRoot();
@@ -174,6 +235,7 @@ test("memory store redacts secrets in legacy entries lazily on read", async () =
   const file = await store.fileFor(project);
   await mkdir(path.dirname(file), { recursive: true });
   const legacyEntry = {
+    projectName: project.name,
     id: "mem-legacy1-aaa",
     kind: "note",
     text: "Leaked AWS key AKIAABCDEFGHIJKLMNOP in old note.",
@@ -398,6 +460,7 @@ test("memory store treats a valid entry missing tags as an empty tag list instea
   const file = await store.fileFor(project);
   await mkdir(path.dirname(file), { recursive: true });
   const withoutTags = {
+    projectName: project.name,
     id: "mem-notags-abc",
     kind: "decision",
     text: "Entry recorded before tags existed.",
@@ -479,6 +542,7 @@ test("formatMemoryList reports empty state and renders entry summaries with stat
   const entries: MemoryEntry[] = [
     {
       schemaVersion: 1,
+      projectName: "webapp",
       id: "mem-1",
       kind: "decision",
       text: "Chose SQLite for local storage.",
@@ -492,6 +556,7 @@ test("formatMemoryList reports empty state and renders entry summaries with stat
     },
     {
       schemaVersion: 1,
+      projectName: "webapp",
       id: "mem-2",
       kind: "outcome",
       text: "succeeded: migrate build.",
@@ -531,6 +596,7 @@ test("formatMemoryList output for a maximal entry set is chunked to fit Discord'
 
 function legacyLine(id: string, text: string): string {
   return JSON.stringify({
+    projectName: "demo",
     id,
     kind: "decision",
     text,
