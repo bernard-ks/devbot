@@ -749,6 +749,12 @@ test("command schema exposes help and autocomplete for high-friction options", (
   assert.equal(forgetId?.autocomplete, true);
   assert.ok(memory?.options?.some((option) => option.name === "list"));
   assert.ok(memory?.options?.some((option) => option.name === "search"));
+  const search = memory?.options?.find((option) => option.name === "search");
+  const searchQuery = search?.options?.find((option) => option.name === "query");
+  assert.equal(searchQuery?.max_length, 200);
+  const promote = memory?.options?.find((option) => option.name === "promote");
+  const promoteId = promote?.options?.find((option) => option.name === "id");
+  assert.equal(promoteId?.autocomplete, true);
 });
 
 test("workroom controls encode IDs and follow lifecycle state", () => {
