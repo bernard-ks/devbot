@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,6 +13,7 @@ import {
   ScheduleStore,
   type ScheduleSpec
 } from "./schedule-store.js";
+import { captureWorkerIdentity, type WorkerIdentity } from "./worker-identity.js";
 
 test("parseScheduleSpec parses daily, weekdays, and every-hours forms", () => {
   assert.deepEqual(parseScheduleSpec("daily 07:00"), { kind: "daily", hour: 7, minute: 0 });
@@ -251,6 +253,158 @@ test("recoverInterrupted releases a stuck running lease and makes the entry due 
   assert.equal(current?.running, false);
   assert.equal(current?.lastResult, "Interrupted when Devbot restarted.");
   assert.ok(new Date(current!.nextRun).getTime() <= Date.now() + 1000);
+});
+
+interface LiveWorker {
+  pid: number;
+  stop: () => Promise<void>;
+}
+
+function spawnLiveWorker(): LiveWorker {
+  // A detached, long-lived child that stands in for a Codex worker that outlived
+  // a runtime crash. `detached` makes it a process-group leader (pgid === pid),
+  // matching how the real worker is spawned.
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+    detached: true,
+    stdio: "ignore"
+  });
+  if (typeof child.pid !== "number") {
+    throw new Error("Failed to spawn a live worker for the test.");
+  }
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  return {
+    pid: child.pid,
+    stop: async () => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      await exited;
+    }
+  };
+}
+
+async function waitForDeath(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Worker ${pid} did not exit in time.`);
+}
+
+// This is the round-5 blocker: on POSIX a detached agent worker can survive a
+// runtime crash, so releasing a `running` occurrence unconditionally would let
+// the next tick reclaim and run it a second time concurrently. Recovery must
+// verify the specific worker's identity before releasing.
+test("recoverInterrupted does not reclaim a running occurrence while its worker survives, then releases it once dead", async () => {
+  if (process.platform === "win32") {
+    return; // POSIX process-group identity is required for this guarantee.
+  }
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-schedule-live-worker-"));
+  const filePath = path.join(root, "schedule.json");
+  const store = new ScheduleStore(filePath);
+  const entry = await store.add(addInput());
+  await store.claimDue(new Date(entry.nextRun));
+
+  const worker = spawnLiveWorker();
+  try {
+    await store.recordRunningWorker(entry.id, captureWorkerIdentity(worker.pid));
+
+    // Simulate the crash + restart: a brand-new store reads the persisted
+    // running occurrence and its worker identity exactly as the next boot would.
+    const rebooted = new ScheduleStore(filePath);
+    const releasedWhileAlive = await rebooted.recoverInterrupted("Interrupted when Devbot restarted.");
+
+    // The live worker still owns this occurrence, so it is not released...
+    assert.equal(releasedWhileAlive.length, 0);
+    const afterCrash = await rebooted.get(entry.id);
+    assert.equal(afterCrash?.running, true);
+    assert.equal(afterCrash?.recoveryBlocked ?? false, false);
+
+    // ...and no tick can reclaim it while the worker lives, so the occurrence
+    // can neither double-fire nor run concurrently with the surviving worker.
+    const future = new Date(Date.now() + 3_600_000 + 1);
+    assert.equal((await rebooted.claimDue(future)).length, 0);
+    assert.equal((await rebooted.due(future)).length, 0);
+
+    // Once the worker is gone, a later boot releases the occurrence to run again.
+    await worker.stop();
+    await waitForDeath(worker.pid);
+    const afterDeath = new ScheduleStore(filePath);
+    const releasedAfterDeath = await afterDeath.recoverInterrupted("Interrupted when Devbot restarted.");
+    assert.equal(releasedAfterDeath.length, 1);
+    const reclaimable = await afterDeath.get(entry.id);
+    assert.equal(reclaimable?.running, false);
+    assert.equal(reclaimable?.worker, undefined);
+    assert.equal((await afterDeath.claimDue(new Date(Date.now() + 1000))).length, 1);
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("recoverInterrupted fails closed and blocks an occurrence when worker ownership cannot be verified", async () => {
+  const store = await tempStore();
+  const entry = await store.add(addInput());
+  await store.claimDue(new Date(entry.nextRun));
+  await store.recordRunningWorker(entry.id, {
+    pid: 999_999,
+    pgid: 999_999,
+    recordedAt: new Date().toISOString()
+  });
+
+  const released = await store.recoverInterrupted("Interrupted when Devbot restarted.", () => "unknown");
+  assert.equal(released.length, 0);
+  const blocked = await store.get(entry.id);
+  assert.equal(blocked?.running, true);
+  assert.equal(blocked?.recoveryBlocked, true);
+  assert.match(blocked!.lastResult!, /Blocked for recovery/);
+
+  // A blocked occurrence is never auto-reclaimed by a later tick.
+  const future = new Date(Date.now() + 3_600_000 + 1);
+  assert.equal((await store.claimDue(future)).length, 0);
+  assert.equal((await store.due(future)).length, 0);
+});
+
+test("recoverInterrupted releases an occurrence whose worker is verifiably gone", async () => {
+  const store = await tempStore();
+  const entry = await store.add(addInput());
+  await store.claimDue(new Date(entry.nextRun));
+  await store.recordRunningWorker(entry.id, {
+    pid: 999_999,
+    pgid: 999_999,
+    recordedAt: new Date().toISOString()
+  });
+
+  const released = await store.recoverInterrupted("Interrupted when Devbot restarted.", () => "dead");
+  assert.equal(released.length, 1);
+  const current = await store.get(entry.id);
+  assert.equal(current?.running, false);
+  assert.equal(current?.recoveryBlocked ?? false, false);
+  assert.equal(current?.worker, undefined);
+});
+
+test("a recorded worker identity survives reload from disk", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-schedule-worker-reload-"));
+  const filePath = path.join(root, "schedule.json");
+  const store = new ScheduleStore(filePath);
+  const entry = await store.add(addInput());
+  await store.claimDue(new Date(entry.nextRun));
+  const worker: WorkerIdentity = {
+    pid: 4242,
+    pgid: 4242,
+    startToken: "boot-abc:123456",
+    recordedAt: new Date().toISOString()
+  };
+  await store.recordRunningWorker(entry.id, worker);
+
+  const reloaded = new ScheduleStore(filePath);
+  const loaded = (await reloaded.list())[0];
+  assert.deepEqual(loaded?.worker, worker);
 });
 
 test("reconcileOnBoot recomputes nextRun from lastRun so a long-offline restart stays due exactly once", async () => {

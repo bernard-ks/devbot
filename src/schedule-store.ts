@@ -9,6 +9,7 @@ import {
   PRIVATE_FILE_MODE,
   redactSensitiveText
 } from "./security.js";
+import { probeWorker, type WorkerIdentity, type WorkerLiveness } from "./worker-identity.js";
 
 /**
  * Recurring schedules are read-only by design: an occurrence fires unattended, with
@@ -40,6 +41,18 @@ export interface ScheduleEntry {
   nextRun: string;
   running: boolean;
   runStartedAt?: string;
+  /**
+   * Strong identity of the detached worker executing this occurrence, persisted
+   * so a later runtime can verify whether that specific process is still alive
+   * before deciding to release the occurrence.
+   */
+  worker?: WorkerIdentity;
+  /**
+   * Set when startup recovery could neither confirm the worker died nor confirm
+   * it is alive. The occurrence is left `running` (never auto-reclaimed) with an
+   * honest blocked status rather than risking a second concurrent execution.
+   */
+  recoveryBlocked?: boolean;
 }
 
 export interface AddScheduleInput {
@@ -212,9 +225,15 @@ export class ScheduleStore {
       const claimed: ScheduleEntry[] = [];
       const nowIso = now.toISOString();
       for (const entry of state.entries) {
-        if (entry.enabled && !entry.running && new Date(entry.nextRun).getTime() <= now.getTime()) {
+        if (
+          entry.enabled &&
+          !entry.running &&
+          !entry.recoveryBlocked &&
+          new Date(entry.nextRun).getTime() <= now.getTime()
+        ) {
           entry.running = true;
           entry.runStartedAt = nowIso;
+          delete entry.worker;
           claimed.push({ ...entry });
         }
       }
@@ -225,8 +244,27 @@ export class ScheduleStore {
   async due(now = new Date()): Promise<ScheduleEntry[]> {
     const state = await this.readState();
     return state.entries
-      .filter((entry) => entry.enabled && !entry.running && new Date(entry.nextRun).getTime() <= now.getTime())
+      .filter(
+        (entry) =>
+          entry.enabled && !entry.running && !entry.recoveryBlocked && new Date(entry.nextRun).getTime() <= now.getTime()
+      )
       .map((entry) => ({ ...entry }));
+  }
+
+  /**
+   * Persists the identity of the detached worker now executing a running
+   * occurrence. Called as soon as the worker process is spawned so that, if this
+   * runtime dies mid-occurrence, a later runtime can positively check whether
+   * that specific worker survived before releasing the occurrence.
+   */
+  async recordRunningWorker(id: string, worker: WorkerIdentity): Promise<void> {
+    await this.mutate((state) => {
+      const entry = state.entries.find((item) => item.id === id);
+      if (!entry || !entry.running) {
+        return;
+      }
+      entry.worker = worker;
+    });
   }
 
   async markRun(id: string, result: string, now = new Date()): Promise<void> {
@@ -237,7 +275,9 @@ export class ScheduleStore {
       }
       const parsed = parseScheduleSpec(entry.spec);
       entry.running = false;
+      entry.recoveryBlocked = false;
       delete entry.runStartedAt;
+      delete entry.worker;
       entry.lastRun = now.toISOString();
       entry.lastResult = sanitizeText(result);
       if (parsed) {
@@ -247,25 +287,59 @@ export class ScheduleStore {
   }
 
   /**
-   * On boot, any entry left `running` belonged to a process that died mid-occurrence.
-   * Release the lease and make it due again promptly instead of silently losing the
-   * occurrence or leaving it permanently unclaimable.
+   * On boot, decide the fate of every occurrence still marked `running` from a
+   * previous runtime. Codex workers are detached and can outlive a runtime crash,
+   * so releasing unconditionally would let the next tick reclaim an occurrence
+   * whose worker is still alive and run it a second time concurrently. Instead we
+   * check the persisted worker identity per occurrence:
+   *
+   *  - worker verifiably dead (or none was ever recorded, so nothing detached can
+   *    still be executing it) → release the lease and make it due again;
+   *  - worker verifiably alive → leave it `running` and untouched, so no tick can
+   *    reclaim it while the old worker still owns it;
+   *  - ownership uncertain (a live pid we cannot match, or an unverifiable record)
+   *    → leave it `running` and flag it `recoveryBlocked`, failing closed rather
+   *    than risking a double execution.
+   *
+   * Returns only the occurrences that were actually released (made due again).
    */
-  async recoverInterrupted(reason: string): Promise<ScheduleEntry[]> {
+  async recoverInterrupted(
+    reason: string,
+    probe: (worker: WorkerIdentity) => WorkerLiveness = probeWorker
+  ): Promise<ScheduleEntry[]> {
     return this.mutate((state) => {
       const now = new Date();
-      const recovered: ScheduleEntry[] = [];
+      const released: ScheduleEntry[] = [];
       for (const entry of state.entries) {
         if (!entry.running) {
           continue;
         }
+        const liveness: WorkerLiveness = entry.worker ? probe(entry.worker) : "dead";
+        if (liveness === "alive") {
+          // The original worker is still running this occurrence elsewhere. Leave
+          // it exactly as-is; claimDue() skips running entries, so it cannot fire
+          // again while the worker lives.
+          entry.recoveryBlocked = false;
+          continue;
+        }
+        if (liveness === "unknown") {
+          // Cannot prove the worker is gone. Fail closed: keep the occurrence out
+          // of circulation and report an honest blocked status for recovery.
+          entry.recoveryBlocked = true;
+          entry.lastResult = sanitizeText(
+            `Blocked for recovery: ${reason} A prior worker's status could not be verified, so this occurrence was not requeued to avoid a double run.`
+          );
+          continue;
+        }
         entry.running = false;
+        entry.recoveryBlocked = false;
         delete entry.runStartedAt;
+        delete entry.worker;
         entry.lastResult = sanitizeText(reason);
         entry.nextRun = now.toISOString();
-        recovered.push({ ...entry });
+        released.push({ ...entry });
       }
-      return recovered;
+      return released;
     });
   }
 
@@ -375,7 +449,13 @@ export function formatScheduleList(entries: ScheduleEntry[]): string {
 
   return entries
     .map((entry) => {
-      const state = entry.running ? "running" : entry.enabled ? "enabled" : "paused";
+      const state = entry.recoveryBlocked
+        ? "blocked (recovery)"
+        : entry.running
+          ? "running"
+          : entry.enabled
+            ? "enabled"
+            : "paused";
       const last = entry.lastRun ? `, last run ${new Date(entry.lastRun).toLocaleString()}` : "";
       const next = entry.enabled ? `, next ${new Date(entry.nextRun).toLocaleString()}` : "";
       return `- \`${entry.id}\` ${state} \`${entry.spec}\` ask on \`${entry.project}\` by ${entry.addedBy}${last}${next}\n  ${truncate(entry.taskText, 120)}`;
@@ -435,7 +515,33 @@ function normalizeLoadedEntry(value: unknown): ScheduleEntry | undefined {
     ...(stringValue(entry.lastResult) ? { lastResult: sanitizeText(stringValue(entry.lastResult)!) } : {}),
     nextRun: entry.nextRun,
     running: entry.running === true,
-    ...(validTimestamp(entry.runStartedAt) ? { runStartedAt: validTimestamp(entry.runStartedAt)! } : {})
+    ...(validTimestamp(entry.runStartedAt) ? { runStartedAt: validTimestamp(entry.runStartedAt)! } : {}),
+    ...(normalizeWorker((value as { worker?: unknown }).worker)
+      ? { worker: normalizeWorker((value as { worker?: unknown }).worker)! }
+      : {}),
+    ...((value as { recoveryBlocked?: unknown }).recoveryBlocked === true ? { recoveryBlocked: true } : {})
+  };
+}
+
+function normalizeWorker(value: unknown): WorkerIdentity | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const worker = value as Partial<WorkerIdentity>;
+  if (
+    !Number.isInteger(worker.pid) ||
+    (worker.pid as number) <= 0 ||
+    !Number.isInteger(worker.pgid) ||
+    (worker.pgid as number) <= 0 ||
+    !validTimestamp(worker.recordedAt)
+  ) {
+    return undefined;
+  }
+  return {
+    pid: worker.pid as number,
+    pgid: worker.pgid as number,
+    recordedAt: worker.recordedAt as string,
+    ...(stringValue(worker.startToken) ? { startToken: stringValue(worker.startToken)! } : {})
   };
 }
 

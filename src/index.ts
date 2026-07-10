@@ -116,6 +116,7 @@ import {
 } from "./task-worktree.js";
 import { formatQueueDigest, formatQueueList, groupQueueItemsByProject, isQueueItemId, QueueStore, type QueueItem } from "./queue-store.js";
 import { formatScheduleList, isScheduleId, ScheduleStore, type ScheduleEntry } from "./schedule-store.js";
+import type { WorkerIdentity } from "./worker-identity.js";
 import {
   parseTaskControl,
   taskActionMatchesState,
@@ -250,6 +251,12 @@ client.once("clientReady", async () => {
     const recoveredScheduleEntries = await scheduleStore.recoverInterrupted("Interrupted when Devbot restarted.");
     if (recoveredScheduleEntries.length > 0) {
       console.log(`Recovered ${recoveredScheduleEntries.length} interrupted scheduled task${recoveredScheduleEntries.length === 1 ? "" : "s"} from the previous runtime.`);
+    }
+    const blocked = (await scheduleStore.list()).filter((entry) => entry.recoveryBlocked);
+    if (blocked.length > 0) {
+      console.warn(
+        `Left ${blocked.length} scheduled occurrence${blocked.length === 1 ? "" : "s"} blocked for recovery: a prior worker's status could not be verified, so ${blocked.length === 1 ? "it was" : "they were"} not requeued to avoid a double run (${blocked.map((entry) => entry.id).join(", ")}).`
+      );
     }
   } catch (error) {
     console.warn(`Unable to recover interrupted scheduled tasks: ${publicErrorMessage(error)}`);
@@ -1516,6 +1523,8 @@ interface ProjectRequestOptions {
   onProgress?: (progress: TaskProgressEvent) => Promise<void>;
   /** Fires once the task record is durably created, before any work that can fail. Used to consume a caller-owned pending record only after there is something to retry against. */
   onTaskStarted?: (taskId: string) => Promise<void>;
+  /** Fires with the detached agent worker's strong identity the moment it is spawned, before it begins working. Used by the scheduler to durably record which process owns an occurrence so a later boot can verify whether it survived a crash. */
+  onWorkerStarted?: (worker: WorkerIdentity) => void | Promise<void>;
 }
 
 interface ProjectRequestResult {
@@ -1665,7 +1674,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       route,
       contextFileCount: context.files.length
     });
-    const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
+    const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal, options.onWorkerStarted);
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree);
       // Every action task runs in an isolated Git worktree (task-worktree.ts); Codex's edits land
@@ -3177,6 +3186,10 @@ async function runScheduledEntry(appConfig: AppConfig, entry: ScheduleEntry): Pr
       requester: entry.addedBy,
       requesterId: entry.addedById,
       source: `schedule:${entry.id}`,
+      // Persist which detached worker owns this occurrence before it starts
+      // working, so if this runtime crashes mid-run a later boot can verify
+      // whether that specific worker survived before releasing the occurrence.
+      onWorkerStarted: (worker) => scheduleStore.recordRunningWorker(entry.id, worker),
       onProgress: async (progress) => {
         if (!channel) {
           return;
@@ -6015,7 +6028,8 @@ async function runCodex(
   context: PackedProjectContext,
   mode: CodexRequestMode,
   route: RequestRoute,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onWorkerStarted?: (worker: WorkerIdentity) => void | Promise<void>
 ): Promise<string> {
   return answerWithProjectContext({
     codex: appConfig.codex,
@@ -6026,7 +6040,8 @@ async function runCodex(
     ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
     tier: route.tier,
     contextMode: route.contextMode,
-    ...(signal ? { signal } : {})
+    ...(signal ? { signal } : {}),
+    ...(onWorkerStarted ? { onWorkerStarted } : {})
   });
 }
 

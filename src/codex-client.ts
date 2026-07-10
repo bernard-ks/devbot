@@ -3,9 +3,19 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { redactSensitiveText } from "./security.js";
+import { captureWorkerIdentity, type WorkerIdentity } from "./worker-identity.js";
 import type { CodexConfig, PackedProjectContext } from "./types.js";
 import type { RequestContextMode } from "./request-router.js";
 import { buildImageExecArgs, getActiveBackend, ImageInputUnsupportedError, type AgentModelTier, type BuildCommandOptions, type SpawnSpec } from "./agent-backend.js";
+
+/**
+ * Notified with the strong identity of the detached agent worker process as soon
+ * as it is spawned, so a caller (e.g. the scheduler) can durably record which
+ * process owns an occurrence before that process begins doing work. When it
+ * returns a promise, the prompt is not fed to the worker until it settles, so
+ * the identity is persisted before the worker can start.
+ */
+export type WorkerStartedListener = (worker: WorkerIdentity) => void | Promise<void>;
 
 export { buildImageExecArgs };
 
@@ -32,6 +42,7 @@ export interface AnswerOptions {
   tier?: AgentModelTier;
   contextMode?: RequestContextMode;
   signal?: AbortSignal;
+  onWorkerStarted?: WorkerStartedListener;
 }
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
@@ -46,7 +57,8 @@ export async function answerWithProjectContext(options: AnswerOptions): Promise<
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     ...(options.tier ? { tier: options.tier } : {}),
-    ...(options.signal ? { signal: options.signal } : {})
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.onWorkerStarted ? { onWorkerStarted: options.onWorkerStarted } : {})
   });
 }
 
@@ -63,6 +75,7 @@ export interface CompleteCodexOptions {
   skipGitRepoCheck?: boolean;
   imagePaths?: string[];
   signal?: AbortSignal;
+  onWorkerStarted?: WorkerStartedListener;
 }
 
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
@@ -104,7 +117,7 @@ export async function completeCodexPrompt(options: CompleteCodexOptions): Promis
           );
         }
       }
-      const output = await runBackend(spec, options.signal);
+      const output = await runBackend(spec, options.signal, options.onWorkerStarted);
       const answer = redactSensitiveText(output.trim());
       return answer || `${backend.displayName} did not produce a final text answer.`;
     } finally {
@@ -303,15 +316,15 @@ export function parseLocateResponse(raw: string): LocatedError {
   };
 }
 
-async function runBackend(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
-  const stdout = await runSpec(spec, signal);
+async function runBackend(spec: SpawnSpec, signal?: AbortSignal, onWorkerStarted?: WorkerStartedListener): Promise<string> {
+  const stdout = await runSpec(spec, signal, onWorkerStarted);
   if (spec.outputFile) {
     return (await readFile(spec.outputFile, "utf8")).trim();
   }
   return stdout;
 }
 
-function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
+function runSpec(spec: SpawnSpec, signal?: AbortSignal, onWorkerStarted?: WorkerStartedListener): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(spec.bin, spec.args, {
       cwd: spec.cwd,
@@ -364,8 +377,23 @@ function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
 
     signal?.addEventListener("abort", abort, { once: true });
 
-    if (spec.stdin !== undefined && child.stdin) {
-      child.stdin.end(spec.stdin);
+    const beginInput = (): void => {
+      if (settled) return;
+      if (spec.stdin !== undefined && child.stdin) {
+        child.stdin.end(spec.stdin);
+      }
+    };
+
+    if (onWorkerStarted && typeof child.pid === "number") {
+      // Persist the worker's identity before it starts working. Awaiting the
+      // listener closes the window where a crash could leave a live worker with
+      // no recorded identity to verify on the next boot. A persistence failure
+      // must not block the run, so we proceed either way.
+      Promise.resolve(captureWorkerIdentity(child.pid))
+        .then((worker) => onWorkerStarted(worker))
+        .then(beginInput, beginInput);
+    } else {
+      beginInput();
     }
 
     function requestTermination(error: Error): void {
