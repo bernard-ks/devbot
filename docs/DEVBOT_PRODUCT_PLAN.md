@@ -44,11 +44,17 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Direct bot mentions can invoke the bot without requesting the privileged Message Content intent.
   - Status-style mentions avoid unnecessary Codex runs.
   - Read-only mentions answer directly; action-shaped mentions open the implemented approval preview and private task workroom flow.
+  - Mentioning the bot with an image attachment (stack trace, console error, or broken UI) routes to screenshot-to-fix instead, ahead of the natural-intent/ambient-workroom flow.
 - Ambient workrooms:
   - Natural intent previews with approve, edit, answer-only, and decline controls.
   - Private task threads, isolated task branches/worktrees, proof-first completion, and `/inbox` / dashboard Needs Me.
   - Owner-bound project rooms through `/setup project-room`.
   - Builder, Reviewer, and Verifier roles with bounded Components V2 cards.
+- Screenshot-to-fix:
+  - Mentioning the bot with an image attachment (stack trace, console error, or broken UI) transcribes the visible error using an image-capable local Codex call, then locates the likely file/symbol using the existing project context ranking seeded by the transcribed text.
+  - Treats all image content as untrusted error-report data; the analysis prompts explicitly instruct the model never to follow instructions that appear inside the screenshot.
+  - Replies with the transcribed error, suspected location, and suggested approach, plus a restart-stable one-tap **Fix it** button (owner/controller-gated) that starts a `/do` task pre-filled with the finding, and a **Dismiss** button.
+  - Honestly reports when no error-looking text is visible instead of inventing one; non-image attachments and unauthorized users are ignored per the deny-by-default access model.
 - Local project context:
   - Scans static or owner-registered project roots and supports a selected default on multi-project hosts.
   - Ignores dependency/build folders and common secret files.
