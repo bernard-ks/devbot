@@ -124,7 +124,18 @@ import {
   type TaskModalAction,
   type TaskProgressEvent
 } from "./task-ui.js";
+import {
+  audioGateMessage,
+  detectVoicePipeline,
+  quoteTranscript,
+  selectVoiceAttachment,
+  transcribeAttachment,
+  truncateTranscriptForReply,
+  voiceSetupInstructions
+} from "./transcribe.js";
 import { UserPreferenceStore } from "./user-preferences.js";
+import { parseVoiceActModal, parseVoiceControl, voiceActModal, voiceControlRow } from "./voice-controls.js";
+import { VoiceStore } from "./voice-store.js";
 import {
   buildFixTaskPrompt,
   canActOnScreenshotFix,
@@ -195,6 +206,7 @@ const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
 const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
+const voiceStore = new VoiceStore(process.env.DEVBOT_VOICE_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
@@ -352,6 +364,18 @@ client.on("interactionCreate", async (interaction) => {
         await handleScreenshotFixControl(interaction, config, screenshotFixControl.action, screenshotFixControl.id);
         return;
       }
+      const voiceControl = parseVoiceControl(interaction.customId);
+      if (voiceControl) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleVoiceControl(interaction, config, voiceControl.action, voiceControl.voiceId);
+        return;
+      }
       if (!parseWorkroomButton(interaction.customId)) {
         return;
       }
@@ -440,6 +464,18 @@ client.on("interactionCreate", async (interaction) => {
         await handleTaskModal(interaction, config, taskModal.action, taskModal.taskId);
         return;
       }
+      const voiceActModalControl = parseVoiceActModal(interaction.customId);
+      if (voiceActModalControl) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleVoiceActModal(interaction, config, voiceActModalControl.voiceId);
+        return;
+      }
       const setupAction = parseSetupWizardAction(interaction.customId);
       if (!setupAction) {
         return;
@@ -506,6 +542,10 @@ client.on("messageCreate", async (message) => {
 
     if (message.author.bot) {
       await maybeHandlePeerMessage(message, config);
+      return;
+    }
+
+    if (await maybeHandleVoiceMessage(message, config)) {
       return;
     }
 
@@ -1354,7 +1394,9 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
     "Coding-agent backends:",
     ...backendSummary,
     "",
-    passed === checks.length ? "Ready. Ask with @devbot, change with /do, and check with /status." : "No changes were made. Resolve FIX items, then run /setup doctor again."
+    passed === checks.length ? "Ready. Ask with @devbot, change with /do, and check with /status." : "No changes were made. Resolve FIX items, then run /setup doctor again.",
+    "",
+    formatVoiceDoctorSection(appConfig)
   ].join("\n");
 }
 
@@ -1390,6 +1432,23 @@ async function formatBackendReport(appConfig: AppConfig, requested?: string): Pr
     lines.push(`Active backend set to ${requested}.`);
   }
   return lines.join("\n");
+}
+
+function formatVoiceDoctorSection(appConfig: AppConfig): string {
+  if (!appConfig.voice.enabled) {
+    return ["Voice notes", "DISABLED  Set DEVBOT_VOICE_ENABLED=true to allow voice-note transcription."].join("\n");
+  }
+  const detection = detectVoicePipeline();
+  const lines = [
+    detection.ffmpegBin ? `READY  ffmpeg: \`${detection.ffmpegBin}\`` : "FIX  ffmpeg - install ffmpeg and add it to PATH.",
+    detection.whisperBin
+      ? `READY  whisper.cpp: \`${detection.whisperBin}\``
+      : "FIX  whisper.cpp - install whisper-cli/whisper-cpp/main or set DEVBOT_WHISPER_BIN.",
+    detection.modelPath
+      ? `READY  Model: \`${detection.modelPath}\``
+      : "FIX  Model - add a ggml-*.bin model under ~/whisper-models or set DEVBOT_WHISPER_MODEL."
+  ];
+  return ["Voice notes", ...lines].join("\n");
 }
 
 function formatSetupMentions(ids: string[]): string {
@@ -2545,6 +2604,187 @@ function agentRole(role: AmbientRole): AgentRole {
   return role === "builder" ? "Builder" : role === "reviewer" ? "Reviewer" : "Verifier";
 }
 
+async function maybeHandleVoiceMessage(message: OmitPartialGroupDMChannel<Message>, appConfig: AppConfig): Promise<boolean> {
+  if (!appConfig.voice.enabled) {
+    return false;
+  }
+
+  const attachment = selectVoiceAttachment(message.flags.has(MessageFlags.IsVoiceMessage), [...message.attachments.values()]);
+  if (!attachment) {
+    return false;
+  }
+
+  const privateChannelId = effectivePrivateRoomId();
+  if (!privateChannelId || message.channelId !== privateChannelId) {
+    return false;
+  }
+  if (!isAllowedMessage(message, appConfig)) {
+    await message.reply("You are not allowed to use this bot.");
+    return true;
+  }
+
+  const visibleProjects = appConfig.projects.filter((project) => isAllowedMessageForProject(message, project));
+  const project = defaultProjectIfAvailable(projectsWithUserPreference(visibleProjects, message.author.id));
+  if (!project) {
+    await message.reply("No configured project is available to you. Ask the owner to run `/setup repo`.");
+    return true;
+  }
+  if (hasProjectAudienceRestriction(project)) {
+    await message.reply(
+      "This project has a scoped audience, so I will not transcribe voice notes into the shared room. Open the workspace or use `/ask` for a private response."
+    );
+    return true;
+  }
+
+  const gateMessage = audioGateMessage({ durationSeconds: attachment.duration, sizeBytes: attachment.size });
+  if (gateMessage) {
+    await message.reply(gateMessage);
+    return true;
+  }
+
+  const detection = detectVoicePipeline();
+  if (!detection.ffmpegBin || !detection.whisperBin || !detection.modelPath) {
+    await message.reply(voiceSetupInstructions(detection));
+    return true;
+  }
+
+  await message.channel.sendTyping();
+  const sourceExtension = path.extname(attachment.name);
+  let transcript: string;
+  try {
+    transcript = await transcribeAttachment({
+      url: attachment.url,
+      ffmpegBin: detection.ffmpegBin,
+      whisperBin: detection.whisperBin,
+      modelPath: detection.modelPath,
+      ...(sourceExtension ? { sourceExtension } : {})
+    });
+  } catch (error) {
+    await message.reply(`Could not transcribe that audio: ${publicErrorMessage(error)}`);
+    return true;
+  }
+
+  if (!transcript) {
+    await message.reply("I could not make out any speech in that clip.");
+    return true;
+  }
+
+  const record = await voiceStore.create({
+    projectName: project.name,
+    requesterId: message.author.id,
+    requesterTag: message.author.tag,
+    transcript
+  });
+  const { preview, truncated } = truncateTranscriptForReply(transcript);
+  const files = truncated ? [new AttachmentBuilder(Buffer.from(transcript, "utf8"), { name: "transcript.txt" })] : [];
+  await message.reply({
+    content: [
+      "**Voice note transcript**",
+      quoteTranscript(preview),
+      truncated ? "Full transcript attached." : undefined,
+      "",
+      `Target project: \`${project.name}\`. Switch it with \`project:<name>\` in a mention, or ask the owner to change the default with \`/setup repo\`.`
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n"),
+    components: [voiceControlRow(record.id, { canControl: isControllerUser(message.author.id, appConfig), safeMode: appConfig.safeMode })],
+    files
+  });
+  return true;
+}
+
+async function handleVoiceControl(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: "ask" | "act" | "dismiss",
+  voiceId: string
+): Promise<void> {
+  const record = await voiceStore.get(voiceId);
+  if (!record) {
+    await interaction.reply({ content: "That voice note transcript is no longer available.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, record.projectName);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That voice note's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (action === "dismiss") {
+    await voiceStore.remove(record.id);
+    await interaction.update({ components: [] });
+    return;
+  }
+
+  if (action === "ask") {
+    await userPreferences.setSelectedProject(interaction.user.id, project.name);
+    await executeInteractionRequest({
+      interaction,
+      appConfig,
+      project,
+      text: record.transcript,
+      includePatterns: [],
+      mode: "answer",
+      requester: interaction.user.tag,
+      source: `voice:ask:${record.id}`,
+      ephemeral: hasProjectAudienceRestriction(project)
+    });
+    return;
+  }
+
+  if (!isControllerUser(interaction.user.id, appConfig)) {
+    await interaction.reply({
+      content: "You have view access, but only the owner or an approved controller can make project changes.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  if (appConfig.safeMode) {
+    await interaction.reply({ content: safeModeActionMessage("voice-note changes"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.showModal(voiceActModal(record.id, record.transcript));
+}
+
+async function handleVoiceActModal(interaction: ModalSubmitInteraction, appConfig: AppConfig, voiceId: string): Promise<void> {
+  const record = await voiceStore.get(voiceId);
+  if (!record) {
+    await interaction.reply({ content: "That voice note transcript is no longer available.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, record.projectName);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That voice note's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!isControllerUser(interaction.user.id, appConfig)) {
+    await interaction.reply({
+      content: "You have view access, but only the owner or an approved controller can make project changes.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  if (appConfig.safeMode) {
+    await interaction.reply({ content: safeModeActionMessage("voice-note changes"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const request = interaction.fields.getTextInputValue("request").trim();
+  await userPreferences.setSelectedProject(interaction.user.id, project.name);
+  await executeInteractionRequest({
+    interaction,
+    appConfig,
+    project,
+    text: request,
+    includePatterns: [],
+    mode: "action",
+    requester: interaction.user.tag,
+    source: `voice:act:${record.id}`,
+    dedupeKey: `voice-act:${record.id}`,
+    ephemeral: hasProjectAudienceRestriction(project)
+  });
+}
 async function getWorkStatusMessage(appConfig: AppConfig, requestedProject?: ProjectEntry): Promise<string> {
   const activeBotWork = filterWorkForProjects(workTracker.snapshot(), appConfig.projects);
   const externalCodexWork = await findExternalCodexWork(appConfig.projects);

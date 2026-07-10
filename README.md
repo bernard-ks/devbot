@@ -89,7 +89,8 @@ npm start
 - **Do:** `/do task:<text>` is the intentional write-capable path for the owner and controllers.
 - **Check:** `/status` reports current work, blockers, repository evidence, and the next action.
 - **Snap-to-fix:** mention `@devbot` with a screenshot of a stack trace, console error, or broken UI attached; Devbot transcribes the visible error, locates the likely spot in the project, and offers a one-tap **Fix it** button that starts a `/do` task pre-filled with the finding.
-- **Set up:** `/setup wizard` is owner-only and resumable; `/setup doctor` diagnoses the full path.
+- **Voice:** send a Discord voice message (or an audio file) in the private room and Devbot transcribes it locally with ffmpeg and whisper.cpp, then offers Ask, Make change, and Dismiss buttons on the transcript.
+- **Set up:** `/setup wizard` is owner-only and resumable; `/setup doctor` diagnoses the full path, including local ffmpeg/whisper.cpp/model detection for voice notes.
 
 The workspace remembers each approved user's selected project locally. Mentions, `/ask`, `/do`, `/status`, and `/dashboard` use that project when no explicit project is supplied. Every interaction rechecks current project access, controller authority, safe mode, and task state.
 

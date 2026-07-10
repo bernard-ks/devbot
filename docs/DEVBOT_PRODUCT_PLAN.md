@@ -78,6 +78,13 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Detects local Codex app/CLI sessions whose working directory belongs to a configured project.
   - Separates confirmed external runs from open app sessions whose activity cannot be known.
   - Reports sanitized repository evidence without leaking process IDs or command prompts.
+- Voice note to task:
+  - Detects Discord voice messages and regular audio-file attachments (ogg/opus/mp3/m4a/wav) from authorized users in the private room.
+  - Transcribes locally with ffmpeg (16kHz mono conversion) and whisper.cpp (`whisper-cli`/`whisper-cpp`/`main`, model auto-discovered or configured), never sending audio anywhere over the network.
+  - Enforces a 5-minute audio cap and a 120s transcription timeout, and always cleans up temporary files.
+  - Degrades to a concise setup message when ffmpeg, whisper.cpp, or a model is missing, with no crash or retry loop.
+  - Replies with the transcript (attached as a `.txt` file when long) and restart-stable Ask / Make change / Dismiss controls; Make change reuses the workspace confirmation modal before running write-capable work.
+  - `/setup doctor` reports ffmpeg/whisper.cpp/model detection in a dedicated voice section.
 - UI screenshot support:
   - Detects running local web dev servers such as Next, Vite, React Scripts, Astro, and Nuxt.
   - Opens the running app and navigates through visible links/buttons based on request language.

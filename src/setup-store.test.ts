@@ -218,7 +218,8 @@ function appConfig(projects: ProjectEntry[]): AppConfig {
     peerBotIds: new Set(["bootstrap-peer"]),
     coordinationChannelId: "bootstrap-room",
     projects,
-    scanner: { maxIndexedFileBytes: 1, maxSnippetCharsPerFile: 1, maxPackedContextChars: 1, maxRankedFiles: 1 }
+    scanner: { maxIndexedFileBytes: 1, maxSnippetCharsPerFile: 1, maxPackedContextChars: 1, maxRankedFiles: 1 },
+    voice: { enabled: true }
   };
 }
 

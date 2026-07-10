@@ -24,6 +24,11 @@ export interface AppConfig {
   coordinationChannelId: string | undefined;
   projects: ProjectEntry[];
   scanner: ScannerConfig;
+  voice: VoiceConfig;
+}
+
+export interface VoiceConfig {
+  enabled: boolean;
 }
 
 export interface BotIdentity {
