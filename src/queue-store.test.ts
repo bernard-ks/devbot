@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -67,6 +67,16 @@ test("queue drops malformed records and rejects an unsupported version on load",
   const badVersionFile = path.join(root, "bad-version.json");
   await writeFile(badVersionFile, JSON.stringify({ version: 99, items: [] }));
   await assert.rejects(() => new QueueStore(badVersionFile).list(), /Unsupported queue state version/);
+});
+
+test("queue state directory and file are owner-only", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-queue-perms-"));
+  const dir = path.join(root, "state");
+  const filePath = path.join(dir, "queue.json");
+  const store = new QueueStore(filePath);
+  await store.add(addInput());
+  assert.equal((await stat(filePath)).mode & 0o777, 0o600);
+  assert.equal((await stat(dir)).mode & 0o777, 0o700);
 });
 
 test("queue redacts secrets and neutralizes mentions in stored text", async () => {
