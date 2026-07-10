@@ -107,6 +107,8 @@ import {
   taskControlRow,
   type TaskControlAction
 } from "./task-controls.js";
+import { isolatedVisualProofNote, resolveShipImage } from "./visual-capture.js";
+import { composeShipCard } from "./ship-card.js";
 import {
   continuationPrompt,
   formatTaskProgress,
@@ -818,6 +820,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     });
     return;
   }
+
+  if (interaction.commandName === "ship") {
+    await handleShipCommand(interaction, appConfig);
+    return;
+  }
 }
 
 async function handleSetupCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
@@ -1365,6 +1372,7 @@ interface ProjectRequestResult {
   context: PackedProjectContext;
   taskId: string;
   route: RequestRoute;
+  visualProofNote?: string;
 }
 
 async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
@@ -1509,6 +1517,16 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree);
+      // Every action task runs in an isolated Git worktree (task-worktree.ts); Codex's edits land
+      // on a review branch, never in options.project.root. Devbot has no managed preview of that
+      // isolated workspace, so there is no server it could honestly screenshot "after" against —
+      // the source checkout's dev server never reflects this task's changes. Per review, automatic
+      // before/after capture is skipped entirely rather than attaching a diff that would silently
+      // misrepresent someone else's (or no) change as this task's result. `/ship` remains available
+      // as an explicit, on-demand, honestly-captioned surface (visual-capture.ts).
+      await taskStore.recordCapture(task.id, {
+        captureNote: isolatedVisualProofNote(task.id, isolatedWorktree.branch)
+      });
     }
     const completed = await taskStore.succeed(task.id, {
       contextFileCount: context.files.length,
@@ -1526,7 +1544,13 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       }
       throw new Error(current?.error ?? `Task stopped while ${current?.status ?? "unavailable"}.`);
     }
-    return { answer, context, taskId: task.id, route };
+    return {
+      answer,
+      context,
+      taskId: task.id,
+      route,
+      ...(isolatedWorktree ? { visualProofNote: isolatedVisualProofNote(task.id, isolatedWorktree.branch) } : {})
+    };
   } catch (error) {
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree, false).catch(() => undefined);
@@ -1641,7 +1665,11 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
         progressRendered = true;
       }
     });
-    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`);
+    const chunks = splitDiscordMessage(
+      [result.answer, result.visualProofNote, formatResultFooter(requestOptions.project, result.route, requestOptions.mode)]
+        .filter((part) => part !== undefined)
+        .join("\n\n")
+    );
     await interaction.editReply({
       content: chunks.shift() ?? "Task completed without a response.",
       components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })]
@@ -1679,7 +1707,11 @@ async function executeMessageRequest(options: MessageRequestOptions): Promise<vo
         progressRendered = true;
       }
     });
-    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`);
+    const chunks = splitDiscordMessage(
+      [result.answer, result.visualProofNote, formatResultFooter(requestOptions.project, result.route, requestOptions.mode)]
+        .filter((part) => part !== undefined)
+        .join("\n\n")
+    );
     await pending.edit({
       content: chunks.shift() ?? "Task completed without a response.",
       components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })]
@@ -2357,6 +2389,7 @@ function completionCardForTask(task: TaskRecord, answer: string, route: RequestR
       detail,
       status: proofStatusForEvidence(detail)
     })),
+    ...(task.captureNote ? [{ label: "Visual proof", detail: task.captureNote, status: "info" as const }] : []),
     { label: "Model route", detail: formatRoute(route), status: "info" as const }
   ];
   return proofFirstCompletionCard({
@@ -2945,6 +2978,20 @@ async function handleTaskControl(
     return;
   }
 
+  if (action === "ship") {
+    if (!canControl) {
+      await interaction.reply({ content: "Only the owner or an approved controller can compose a ship card.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const shipBuild = await buildShipCard(project, task);
+    await interaction.editReply({
+      content: shipCardCaption(project, task, shipBuild),
+      files: [new AttachmentBuilder(shipBuild.card, { name: `devbot-ship-${task.id}.png` })]
+    });
+    return;
+  }
+
   if (action === "cancel") {
     if (!canControl) {
       await interaction.reply({ content: "Only the owner or an approved controller can cancel work.", flags: MessageFlags.Ephemeral });
@@ -3365,6 +3412,66 @@ async function handleReviewCommand(interaction: ChatInputCommandInteraction, app
     const result = await evaluateMergeGates(project, commandNames);
     await editInteractionWithChunks(interaction, { content: formatMergeGateResult(project, result) }, privateReply);
   }
+}
+
+async function handleShipCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const taskId = interaction.options.getString("task", true);
+  const task = await taskStore.get(taskId);
+  if (!task) {
+    await interaction.reply({ content: "That saved task is no longer available.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, task.projectName);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That task's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (task.status !== "succeeded") {
+    await interaction.reply({
+      content: `Task \`${task.id}\` is ${task.status}, not completed. \`/ship\` needs a succeeded task.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  const privateReply = hasProjectAudienceRestriction(project);
+  await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
+  const shipBuild = await buildShipCard(project, task);
+  await interaction.editReply({
+    content: shipCardCaption(project, task, shipBuild),
+    files: [new AttachmentBuilder(shipBuild.card, { name: `devbot-ship-${task.id}.png` })]
+  });
+}
+
+interface ShipCardBuild {
+  card: Buffer;
+  hasScreenshot: boolean;
+  isolatedBranch?: string;
+}
+
+async function buildShipCard(project: ProjectEntry, task: TaskRecord): Promise<ShipCardBuild> {
+  const source = await resolveShipImage(task, project);
+  const image = source && !source.isolated ? source.image : undefined;
+  const card = await composeShipCard({
+    projectName: project.name,
+    summary: task.text,
+    ...(image ? { image } : {})
+  });
+  return {
+    card,
+    hasScreenshot: Boolean(image),
+    ...(source?.isolated ? { isolatedBranch: source.branch ?? "unknown" } : {})
+  };
+}
+
+function shipCardCaption(project: ProjectEntry, task: TaskRecord, build: ShipCardBuild): string {
+  const header = `Ship card for \`${project.name}\` task \`${task.id}\`.`;
+  if (build.isolatedBranch) {
+    return `${header} Visual proof unavailable for isolated branch \`${build.isolatedBranch}\`: Devbot has no managed preview of that isolated workspace, so no screenshot was attempted. The card is text-only; review the branch directly.`;
+  }
+  return build.hasScreenshot
+    ? `${header} Attach and post anywhere.`
+    : `${header} No screenshot was available for this task, so the card is text-only.`;
 }
 
 async function handleDevbotCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
@@ -5494,7 +5601,7 @@ function isControllerUser(userId: string, appConfig: AppConfig): boolean {
 }
 
 function commandRequiresController(interaction: ChatInputCommandInteraction): boolean {
-  if (interaction.commandName === "do" || interaction.commandName === "run") {
+  if (interaction.commandName === "do" || interaction.commandName === "run" || interaction.commandName === "ship") {
     return true;
   }
   const subcommand = interaction.options.getSubcommand(false);

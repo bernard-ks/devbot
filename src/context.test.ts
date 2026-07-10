@@ -394,6 +394,31 @@ test("task store persists task lifecycle to disk", async () => {
   assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
 });
 
+test("task store persists and normalizes the visual-proof capture note across reload", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-capture-"));
+  const stateFile = path.join(root, "tasks.json");
+  const store = new TaskStore(stateFile);
+  const task = await store.start({
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    text: "make the header sticky"
+  });
+  const note = "Visual proof unavailable: this task ran on isolated branch `devbot/task/task-1`.";
+  await store.recordCapture(task.id, { captureNote: note });
+
+  const reloaded = new TaskStore(stateFile);
+  const saved = await reloaded.get(task.id);
+  assert.equal(saved?.captureNote, note);
+  assert.match(formatTaskDetail(saved!), /Visual proof: Visual proof unavailable/);
+
+  // A blank note must be dropped by normalization, never restored as an empty string.
+  await store.recordCapture(task.id, { captureNote: "   " });
+  const blanked = await new TaskStore(stateFile).get(task.id);
+  assert.equal(blanked?.captureNote, undefined);
+});
+
 test("task store preserves proposals and their Discord workroom context", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-task-proposal-"));
   const stateFile = path.join(root, "tasks.json");
@@ -794,6 +819,39 @@ test("task controls keep task IDs behind state-aware public and private actions"
   ).flatMap((row) => row.toJSON().components);
   assert.deepEqual(safeModeRecovery.map((component) => "label" in component ? component.label : undefined), ["Adjust request", "Retry"]);
   assert.equal(safeModeRecovery.every((component) => "disabled" in component && component.disabled), true);
+});
+
+test("ship control is offered to controllers on completed action tasks but never on answer tasks", () => {
+  assert.deepEqual(parseTaskControl("devbot:task-control:ship:task-abc"), { action: "ship", taskId: "task-abc" });
+
+  const succeededAction = {
+    id: "task-ship",
+    status: "succeeded" as const,
+    source: "test",
+    mode: "action",
+    projectName: "webapp",
+    requester: "tester",
+    text: "Make the header sticky",
+    includePatterns: [],
+    startedAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z"
+  };
+  assert.equal(taskActionMatchesState("ship", succeededAction), true);
+
+  const controllerLabels = taskActionRows(succeededAction, { canControl: true, safeMode: false, hasChecks: false }).flatMap((row) =>
+    row.toJSON().components.map((component) => ("label" in component ? component.label : undefined))
+  );
+  assert.ok(controllerLabels.includes("Ship it"));
+
+  const viewerLabels = taskActionRows(succeededAction, { canControl: false, safeMode: false, hasChecks: false }).flatMap((row) =>
+    row.toJSON().components.map((component) => ("label" in component ? component.label : undefined))
+  );
+  assert.ok(!viewerLabels.includes("Ship it"));
+
+  const answerLabels = taskActionRows({ ...succeededAction, mode: "answer" }, { canControl: true, safeMode: false, hasChecks: false }).flatMap(
+    (row) => row.toJSON().components.map((component) => ("label" in component ? component.label : undefined))
+  );
+  assert.ok(!answerLabels.includes("Ship it"));
 });
 
 interface CommandJson {

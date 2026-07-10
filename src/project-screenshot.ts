@@ -8,6 +8,19 @@ import type { ProjectEntry } from "./types.js";
 const execFileAsync = promisify(execFile);
 const DEFAULT_VIEWPORT = { width: 1440, height: 1000 };
 const MAX_CONCURRENT_SCREENSHOTS = 2;
+const STABILITY_ATTEMPTS = 3;
+const STABILITY_INTERVAL_MS = 200;
+const DISABLE_MOTION_STYLE = [
+  "*, *::before, *::after {",
+  "  animation-play-state: paused !important;",
+  "  animation-delay: 0s !important;",
+  "  animation-duration: 0s !important;",
+  "  transition-delay: 0s !important;",
+  "  transition-duration: 0s !important;",
+  "  caret-color: transparent !important;",
+  "  scroll-behavior: auto !important;",
+  "}"
+].join("\n");
 let activeScreenshots = 0;
 const VIEWPORTS = {
   desktop: DEFAULT_VIEWPORT,
@@ -73,6 +86,7 @@ export async function captureProjectScreenshot(
           }
         });
         const diagnostics = collectScreenshotDiagnostics(page);
+        await page.emulateMedia({ reducedMotion: "reduce" }).catch(() => undefined);
         await page.goto(startUrl, { waitUntil: "networkidle", timeout: 20_000 });
         if (!isAllowedScreenshotResource(page.url(), allowedOrigins)) {
           continue;
@@ -80,8 +94,9 @@ export async function captureProjectScreenshot(
         if (!target.path && !target.url) {
           await navigateByVisibleUi(page, options.requestText ?? "");
         }
+        await freezeDynamicUi(page);
 
-        const image = await page.screenshot({ type: "png", fullPage: false });
+        const image = await captureStableScreenshot(page);
         const finalUrl = safeReportedUrl(page.url());
         return {
           image,
@@ -199,6 +214,29 @@ function collectScreenshotDiagnostics(page: Page): {
   });
 
   return { consoleErrors, failedRequests, badResponses };
+}
+
+async function freezeDynamicUi(page: Page): Promise<void> {
+  await page.addStyleTag({ content: DISABLE_MOTION_STYLE }).catch(() => undefined);
+}
+
+/**
+ * Loading spinners, blinking carets, and async layout shifts can make a
+ * single screenshot land mid-transition. Captures repeatedly until two
+ * consecutive frames come back byte-identical (or the attempt budget runs
+ * out), so a diff against this screenshot reflects real content, not timing.
+ */
+async function captureStableScreenshot(page: Page): Promise<Buffer> {
+  let previous = await page.screenshot({ type: "png", fullPage: false });
+  for (let attempt = 1; attempt < STABILITY_ATTEMPTS; attempt++) {
+    await page.waitForTimeout(STABILITY_INTERVAL_MS);
+    const next = await page.screenshot({ type: "png", fullPage: false });
+    if (next.equals(previous)) {
+      return next;
+    }
+    previous = next;
+  }
+  return previous;
 }
 
 export interface NavigationCandidate {

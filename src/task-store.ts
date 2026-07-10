@@ -60,6 +60,11 @@ export interface TaskRecord {
   startedAt: string;
   updatedAt: string;
   finishedAt?: string;
+  captureNote?: string;
+}
+
+export interface TaskCaptureInput {
+  captureNote?: string;
 }
 
 export interface StartTaskInput {
@@ -316,6 +321,12 @@ export class TaskStore {
     return transitioned;
   }
 
+  async recordCapture(id: string, capture: TaskCaptureInput): Promise<void> {
+    await this.update(id, (task) => {
+      if (capture.captureNote !== undefined) task.captureNote = capture.captureNote;
+    });
+  }
+
   async cancel(id: string, reason = "Canceled by user request."): Promise<TaskRecord | undefined> {
     let canceled: TaskRecord | undefined;
     await this.update(id, (task, now) => {
@@ -548,6 +559,7 @@ export function formatTaskDetail(task: TaskRecord): string {
     task.changedFiles?.length ? `Changed files: ${task.changedFiles.map((file) => `\`${file}\``).join(", ")}` : undefined,
     task.diffStat ? `Diff: ${task.diffStat}` : undefined,
     task.verification?.length ? ["", "Verification:", ...task.verification.map((item) => `- ${item}`)].join("\n") : undefined,
+    task.captureNote ? `Visual proof: ${task.captureNote}` : undefined,
     "",
     "Request:",
     neutralizeMentions(truncate(task.text, 800)),
@@ -666,6 +678,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
     ...(stringValue(task.routeSource) ? { routeSource: stringValue(task.routeSource)! } : {}),
     ...(stringValue(task.resultPreview) ? { resultPreview: stringValue(task.resultPreview)! } : {}),
     ...(stringValue(task.error) ? { error: stringValue(task.error)! } : {}),
+    ...(stringValue(task.captureNote) ? { captureNote: stringValue(task.captureNote)! } : {}),
     startedAt,
     updatedAt: validTimestamp(task.updatedAt) ?? startedAt,
     ...(validTimestamp(task.finishedAt) ? { finishedAt: validTimestamp(task.finishedAt)! } : {})

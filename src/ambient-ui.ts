@@ -284,7 +284,7 @@ export function proofFirstCompletionCard(input: ProofFirstCompletionInput): Ambi
   ].join("\n");
   const proof = input.proof.length === 0
     ? "No verification evidence was recorded."
-    : input.proof.slice(0, 5).map((item) => {
+    : input.proof.slice(0, 6).map((item) => {
       const status = item.status === "failed" ? "FAIL" : item.status === "info" ? "INFO" : "PASS";
       return `- **[${status}] ${inline(item.label, 80)}:** ${block(item.detail, 280)}`;
     }).join("\n");
