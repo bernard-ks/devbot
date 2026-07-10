@@ -87,7 +87,7 @@ Ideas 1-8 are implemented as the ambient workroom flow:
 
 1. **Natural intent preview:** `@devbot fix the failing auth test` is classified as a proposed action and shown as a confirmation card. `@devbot why is auth failing?` remains an immediate read-only answer. The proposal offers **Approve and start**, **Edit**, **Answer only**, and **Decline**. Editing opens a modal; answer-only runs without write access.
 2. **Private task threads:** an approved-room mention creates a private task thread and posts the proposal there. Unrestricted projects inherit the configured Devbot audience; scoped projects admit the requester and explicit project audience IDs. Eligible peers and the bot are added when project policy permits.
-3. **Isolated work:** an approved write action runs from a separate `devbot/task/<task-name>` branch and worktree under `~/.devbot/worktrees` by default. The source checkout is left untouched. Changed-file and bounded diff-status evidence are saved, while the changes remain uncommitted for human review; Devbot does not merge or push them.
+3. **Isolated work:** an approved write action runs from a separate `devbot/task/<task-name>` branch and worktree under `~/.devbot/worktrees` by default. The source checkout is left untouched. Changed-file and bounded diff-status evidence are saved, while the changes remain uncommitted for human review; Devbot does not merge or push them. When the project's default branch moves on, `/task freshness` reports how far each task branch is behind, detects branches that are already fully merged, and `/task sync` can rebase a branch in the same isolated worktree.
 4. **Needs Me:** `/inbox` and the dashboard **Needs Me** control surface proposals and other decisions waiting for the current user. Open an item to see its private task detail, workroom, approval state, branch, changed files, and verification evidence.
 5. **Proof-first completion:** completion cards show recorded proof before the result, including isolation evidence, changed files, and the route used. **Open proof** reveals the saved task detail; **Mark reviewed** clears the item from Needs Me for the requester and controllers.
 6. **Project rooms:** the owner can bind a private channel or private thread to one project with `/setup project-room action:bind project:webapp channel:#webapp-room`. Mentions in that room are restricted to the bound project; remove the binding with `action:remove`.
@@ -121,6 +121,8 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/task logs id:<task-id>`: Show the saved request, result preview, and error text.
 - `/task cancel id:<task-id>`: Mark a running saved task as canceled in local history.
 - `/task retry id:<task-id>`: Retry a saved task with the same project, mode, text, and include patterns.
+- `/task freshness project:<name> limit:<optional>`: Show merged state and behind/ahead counts for saved task branches against the project's local default branch. Branches that are fully merged are marked durably on the task record and flagged as prune-eligible worktrees.
+- `/task sync task:<task-id>`: Rebase one task branch onto the current local default branch inside its isolated worktree. Available to the task requester, the owner, or an approved controller; blocked by safe mode and while the task is still open. The pre-sync tip is preserved under `refs/devbot/backup/<task-id>` first, conflicts abort with the branch restored and the conflicted files reported, and configured validation runs afterwards for controllers with results reported as-is.
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
 - `/dashboard project:<optional>`: Open the personal interactive workspace with project selection, current status, recent work, and native Ask / Change controls.
 - `/inbox project:<optional> limit:<optional>`: Open the ephemeral **Needs Me** inbox for pending proposals and decisions, with review controls and refresh.
@@ -206,7 +208,7 @@ Each target project can define optional metadata at `<project>/.devbot/project.j
 }
 ```
 
-Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables write-capable work: `/do`, action-task retries, `/run`, `/review validate`, and `/review gates`.
+Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables write-capable work: `/do`, action-task retries, `/run`, `/task sync`, `/review validate`, and `/review gates`.
 
 Global access can be limited with `ALLOWED_USER_IDS`, `ALLOWED_USERNAMES`, and `ALLOWED_ROLE_IDS`. User IDs are the most stable option. Account usernames are matched case-insensitively; mutable global display names and guild nicknames are intentionally ignored.
 
@@ -228,7 +230,8 @@ The safety boundary is deliberate: peer bots can ask, observe, plan, review, and
 
 - Discord-launched Codex processes receive a minimal environment without the bot token or application credentials. Prompts are sent over standard input instead of command-line arguments, user config and rules are ignored, optional tools are disabled, and `danger-full-access` is rejected.
 - Git inspection and isolated-worktree operations run without inherited credentials, hooks, signing, filesystem monitors, pagers, or external diff helpers. Repositories with locally configured checkout filters are refused before a worktree is created.
-- Retained isolated worktrees are capped at 100 by default so abandoned task branches cannot grow without bound; remove reviewed worktrees before starting more.
+- Retained isolated worktrees are capped at 100 by default so abandoned task branches cannot grow without bound; remove reviewed worktrees before starting more. `/task freshness` and `/task show` detect task branches that are fully merged into the local default branch and mark their worktrees as eligible for that cleanup.
+- `/task sync` rewrites only the isolated task branch, never the source checkout. The pre-sync tip is preserved under an exact-format `refs/devbot/backup/<task-id>` ref before the rebase, conflicts are never auto-resolved, and a conflicted or failed sync restores the branch and reports honestly.
 - Screenshots are limited to configured or detected loopback origins. Redirects and browser subresources are restricted to those approved origins; arbitrary localhost ports, remote hosts, credentials in URLs, and link-local metadata addresses are rejected.
 - Local task, setup, preference, peer, and collaboration state is written owner-only inside owner-only directories. Responses, stored results, errors, command output, and indexed context pass through credential redaction.
 - These controls reduce exposure but do not make untrusted repositories harmless. Keep credentials out of project roots, review isolated changes before applying them, use ID-based Discord allowlists, and leave screenshot policy at `approval` unless a project UI is safe to post.

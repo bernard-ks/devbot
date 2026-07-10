@@ -44,6 +44,7 @@ export interface TaskRecord {
   branchName?: string;
   baseBranch?: string;
   workspaceIsolated?: boolean;
+  branchMerged?: boolean;
   changedFiles?: string[];
   diffStat?: string;
   commitSha?: string;
@@ -84,6 +85,11 @@ export interface TaskWorkspaceUpdate {
   branchName?: string;
   baseBranch?: string;
   isolated: boolean;
+}
+
+export interface TaskBranchSyncUpdate {
+  merged?: boolean;
+  baseBranch?: string;
 }
 
 export interface TaskEvidenceUpdate {
@@ -221,6 +227,17 @@ export class TaskStore {
       task.workspaceIsolated = input.isolated;
       if (input.branchName) task.branchName = input.branchName;
       if (input.baseBranch) task.baseBranch = input.baseBranch;
+      updated = cloneTask(task);
+    });
+    return updated;
+  }
+
+  async setBranchSync(id: string, input: TaskBranchSyncUpdate): Promise<TaskRecord | undefined> {
+    let updated: TaskRecord | undefined;
+    await this.update(id, (task) => {
+      if (input.merged === true) task.branchMerged = true;
+      else if (input.merged === false) delete task.branchMerged;
+      if (input.baseBranch) task.baseBranch = redactSensitiveText(input.baseBranch);
       updated = cloneTask(task);
     });
     return updated;
@@ -482,7 +499,8 @@ export function formatTaskList(tasks: TaskRecord[]): string {
     .map((task) => {
       const finished = task.finishedAt ? `, finished ${formatTime(task.finishedAt)}` : "";
       const route = task.modelTier ? `, ${task.modelTier}/${task.contextMode ?? "unknown"}` : "";
-      return `- \`${task.id}\` ${task.status} ${task.mode}${route} via ${task.source} on \`${task.projectName}\` for ${neutralizeMentions(task.requester)}${finished}: ${neutralizeMentions(truncate(task.text, 90))}`;
+      const merged = task.branchMerged ? " (branch merged)" : "";
+      return `- \`${task.id}\` ${task.status}${merged} ${task.mode}${route} via ${task.source} on \`${task.projectName}\` for ${neutralizeMentions(task.requester)}${finished}: ${neutralizeMentions(truncate(task.text, 90))}`;
     })
     .join("\n");
 }
@@ -518,7 +536,8 @@ export function formatTaskDetail(task: TaskRecord): string {
     task.approvalStatus ? `Approval: ${task.approvalStatus}${task.approvalActor ? ` by ${neutralizeMentions(task.approvalActor)}` : ""}` : undefined,
     task.proposalRevision ? `Proposal revision: ${task.proposalRevision}${task.approvedRevision ? ` (approved r${task.approvedRevision})` : ""}` : undefined,
     task.agentRoles?.length ? `Workroom roles: ${task.agentRoles.join(", ")}` : undefined,
-    task.branchName ? `Branch: \`${task.branchName}\`${task.workspaceIsolated ? " (isolated)" : ""}` : undefined,
+    task.branchName ? `Branch: \`${task.branchName}\`${task.workspaceIsolated ? " (isolated)" : ""}${task.branchMerged ? ", merged into the default branch" : ""}` : undefined,
+    task.branchMerged && task.workspaceIsolated ? "Worktree: eligible for pruning; the branch is fully merged." : undefined,
     task.baseBranch ? `Base revision: \`${task.baseBranch}\`` : undefined,
     task.commitSha ? `Commit: \`${task.commitSha}\`` : undefined,
     `Requester: ${neutralizeMentions(task.requester)}`,
@@ -632,6 +651,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
     ...(stringValue(task.branchName) ? { branchName: stringValue(task.branchName)! } : {}),
     ...(stringValue(task.baseBranch) ? { baseBranch: stringValue(task.baseBranch)! } : {}),
     ...(typeof task.workspaceIsolated === "boolean" ? { workspaceIsolated: task.workspaceIsolated } : {}),
+    ...(task.branchMerged === true ? { branchMerged: true } : {}),
     ...(normalizedChangedFiles.length > 0 ? { changedFiles: normalizedChangedFiles } : {}),
     ...(stringValue(task.diffStat) ? { diffStat: stringValue(task.diffStat)! } : {}),
     ...(stringValue(task.commitSha) ? { commitSha: stringValue(task.commitSha)! } : {}),

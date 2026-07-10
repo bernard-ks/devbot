@@ -67,6 +67,7 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Tracks active work in memory and persists task history locally.
   - Updates one Discord task message through routing, context preparation, work, failure, cancellation, and completion.
   - Uses restart-stable task controls for follow-up, review, validation, adjustment, retry, and cancellation.
+  - Tracks task branch freshness and merged state against the local default branch (`/task freshness`, `/task show`) and rebases stale task branches inside their isolated worktrees on request (`/task sync`) with a backup ref, conflict-abort safety, and honest reporting.
 - External local Codex awareness:
   - Detects local Codex app/CLI sessions whose working directory belongs to a configured project.
   - Separates confirmed external runs from open app sessions whose activity cannot be known.
@@ -80,7 +81,7 @@ The safety contract is explicit: only the requester or an approved controller ca
 ## Current Constraints
 
 - Active process tracking is in memory, while task, setup, peer, and collaboration history use local JSON stores rather than a shared database.
-- Review packets and approval records are durable, but branch and provider merge state are not synchronized automatically.
+- Review packets and approval records are durable. Local branch merge state and freshness are now synchronized on demand: `/task freshness` and `/task show` detect merged and stale task branches, mark merged state durably, and `/task sync` rebases a task branch onto the local default branch inside its isolated worktree with a backup ref and conflict-abort safety. Provider (pull request) merge state remains unsynchronized; Devbot stays local-git only.
 - The context scanner is text-only and does not understand repository structure beyond path/content ranking.
 - Screenshot targeting can click one visible matching UI control, but it does not yet plan multi-step flows, log in, seed test data, or navigate complex dynamic states.
 - Local Codex process detection is heuristic and depends on command-line shape.

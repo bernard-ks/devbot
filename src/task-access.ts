@@ -17,3 +17,14 @@ export function canAccessTaskRecord(task: TaskRecord, context: TaskAccessContext
 export function isTaskListVisible(task: TaskRecord, context: TaskAccessContext): boolean {
   return !task.internal && canAccessTaskRecord(task, context);
 }
+
+export type TaskSyncRefusal = "access" | "no-isolated-branch" | "task-active" | "requester-or-controller" | "safe-mode";
+
+export function taskSyncRefusal(task: TaskRecord, context: TaskAccessContext & { safeMode: boolean }): TaskSyncRefusal | undefined {
+  if (!canAccessTaskRecord(task, context)) return "access";
+  if (!task.workspaceIsolated || !task.workspacePath || !task.branchName || !task.baseBranch) return "no-isolated-branch";
+  if (task.status === "running" || task.status === "awaiting-approval") return "task-active";
+  if (!context.controller && task.requesterId !== context.userId) return "requester-or-controller";
+  if (context.safeMode) return "safe-mode";
+  return undefined;
+}
