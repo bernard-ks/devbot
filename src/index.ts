@@ -1707,7 +1707,7 @@ async function handleScreenshotMention(
       });
       const transcription = parseTranscription(transcriptionRaw);
       if (!transcription.found) {
-        await message.reply(formatNoErrorFoundReply(transcription.text, attachments.length));
+        await message.reply(formatNoErrorFoundReply(redactSensitiveText(transcription.text), attachments.length));
         return;
       }
 
@@ -1718,12 +1718,15 @@ async function handleScreenshotMention(
         transcription: transcription.text
       });
       const located = parseLocateResponse(locateRaw);
-      const analysis = { transcription: transcription.text, location: located.location, approach: located.approach };
+      const analysis = {
+        transcription: redactSensitiveText(transcription.text),
+        location: redactSensitiveText(located.location),
+        approach: redactSensitiveText(located.approach)
+      };
 
       const record = await screenshotFixStore.create({
         projectName: project.name,
         requesterId: message.author.id,
-        requesterTag: message.author.tag,
         ...analysis
       });
 
@@ -1733,8 +1736,8 @@ async function handleScreenshotMention(
       });
     });
   } catch (error) {
-    console.error(error);
-    await message.reply(`Error analyzing the attached image: ${(error as Error).message}`);
+    console.error(publicErrorMessage(error));
+    await message.reply(`Error analyzing the attached image: ${publicErrorMessage(error)}`);
   }
 }
 

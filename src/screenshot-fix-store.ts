@@ -1,19 +1,25 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
+import {
+  hardenPrivateDirectoryPermissions,
+  hardenPrivateFilePermissions,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+  redactSensitiveText
+} from "./security.js";
 import { isScreenshotFixId, newScreenshotFixId, type ScreenshotAnalysis } from "./screenshot-fix.js";
 
 export interface ScreenshotFixRecord extends ScreenshotAnalysis {
   id: string;
   projectName: string;
   requesterId: string;
-  requesterTag: string;
   createdAt: string;
 }
 
 export interface CreateScreenshotFixInput extends ScreenshotAnalysis {
   projectName: string;
   requesterId: string;
-  requesterTag: string;
 }
 
 interface ScreenshotFixStateFile {
@@ -35,10 +41,9 @@ export class ScreenshotFixStore {
         id: newScreenshotFixId(),
         projectName: input.projectName,
         requesterId: input.requesterId,
-        requesterTag: input.requesterTag,
-        transcription: input.transcription,
-        location: input.location,
-        approach: input.approach,
+        transcription: redactSensitiveText(input.transcription),
+        location: redactSensitiveText(input.location),
+        approach: redactSensitiveText(input.approach),
         createdAt: new Date().toISOString()
       };
       state.records.unshift(record);
@@ -91,8 +96,19 @@ export class ScreenshotFixStore {
     }
 
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as ScreenshotFixStateFile;
-      this.state = { version: 1, records: Array.isArray(parsed.records) ? parsed.records : [] };
+      const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as unknown;
+      await hardenPrivateFilePermissions(this.stateFile);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Screenshot-fix state must be a JSON object.");
+      }
+      const raw = parsed as { version?: unknown; records?: unknown };
+      if (raw.version !== undefined && raw.version !== 1) {
+        throw new Error(`Unsupported screenshot-fix state version: ${String(raw.version)}.`);
+      }
+      this.state = {
+        version: 1,
+        records: Array.isArray(raw.records) ? raw.records.map(normalizeLoadedRecord).filter((record) => record !== undefined) : []
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw new Error(`Unable to read screenshot-fix state at ${this.stateFile}: ${(error as Error).message}`, { cause: error });
@@ -108,9 +124,48 @@ export class ScreenshotFixStore {
       return;
     }
 
-    await mkdir(path.dirname(this.stateFile), { recursive: true });
-    const tempFile = `${this.stateFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`);
+    const directory = path.dirname(this.stateFile);
+    await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    await hardenPrivateDirectoryPermissions(directory);
+    const tempFile = `${this.stateFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE
+    });
     await rename(tempFile, this.stateFile);
   }
+}
+
+function normalizeLoadedRecord(value: unknown): ScreenshotFixRecord | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Partial<ScreenshotFixRecord>;
+  if (
+    typeof record.id !== "string" ||
+    !isScreenshotFixId(record.id) ||
+    typeof record.projectName !== "string" ||
+    !record.projectName.trim() ||
+    typeof record.requesterId !== "string" ||
+    !record.requesterId.trim() ||
+    typeof record.transcription !== "string" ||
+    typeof record.location !== "string" ||
+    typeof record.approach !== "string"
+  ) {
+    return undefined;
+  }
+
+  const createdAt = validTimestamp(record.createdAt) ?? new Date(0).toISOString();
+  return {
+    id: record.id,
+    projectName: record.projectName,
+    requesterId: record.requesterId,
+    transcription: redactSensitiveText(record.transcription),
+    location: redactSensitiveText(record.location),
+    approach: redactSensitiveText(record.approach),
+    createdAt
+  };
+}
+
+function validTimestamp(value: unknown): string | undefined {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : undefined;
 }
