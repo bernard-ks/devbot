@@ -142,7 +142,8 @@ const commandBuilders = [
               { name: "awaiting approval", value: "awaiting-approval" },
               { name: "succeeded", value: "succeeded" },
               { name: "failed", value: "failed" },
-              { name: "canceled", value: "canceled" }
+              { name: "canceled", value: "canceled" },
+              { name: "interrupted", value: "interrupted" }
             )
         )
         .addIntegerOption((option) =>

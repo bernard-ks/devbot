@@ -80,12 +80,16 @@ import {
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord, type TaskStatus } from "./task-store.js";
 import { canAccessTaskRecord } from "./task-access.js";
+import { captureChildIdentity, ExecutionLedger, reconcileInterruptedTasks } from "./task-recovery.js";
 import {
   createTaskWorktree,
   inspectTaskWorktree,
+  resumeTaskWorktree,
+  type CreateTaskWorktreeResult,
   type TaskWorktree
 } from "./task-worktree.js";
 import {
+  interruptedTaskNoticeRow,
   parseTaskControl,
   taskActionMatchesState,
   taskActionRows,
@@ -94,6 +98,7 @@ import {
 } from "./task-controls.js";
 import {
   continuationPrompt,
+  formatInterruptedTaskNotice,
   formatTaskProgress,
   parseTaskModal,
   taskRequestModal,
@@ -154,6 +159,7 @@ applySetupState(config, bootstrapConfig, setupStore.snapshot());
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
+const executionLedger = new ExecutionLedger(process.env.DEVBOT_EXECUTION_STORE?.trim() || undefined);
 const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
@@ -176,12 +182,21 @@ const client = new Client({
 
 client.once("clientReady", async () => {
   try {
-    const interrupted = await taskStore.interruptRunning();
-    if (interrupted > 0) {
-      console.log(`Recovered ${interrupted} interrupted task${interrupted === 1 ? "" : "s"} from the previous runtime.`);
+    const summary = await reconcileInterruptedTasks({
+      ledger: executionLedger,
+      tasks: taskStore,
+      log: (message) => console.warn(message),
+      notify: async ({ task }) => announceInterruptedTask(task),
+      isActive: (taskId) => activeTaskControllers.has(taskId)
+    });
+    if (summary.interruptedTasks > 0) {
+      const orphans = summary.orphansStopped > 0
+        ? ` and stopped ${summary.orphansStopped} orphaned worker process${summary.orphansStopped === 1 ? "" : "es"}`
+        : "";
+      console.log(`Marked ${summary.interruptedTasks} task${summary.interruptedTasks === 1 ? "" : "s"} interrupted after the restart${orphans}.`);
     }
   } catch (error) {
-    console.warn(`Unable to recover interrupted tasks: ${publicErrorMessage(error)}`);
+    console.warn(`Unable to reconcile interrupted tasks: ${publicErrorMessage(error)}`);
   }
   if (config.autoDeployCommands && client.application) {
     try {
@@ -1292,6 +1307,7 @@ interface ProjectRequestOptions {
   threadId?: string;
   agentRoles?: AmbientRole[];
   displayText?: string;
+  resumeWorkspace?: { workspacePath: string; branchName: string; baseBranch: string };
   signal?: AbortSignal;
   onProgress?: (progress: TaskProgressEvent) => Promise<void>;
 }
@@ -1326,6 +1342,18 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
         ...(options.threadId ? { threadId: options.threadId } : {}),
         ...(options.agentRoles?.length ? { agentRoles: options.agentRoles } : {})
       });
+  await recordExecutionState(task.id, executionLedger.record({
+    taskId: task.id,
+    projectName: options.project.name,
+    mode: options.mode,
+    requester: options.requester,
+    ...(task.requesterId ? { requesterId: task.requesterId } : {}),
+    ...(task.accessScope ? { accessScope: task.accessScope } : {}),
+    ...(task.channelId ? { channelId: task.channelId } : {}),
+    ...(task.threadId ? { threadId: task.threadId } : {}),
+    ...(task.controlMessageId ? { controlMessageId: task.controlMessageId } : {}),
+    startedAt: task.startedAt
+  }));
   const controller = new AbortController();
   const abortFromParent = (): void => controller.abort(options.signal?.reason);
   if (options.signal?.aborted) abortFromParent();
@@ -1337,10 +1365,26 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
   };
   let executionProject = options.project;
   let isolatedWorktree: TaskWorktree | undefined;
+  const workspaceNotes: string[] = [];
   try {
     await ensureRequestStillActive();
     if (options.mode === "action") {
-      const isolated = await createTaskWorktree({
+      let isolated: CreateTaskWorktreeResult | undefined;
+      if (options.resumeWorkspace) {
+        const resumed = await resumeTaskWorktree({
+          sourcePath: options.project.root,
+          worktreePath: options.resumeWorkspace.workspacePath,
+          branch: options.resumeWorkspace.branchName,
+          baseRevision: options.resumeWorkspace.baseBranch
+        });
+        if (resumed.available) {
+          isolated = resumed;
+          workspaceNotes.push(`Reused the isolated workspace preserved on branch ${resumed.worktree.branch} from the interrupted task.`);
+        } else {
+          workspaceNotes.push(`The preserved workspace could not be reused (${resumed.message}); a fresh isolated worktree was created.`);
+        }
+      }
+      isolated ??= await createTaskWorktree({
         sourcePath: options.project.root,
         taskName: task.id,
         baseRef: "HEAD"
@@ -1356,6 +1400,12 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
           baseBranch: isolated.worktree.baseRevision,
           isolated: true
         });
+        await recordExecutionState(task.id, executionLedger.setWorkspace(task.id, {
+          workspacePath: isolated.worktree.path,
+          branchName: isolated.worktree.branch,
+          baseBranch: isolated.worktree.baseRevision,
+          isolated: true
+        }));
         await ensureRequestStillActive();
       } else {
         await taskStore.setWorkspace(task.id, {
@@ -1374,6 +1424,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
   } catch (error) {
     if (controller.signal.aborted) await taskStore.cancel(task.id, "Canceled by user request.");
     else await taskStore.fail(task.id, error);
+    await recordExecutionState(task.id, executionLedger.clear(task.id));
     releaseController();
     throw error;
   }
@@ -1395,6 +1446,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     startedAt: task.startedAt
   };
   await reportTaskProgress(options, { ...progressBase, phase: "routing" });
+  await recordExecutionState(task.id, executionLedger.setPhase(task.id, "routing"));
   let selectedRoute: RequestRoute | undefined;
 
   try {
@@ -1415,6 +1467,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       contextMode: route.contextMode
     });
     await reportTaskProgress(options, { ...progressBase, phase: "gathering-context", route });
+    await recordExecutionState(task.id, executionLedger.setPhase(task.id, "gathering-context"));
     const contextCharLimit = contextLimitForRoute(
       route,
       options.appConfig.scanner.maxPackedContextChars,
@@ -1435,9 +1488,10 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       route,
       contextFileCount: context.files.length
     });
-    const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
+    await recordExecutionState(task.id, executionLedger.setPhase(task.id, "running-codex"));
+    const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal, recordExecutionChild(task.id));
     if (isolatedWorktree) {
-      await recordTaskWorktreeEvidence(task.id, isolatedWorktree);
+      await recordTaskWorktreeEvidence(task.id, isolatedWorktree, true, workspaceNotes);
     }
     const completed = await taskStore.succeed(task.id, {
       contextFileCount: context.files.length,
@@ -1458,7 +1512,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     return { answer, context, taskId: task.id, route };
   } catch (error) {
     if (isolatedWorktree) {
-      await recordTaskWorktreeEvidence(task.id, isolatedWorktree, false).catch(() => undefined);
+      await recordTaskWorktreeEvidence(task.id, isolatedWorktree, false, workspaceNotes).catch(() => undefined);
     }
     if (controller.signal.aborted) {
       await taskStore.cancel(task.id, "Canceled by user request.");
@@ -1482,6 +1536,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     if (options.mode === "action") {
       contextService.invalidate(options.project.name);
     }
+    await recordExecutionState(task.id, executionLedger.clear(task.id));
     releaseController();
     if (work) workTracker.finish(work.id);
   }
@@ -1502,21 +1557,75 @@ async function requireRunningTask(taskId: string, projectName: string): Promise<
   return task;
 }
 
+async function recordExecutionState(taskId: string, operation: Promise<void>): Promise<void> {
+  try {
+    await operation;
+  } catch (error) {
+    console.warn(`Unable to update the execution ledger for ${taskId}: ${publicErrorMessage(error)}`);
+  }
+}
+
+function recordExecutionChild(taskId: string): (pid: number) => void {
+  return (pid) => {
+    void captureChildIdentity(pid)
+      .then(async (identity) => {
+        if (identity) await executionLedger.setChild(taskId, identity);
+      })
+      .catch((error) => console.warn(`Unable to record the worker process for ${taskId}: ${publicErrorMessage(error)}`));
+  };
+}
+
+async function rememberTaskMessage(taskId: string, channelId: string, messageId: string): Promise<void> {
+  try {
+    await taskStore.setDiscordContext(taskId, { channelId, controlMessageId: messageId });
+    await executionLedger.setDiscordContext(taskId, { channelId, controlMessageId: messageId });
+  } catch (error) {
+    console.warn(`Unable to record the task message for ${taskId}: ${publicErrorMessage(error)}`);
+  }
+}
+
+async function fetchOwnTaskMessage(task: TaskRecord): Promise<Message | undefined> {
+  const channelId = task.threadId ?? task.channelId;
+  if (!channelId || !task.controlMessageId) {
+    return undefined;
+  }
+  const channel = await client.channels.fetch(channelId);
+  if (!channel?.isTextBased() || channel.isDMBased()) {
+    return undefined;
+  }
+  const message = await channel.messages.fetch(task.controlMessageId);
+  return message.author.id === client.user?.id ? message : undefined;
+}
+
+async function announceInterruptedTask(task: TaskRecord): Promise<void> {
+  const message = await fetchOwnTaskMessage(task);
+  if (!message) {
+    return;
+  }
+  await message.edit({
+    content: formatInterruptedTaskNotice(task),
+    components: [interruptedTaskNoticeRow(task.id, { mode: task.mode, safeMode: config.safeMode })],
+    allowedMentions: { parse: [] }
+  });
+}
+
 async function recordTaskWorktreeEvidence(
   taskId: string,
   worktree: TaskWorktree,
-  completed = true
+  completed = true,
+  notes: readonly string[] = []
 ): Promise<void> {
   const inspection = await inspectTaskWorktree(worktree);
   if (!inspection.available) {
     await taskStore.setEvidence(taskId, {
-      verification: [`Isolated branch created, but evidence collection failed: ${inspection.message}`]
+      verification: [...notes, `Isolated branch created, but evidence collection failed: ${inspection.message}`]
     });
     return;
   }
 
   const changedFiles = [...new Set(inspection.changes.map((change) => change.path))];
   const verification = [
+    ...notes,
     `Work isolated on branch ${worktree.branch}.`,
     inspection.diff.truncated
       ? "Git diff inspection exceeded 100 KB; only changed-file status was retained."
@@ -1567,7 +1676,17 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
           content: formatTaskProgress(progress),
           components: [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })]
         });
-        progressRendered = true;
+        if (!progressRendered) {
+          progressRendered = true;
+          try {
+            const reply = await interaction.fetchReply();
+            if (!reply.flags.has(MessageFlags.Ephemeral)) {
+              await rememberTaskMessage(progress.taskId, reply.channelId, reply.id);
+            }
+          } catch (error) {
+            console.warn(`Unable to resolve the task message for ${progress.taskId}: ${publicErrorMessage(error)}`);
+          }
+        }
       }
     });
     const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`);
@@ -1605,7 +1724,10 @@ async function executeMessageRequest(options: MessageRequestOptions): Promise<vo
           content: formatTaskProgress(progress),
           components: [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })]
         });
-        progressRendered = true;
+        if (!progressRendered) {
+          progressRendered = true;
+          await rememberTaskMessage(progress.taskId, pending.channelId, pending.id);
+        }
       }
     });
     const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`);
@@ -2486,7 +2608,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
       return;
     }
     if (!taskActionMatchesState("retry", task)) {
-      await interaction.editReply(`Task \`${id}\` is ${task.status}; only failed or canceled tasks can be retried.`);
+      await interaction.editReply(`Task \`${id}\` is ${task.status}; only failed, canceled, or interrupted tasks can be retried.`);
       return;
     }
 
@@ -2506,6 +2628,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
       requester: interaction.user.tag,
       requesterId: task.requesterId ?? interaction.user.id,
       ...(task.accessScope ? { accessScope: task.accessScope } : {}),
+      ...(resumeWorkspaceForRetry(task) ?? {}),
       source: `retry:${task.id}`,
       parentTaskId: task.id,
       dedupeKey: `task-retry:${task.id}`,
@@ -2563,14 +2686,17 @@ async function handleTaskControl(
 
   const mode: CodexRequestMode = task.mode === "action" ? "action" : "answer";
   const canControl = isControllerUser(interaction.user.id, appConfig);
+  const canRecover = canControl || (Boolean(task.requesterId) && task.requesterId === interaction.user.id);
 
   if (action === "actions") {
     const rows = taskActionRows(task, {
       canControl,
       safeMode: appConfig.safeMode,
-      hasChecks: configuredCommandNames(project).length > 0
+      hasChecks: configuredCommandNames(project).length > 0,
+      canRecover
     });
-    const safeModeBlocksRecovery = appConfig.safeMode && mode === "action" && (task.status === "failed" || task.status === "canceled");
+    const safeModeBlocksRecovery =
+      appConfig.safeMode && mode === "action" && (task.status === "failed" || task.status === "canceled" || task.status === "interrupted");
     await interaction.reply({
       content: [
         `**${project.name} task actions**`,
@@ -2657,10 +2783,39 @@ async function handleTaskControl(
     return;
   }
 
+  if (action === "dismiss") {
+    if (!canRecover) {
+      await interaction.reply({
+        content: "Only the requester or an approved controller can dismiss interrupted work.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    const dismissed = await taskStore.dismiss(task.id, interaction.user.tag);
+    if (dismissed) {
+      await refreshDismissedNotice(dismissed);
+    }
+    await interaction.reply({
+      content: dismissed
+        ? "Interrupted task dismissed. Its preserved workspace remains available for review until normal cleanup."
+        : `This task is already ${(await taskStore.get(task.id))?.status ?? "unavailable"}.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
   if (action !== "retry") {
     return;
   }
-  if (mode === "action" && !canControl) {
+  if (task.status === "interrupted") {
+    if (!canRecover) {
+      await interaction.reply({
+        content: "Only the requester or an approved controller can retry work that a restart interrupted.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+  } else if (mode === "action" && !canControl) {
     await interaction.reply({
       content: "Only the owner or an approved controller can retry write-capable work.",
       flags: MessageFlags.Ephemeral
@@ -2684,12 +2839,49 @@ async function handleTaskControl(
       requester: interaction.user.tag,
       requesterId: task.requesterId ?? interaction.user.id,
       ...(task.accessScope ? { accessScope: task.accessScope } : {}),
+      ...(resumeWorkspaceForRetry(task) ?? {}),
       source: `button:retry:${task.id}`,
       ephemeral: true,
       parentTaskId: task.id,
       dedupeKey: `task-retry:${task.id}`
     });
   });
+}
+
+function resumeWorkspaceForRetry(task: TaskRecord): Pick<ProjectRequestOptions, "resumeWorkspace"> | undefined {
+  if (task.status !== "interrupted" || task.mode !== "action" || !task.workspaceIsolated) {
+    return undefined;
+  }
+  if (!task.workspacePath || !task.branchName || !task.baseBranch) {
+    return undefined;
+  }
+  return {
+    resumeWorkspace: {
+      workspacePath: task.workspacePath,
+      branchName: task.branchName,
+      baseBranch: task.baseBranch
+    }
+  };
+}
+
+async function refreshDismissedNotice(task: TaskRecord): Promise<void> {
+  try {
+    const message = await fetchOwnTaskMessage(task);
+    if (!message) {
+      return;
+    }
+    await message.edit({
+      content: [
+        `**${task.projectName} task dismissed**`,
+        task.error ?? "The interrupted task was dismissed.",
+        task.branchName ? `Branch \`${task.branchName}\` remains preserved for review.` : undefined
+      ].filter((line) => line !== undefined).join("\n"),
+      components: [],
+      allowedMentions: { parse: [] }
+    });
+  } catch (error) {
+    console.warn(`Unable to update the dismissed task notice for ${task.id}: ${publicErrorMessage(error)}`);
+  }
 }
 
 async function runTaskActionOnce(interaction: ButtonInteraction, key: string, run: () => Promise<void>): Promise<void> {
@@ -4775,7 +4967,8 @@ async function runCodex(
   context: PackedProjectContext,
   mode: CodexRequestMode,
   route: RequestRoute,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onSpawn?: (pid: number) => void
 ): Promise<string> {
   return answerWithProjectContext({
     codex: appConfig.codex,
@@ -4785,7 +4978,8 @@ async function runCodex(
     ...(route.model ? { model: route.model } : {}),
     ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
     contextMode: route.contextMode,
-    ...(signal ? { signal } : {})
+    ...(signal ? { signal } : {}),
+    ...(onSpawn ? { onSpawn } : {})
   });
 }
 
