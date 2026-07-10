@@ -1328,20 +1328,22 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
   const backends = await detectBackends(appConfig.codex).catch(() => [] as BackendAvailability[]);
   const activeBackendId = getActiveBackendId();
   const activeBackend = backends.find((backend) => backend.id === activeBackendId);
-  const backendReady = Boolean(activeBackend?.installed);
+  const backendReady = Boolean(activeBackend?.installed && activeBackend.compatible);
   const answerReadOnly = activeBackend ? activeBackend.capabilities.enforcesAnswerReadOnly : true;
+  const actionConfined = activeBackend ? activeBackend.capabilities.confinesActionWorkspace : true;
   const checks = [
     [Boolean(appConfig.ownerUserId), "Owner identity", "Set DEVBOT_OWNER_USER_ID locally and restart."],
     [Boolean(effectivePrivateRoomId()), "Private room", "Run /setup wizard and choose Use private room."],
     [repoReady, "Default repository", "Add or repair a repository in /setup wizard."],
-    [backendReady, `Agent backend (${activeBackendId})`, "Install the selected agent CLI or pick another with /setup backend."],
+    [backendReady, `Agent backend (${activeBackendId})`, activeBackend?.compatibilityError ?? "Install the selected agent CLI or pick another with /setup backend."],
     [answerReadOnly, `Read-only answers (${activeBackendId})`, "This backend cannot guarantee read-only /ask runs; switch to codex or claude with /setup backend."],
+    [actionConfined, `Workspace-confined actions (${activeBackendId})`, "This backend cannot confine /do writes to the task workspace; switch to codex with /setup backend."],
     [appConfig.routing.enabled && Boolean(appConfig.routing.fastModel && appConfig.routing.standardModel && appConfig.routing.deepModel), "Luna / Terra / Sol routing", "Check CODEX_ROUTER_MODEL and tier model settings."],
     [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."]
   ] as const;
   const passed = checks.filter(([ready]) => ready).length;
   const backendSummary = backends.length
-    ? backends.map((backend) => `${backend.id === activeBackendId ? "*" : "-"} ${backend.id}: ${backend.installed ? backend.version ?? "installed" : "not installed"}${backend.experimental ? " (experimental)" : ""}${backend.capabilities.enforcesAnswerReadOnly ? "" : " (no read-only /ask)"}`)
+    ? backends.map((backend) => `${backend.id === activeBackendId ? "*" : "-"} ${backend.id}: ${backend.installed ? backend.version ?? "installed" : "not installed"}${backend.experimental ? " (experimental)" : ""}${backend.capabilities.enforcesAnswerReadOnly ? "" : " (no read-only /ask)"}${backend.capabilities.confinesActionWorkspace ? "" : " (no /do actions)"}${backend.installed && !backend.compatible ? " (execution disabled)" : ""}`)
     : ["- backend detection unavailable"];
   return [
     "Devbot doctor",
@@ -1362,6 +1364,8 @@ function formatBackendLine(backend: BackendAvailability, activeId: string): stri
   const tags = [
     backend.experimental ? "experimental" : "",
     backend.capabilities.enforcesAnswerReadOnly ? "" : "no read-only /ask",
+    backend.capabilities.confinesActionWorkspace ? "" : "no /do actions",
+    backend.installed && !backend.compatible ? backend.compatibilityError ?? "execution disabled" : "",
     backend.error && !backend.installed ? backend.error : ""
   ].filter(Boolean);
   return `${marker}${backend.id} (${backend.displayName}): ${status}${tags.length ? ` [${tags.join("; ")}]` : ""}`;
@@ -1378,7 +1382,7 @@ async function formatBackendReport(appConfig: AppConfig, requested?: string): Pr
     "",
     ...availabilities.map((backend) => formatBackendLine(backend, activeId)),
     "",
-    "Selection order: DEVBOT_AGENT_BACKEND env, then /setup backend, then first detected (codex, claude, gemini, opencode)."
+    "Selection order: DEVBOT_AGENT_BACKEND env, then /setup backend. Only codex is auto-selected; every other backend requires an explicit choice here."
   ];
   if (requested && envForced && envForced.toLowerCase() !== requested.toLowerCase()) {
     lines.push(`Saved ${requested}, but DEVBOT_AGENT_BACKEND=${envForced} overrides it until the env var is cleared.`);

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
-import { minimalChildEnvironment, scopedChildEnvironment, type ChildEnvironmentAllowList } from "./security.js";
+import { minimalChildEnvironment, scopedChildEnvironment } from "./security.js";
 import type { CodexConfig } from "./types.js";
 
 export type AgentRequestMode = "answer" | "action";
@@ -28,6 +28,7 @@ export interface BuildCommandOptions {
   model?: string;
   reasoningEffort?: string;
   outputFile?: string;
+  runtimeDir?: string;
   skipGitRepoCheck?: boolean;
   imagePaths?: string[];
   sandbox?: CodexConfig["sandbox"];
@@ -73,6 +74,9 @@ export interface BackendAvailability {
   binary: string;
   installed: boolean;
   experimental: boolean;
+  /** The installed CLI passed this backend's required-flag/verification probe. */
+  compatible: boolean;
+  compatibilityError?: string;
   capabilities: BackendCapabilities;
   version?: string;
   error?: string;
@@ -84,6 +88,8 @@ export interface AgentBackend {
   binary: string;
   experimental: boolean;
   usesOutputFile: boolean;
+  /** The run needs a private temporary directory to use as the child HOME. */
+  usesRuntimeHome: boolean;
   capabilities: BackendCapabilities;
   detect(): Promise<BackendAvailability>;
   buildAnswerCommand(options: BuildCommandOptions): SpawnSpec;
@@ -97,6 +103,16 @@ export class ReadOnlyUnsupportedError extends Error {
         `Switch to a read-only-capable backend with /setup backend id:codex (or id:claude).`
     );
     this.name = "ReadOnlyUnsupportedError";
+  }
+}
+
+export class UnconfinedActionError extends Error {
+  constructor(displayName: string) {
+    super(
+      `${displayName} cannot confine action-mode writes to the isolated task workspace, so Devbot refuses ` +
+        `action-mode (/do) requests on it. Switch to a workspace-confining backend with /setup backend id:codex.`
+    );
+    this.name = "UnconfinedActionError";
   }
 }
 
@@ -142,11 +158,13 @@ interface DetectResult {
   error?: string;
 }
 
-function probeVersion(bin: string, timeoutMs = 5_000): Promise<DetectResult> {
+export type CliProbe = (bin: string, args: readonly string[]) => Promise<DetectResult>;
+
+function probeCli(bin: string, args: readonly string[], timeoutMs = 5_000): Promise<DetectResult> {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(bin, ["--version"], { env: minimalChildEnvironment(process.env), stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(bin, [...args], { env: minimalChildEnvironment(process.env), stdio: ["ignore", "pipe", "pipe"] });
     } catch (error) {
       resolve({ installed: false, stdout: "", error: (error as Error).message });
       return;
@@ -156,7 +174,7 @@ function probeVersion(bin: string, timeoutMs = 5_000): Promise<DetectResult> {
     let settled = false;
     const timer = setTimeout(() => {
       child?.kill("SIGKILL");
-      finish({ installed: true, stdout, error: "version probe timed out" });
+      finish({ installed: true, stdout, error: "CLI probe timed out" });
     }, timeoutMs);
     const finish = (result: DetectResult): void => {
       if (settled) {
@@ -181,22 +199,60 @@ function probeVersion(bin: string, timeoutMs = 5_000): Promise<DetectResult> {
   });
 }
 
+/**
+ * A backend definition carries its verification requirements alongside the
+ * command builders. `requiredFlags` are probed against the installed CLI's
+ * --help output before the backend is considered executable; a
+ * `verificationGap` marks an adapter whose safety has not been proven against
+ * the real CLI, which keeps it visible in detection but never executable.
+ */
+interface BackendDefinition extends Omit<AgentBackend, "detect"> {
+  requiredFlags?: readonly string[];
+  verificationGap?: string;
+}
+
 const detectionCache = new Map<string, Promise<BackendAvailability>>();
 
-function detectBackend(backend: Omit<AgentBackend, "detect">, probe = probeVersion): Promise<BackendAvailability> {
+async function resolveCompatibility(
+  backend: BackendDefinition,
+  probe: CliProbe
+): Promise<{ compatible: boolean; compatibilityError?: string }> {
+  if (backend.verificationGap) {
+    return { compatible: false, compatibilityError: backend.verificationGap };
+  }
+  if (!backend.requiredFlags || backend.requiredFlags.length === 0) {
+    return { compatible: true };
+  }
+  const help = await probe(backend.binary, ["--help"]);
+  const missing = backend.requiredFlags.filter((flag) => !help.stdout.includes(flag));
+  if (missing.length > 0) {
+    return {
+      compatible: false,
+      compatibilityError: `${backend.displayName} does not support required flags: ${missing.join(", ")}. Upgrade the CLI.`
+    };
+  }
+  return { compatible: true };
+}
+
+function detectBackend(backend: BackendDefinition, probe: CliProbe): Promise<BackendAvailability> {
   const cacheKey = `${backend.id}:${backend.binary}`;
   const cached = detectionCache.get(cacheKey);
   if (cached) {
     return cached;
   }
-  const run = probe(backend.binary).then((result): BackendAvailability => {
+  const run = probe(backend.binary, ["--version"]).then(async (result): Promise<BackendAvailability> => {
     const version = result.installed ? parseVersionOutput(result.stdout) : undefined;
+    const compatibility = result.installed
+      ? await resolveCompatibility(backend, probe)
+      : { compatible: false as const };
     return {
       id: backend.id,
       displayName: backend.displayName,
       binary: backend.binary,
       installed: result.installed,
       experimental: backend.experimental,
+      compatible: compatibility.compatible,
+      ...(compatibility.compatibilityError ? { compatibilityError: compatibility.compatibilityError } : {}),
       capabilities: backend.capabilities,
       ...(version ? { version } : {}),
       ...(result.error && !result.installed ? { error: result.error } : {})
@@ -204,6 +260,31 @@ function detectBackend(backend: Omit<AgentBackend, "detect">, probe = probeVersi
   });
   detectionCache.set(cacheKey, run);
   return run;
+}
+
+/**
+ * The declared capabilities drive fail-closed behavior structurally: any
+ * backend that does not guarantee read-only answers or workspace-confined
+ * actions throws before a spawn spec exists, regardless of what its own
+ * builders would produce.
+ */
+function finalizeBackend(backend: BackendDefinition, probe: CliProbe): AgentBackend {
+  return {
+    ...backend,
+    buildAnswerCommand: (options) => {
+      if (!backend.capabilities.enforcesAnswerReadOnly) {
+        throw new ReadOnlyUnsupportedError(backend.displayName);
+      }
+      return backend.buildAnswerCommand(options);
+    },
+    buildActionCommand: (options) => {
+      if (!backend.capabilities.confinesActionWorkspace) {
+        throw new UnconfinedActionError(backend.displayName);
+      }
+      return backend.buildActionCommand(options);
+    },
+    detect: () => detectBackend(backend, probe)
+  };
 }
 
 export function clearDetectionCache(): void {
@@ -312,160 +393,190 @@ function isolatedCodexEnvironment(environment: NodeJS.ProcessEnv, runtimeHome: s
   return isolated;
 }
 
-export function createCodexBackend(codex: CodexConfig, env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend {
-  const backend: Omit<AgentBackend, "detect"> = {
-    id: "codex",
-    displayName: "Codex CLI",
-    binary: codex.bin,
-    experimental: false,
-    usesOutputFile: true,
-    capabilities: CODEX_CAPABILITIES,
-    buildAnswerCommand: (options) => buildCodexArgs(options, codex, codex.sandbox, env),
-    buildActionCommand: (options) => buildCodexArgs(options, codex, codex.actionSandbox, env)
-  };
-  return { ...backend, detect: () => detectBackend(backend, probe) };
+export function createCodexBackend(codex: CodexConfig, env: NodeJS.ProcessEnv = process.env, probe: CliProbe = probeCli): AgentBackend {
+  return finalizeBackend(
+    {
+      id: "codex",
+      displayName: "Codex CLI",
+      binary: codex.bin,
+      experimental: false,
+      usesOutputFile: true,
+      usesRuntimeHome: false,
+      capabilities: CODEX_CAPABILITIES,
+      buildAnswerCommand: (options) => buildCodexArgs(options, codex, codex.sandbox, env),
+      buildActionCommand: (options) => buildCodexArgs(options, codex, codex.actionSandbox, env)
+    },
+    probe
+  );
 }
 
-const CLAUDE_ENV_ALLOW: ChildEnvironmentAllowList = {
-  exactKeys: [
-    "AWS_REGION",
-    "CLOUD_ML_REGION",
-    "GOOGLE_APPLICATION_CREDENTIALS"
-  ],
-  keyPrefixes: ["ANTHROPIC_", "CLAUDE_CODE_"]
-};
+/**
+ * Exact documented variables the Claude CLI needs for authentication and
+ * first-party provider routing. Every entry is named individually; prefix
+ * admission is not supported, so unrelated ANTHROPIC_- or CLAUDE_CODE_-prefixed
+ * values in the bot environment never reach the child.
+ */
+const CLAUDE_ENV_EXACT_KEYS = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_VERTEX_PROJECT_ID",
+  "AWS_REGION",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLOUD_ML_REGION",
+  "GOOGLE_APPLICATION_CREDENTIALS"
+] as const;
 
+const CLAUDE_READ_ONLY_ALLOWED_TOOLS = "Read,Glob,Grep";
 const CLAUDE_READ_ONLY_DENY_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "WebFetch", "WebSearch"];
 
-export function createClaudeBackend(env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend {
+/**
+ * Flags the answer command depends on. Detection probes --help and refuses to
+ * treat the CLI as compatible unless every one is supported, so an older
+ * `claude` binary that would silently ignore the safety flags never runs.
+ */
+const CLAUDE_REQUIRED_FLAGS = [
+  "--print",
+  "--safe-mode",
+  "--no-session-persistence",
+  "--strict-mcp-config",
+  "--permission-mode",
+  "--tools",
+  "--disallowedTools"
+] as const;
+
+/**
+ * The child gets a private empty HOME so ambient dotfiles are unreachable,
+ * while CLAUDE_CONFIG_DIR still points at the real config directory so stored
+ * credentials keep working (the same split Codex gets via CODEX_HOME).
+ * --safe-mode is what disables user customization; this only removes the
+ * ambient home directory from the child's view.
+ */
+function isolatedClaudeEnvironment(environment: NodeJS.ProcessEnv, runtimeHome: string): NodeJS.ProcessEnv {
+  const isolated = scopedChildEnvironment(environment, CLAUDE_ENV_EXACT_KEYS);
+  const realHome = environment.HOME?.trim() || environment.USERPROFILE?.trim() || homedir();
+  isolated.CLAUDE_CONFIG_DIR = environment.CLAUDE_CONFIG_DIR?.trim() || path.join(realHome, ".claude");
+  isolated.HOME = runtimeHome;
+  isolated.USERPROFILE = runtimeHome;
+  return isolated;
+}
+
+export function createClaudeBackend(env: NodeJS.ProcessEnv = process.env, probe: CliProbe = probeCli): AgentBackend {
   const binary = envValue(env, "DEVBOT_CLAUDE_BIN") ?? "claude";
   const models = tierModels(env, "DEVBOT_CLAUDE");
-  const base = (options: BuildCommandOptions, extra: string[]): SpawnSpec => {
-    const model = modelForTier(models, options.tier);
-    const args = ["-p", "--strict-mcp-config", ...extra, ...(model ? ["--model", model] : [])];
-    return {
-      bin: binary,
-      args,
-      cwd: options.cwd,
-      env: scopedChildEnvironment(env, CLAUDE_ENV_ALLOW),
-      timeoutMs: options.timeoutMs,
-      stdin: options.prompt
-    };
-  };
-  const backend: Omit<AgentBackend, "detect"> = {
-    id: "claude",
-    displayName: "Claude Code",
-    binary,
-    experimental: false,
-    usesOutputFile: false,
-    capabilities: {
-      minimalEnvironment: true,
-      isolatesUserConfig: true,
-      constrainsNetwork: false,
-      enforcesAnswerReadOnly: true,
-      confinesActionWorkspace: true,
-      supportsCancellation: true,
-      promptTransport: "stdin",
-      outputTransport: "stdout"
+  const displayName = "Claude Code";
+  return finalizeBackend(
+    {
+      id: "claude",
+      displayName,
+      binary,
+      experimental: false,
+      usesOutputFile: false,
+      usesRuntimeHome: true,
+      requiredFlags: CLAUDE_REQUIRED_FLAGS,
+      capabilities: {
+        minimalEnvironment: true,
+        // --safe-mode disables CLAUDE.md, hooks, plugins, skills, MCP servers,
+        // custom commands/agents, and other customization by the CLI's own
+        // contract; the child additionally runs with an isolated HOME.
+        isolatesUserConfig: true,
+        constrainsNetwork: false,
+        // plan permission mode + a read-only tool allow list + a write/network
+        // tool deny list, with MCP restricted to --mcp-config (none supplied).
+        enforcesAnswerReadOnly: true,
+        // The Claude CLI has no supported flag that restricts filesystem writes
+        // to a single directory (--add-dir only grants extra access), so action
+        // mode fails closed instead of claiming confinement.
+        confinesActionWorkspace: false,
+        supportsCancellation: true,
+        promptTransport: "stdin",
+        outputTransport: "stdout"
+      },
+      buildAnswerCommand: (options) => {
+        if (!options.runtimeDir) {
+          throw new Error("Claude backend requires an isolated runtime home directory.");
+        }
+        const model = modelForTier(models, options.tier);
+        const args = [
+          "--print",
+          "--safe-mode",
+          "--no-session-persistence",
+          "--strict-mcp-config",
+          "--permission-mode",
+          "plan",
+          "--tools",
+          CLAUDE_READ_ONLY_ALLOWED_TOOLS,
+          "--disallowedTools",
+          ...CLAUDE_READ_ONLY_DENY_TOOLS,
+          ...(model ? ["--model", model] : [])
+        ];
+        return {
+          bin: binary,
+          args,
+          cwd: options.cwd,
+          env: isolatedClaudeEnvironment(env, options.runtimeDir),
+          timeoutMs: options.timeoutMs,
+          stdin: options.prompt
+        };
+      },
+      buildActionCommand: () => {
+        throw new UnconfinedActionError(displayName);
+      }
     },
-    buildAnswerCommand: (options) =>
-      base(options, ["--permission-mode", "plan", "--disallowedTools", ...CLAUDE_READ_ONLY_DENY_TOOLS]),
-    buildActionCommand: (options) => base(options, ["--permission-mode", "acceptEdits", "--add-dir", options.cwd])
-  };
-  return { ...backend, detect: () => detectBackend(backend, probe) };
+    probe
+  );
 }
 
-const GEMINI_ENV_ALLOW: ChildEnvironmentAllowList = {
-  exactKeys: ["GOOGLE_APPLICATION_CREDENTIALS"],
-  keyPrefixes: ["GEMINI_", "GOOGLE_"]
+const UNVERIFIED_CAPABILITIES: BackendCapabilities = {
+  minimalEnvironment: true,
+  isolatesUserConfig: false,
+  constrainsNetwork: false,
+  enforcesAnswerReadOnly: false,
+  confinesActionWorkspace: false,
+  supportsCancellation: true,
+  promptTransport: "stdin",
+  outputTransport: "stdout"
 };
 
-export function createGeminiBackend(env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend {
-  const binary = envValue(env, "DEVBOT_GEMINI_BIN") ?? "gemini";
-  const models = tierModels(env, "DEVBOT_GEMINI");
-  const base = (options: BuildCommandOptions, extra: string[]): SpawnSpec => {
-    const model = modelForTier(models, options.tier);
-    const args = [...extra, ...(model ? ["--model", model] : [])];
-    return {
-      bin: binary,
-      args,
-      cwd: options.cwd,
-      env: scopedChildEnvironment(env, GEMINI_ENV_ALLOW),
-      timeoutMs: options.timeoutMs,
-      stdin: options.prompt
-    };
-  };
-  const displayName = "Gemini CLI";
-  const backend: Omit<AgentBackend, "detect"> = {
-    id: "gemini",
-    displayName,
-    binary,
-    experimental: true,
-    usesOutputFile: false,
-    capabilities: {
-      minimalEnvironment: true,
-      isolatesUserConfig: false,
-      constrainsNetwork: false,
-      enforcesAnswerReadOnly: false,
-      confinesActionWorkspace: false,
-      supportsCancellation: true,
-      promptTransport: "stdin",
-      outputTransport: "stdout"
+/**
+ * Gemini CLI and opencode are detection-only placeholders: neither can prove
+ * read-only answers or workspace-confined actions against the real CLI yet, so
+ * no spawn spec exists for either mode and no environment is ever forwarded.
+ */
+function createUnverifiedBackend(id: BackendId, displayName: string, binary: string, probe: CliProbe): AgentBackend {
+  return finalizeBackend(
+    {
+      id,
+      displayName,
+      binary,
+      experimental: true,
+      usesOutputFile: false,
+      usesRuntimeHome: false,
+      verificationGap:
+        `${displayName} has not passed a real-CLI verification of read-only answers and workspace-confined actions, ` +
+        `so Devbot will not execute it.`,
+      capabilities: UNVERIFIED_CAPABILITIES,
+      buildAnswerCommand: () => {
+        throw new ReadOnlyUnsupportedError(displayName);
+      },
+      buildActionCommand: () => {
+        throw new UnconfinedActionError(displayName);
+      }
     },
-    buildAnswerCommand: () => {
-      throw new ReadOnlyUnsupportedError(displayName);
-    },
-    buildActionCommand: (options) => base(options, ["--yolo"])
-  };
-  return { ...backend, detect: () => detectBackend(backend, probe) };
+    probe
+  );
 }
 
-const OPENCODE_ENV_ALLOW: ChildEnvironmentAllowList = {
-  exactKeys: ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY"],
-  keyPrefixes: ["OPENCODE_"]
-};
-
-export function createOpencodeBackend(env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend {
-  const binary = envValue(env, "DEVBOT_OPENCODE_BIN") ?? "opencode";
-  const models = tierModels(env, "DEVBOT_OPENCODE");
-  const base = (options: BuildCommandOptions): SpawnSpec => {
-    const model = modelForTier(models, options.tier);
-    const args = ["run", ...(model ? ["--model", model] : [])];
-    return {
-      bin: binary,
-      args,
-      cwd: options.cwd,
-      env: scopedChildEnvironment(env, OPENCODE_ENV_ALLOW),
-      timeoutMs: options.timeoutMs,
-      stdin: options.prompt
-    };
-  };
-  const displayName = "opencode";
-  const backend: Omit<AgentBackend, "detect"> = {
-    id: "opencode",
-    displayName,
-    binary,
-    experimental: true,
-    usesOutputFile: false,
-    capabilities: {
-      minimalEnvironment: true,
-      isolatesUserConfig: false,
-      constrainsNetwork: false,
-      enforcesAnswerReadOnly: false,
-      confinesActionWorkspace: false,
-      supportsCancellation: true,
-      promptTransport: "stdin",
-      outputTransport: "stdout"
-    },
-    buildAnswerCommand: () => {
-      throw new ReadOnlyUnsupportedError(displayName);
-    },
-    buildActionCommand: (options) => base(options)
-  };
-  return { ...backend, detect: () => detectBackend(backend, probe) };
+export function createGeminiBackend(env: NodeJS.ProcessEnv = process.env, probe: CliProbe = probeCli): AgentBackend {
+  return createUnverifiedBackend("gemini", "Gemini CLI", envValue(env, "DEVBOT_GEMINI_BIN") ?? "gemini", probe);
 }
 
-export function createBackends(codex: CodexConfig, env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend[] {
+export function createOpencodeBackend(env: NodeJS.ProcessEnv = process.env, probe: CliProbe = probeCli): AgentBackend {
+  return createUnverifiedBackend("opencode", "opencode", envValue(env, "DEVBOT_OPENCODE_BIN") ?? "opencode", probe);
+}
+
+export function createBackends(codex: CodexConfig, env: NodeJS.ProcessEnv = process.env, probe: CliProbe = probeCli): AgentBackend[] {
   return [
     createCodexBackend(codex, env, probe),
     createClaudeBackend(env, probe),
@@ -478,6 +589,13 @@ export function normalizeBackendId(value: string | undefined): BackendId | undef
   const trimmed = value?.trim().toLowerCase();
   return trimmed && (BACKEND_ORDER as readonly string[]).includes(trimmed) ? (trimmed as BackendId) : undefined;
 }
+
+/**
+ * Only Codex may be chosen automatically. Every other backend requires an
+ * explicit owner opt-in through DEVBOT_AGENT_BACKEND or /setup backend, so an
+ * incidentally installed CLI can never become the executor by mere presence.
+ */
+const AUTO_SELECTABLE_BACKENDS: readonly BackendId[] = ["codex"];
 
 export function selectBackendId(input: {
   envBackend?: string | undefined;
@@ -492,7 +610,7 @@ export function selectBackendId(input: {
   if (setup) {
     return setup;
   }
-  for (const id of BACKEND_ORDER) {
+  for (const id of AUTO_SELECTABLE_BACKENDS) {
     if (input.detected.has(id)) {
       return id;
     }

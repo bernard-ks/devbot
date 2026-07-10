@@ -79,30 +79,26 @@ export function minimalChildEnvironment(
  */
 const NEVER_FORWARD_PREFIXES = ["DISCORD", "DEVBOT"] as const;
 
-export interface ChildEnvironmentAllowList {
-  exactKeys?: readonly string[];
-  keyPrefixes?: readonly string[];
-}
-
 /**
- * Builds a minimal child environment and then re-admits only the explicitly
- * documented authentication/config variables a specific backend needs (its own
- * API key or config-home pointers). Devbot's own credentials can never be
- * forwarded: the sensitive-name filter still applies to core keys, and the
- * Discord/Devbot prefixes are always dropped even from the allow list.
+ * Builds a minimal child environment and then re-admits only exact, documented
+ * authentication/config variable names a specific backend needs. Prefix
+ * admission is deliberately unsupported: every forwarded key must be named, so
+ * an unrelated secret that happens to share a provider prefix can never cross
+ * the boundary. Devbot's own credentials can never be forwarded: the
+ * sensitive-name filter still applies to core keys, and the Discord/Devbot
+ * prefixes are always dropped even from the allow list.
  */
 export function scopedChildEnvironment(
   environment: NodeJS.ProcessEnv = process.env,
-  allow: ChildEnvironmentAllowList = {}
+  allowedExactKeys: readonly string[] = []
 ): NodeJS.ProcessEnv {
   const output = minimalChildEnvironment(environment, "project");
-  const exact = new Set((allow.exactKeys ?? []).map((key) => key.toUpperCase()));
-  const prefixes = (allow.keyPrefixes ?? []).map((prefix) => prefix.toUpperCase());
+  const exact = new Set(allowedExactKeys.map((key) => key.toUpperCase()));
   for (const [key, value] of Object.entries(environment)) {
     if (value === undefined) continue;
     const normalized = key.toUpperCase();
     if (NEVER_FORWARD_PREFIXES.some((prefix) => normalized.startsWith(prefix))) continue;
-    if (exact.has(normalized) || prefixes.some((prefix) => normalized.startsWith(prefix))) {
+    if (exact.has(normalized)) {
       output[key] = value;
     }
   }

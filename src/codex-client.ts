@@ -68,8 +68,10 @@ export interface CompleteCodexOptions {
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
   const backend = getActiveBackend(options.codex);
   const releaseSlot = await acquireCodexRunSlot(options.signal);
-  const tempDir = backend.usesOutputFile ? await mkdtemp(path.join(tmpdir(), "devbot-agent-")) : undefined;
-  const outputFile = tempDir ? path.join(tempDir, "answer.txt") : undefined;
+  const tempDir = backend.usesOutputFile || backend.usesRuntimeHome
+    ? await mkdtemp(path.join(tmpdir(), "devbot-agent-"))
+    : undefined;
+  const outputFile = backend.usesOutputFile && tempDir ? path.join(tempDir, "answer.txt") : undefined;
 
   try {
     const buildOptions: BuildCommandOptions = {
@@ -77,6 +79,7 @@ export async function completeCodexPrompt(options: CompleteCodexOptions): Promis
       cwd: options.cwd,
       timeoutMs: options.timeoutMs ?? options.codex.timeoutMs,
       ...(outputFile ? { outputFile } : {}),
+      ...(tempDir ? { runtimeDir: tempDir } : {}),
       ...(options.sandbox ? { sandbox: options.sandbox } : {}),
       ...(options.skipGitRepoCheck ? { skipGitRepoCheck: true } : {}),
       ...(options.model ? { model: options.model } : {}),
@@ -85,6 +88,18 @@ export async function completeCodexPrompt(options: CompleteCodexOptions): Promis
       ...(options.imagePaths?.length ? { imagePaths: options.imagePaths } : {})
     };
     const spec = options.mode === "action" ? backend.buildActionCommand(buildOptions) : backend.buildAnswerCommand(buildOptions);
+    if (backend.id !== "codex") {
+      const availability = await backend.detect();
+      if (!availability.installed) {
+        throw new Error(`${backend.displayName} is not installed. Pick an available backend with /setup backend.`);
+      }
+      if (!availability.compatible) {
+        throw new Error(
+          availability.compatibilityError ??
+            `${backend.displayName} did not pass its compatibility check, so Devbot will not execute it.`
+        );
+      }
+    }
     const output = await runBackend(spec, options.signal);
     const answer = redactSensitiveText(output.trim());
     return answer || `${backend.displayName} did not produce a final text answer.`;
