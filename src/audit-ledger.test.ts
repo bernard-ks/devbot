@@ -106,6 +106,78 @@ test("truncating the ledger tail is detected through the head anchor", async () 
   await assert.rejects(new AuditLedger(directory).record(sampleEvent(6)), /diverges from its anchor/);
 });
 
+test("a divergent head anchor makes ordinary reads fail closed, not only verify", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "devbot-audit-read-failclosed-"));
+  const ledger = new AuditLedger(directory);
+  for (let index = 1; index <= 5; index += 1) {
+    await ledger.record(sampleEvent(index));
+  }
+
+  // Roll the chain back by one record while the head anchor still points at seq 5.
+  const filePath = path.join(directory, (await ledgerFileNames(directory))[0]!);
+  const lines = (await readFile(filePath, "utf8")).split("\n").filter(Boolean);
+  await writeFile(filePath, `${lines.slice(0, -1).join("\n")}\n`, "utf8");
+
+  const reader = new AuditLedger(directory);
+  assert.equal((await reader.verify()).anchor, "divergent");
+  await assert.rejects(reader.records(), /anchor diverges/);
+  await assert.rejects(reader.recent({ limit: 5 }), /anchor diverges/);
+  await assert.rejects(reader.show(3), /anchor diverges/);
+});
+
+test("an interrupted anchor write does not let a later append reuse the sequence", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "devbot-audit-anchor-fault-"));
+  const ledger = new AuditLedger(directory);
+  await ledger.record(sampleEvent(1));
+  await ledger.record(sampleEvent(2));
+
+  const original = (ledger as unknown as { writeAnchor: (anchor: unknown) => Promise<void> }).writeAnchor.bind(ledger);
+  let failNext = true;
+  (ledger as unknown as { writeAnchor: (anchor: unknown) => Promise<void> }).writeAnchor = async (anchor: unknown) => {
+    if (failNext) {
+      failNext = false;
+      throw new Error("simulated anchor write failure");
+    }
+    return original(anchor);
+  };
+
+  // The seq-3 line is fsynced to disk, then the anchor update fails.
+  await assert.rejects(ledger.record(sampleEvent(3)), /simulated anchor write failure/);
+  assert.equal((await ledger.health()).ok, false);
+
+  // The next append must reload the true head from disk and continue at seq 4,
+  // never reusing seq 3, and it reconciles the interrupted anchor update.
+  await ledger.record(sampleEvent(4));
+
+  const records = await ledger.records();
+  assert.deepEqual(records.map((record) => record.seq), [1, 2, 3, 4]);
+  const seqs = new Set(records.map((record) => record.seq));
+  assert.equal(seqs.size, records.length);
+  const verification = await ledger.verify();
+  assert.equal(verification.ok, true);
+  assert.equal(verification.anchor, "match");
+  assert.equal(verification.lastSeq, 4);
+});
+
+test("a tampered middle record blocks future appends instead of extending a forged chain", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "devbot-audit-middle-tamper-"));
+  const ledger = new AuditLedger(directory);
+  for (let index = 1; index <= 8; index += 1) {
+    await ledger.record(sampleEvent(index));
+  }
+
+  const filePath = path.join(directory, (await ledgerFileNames(directory))[0]!);
+  const lines = (await readFile(filePath, "utf8")).split("\n").filter(Boolean);
+  const tampered = lines.map((line) => {
+    const record = JSON.parse(line) as AuditRecord;
+    if (record.seq !== 4) return line;
+    return JSON.stringify({ ...record, summary: "history rewritten" });
+  });
+  await writeFile(filePath, `${tampered.join("\n")}\n`, "utf8");
+
+  await assert.rejects(new AuditLedger(directory).record(sampleEvent(9)), /integrity checks/);
+});
+
 test("rotation chains files together and retention prunes to an anchored prefix", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "devbot-audit-rotation-"));
   const ledger = new AuditLedger(directory, { maxFileBytes: 10, maxFiles: 3 });

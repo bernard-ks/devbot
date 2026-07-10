@@ -132,6 +132,12 @@ export class AuditLedger implements AuditRecorder {
         `The audit ledger failed integrity checks at ${verification.failure.file} line ${verification.failure.line}: ${verification.failure.reason} Run /audit verify for details.`
       );
     }
+    const anchor = await this.computeAnchorStatus(verification.records);
+    if (anchor.status === "divergent") {
+      throw new Error(
+        `The audit ledger head anchor diverges from the chain: ${anchor.detail ?? "the head anchor does not match the chain head."} Run /audit verify for details.`
+      );
+    }
     return verification.records;
   }
 
@@ -155,41 +161,7 @@ export class AuditLedger implements AuditRecorder {
     const records = walk.records;
     const firstSeq = records[0]?.seq ?? 0;
     const lastSeq = records.at(-1)?.seq ?? 0;
-    const anchor = await this.readAnchor();
-    let anchorStatus: AuditAnchorStatus;
-    let anchorDetail: string | undefined;
-    if (anchor === "missing") {
-      anchorStatus = records.length === 0 ? "empty" : "missing";
-    } else if (anchor === "unreadable") {
-      anchorStatus = "divergent";
-      anchorDetail = "The head anchor file exists but is unreadable or malformed.";
-    } else if (records.length === 0) {
-      anchorStatus = "divergent";
-      anchorDetail = `The head anchor records seq ${anchor.seq}, but the ledger has no records (possible deletion or rollback).`;
-    } else if (anchor.seq === lastSeq) {
-      const head = records.at(-1)!;
-      if (anchor.hash === head.hash) {
-        anchorStatus = "match";
-      } else {
-        anchorStatus = "divergent";
-        anchorDetail = `The head anchor hash does not match the chain head at seq ${lastSeq}.`;
-      }
-    } else if (anchor.seq > lastSeq) {
-      anchorStatus = "divergent";
-      anchorDetail = `The head anchor records seq ${anchor.seq}, but the ledger ends at seq ${lastSeq} (possible truncation or rollback).`;
-    } else if (anchor.seq < firstSeq) {
-      anchorStatus = "behind";
-      anchorDetail = `The head anchor at seq ${anchor.seq} predates the retained records; it cannot be cross-checked.`;
-    } else {
-      const anchored = records.find((record) => record.seq === anchor.seq);
-      if (anchored && anchored.hash === anchor.hash) {
-        anchorStatus = "behind";
-        anchorDetail = `The head anchor is ${lastSeq - anchor.seq} append(s) behind the chain head (an interrupted anchor update).`;
-      } else {
-        anchorStatus = "divergent";
-        anchorDetail = `The head anchor hash does not match the chain at seq ${anchor.seq}.`;
-      }
-    }
+    const { status: anchorStatus, detail: anchorDetail } = await this.computeAnchorStatus(records);
 
     return {
       ok: !walk.failure && anchorStatus !== "divergent",
@@ -202,6 +174,50 @@ export class AuditLedger implements AuditRecorder {
       ...(anchorDetail ? { anchorDetail } : {}),
       ...(walk.failure ? { failure: walk.failure } : {})
     };
+  }
+
+  private async computeAnchorStatus(records: AuditRecord[]): Promise<{ status: AuditAnchorStatus; detail?: string }> {
+    const firstSeq = records[0]?.seq ?? 0;
+    const lastSeq = records.at(-1)?.seq ?? 0;
+    const anchor = await this.readAnchor();
+    if (anchor === "missing") {
+      return { status: records.length === 0 ? "empty" : "missing" };
+    }
+    if (anchor === "unreadable") {
+      return { status: "divergent", detail: "The head anchor file exists but is unreadable or malformed." };
+    }
+    if (records.length === 0) {
+      return {
+        status: "divergent",
+        detail: `The head anchor records seq ${anchor.seq}, but the ledger has no records (possible deletion or rollback).`
+      };
+    }
+    if (anchor.seq === lastSeq) {
+      const head = records.at(-1)!;
+      return head.hash === anchor.hash
+        ? { status: "match" }
+        : { status: "divergent", detail: `The head anchor hash does not match the chain head at seq ${lastSeq}.` };
+    }
+    if (anchor.seq > lastSeq) {
+      return {
+        status: "divergent",
+        detail: `The head anchor records seq ${anchor.seq}, but the ledger ends at seq ${lastSeq} (possible truncation or rollback).`
+      };
+    }
+    if (anchor.seq < firstSeq) {
+      return {
+        status: "behind",
+        detail: `The head anchor at seq ${anchor.seq} predates the retained records; it cannot be cross-checked.`
+      };
+    }
+    const anchored = records.find((record) => record.seq === anchor.seq);
+    if (anchored && anchored.hash === anchor.hash) {
+      return {
+        status: "behind",
+        detail: `The head anchor is ${lastSeq - anchor.seq} append(s) behind the chain head (an interrupted anchor update).`
+      };
+    }
+    return { status: "divergent", detail: `The head anchor hash does not match the chain at seq ${anchor.seq}.` };
   }
 
   async health(): Promise<AuditLedgerHealth> {
@@ -244,15 +260,35 @@ export class AuditLedger implements AuditRecorder {
     try {
       await handle.writeFile(line, "utf8");
       await handle.datasync();
+    } catch (error) {
+      // The line may be partially written; the cached tail can no longer be
+      // trusted. Drop it so the next append reloads the real head from disk
+      // rather than reusing a sequence/hash that may already be persisted.
+      this.tail = undefined;
+      throw error;
     } finally {
       await handle.close();
     }
-    await hardenPrivateFilePermissions(filePath);
-    await this.writeAnchor({ seq: record.seq, hash: record.hash });
-    if (fileIndex !== tail.fileIndex) {
-      await this.pruneOldFiles();
-    }
+    // The record is now durably on disk, so it is the authoritative head.
+    // Advance the cached tail before the anchor and pruning steps: those are
+    // secondary bookkeeping, and if either fails the sequence/hash must never
+    // be reused by a later append.
     this.tail = { seq: record.seq, hash: record.hash, fileIndex, fileBytes: fileBytes + lineBytes };
+    try {
+      await hardenPrivateFilePermissions(filePath);
+      await this.writeAnchor({ seq: record.seq, hash: record.hash });
+      if (fileIndex !== tail.fileIndex) {
+        await this.pruneOldFiles();
+      }
+    } catch (error) {
+      // The record is durable but the anchor update or pruning did not
+      // complete. Invalidate the cached tail so the next append reloads from
+      // disk: loadTail then either reconciles an interrupted (behind) anchor
+      // update by re-reading the true head, or refuses further appends if the
+      // on-disk state is genuinely divergent.
+      this.tail = undefined;
+      throw error;
+    }
   }
 
   private async loadTail(): Promise<LedgerTail> {
@@ -295,6 +331,17 @@ export class AuditLedger implements AuditRecorder {
           `The audit ledger head (seq ${tail.seq}) diverges from its anchor (seq ${anchor.seq}). Appends are refused until the divergence is investigated; run /audit verify.`
         );
       }
+    }
+
+    // Fail closed on a cold load: walk the entire retained chain before trusting
+    // it as the base for new appends. The tail-only check above cannot see an
+    // interior tamper, so without this a forged middle record could be silently
+    // extended by the next append.
+    const walk = await this.walk();
+    if (walk.failure) {
+      throw new Error(
+        `The audit ledger failed integrity checks at ${walk.failure.file} line ${walk.failure.line}: ${walk.failure.reason} Appends are refused; run /audit verify.`
+      );
     }
 
     this.tail = tail;
