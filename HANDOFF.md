@@ -278,3 +278,36 @@ checklist is in `src/transcribe.test.ts` (see issue 1 above).
 `security.test.ts`'s "configured project commands receive an empty temporary
 home" failed once under load and passed clean on the immediate rerun, matching
 the pre-existing known flake, not a regression from this round's changes.
+
+## Review round 2
+
+Maintainer flagged two remaining capacity leaks in `src/transcribe.ts` on head
+`1e37a1a`, plus a rebase-and-smoke request. Addressed:
+
+1. **Stalled body held a transcription slot forever.** The download abort
+   deadline was cleared as soon as response headers arrived, so the later body
+   stream ran with no deadline. `downloadBoundedAttachment` now keeps one
+   `AbortController`/timeout armed across the whole exchange with each hop
+   (headers and streamed body) and clears it only in a `finally` after the
+   response is fully processed. A stalled CDN body now aborts on the deadline
+   instead of hanging.
+
+2. **Temp-directory failure permanently leaked capacity.** The slot counter
+   was incremented and both `mkdtemp()` calls ran before the `try/finally`
+   began, so a `mkdtemp` failure skipped the release. `transcribeAttachment`
+   now enters the `try` immediately after acquiring the slot; both `mkdtemp`
+   calls run inside it, and the `finally` always releases the slot and removes
+   whichever temp dirs were created.
+
+New tests in `src/transcribe.test.ts` drive `transcribeAttachment` through both
+failure modes (stalled body via an injected stalling fetch + short deadline;
+injected failing `mkdtemp`) and assert `activeTranscriptionCount()` returns to
+zero, proving capacity recovers.
+
+Rebased onto `main` (`45d8833`). Combined suite: 226/226 (the count rose from
+the branch-freshness tests that merged into `main`). The known
+`security.test.ts` child-process 5s-timeout flake appeared under CPU load
+during the run overlapping the whisper smoke; solo and idle reruns were clean.
+
+Real download -> ffmpeg -> whisper.cpp -> approval-button smoke was run locally
+(see PR comment). The live Discord bot leg still needs a manual session.

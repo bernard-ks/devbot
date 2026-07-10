@@ -114,62 +114,64 @@ export async function downloadBoundedAttachment(url: string, options: DownloadBo
       throw new Error("The attachment URL is not from an allowed Discord media host.");
     }
 
+    // A single abort deadline stays armed for the whole exchange with this hop: it bounds the
+    // header fetch AND the body stream. Clearing it after headers arrived would leave the streamed
+    // download without a deadline, so a stalled CDN body could hang forever and hold a slot.
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
     try {
-      response = await fetchImpl(currentUrl, { redirect: "manual", signal: controller.signal });
+      const response = await fetchImpl(currentUrl, { redirect: "manual", signal: controller.signal });
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location) {
+          throw new Error("The attachment redirected without a location header.");
+        }
+        if (redirects >= maxRedirects) {
+          throw new Error("The attachment redirected too many times.");
+        }
+        currentUrl = new URL(location, currentUrl).toString();
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new Error(`Failed to download the audio attachment (HTTP ${response.status}).`);
+      }
+
+      const declaredLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        throw new Error(`Attachment exceeds the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
+      }
+
+      if (!response.body) {
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (buffer.byteLength > maxBytes) {
+          throw new Error(`Attachment exceeds the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
+        }
+        return buffer;
+      }
+
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value) {
+          total += value.byteLength;
+          if (total > maxBytes) {
+            await reader.cancel().catch(() => undefined);
+            throw new Error(`Attachment exceeds the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
+          }
+          chunks.push(value);
+        }
+      }
+      return Buffer.concat(chunks);
     } finally {
       clearTimeout(timeout);
     }
-
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-      if (!location) {
-        throw new Error("The attachment redirected without a location header.");
-      }
-      if (redirects >= maxRedirects) {
-        throw new Error("The attachment redirected too many times.");
-      }
-      currentUrl = new URL(location, currentUrl).toString();
-      continue;
-    }
-
-    if (!response.ok) {
-      throw new Error(`Failed to download the audio attachment (HTTP ${response.status}).`);
-    }
-
-    const declaredLength = Number(response.headers.get("content-length"));
-    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-      throw new Error(`Attachment exceeds the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
-    }
-
-    if (!response.body) {
-      const buffer = Buffer.from(await response.arrayBuffer());
-      if (buffer.byteLength > maxBytes) {
-        throw new Error(`Attachment exceeds the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
-      }
-      return buffer;
-    }
-
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      if (value) {
-        total += value.byteLength;
-        if (total > maxBytes) {
-          await reader.cancel().catch(() => undefined);
-          throw new Error(`Attachment exceeds the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
-        }
-        chunks.push(value);
-      }
-    }
-    return Buffer.concat(chunks);
   }
 }
 
@@ -371,18 +373,37 @@ export interface TranscribeAttachmentOptions {
   whisperBin: string;
   modelPath: string;
   sourceExtension?: string;
+  // Injectable seams so capacity-leak behavior (stalled download, temp-dir failure) can be
+  // exercised deterministically; every one defaults to the real implementation.
+  fetchImpl?: typeof fetch;
+  downloadTimeoutMs?: number;
+  mkdtempImpl?: (prefix: string) => Promise<string>;
+}
+
+/** Current number of held transcription slots. Exposed so leak tests can assert capacity recovers. */
+export function activeTranscriptionCount(): number {
+  return activeTranscriptions;
 }
 
 export async function transcribeAttachment(options: TranscribeAttachmentOptions): Promise<string> {
   if (activeTranscriptions >= MAX_CONCURRENT_TRANSCRIPTIONS) {
     throw new Error("Devbot is at its voice transcription limit. Try again after an active transcription finishes.");
   }
+  // The slot is acquired here; everything after this point runs inside the try/finally so that any
+  // failure (including the mkdtemp calls below) still releases the slot and cleans up temp dirs.
   activeTranscriptions += 1;
-  const tempDir = await mkdtemp(path.join(tmpdir(), "devbot-voice-"));
-  const runtimeHome = await mkdtemp(path.join(tmpdir(), "devbot-voice-home-"));
+  const makeTempDir = options.mkdtempImpl ?? ((prefix: string) => mkdtemp(prefix));
+  let tempDir: string | undefined;
+  let runtimeHome: string | undefined;
   try {
+    tempDir = await makeTempDir(path.join(tmpdir(), "devbot-voice-"));
+    runtimeHome = await makeTempDir(path.join(tmpdir(), "devbot-voice-home-"));
+
     const inputPath = path.join(tempDir, `input${options.sourceExtension ?? ".ogg"}`);
-    const audioBuffer = await downloadBoundedAttachment(options.url);
+    const audioBuffer = await downloadBoundedAttachment(options.url, {
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.downloadTimeoutMs !== undefined ? { timeoutMs: options.downloadTimeoutMs } : {})
+    });
     if (!looksLikeAudioBuffer(audioBuffer)) {
       throw new Error("The downloaded attachment does not look like a supported audio file.");
     }
@@ -407,7 +428,11 @@ export async function transcribeAttachment(options: TranscribeAttachmentOptions)
     return transcript.trim();
   } finally {
     activeTranscriptions -= 1;
-    await rm(tempDir, { force: true, recursive: true });
-    await rm(runtimeHome, { force: true, recursive: true });
+    if (tempDir) {
+      await rm(tempDir, { force: true, recursive: true });
+    }
+    if (runtimeHome) {
+      await rm(runtimeHome, { force: true, recursive: true });
+    }
   }
 }

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  activeTranscriptionCount,
   audioGateMessage,
   defaultBinaryDirs,
   defaultModelDirs,
@@ -24,6 +25,7 @@ import {
   resolveWhisperModel,
   selectVoiceAttachment,
   smallestModelCandidate,
+  transcribeAttachment,
   truncateTranscriptForReply,
   voiceSetupInstructions,
   whisperArgs
@@ -304,4 +306,57 @@ test("voiceSetupInstructions lists exactly the missing pieces", () => {
   const onlyModelMissing = voiceSetupInstructions({ ffmpegBin: "/bin/ffmpeg", whisperBin: "/bin/whisper-cli" });
   assert.doesNotMatch(onlyModelMissing, /ffmpeg`/);
   assert.match(onlyModelMissing, /ggml-\*\.bin/);
+});
+
+// A body stream that never closes and only ends when the download's abort deadline fires,
+// standing in for a CDN connection that delivered headers and then stalled mid-body.
+function stallingFetch(): typeof fetch {
+  return (async (_input: unknown, init?: { signal?: AbortSignal }): Promise<Response> => {
+    const signal = init?.signal;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (signal?.aborted) {
+          controller.error(new Error("aborted"));
+          return;
+        }
+        signal?.addEventListener("abort", () => controller.error(new Error("aborted")), { once: true });
+        // Never enqueue and never close: the read blocks until the deadline aborts it.
+      }
+    });
+    return new Response(stream, { status: 200, headers: new Headers() });
+  }) as unknown as typeof fetch;
+}
+
+test("transcribeAttachment releases its slot when the download body stalls past the deadline", async () => {
+  assert.equal(activeTranscriptionCount(), 0);
+  await assert.rejects(
+    transcribeAttachment({
+      url: "https://cdn.discordapp.com/attachments/1/2/voice.ogg",
+      ffmpegBin: "/bin/ffmpeg",
+      whisperBin: "/bin/whisper-cli",
+      modelPath: "/models/ggml-tiny.bin",
+      fetchImpl: stallingFetch(),
+      downloadTimeoutMs: 50
+    })
+  );
+  // Capacity recovers: the stalled download did not permanently hold one of the two slots.
+  assert.equal(activeTranscriptionCount(), 0);
+});
+
+test("transcribeAttachment releases its slot when mkdtemp fails after slot acquisition", async () => {
+  assert.equal(activeTranscriptionCount(), 0);
+  await assert.rejects(
+    transcribeAttachment({
+      url: "https://cdn.discordapp.com/attachments/1/2/voice.ogg",
+      ffmpegBin: "/bin/ffmpeg",
+      whisperBin: "/bin/whisper-cli",
+      modelPath: "/models/ggml-tiny.bin",
+      mkdtempImpl: async () => {
+        throw new Error("no space left on device");
+      }
+    }),
+    /no space left on device/
+  );
+  // Temp-directory failure must not leak the slot.
+  assert.equal(activeTranscriptionCount(), 0);
 });
