@@ -90,13 +90,14 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
 - Community bug intake:
-  - `/intake set|off|status` (owner-only) designates a single public channel as a triage pipeline, off by default.
-  - Per-user and channel-wide hourly rate limits gate every report before any model call.
-  - A cheap read-only classification call rejects incomplete reports with a templated request for missing specifics.
-  - Complete reports get a strictly read-only repro attempt (ranked project context, optional dev-server screenshot with console/network evidence, read-only Codex judgment); no action-mode call site is reachable from this path.
+  - `/intake set|off|status` (owner-only) designates a single public channel as a triage pipeline, off by default; `set` requires the Message Content intent to already be enabled, rejects the private/project rooms as the intake channel, and verifies public visibility, bot permissions, and a resolvable delivery room before turning on.
+  - Per-user and channel-wide hourly rate limits, persisted to disk, gate every report before any model call; a reply to Devbot's own follow-up prompt is correlated back to the original report instead of spending another quota slot.
+  - A deterministic, model-free completeness check rejects incomplete reports with a templated request for missing specifics; this step makes no Codex call and never touches the project directory.
+  - Complete reports get a strictly read-only repro attempt (ranked project context capped to a small bounded window, optional dev-server screenshot with redacted/bounded console-network evidence — captured only under the project's screenshot policy and never steered by reporter text, read-only Codex judgment run through a dedicated low-concurrency lane); no action-mode call site is reachable from this path.
   - Reporter text is always treated as untrusted data in every model prompt, never as instructions.
-  - Evidence-backed triage cards post only to the private room with owner/controller-gated Accept-as-task, Ask-reporter, and Dismiss buttons; the public channel gets one acknowledgment reply.
+  - Evidence-backed triage cards post only to a project-authorized room (the project's bound ambient room, or the private room when the project has no scoped audience) with owner/controller-and-project-policy-gated Accept-as-task, Ask-reporter, and Dismiss buttons; accepting is an atomic compare-and-set with a recoverable `accept-failed` state; the public channel gets one acknowledgment reply that is honest about whether delivery actually happened.
   - Likely-duplicate reports are linked by normalized error string or route.
+  - The intake store (`.devbot/intake.json`) is written with owner-only file/directory permissions and validates every record on load.
 
 ## Current Constraints
 
