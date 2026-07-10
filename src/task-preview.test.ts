@@ -130,6 +130,19 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 
   throw new Error("Condition was not met in time.");
 }
 
+async function respondsOnPort(origin: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 500);
+  try {
+    await fetch(`${origin}/`, { method: "GET", redirect: "manual", signal: controller.signal });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function processGone(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -280,7 +293,10 @@ test("TTL expiry stops the preview after observing its exit", async () => {
   const expired = manager.status(result.instance.id);
   assert.equal(expired?.stopReason, "expired");
   await waitFor(() => processGone(result.instance.pid!));
-  assert.equal((await readLedger(fixture)).previews.length, 0);
+  // The TTL stop is timer-driven, so the durable clear lands just after the
+  // state flips to stopped: it is gated on the process group being proven
+  // quiescent, not on the leader exit alone.
+  await waitFor(async () => (await readLedger(fixture)).previews.length === 0);
 });
 
 test("escalates SIGTERM to SIGKILL when the preview ignores termination", async () => {
@@ -349,6 +365,75 @@ test("restart reconciliation kills identifiable orphans and never signals other 
   assert.ok(notes.some((note) => note.includes(`no longer belongs to preview ${foreignId}`)));
   await waitFor(() => processGone(orphan.pid!));
   assert.equal((await readLedger(fixture)).previews.length, 0);
+});
+
+test("reaps a same-group child that outlives its exiting leader before clearing state", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX process groups");
+    return;
+  }
+  const fixture = await createFixture();
+  // The orphan child stays in the leader's process group (detached: false) and
+  // only starts serving after a delay, so the leader exits while the child is
+  // still alive but has not yet claimed the loopback port.
+  const orphanChild = path.join(fixture.workspace, "orphan-child.cjs");
+  await writeFile(
+    orphanChild,
+    [
+      'const http = require("node:http");',
+      'const fs = require("node:fs");',
+      "const port = Number(process.env.PORT);",
+      'const host = process.env.HOST || "127.0.0.1";',
+      'const server = http.createServer((_request, response) => { response.statusCode = 200; response.end("orphan-child"); });',
+      "setTimeout(() => {",
+      "  server.listen(port, host, () => {",
+      `    fs.writeFileSync(${JSON.stringify(fixture.reportFile)}, "listening");`,
+      "  });",
+      "}, 400);"
+    ].join("\n"),
+    "utf8"
+  );
+  // The leader spawns the unref'd same-group child and exits immediately, before
+  // the preview can ever be reported ready.
+  const leader = path.join(fixture.workspace, "orphan-leader.cjs");
+  await writeFile(
+    leader,
+    [
+      'const { spawn } = require("node:child_process");',
+      `const child = spawn(process.execPath, [${JSON.stringify(orphanChild)}], {`,
+      "  env: process.env,",
+      "  detached: false,",
+      '  stdio: "ignore"',
+      "});",
+      "child.unref();",
+      "process.exit(0);"
+    ].join("\n"),
+    "utf8"
+  );
+
+  const manager = makeManager(fixture, { sigkillDelayMs: 300 });
+  try {
+    const result = await manager.start(startInput(fixture, nodeCommand(leader), "task-orphan-group"));
+
+    // The leader exited without a proven ready preview, so the start fails.
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.instance?.state, "failed");
+
+    // The whole managed group must be reaped: the orphan child is killed before
+    // it can bind, so the loopback origin never becomes reachable, and the
+    // durable ledger is only cleared once quiescence is proven.
+    const origin = result.instance!.origin;
+    await waitFor(async () => (await readLedger(fixture)).previews.length === 0);
+    const settledAt = Date.now();
+    while (Date.now() - settledAt < 1_200) {
+      assert.equal(await respondsOnPort(origin), false);
+      assert.equal((await readLedger(fixture)).previews.length, 0);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  } finally {
+    await manager.stopAll("requested");
+  }
 });
 
 test("never accepts a foreign server that races for the selected port", async (t) => {
