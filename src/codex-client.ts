@@ -1,10 +1,13 @@
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { minimalChildEnvironment, redactSensitiveText } from "./security.js";
+import { redactSensitiveText } from "./security.js";
 import type { CodexConfig, PackedProjectContext } from "./types.js";
 import type { RequestContextMode } from "./request-router.js";
+import { buildImageExecArgs, getActiveBackend, type AgentModelTier, type BuildCommandOptions, type SpawnSpec } from "./agent-backend.js";
+
+export { buildImageExecArgs };
 
 const MAX_CONCURRENT_CODEX_RUNS = 4;
 const MAX_QUEUED_CODEX_RUNS = 8;
@@ -26,6 +29,7 @@ export interface AnswerOptions {
   mode?: CodexRequestMode;
   model?: string;
   reasoningEffort?: string;
+  tier?: AgentModelTier;
   contextMode?: RequestContextMode;
   signal?: AbortSignal;
 }
@@ -38,8 +42,10 @@ export async function answerWithProjectContext(options: AnswerOptions): Promise<
     prompt,
     cwd: options.context.project.root,
     sandbox: mode === "action" ? options.codex.actionSandbox : options.codex.sandbox,
+    mode,
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+    ...(options.tier ? { tier: options.tier } : {}),
     ...(options.signal ? { signal: options.signal } : {})
   });
 }
@@ -48,103 +54,40 @@ export interface CompleteCodexOptions {
   codex: CodexConfig;
   prompt: string;
   cwd: string;
+  mode?: CodexRequestMode;
   sandbox?: CodexConfig["sandbox"];
   model?: string;
   reasoningEffort?: string;
+  tier?: AgentModelTier;
   timeoutMs?: number;
   skipGitRepoCheck?: boolean;
   imagePaths?: string[];
   signal?: AbortSignal;
 }
 
-export function buildImageExecArgs(imagePaths: string[]): string[] {
-  const args: string[] = [];
-  for (const imagePath of imagePaths) {
-    if (imagePath.trim()) {
-      args.push("-i", imagePath);
-    }
-  }
-  return args;
-}
-
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
+  const backend = getActiveBackend(options.codex);
   const releaseSlot = await acquireCodexRunSlot(options.signal);
-  let tempDir: string | undefined;
+  const tempDir = backend.usesOutputFile ? await mkdtemp(path.join(tmpdir(), "devbot-agent-")) : undefined;
+  const outputFile = tempDir ? path.join(tempDir, "answer.txt") : undefined;
 
   try {
-    tempDir = await mkdtemp(path.join(tmpdir(), "devbot-codex-"));
-    const outputFile = path.join(tempDir, "answer.txt");
-    const childEnvironment = isolatedCodexEnvironment(process.env, tempDir);
-    const args = [
-      "--ask-for-approval",
-      "never",
-      "exec",
-      "--ephemeral",
-      "--strict-config",
-      "--sandbox",
-      options.sandbox ?? "read-only",
-      "--ignore-user-config",
-      "--ignore-rules",
-      "--disable",
-      "apps",
-      "--disable",
-      "plugins",
-      "--disable",
-      "hooks",
-      "--disable",
-      "browser_use",
-      "--disable",
-      "computer_use",
-      "--disable",
-      "in_app_browser",
-      "--disable",
-      "image_generation",
-      "--disable",
-      "multi_agent",
-      "--config",
-      "allow_login_shell=false",
-      "--config",
-      "project_doc_max_bytes=0",
-      "--config",
-      "web_search=\"disabled\"",
-      "--config",
-      "sandbox_workspace_write.network_access=false",
-      "--config",
-      "shell_environment_policy.inherit=\"core\"",
-      "--config",
-      "shell_environment_policy.include_only=[\"PATH\",\"HOME\",\"USER\",\"LOGNAME\",\"SHELL\",\"TMPDIR\",\"TEMP\",\"TMP\",\"LANG\",\"LC_*\",\"TERM\",\"COLORTERM\",\"NO_COLOR\",\"FORCE_COLOR\",\"CI\"]",
-      "--cd",
-      options.cwd,
-      "--output-last-message",
-      outputFile,
-      "-"
-    ];
-    if (options.skipGitRepoCheck) {
-      args.splice(args.length - 1, 0, "--skip-git-repo-check");
-    }
-    if (options.imagePaths?.length) {
-      args.splice(args.length - 1, 0, ...buildImageExecArgs(options.imagePaths));
-    }
-
-    const model = options.model ?? options.codex.model;
-    const execOptionIndex = args.indexOf("exec") + 1;
-    if (model) {
-      args.splice(execOptionIndex, 0, "--model", model);
-    }
-    if (options.reasoningEffort) {
-      args.splice(execOptionIndex, 0, "--config", `model_reasoning_effort=${JSON.stringify(options.reasoningEffort)}`);
-    }
-
-    await runCodex(
-      options.codex.bin,
-      args,
-      options.prompt,
-      options.timeoutMs ?? options.codex.timeoutMs,
-      childEnvironment,
-      options.signal
-    );
-    const answer = redactSensitiveText((await readFile(outputFile, "utf8")).trim());
-    return answer || "Codex did not produce a final text answer.";
+    const buildOptions: BuildCommandOptions = {
+      prompt: options.prompt,
+      cwd: options.cwd,
+      timeoutMs: options.timeoutMs ?? options.codex.timeoutMs,
+      ...(outputFile ? { outputFile } : {}),
+      ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+      ...(options.skipGitRepoCheck ? { skipGitRepoCheck: true } : {}),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+      ...(options.tier ? { tier: options.tier } : {}),
+      ...(options.imagePaths?.length ? { imagePaths: options.imagePaths } : {})
+    };
+    const spec = options.mode === "action" ? backend.buildActionCommand(buildOptions) : backend.buildAnswerCommand(buildOptions);
+    const output = await runBackend(spec, options.signal);
+    const answer = redactSensitiveText(output.trim());
+    return answer || `${backend.displayName} did not produce a final text answer.`;
   } finally {
     try {
       if (tempDir) await rm(tempDir, { force: true, recursive: true });
@@ -342,18 +285,20 @@ export function parseLocateResponse(raw: string): LocatedError {
   };
 }
 
-function runCodex(
-  bin: string,
-  args: string[],
-  prompt: string,
-  timeoutMs: number,
-  environment: NodeJS.ProcessEnv,
-  signal?: AbortSignal
-): Promise<void> {
+async function runBackend(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
+  const stdout = await runSpec(spec, signal);
+  if (spec.outputFile) {
+    return (await readFile(spec.outputFile, "utf8")).trim();
+  }
+  return stdout;
+}
+
+function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, {
-      env: environment,
-      stdio: ["pipe", "pipe", "pipe"],
+    const child = spawn(spec.bin, spec.args, {
+      cwd: spec.cwd,
+      env: spec.env,
+      stdio: [spec.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });
     let stdout = "";
@@ -363,19 +308,19 @@ function runCodex(
     let terminationFallback: NodeJS.Timeout | undefined;
 
     const timer = setTimeout(() => {
-      requestTermination(new Error(`Codex timed out after ${timeoutMs}ms.`));
-    }, timeoutMs);
+      requestTermination(new Error(`Agent timed out after ${spec.timeoutMs}ms.`));
+    }, spec.timeoutMs);
     const abort = (): void => {
-      requestTermination(new Error("Codex run was canceled."));
+      requestTermination(new Error("Agent run was canceled."));
     };
 
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdout?.on("data", (chunk: Buffer) => {
       stdout = appendProcessOutput(stdout, chunk.toString("utf8"));
     });
-    child.stderr.on("data", (chunk: Buffer) => {
+    child.stderr?.on("data", (chunk: Buffer) => {
       stderr = appendProcessOutput(stderr, chunk.toString("utf8"));
     });
-    child.on("error", finish);
+    child.on("error", (error) => finish(error));
     child.on("close", (code) => {
       if (terminationError) {
         finish(terminationError);
@@ -386,11 +331,13 @@ function runCodex(
         return;
       }
 
-      finish(new Error(`Codex exited with code ${code}.\n${trimProcessOutput(stderr || stdout)}`));
+      finish(new Error(`Agent exited with code ${code}.\n${trimProcessOutput(stderr || stdout)}`));
     });
-    child.stdin.on("error", (error) => {
-      if (!terminationError) finish(error);
-    });
+    if (spec.stdin !== undefined && child.stdin) {
+      child.stdin.on("error", (error) => {
+        if (!terminationError) finish(error);
+      });
+    }
 
     if (signal?.aborted) {
       abort();
@@ -398,7 +345,10 @@ function runCodex(
     }
 
     signal?.addEventListener("abort", abort, { once: true });
-    child.stdin.end(prompt);
+
+    if (spec.stdin !== undefined && child.stdin) {
+      child.stdin.end(spec.stdin);
+    }
 
     function requestTermination(error: Error): void {
       if (settled || terminationError) return;
@@ -422,20 +372,9 @@ function runCodex(
         return;
       }
 
-      resolve();
+      resolve(stdout);
     }
   });
-}
-
-function isolatedCodexEnvironment(environment: NodeJS.ProcessEnv, runtimeHome: string): NodeJS.ProcessEnv {
-  const isolated = minimalChildEnvironment(environment, "codex");
-  const realHome = environment.HOME?.trim() || environment.USERPROFILE?.trim() || homedir();
-  isolated.CODEX_HOME = environment.CODEX_HOME?.trim() || path.join(realHome, ".codex");
-  isolated.HOME = runtimeHome;
-  isolated.USERPROFILE = runtimeHome;
-  delete isolated.XDG_CONFIG_HOME;
-  delete isolated.XDG_DATA_HOME;
-  return isolated;
 }
 
 function terminateChild(pid: number | undefined): void {
