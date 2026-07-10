@@ -44,7 +44,7 @@ import { renderStatusImage } from "./status-image.js";
 import { TaskStore } from "./task-store.js";
 import { parseTaskControl, taskControlRow } from "./task-controls.js";
 import type { ProjectEntry } from "./types.js";
-import { formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
+import { filterWorkForProjects, formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
 
 const scanner = {
@@ -249,8 +249,20 @@ test("status requests preserve detail questions and image intent", () => {
 
   assert.deepEqual(parseStatusRequest("what's the status on the web build, send me a snip of the output"), {
     isStatus: true,
-    question: "what's the status on the web build, send me a snip of the output",
+    question: undefined,
     wantsImage: true
+  });
+
+  assert.deepEqual(parseStatusRequest("can you give me a breakdown on what u are working on rn"), {
+    isStatus: true,
+    question: undefined,
+    wantsImage: false
+  });
+
+  assert.deepEqual(parseStatusRequest("what's the status on the web build and why is it stuck?"), {
+    isStatus: true,
+    question: "what's the status on the web build and why is it stuck?",
+    wantsImage: false
   });
 
   assert.deepEqual(parseStatusRequest("fix the failing tests"), {
@@ -263,24 +275,57 @@ test("status requests preserve detail questions and image intent", () => {
 test("work status reports empty and active Codex work", () => {
   const tracker = new WorkTracker();
 
-  assert.equal(formatWorkStatus(tracker.snapshot()), "No Codex dev work is currently in progress.");
+  assert.match(formatWorkStatus(tracker.snapshot()), /No Devbot-managed task or external Codex command is confirmed running/);
+  assert.match(formatWorkStatus(tracker.snapshot()), /Ready for the next assignment/);
 
   const startedAt = new Date("2026-06-23T20:00:00.000Z");
   const work = tracker.start({
     mode: "action",
     projectName: "webapp",
     requester: "Alex",
-    text: "run a repo health check"
+    text: "run a repo health check",
+    taskId: "task-123"
   });
   work.startedAt = startedAt;
+  tracker.update(work.id, {
+    phase: "running-codex",
+    modelTier: "deep",
+    contextMode: "full",
+    contextFileCount: 8
+  });
 
-  assert.equal(
-    formatWorkStatus(tracker.snapshot(), new Date("2026-06-23T20:01:05.000Z")),
-    "Codex dev work currently in progress: 1\n- `webapp` action via bot for Alex, running 1m 5s: run a repo health check"
-  );
+  const active = formatWorkStatus(tracker.snapshot(), new Date("2026-06-23T20:01:05.000Z"));
+  assert.match(active, /Devbot tasks: 1 \| External runs: 0 \| Open sessions: 0/);
+  assert.match(active, /`webapp`: `run a repo health check`/);
+  assert.match(active, /Phase: Sol is working with 8 context files \| 1m 5s \| requested by Alex/);
+  assert.match(active, /`\/task status id:task-123`/);
+
+  const hidden = tracker.start({
+    mode: "answer",
+    projectName: "private-api",
+    requester: "Taylor",
+    text: "inspect a private incident"
+  });
+  const visibleWork = filterWorkForProjects(tracker.snapshot(), [project("webapp", "/tmp/webapp")]);
+  assert.deepEqual(visibleWork.map((item) => item.id), [work.id]);
+  assert.doesNotMatch(formatWorkStatus(visibleWork), /private-api|private incident|Taylor/);
 
   tracker.finish(work.id);
-  assert.equal(formatWorkStatus(tracker.snapshot()), "No Codex dev work is currently in progress.");
+  tracker.finish(hidden.id);
+  assert.match(formatWorkStatus(tracker.snapshot()), /No Devbot-managed task or external Codex command is confirmed running/);
+
+  const dirtyDefaultBranch = formatWorkStatus([], new Date("2026-06-23T20:01:05.000Z"), [
+    {
+      projectName: "webapp",
+      branch: "main",
+      defaultBranch: "main",
+      status: " M src/index.ts",
+      diffStat: "1 file changed, 4 insertions(+)",
+      lastCommit: "abc1234 Last stable commit"
+    }
+  ]);
+  assert.match(dirtyDefaultBranch, /Branch risk: `webapp` has uncommitted work on its default branch `main`/);
+  assert.match(dirtyDefaultBranch, /`\/review packet project:webapp`/);
 });
 
 test("task store persists task lifecycle to disk", async () => {
@@ -889,7 +934,7 @@ test("project policy gates peers screenshots and commands", () => {
 });
 
 test("status image renderer returns a png", async () => {
-  const image = await renderStatusImage("Codex dev work currently in progress: 1\n- webapp session");
+  const image = await renderStatusImage("Development status\nNo confirmed work\nBest next step: review recent tasks");
   assert.equal(image.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
 });
 
@@ -923,7 +968,7 @@ test("project screenshot navigation chooses visible UI by request text", () => {
 
 test("external Codex process parser detects configured project sessions without leaking commands", () => {
   const output = [
-    "42248 16:54 /Applications/Codex.app/Contents/Resources/cua_node/bin/node --experimental-vm-modules /tmp/kernel.js --session-id abc --working-dir /tmp/webapp",
+    "42248 49:07 /Applications/Codex.app/Contents/Resources/cua_node/bin/node --experimental-vm-modules /tmp/kernel.js --session-id abc --working-dir /tmp/webapp",
     "59726 01:02 /Applications/Codex.app/Contents/Resources/codex exec --ephemeral --sandbox workspace-write --cd /tmp/webapp --output-last-message /tmp/answer.txt long prompt text",
     "59727 01:02 /Applications/Codex.app/Contents/Resources/codex exec --cd /tmp/webapp --output-last-message /tmp/devbot-codex-abc/answer.txt bot-owned prompt",
     "99999 00:01 rg webapp"
@@ -944,4 +989,23 @@ test("external Codex process parser detects configured project sessions without 
   assert.equal(work[1]?.mode, "action");
   assert.equal(work[1]?.pid, 59726);
   assert.equal(work.some((item) => item.text.includes("long prompt text")), false);
+
+  const status = formatWorkStatus(work, new Date("2026-06-23T20:20:00.000Z"), [
+    {
+      projectName: "webapp",
+      branch: "codex/status-brief",
+      defaultBranch: "main",
+      status: " M src/work-status.ts\n?? src/new-status.test.ts\n?? .env.local",
+      diffStat: "2 files changed, 20 insertions(+)",
+      lastCommit: "abc1234 Improve status routing"
+    }
+  ]);
+  assert.match(status, /Open sessions \(activity unknown\)/);
+  assert.match(status, /Open does not prove active work/);
+  assert.match(status, /branch `codex\/status-brief`; 3 changed paths/);
+  assert.match(status, /`\[sensitive path hidden\]`/);
+  assert.doesNotMatch(status, /\.env\.local/);
+  assert.match(status, /Visibility gap: `webapp` has an external session open 49m 7s/);
+  assert.match(status, /completed \/ in progress \/ blocked \/ next/);
+  assert.doesNotMatch(status, /pid 42248|pid 59726|long prompt text|bot-owned prompt/);
 });

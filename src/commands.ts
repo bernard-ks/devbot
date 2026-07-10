@@ -71,14 +71,14 @@ export const commandDefinitions = [
     ),
   new SlashCommandBuilder()
     .setName("status")
-    .setDescription("Show Codex dev work currently in progress.")
+    .setDescription("Show current work, blockers, repository evidence, and the best next step.")
     .addStringOption((option) =>
-      option.setName("project").setDescription("Optional project for a deeper status question.").setRequired(false).setAutocomplete(true)
+      option.setName("project").setDescription("Optional project for repository evidence or deeper inspection.").setRequired(false).setAutocomplete(true)
     )
     .addStringOption((option) =>
       option
         .setName("question")
-        .setDescription("Optional deeper status question; describe the UI target for screenshots.")
+        .setDescription("Optional read-only repository inspection question.")
         .setRequired(false)
     )
     .addBooleanOption((option) =>

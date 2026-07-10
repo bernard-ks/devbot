@@ -18,7 +18,7 @@ The small-team foundation now exists: owner-managed private setup, durable local
   - `/setup wizard` provides resumable owner setup for viewers, controllers, peer bots, a private room, and runtime project roots.
   - `/setup doctor` diagnoses the complete local and Discord setup path.
   - `/projects` lists configured local projects.
-  - `/status` reports active bot work and detected local Codex sessions for configured projects.
+  - `/status` reports a decision-ready brief: confirmed bot work and phases, external runs, activity-unknown app sessions, repository evidence, risks, and a recommended next step.
   - `/status image:true` can attach a live local UI screenshot when a web dev server is detected.
   - `/refresh` rebuilds the in-memory project file index.
   - `/ask` answers read-only project questions with local context.
@@ -40,7 +40,8 @@ The small-team foundation now exists: owner-managed private setup, durable local
   - Tracks active work in memory and persists task history locally.
 - External local Codex awareness:
   - Detects local Codex app/CLI sessions whose working directory belongs to a configured project.
-  - Reports sanitized process status without leaking command prompts.
+  - Separates confirmed external runs from open app sessions whose activity cannot be known.
+  - Reports sanitized repository evidence without leaking process IDs or command prompts.
 - UI screenshot support:
   - Detects running local web dev servers such as Next, Vite, React Scripts, Astro, and Nuxt.
   - Opens the running app and navigates through visible links/buttons based on request language.

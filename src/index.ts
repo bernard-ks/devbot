@@ -37,7 +37,7 @@ import type { CollabContribution, CollabConversation } from "./collab-store.js";
 import { loadConfig, normalizeProjectName } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
-import { parseMentionRequest, parseStatusRequest, stripBotMention } from "./mention.js";
+import { parseMentionRequest, parseStatusRequest, statusDetailQuestion, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { captureProjectScreenshot, type ProjectScreenshot } from "./project-screenshot.js";
 import { configuredCommandNames, formatProjectCommandResult, runConfiguredProjectCommand } from "./command-runner.js";
@@ -64,7 +64,7 @@ import {
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskStatus } from "./task-store.js";
 import { parseTaskControl, taskControlRow, type TaskControlAction } from "./task-controls.js";
-import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
+import { filterWorkForProjects, findExternalCodexWork, formatWorkStatus, WorkTracker, type ProjectWorkSnapshot } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
 import { applySetupState, captureBootstrapConfig, isSetupController } from "./runtime-setup.js";
 import { clearRuntimeLock, markRuntimeRunning, runtimeLockPath } from "./runtime-lock.js";
@@ -1027,12 +1027,6 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     throw new Error(safeModeActionMessage(options.source));
   }
 
-  const work = workTracker.start({
-    mode: options.mode,
-    projectName: options.project.name,
-    requester: options.requester,
-    text: options.text
-  });
   const task = await taskStore.start({
     source: options.source,
     mode: options.mode,
@@ -1040,6 +1034,13 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     requester: options.requester,
     text: options.text,
     includePatterns: options.includePatterns
+  });
+  const work = workTracker.start({
+    mode: options.mode,
+    projectName: options.project.name,
+    requester: options.requester,
+    text: options.text,
+    taskId: task.id
   });
   const controller = new AbortController();
   activeTaskControllers.set(task.id, controller);
@@ -1055,6 +1056,11 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       hasExplicitIncludes: options.includePatterns.length > 0,
       signal: controller.signal
     });
+    workTracker.update(work.id, {
+      phase: "gathering-context",
+      modelTier: route.tier,
+      contextMode: route.contextMode
+    });
     await options.onRoute?.(route);
     const contextCharLimit = contextLimitForRoute(
       route,
@@ -1066,6 +1072,10 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     const context = contextCharLimit === 0
       ? { project: options.project, files: [], packedText: "" }
       : await contextService.pack(options.project, options.text, options.includePatterns, contextCharLimit);
+    workTracker.update(work.id, {
+      phase: "running-codex",
+      contextFileCount: context.files.length
+    });
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
     await taskStore.succeed(task.id, {
       contextFileCount: context.files.length,
@@ -1090,10 +1100,29 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
   }
 }
 
-async function getWorkStatusMessage(appConfig: AppConfig): Promise<string> {
-  const activeBotWork = workTracker.snapshot();
+async function getWorkStatusMessage(appConfig: AppConfig, requestedProject?: ProjectEntry): Promise<string> {
+  const activeBotWork = filterWorkForProjects(workTracker.snapshot(), appConfig.projects);
   const externalCodexWork = await findExternalCodexWork(appConfig.projects);
-  return formatWorkStatus([...activeBotWork, ...externalCodexWork]);
+  const activeWork = [...activeBotWork, ...externalCodexWork];
+  const relevantProjectNames = new Set(activeWork.map((work) => work.projectName));
+  if (requestedProject) {
+    relevantProjectNames.add(requestedProject.name);
+  }
+  const relevantProjects = appConfig.projects.filter((project) => relevantProjectNames.has(project.name));
+  const projectSnapshots: ProjectWorkSnapshot[] = await Promise.all(
+    relevantProjects.map(async (project) => {
+      const packet = await createReviewPacket(project);
+      return {
+        projectName: project.name,
+        branch: packet.branch,
+        defaultBranch: packet.defaultBranch,
+        status: packet.status,
+        diffStat: packet.diffStat,
+        lastCommit: packet.lastCommit
+      };
+    })
+  );
+  return formatWorkStatus(activeWork, new Date(), projectSnapshots);
 }
 
 interface StatusResponseOptions {
@@ -1115,7 +1144,7 @@ async function getStatusSnapshotResponse(
   requestedProject?: ProjectEntry,
   requestText = ""
 ): Promise<BotResponse> {
-  let content = await getWorkStatusMessage(appConfig);
+  let content = await getWorkStatusMessage(appConfig, requestedProject);
 
   if (wantsImage) {
     const project = requestedProject ?? defaultProject(appConfig.projects);
@@ -1133,12 +1162,13 @@ async function getStatusSnapshotResponse(
 }
 
 async function getDetailedStatusResponse(options: StatusResponseOptions): Promise<BotResponse> {
-  const status = await getWorkStatusMessage(options.appConfig);
+  const status = await getWorkStatusMessage(options.appConfig, options.project);
   const project = options.project ?? defaultProject(options.appConfig.projects);
   const detailPrompt = [
-    "Give a deeper development status update for the configured project.",
+    "Give a read-only repository assessment for the configured project.",
     "Use the current work snapshot below as live context, then inspect the project read-only if needed.",
-    "Be concrete about what appears active, what output/state is visible, and what is unknown.",
+    "Be concrete about repository state, likely blockers, and useful next actions.",
+    "Do not present repository evidence as private progress telemetry from an external Codex session.",
     "",
     "Current work snapshot:",
     status,
@@ -1155,7 +1185,7 @@ async function getDetailedStatusResponse(options: StatusResponseOptions): Promis
     requester: options.requester,
     source: "status-detail"
   });
-  return { content: [`Detailed update for \`${project.name}\`:`, answer].join("\n") };
+  return { content: [`Repository assessment for \`${project.name}\`:`, answer].join("\n") };
 }
 
 async function handleTaskCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
@@ -3276,7 +3306,7 @@ function parseFallbackStatusRequest(text: string): { isStatus: boolean; question
   }
 
   const wantsImage = /\b(snip|screenshot|screen shot|image|picture|pic|output)\b/.test(normalized);
-  return { isStatus: true, question: text.trim() || undefined, wantsImage };
+  return { isStatus: true, question: statusDetailQuestion(text), wantsImage };
 }
 
 function truncateForLog(value: string): string {
