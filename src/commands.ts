@@ -103,6 +103,18 @@ const commandBuilders = [
         .addChannelOption((option) =>
           option.setName("channel").setDescription("Discord channel to use when binding the project room.").setRequired(false)
         )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("preview")
+        .setDescription("Enable or disable owner-only public preview tunnels (default off).")
+        .addStringOption((option) =>
+          option
+            .setName("action")
+            .setDescription("Whether to enable or disable preview tunnels.")
+            .setRequired(true)
+            .addChoices({ name: "enable", value: "enable" }, { name: "disable", value: "disable" })
+        )
     ),
   new SlashCommandBuilder()
     .setName("status")
@@ -523,6 +535,34 @@ const commandBuilders = [
         .setDescription("Optional comma-separated path patterns, e.g. src/*,README.md,*.json.")
         .setRequired(false)
     ),
+  new SlashCommandBuilder()
+    .setName("preview")
+    .setDescription("Owner-only: turn a running local dev server into an expiring public preview link.")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("share")
+        .setDescription("Start a public preview tunnel to a running local dev server.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+        .addIntegerOption((option) =>
+          option
+            .setName("minutes")
+            .setDescription("Minutes until the tunnel expires, 1-60. Defaults to 15.")
+            .setRequired(false)
+            .setMinValue(1)
+            .setMaxValue(60)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("stop")
+        .setDescription("Stop an active preview tunnel.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) => subcommand.setName("status").setDescription("Show active preview tunnels.")),
   new SlashCommandBuilder()
     .setName("do")
     .setDescription("Intentionally ask Devbot to make a focused project change.")
