@@ -153,7 +153,7 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/refresh project:<name>`: Rebuild the in-memory file index for a project.
 - `/ask question:<text> project:<optional> include:<optional patterns>`: Ask the model a question with local project context.
 - `/do task:<text> project:<optional> include:<optional patterns>`: Ask local Codex to perform a focused project task. Requires owner or controller access.
-- `/ship task:<task-id>`: Compose a 1200x675 shareable card for a completed `/do` task, using its automatic before/after screenshot diff (or the after screenshot) plus project name and task summary. Requires owner or controller access; also available as a "Ship it" button on completed action tasks.
+- `/ship task:<task-id>`: Compose a 1200x675 shareable card for a completed `/do` task with the project name and task summary. Action tasks run in an isolated Git worktree with no managed preview, so their card is text-only with an explicit "visual proof unavailable" note; a live screenshot is only attempted for non-isolated tasks. Requires owner or controller access; also available as a "Ship it" button on completed action tasks.
 
 You can also mention the bot in a channel:
 

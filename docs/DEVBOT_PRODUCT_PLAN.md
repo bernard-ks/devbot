@@ -77,11 +77,12 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Opens the running app and navigates through visible links/buttons based on request language.
   - Handles requests like "browse page" or "watchlist view" without reading framework routes from disk.
   - Supports explicit URLs and paths such as `/cards/op01-016` when the user wants an exact target.
-- Visual diff and ship cards:
-  - `/do` action tasks on a project with a detected local web server automatically capture a before screenshot at task start and an after screenshot at completion, when the project's screenshot policy allows it.
-  - Computes a per-pixel changed region diff (grid-cell clustering, no external image-diff dependency) and attaches a composed before/after card with highlighted changed regions to the completed task message once the change crosses a small threshold.
-  - `/ship task:<task-id>` (also a "Ship it" button on completed action tasks, owner/controller-gated) composes a 1200x675 shareable card with the project name, task summary, and the before/after strip or after screenshot, for posting outside Discord.
-  - Capture metadata (target URLs, timestamps, changed percent) persists on the saved task record; capture failures degrade to a note rather than failing the task.
+- Ship cards (`/ship`-only; see HANDOFF "Review round 1" for why this is narrower than automatic before/after capture):
+  - `/do` action tasks always run in an isolated Git worktree (see task-worktree.ts); Devbot has no managed preview of that isolated workspace, so it never screenshots the source checkout's dev server and calls it "proof" of an isolated task's change. Completed action tasks instead get an explicit `captureNote` ("Visual proof unavailable...") on the task record, visible via `/task show`.
+  - `/ship task:<task-id>` (also a "Ship it" button on completed action tasks, owner/controller-gated) composes a 1200x675 shareable card with the project name and task summary. For isolated tasks the card is text-only with a "visual proof unavailable for isolated branch" caption; for non-isolated tasks (e.g. answer-mode) it attempts one stabilized live screenshot of the project's detected dev server, when the project's screenshot policy allows it.
+  - Screenshots wait for two consecutive identical frames (animations/transitions disabled, `prefers-reduced-motion` emulated) before being used, so loading spinners and blinking carets don't get misread as content.
+  - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
+  - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
 
 ## Current Constraints
 
