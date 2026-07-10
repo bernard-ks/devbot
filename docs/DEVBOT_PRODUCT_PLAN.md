@@ -65,7 +65,8 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Pluggable executor runs on Codex CLI, Claude Code, Gemini CLI, or opencode — whichever is installed.
   - Selection order is `DEVBOT_AGENT_BACKEND`, then the `/setup backend` choice, then the first agent detected on PATH (codex, claude, gemini, opencode).
   - Codex remains the default and reference backend with unchanged flags; unverified backends are surfaced as experimental.
-  - Read-only answer and write-capable action modes map to each CLI's real sandbox/permission flags, and Luna / Terra / Sol tiers map to a backend's own model when configured.
+  - Every backend declares an explicit, tested capability contract (environment policy, user-config/plugin isolation, network behavior, read-only enforcement, action-workspace confinement, cancellation, prompt/output transport) and inherits Codex's hardening: a minimal child environment that never carries Devbot secrets, and prompts delivered over stdin rather than argv.
+  - Read-only is fail-closed: a backend that cannot guarantee a read-only run (currently the experimental Gemini and opencode backends) refuses answer mode instead of assuming safety. Write-capable action mode maps to each CLI's real sandbox/permission flags, and Luna / Terra / Sol tiers map to a backend's own model when configured.
 - Local Codex execution:
   - Uses the installed Codex CLI/app session instead of OpenAI API keys.
   - Supports read-only answer mode and workspace-write action mode.

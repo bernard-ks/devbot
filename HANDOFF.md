@@ -45,8 +45,35 @@ Devbot's executor is now pluggable. Instead of only driving the local Codex CLI,
 4. With only codex installed and nothing configured, everything behaves exactly as before (codex is auto-selected).
 
 ## Known limitations / risks
-- **gemini and opencode are experimental** — their flags were not verifiable on this machine. gemini's `--yolo` and opencode's `run` invocation follow the brief but should be smoke-tested against the real CLIs. opencode has no distinct read-only mode wired, so answer and action modes are currently identical for it (documented as experimental).
-- **Claude `plan` mode for answers**: `plan` is the read-only-safe permission mode. In non-interactive `-p` runs Claude may present a plan rather than a discursive answer for some prompts; acceptable for the deny-by-default posture, but worth watching in real use.
-- **Prompt passing**: codex pipes the prompt over **stdin** (`-`) post-rebase (bernard's approach); claude/gemini/opencode still pass it as an argv positional. Extremely large prompts on the non-codex backends could in theory hit `E2BIG`; `SpawnSpec` already supports `stdin` if a backend later needs to switch.
+- **gemini and opencode are experimental** — their flags were not verifiable on this machine. Post-review they are **action-only**: neither can prove read-only, so `buildAnswerCommand` refuses (fail closed) and only `/do` is wired. gemini's `--yolo` and opencode's `run` follow the brief but should be smoke-tested against the real CLIs before promotion.
+- **Claude `plan` mode for answers**: `plan` is the read-only-safe permission mode, now reinforced with a `--disallowedTools` write/network denylist and `--strict-mcp-config`. In non-interactive `-p` runs Claude may present a plan rather than a discursive answer for some prompts; acceptable for the deny-by-default posture, but worth watching in real use.
+- **Prompt passing**: all backends now deliver the prompt over **stdin** (codex via `-`; claude/gemini/opencode via `spec.stdin`), so no request text reaches argv/process listings.
 - **`DEVBOT_AGENT_BACKEND` env overrides `/setup backend`.** When both disagree, `/setup backend` saves the choice but reports that the env var wins until cleared.
 - No instruction-shaped / agent-directed text was found in the repo files touched.
+
+## Review round 1 (maintainer: bernard) — blocking issues addressed
+Appended as new commits on top of the reviewed branch; existing commits were not rewritten. Each blocking issue → fix + test:
+
+1. **Non-Codex agents inherited the full bot environment (`env: process.env`).**
+   - Fix: added `scopedChildEnvironment(env, allowList)` to `src/security.ts`. It starts from `minimalChildEnvironment` (which already drops the bot token / sensitive-named vars) and re-admits only a per-backend allow list of that CLI's own documented auth/config vars (claude: `ANTHROPIC_*` / `CLAUDE_CODE_*`; gemini: `GEMINI_*` / `GOOGLE_*`; opencode: `OPENCODE_*` + provider keys). `DISCORD_*` and `DEVBOT_*` prefixes are dropped unconditionally even if an allow list matched. claude/gemini/opencode backends now build `env` via this helper instead of `process.env`. The version probe also switched to `minimalChildEnvironment`.
+   - Test: `non-codex backends never forward Devbot secrets but do forward their own documented auth` (asserts `DISCORD_TOKEN`/`APPLICATION_SECRET`/`DEVBOT_*` absent, provider key present, `PATH` present) and `codex backend uses an isolated environment without Devbot secrets`.
+
+2. **Prompts were placed in argv.** claude/gemini/opencode passed the full request as an argv positional.
+   - Fix: all backends now set `spec.stdin = options.prompt` and carry no prompt token in `args` (the runner already pipes `stdin`). Matches how the hardened codex path uses `-` + stdin.
+   - Test: `no backend places the prompt in argv; every backend delivers it off-argv` (iterates all backends: asserts the secret prompt is not in any argv token and equals `spec.stdin`).
+
+3. **Read-only was not a guaranteed capability.** opencode's answer/action were identical; gemini answer safety was assumed.
+   - Fix: added a `BackendCapabilities` contract with `enforcesAnswerReadOnly`. Backends that can't guarantee it (gemini — unproven; opencode — no read-only mode) now **throw `ReadOnlyUnsupportedError` from `buildAnswerCommand`** (fail closed) instead of returning an action-equivalent spec. codex (sandbox `read-only`) and claude (`plan` mode + `--disallowedTools` write/network tools) keep answer mode. The router preflight and task runner surface the refusal cleanly (router falls back to heuristic routing; `/ask` returns the clear "switch backend" message).
+   - Test: `gemini backend ... refuses read-only answers` and `opencode backend ... refuses read-only answers` (assert `throws(/read-only/i)` and `capabilities.enforcesAnswerReadOnly === false`); claude/codex capability tests assert `true`.
+
+4. **Backend user config / extensions / network not constrained; no capability fields.**
+   - Fix: `BackendCapabilities` now carries explicit, tested fields for `minimalEnvironment`, `isolatesUserConfig`, `constrainsNetwork`, `enforcesAnswerReadOnly`, `confinesActionWorkspace`, `supportsCancellation`, `promptTransport`, `outputTransport` on every backend. claude gained `--strict-mcp-config` (no ambient MCP servers/plugins/tool extensions) on both modes and a read-only write-tool denylist on answer mode; action mode stays confined via `acceptEdits` + `--add-dir <project>`. gemini/opencode declare the unproven fields as `false` (consistent with their fail-closed answer refusal + experimental flag).
+   - Test: `claude backend declares a read-only-capable, minimal-env, confined capability contract` (full `capabilities` deepEqual) and the hardened-args test asserting `--strict-mcp-config` + `--disallowedTools`.
+
+5. **`/setup doctor` had an unconditional Codex executable check.**
+   - Fix: removed the codex-specific "Codex executable" readiness line from `formatSetupDoctor` in `src/index.ts`. Readiness is now generalized around the active backend (`Agent backend (<id>)`) plus a new `Read-only answers (<id>)` capability check driven by `capabilities.enforcesAnswerReadOnly`. The backend summary and `/setup backend` report annotate any backend that cannot serve read-only `/ask`.
+
+### Residual notes for the maintainer
+- gemini and opencode remain **experimental** and are only wired for `/do` (action) after the fail-closed answer refusal; they still need a real-CLI smoke test for action/cancellation/timeout/output parsing before promotion. No real third-party CLI is spawned in tests.
+- claude `--strict-mcp-config` blocks ambient MCP/plugin extensions, but the CLI has no flag to fully ignore `~/.claude/settings.json`; in `plan`/read-only answer mode this cannot grant writes, and action mode stays scoped to the project dir. Documented rather than assumed.
+- `npm test` → **133 pass / 0 fail** (rerun once: the first run's single failure was the known flaky child-process timeout in `security.test.ts`, green on rerun).
