@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, mkdir, open, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { canAccessScopedRecord, type TaskAccessContext } from "./task-access.js";
 import { selectRelevantMemories } from "./memory-recall.js";
@@ -80,6 +80,7 @@ export const MAX_FILE_BYTES = 4_000_000;
 
 export class MemoryStore {
   private readonly mutationTails = new Map<string, Promise<void>>();
+  private readonly legacyMigrations = new Map<string, Promise<void>>();
   readonly root: string;
 
   constructor(
@@ -182,6 +183,11 @@ export class MemoryStore {
 
   private async readState(project: Pick<ProjectEntry, "root">): Promise<MemoryFileState> {
     const file = await this.fileFor(project);
+    await this.ensureLegacyMigrated(project, file);
+    return this.readStateFromFile(file);
+  }
+
+  private async readStateFromFile(file: string): Promise<MemoryFileState> {
     let raw: string;
     try {
       raw = await readFileRejectingSymlinks(file);
@@ -197,6 +203,52 @@ export class MemoryStore {
     }
     await hardenPrivateFilePermissions(file);
     return parseJsonl(raw);
+  }
+
+  private async ensureLegacyMigrated(project: Pick<ProjectEntry, "root">, file: string): Promise<void> {
+    let migration = this.legacyMigrations.get(file);
+    if (!migration) {
+      migration = this.migrateLegacyProjectMemory(project, file).catch((error: unknown) => {
+        console.warn(`Skipping legacy project memory migration for ${project.root}: ${(error as Error).message}`);
+      });
+      this.legacyMigrations.set(file, migration);
+    }
+    await migration;
+  }
+
+  /**
+   * Reads a memory file that an earlier Devbot build wrote inside the managed
+   * project checkout, merges its records into the central store (invalid lines
+   * are quarantined, migrated entries keep their normalized untrusted-by-default
+   * state so they are never auto-recalled without promotion), then retires the
+   * stray file so it can never be committed to the target repository or read
+   * from the project root. Symlinked or oversized legacy files are left alone.
+   */
+  private async migrateLegacyProjectMemory(project: Pick<ProjectEntry, "root">, centralFile: string): Promise<void> {
+    const legacyDirectory = path.join(project.root, ".devbot");
+    const legacyFile = path.join(legacyDirectory, "memory.jsonl");
+    const directoryStats = await lstat(legacyDirectory).catch(() => undefined);
+    if (!directoryStats || directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+      return;
+    }
+    const fileStats = await lstat(legacyFile).catch(() => undefined);
+    if (!fileStats || !fileStats.isFile()) {
+      return;
+    }
+    if (fileStats.size > this.maxFileBytes) {
+      throw new Error(`legacy memory file exceeds the ${this.maxFileBytes}-byte budget; leaving it in place`);
+    }
+
+    const legacy = parseJsonl(await readFileRejectingSymlinks(legacyFile));
+    const current = await this.readStateFromFile(centralFile);
+    const knownIds = new Set(current.entries.map((entry) => entry.id));
+    const merged: MemoryFileState = {
+      entries: [...current.entries, ...legacy.entries.filter((entry) => !knownIds.has(entry.id))],
+      quarantined: [...current.quarantined, ...legacy.quarantined]
+    };
+    await writeAll(centralFile, merged, this.maxFileBytes);
+    await rm(legacyFile, { force: true });
+    await rmdir(legacyDirectory).catch(() => undefined);
   }
 
   private async mutate(

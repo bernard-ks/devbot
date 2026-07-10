@@ -525,3 +525,84 @@ test("formatMemoryList output for a maximal entry set is chunked to fit Discord'
   assert.ok(chunks.length > 1, "a maximal memory list must split into more than one Discord message");
   assert.ok(chunks.every((chunk) => chunk.length <= 2_000));
 });
+
+function legacyLine(id: string, text: string): string {
+  return JSON.stringify({
+    id,
+    kind: "decision",
+    text,
+    source: "manual",
+    author: "tom",
+    createdAt: "2026-06-01T00:00:00.000Z",
+    tags: ["legacy"]
+  });
+}
+
+test("memory store migrates a legacy in-checkout memory file into the central store and retires it", async () => {
+  const project = await tempProject();
+  const legacyDirectory = path.join(project.root, ".devbot");
+  const legacyFile = path.join(legacyDirectory, "memory.jsonl");
+  await mkdir(legacyDirectory, { recursive: true });
+  const corruptLine = '{"broken":';
+  await writeFile(
+    legacyFile,
+    [legacyLine("mem-legacy-aaa", "Ship the v1 importer."), legacyLine("mem-legacy-bbb", "Token AKIAABCDEFGHIJKLMNOP leaked once."), corruptLine].join("\n") + "\n",
+    "utf8"
+  );
+
+  const store = new MemoryStore(await tempStoreRoot());
+  const entries = await store.list(project, { access: owner });
+  assert.deepEqual(entries.map((entry) => entry.id).sort(), ["mem-legacy-aaa", "mem-legacy-bbb"]);
+  const migrated = entries.find((entry) => entry.id === "mem-legacy-bbb");
+  assert.ok(migrated && !migrated.text.includes("AKIAABCDEFGHIJKLMNOP"), "secrets in legacy entries must be redacted");
+  assert.ok(migrated?.text.includes("[REDACTED AWS KEY]"));
+
+  assert.equal((await store.recallFor(project, "ship the importer", owner)).length, 0, "migrated entries stay untrusted until promoted");
+
+  await assert.rejects(() => stat(legacyFile), "legacy file must be retired from the checkout");
+  await assert.rejects(() => stat(legacyDirectory), "an emptied legacy .devbot directory is removed");
+
+  const centralRaw = await readFile(await store.fileFor(project), "utf8");
+  assert.ok(centralRaw.includes(corruptLine), "corrupt legacy lines are quarantined, not destroyed");
+});
+
+test("memory store legacy migration keeps a .devbot directory that still holds other files", async () => {
+  const project = await tempProject();
+  const legacyDirectory = path.join(project.root, ".devbot");
+  await mkdir(legacyDirectory, { recursive: true });
+  const policyFile = path.join(legacyDirectory, "project.json");
+  await writeFile(policyFile, "{}\n", "utf8");
+  await writeFile(path.join(legacyDirectory, "memory.jsonl"), legacyLine("mem-legacy-ccc", "Keep the policy file.") + "\n", "utf8");
+
+  const store = new MemoryStore(await tempStoreRoot());
+  const entries = await store.list(project, { access: owner });
+  assert.deepEqual(entries.map((entry) => entry.id), ["mem-legacy-ccc"]);
+
+  await assert.rejects(() => stat(path.join(legacyDirectory, "memory.jsonl")));
+  assert.ok(await stat(policyFile), "unrelated .devbot files must survive migration");
+});
+
+test("memory store legacy migration refuses to follow a symlinked .devbot directory", { skip: process.platform === "win32" }, async () => {
+  const project = await tempProject();
+  const outside = await tempStoreRoot();
+  await writeFile(path.join(outside, "memory.jsonl"), legacyLine("mem-legacy-ddd", "Planted via symlink.") + "\n", "utf8");
+  await symlink(outside, path.join(project.root, ".devbot"));
+
+  const store = new MemoryStore(await tempStoreRoot());
+  const entries = await store.list(project, { access: owner });
+  assert.equal(entries.length, 0);
+  assert.ok(await stat(path.join(outside, "memory.jsonl")), "symlink targets must never be consumed or deleted");
+});
+
+test("memory store legacy migration leaves oversized legacy files in place", async () => {
+  const project = await tempProject();
+  const legacyDirectory = path.join(project.root, ".devbot");
+  const legacyFile = path.join(legacyDirectory, "memory.jsonl");
+  await mkdir(legacyDirectory, { recursive: true });
+  await writeFile(legacyFile, legacyLine("mem-legacy-eee", "x".repeat(1_000)) + "\n", "utf8");
+
+  const store = new MemoryStore(await tempStoreRoot(), 500, 2_000, 512);
+  const entries = await store.list(project, { access: owner });
+  assert.equal(entries.length, 0);
+  assert.ok(await stat(legacyFile), "an oversized legacy file is skipped, not deleted");
+});
