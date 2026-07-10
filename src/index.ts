@@ -127,6 +127,7 @@ import {
 } from "./task-ui.js";
 import {
   clampTtlMinutes,
+  cloudflaredVersion,
   describeProjectRevision,
   findCloudflaredPath,
   findRunningProjectOrigin,
@@ -155,6 +156,7 @@ import {
   tunnelShareMessage,
   tunnelWrongRoomMessage
 } from "./tunnel-ui.js";
+import { TunnelProcessLedger } from "./tunnel-ledger.js";
 import { UserPreferenceStore } from "./user-preferences.js";
 import {
   buildFixTaskPrompt,
@@ -229,9 +231,11 @@ const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_S
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
+const tunnelLedger = new TunnelProcessLedger(process.env.DEVBOT_TUNNEL_LEDGER?.trim() || undefined);
 const tunnelManager = new TunnelManager({
   spawnFn: (command, args, env) => spawn(command, args, { env }),
-  findCloudflaredPath: () => findCloudflaredPath()
+  findCloudflaredPath: () => findCloudflaredPath(),
+  processLedger: tunnelLedger
 });
 const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
@@ -258,6 +262,23 @@ client.once("clientReady", async () => {
     }
   } catch (error) {
     console.warn(`Unable to recover interrupted tasks: ${publicErrorMessage(error)}`);
+  }
+  try {
+    const reconciled = await tunnelLedger.reconcile();
+    const touched = reconciled.alreadyGone + reconciled.killed + reconciled.unverified + reconciled.survived;
+    if (touched > 0) {
+      console.log(
+        `Preview tunnel reconciliation: ${reconciled.killed} orphaned cloudflared process(es) killed, ` +
+          `${reconciled.alreadyGone} already gone, ${reconciled.unverified} unverified, ${reconciled.survived} survived kill.`
+      );
+    }
+    if (reconciled.unverified > 0 || reconciled.survived > 0) {
+      console.warn(
+        "Some previously recorded cloudflared processes could not be confirmed dead; check `ps aux | grep cloudflared` manually."
+      );
+    }
+  } catch (error) {
+    console.warn(`Unable to reconcile preview tunnel processes from the previous runtime: ${publicErrorMessage(error)}`);
   }
   if (config.autoDeployCommands && client.application) {
     try {
@@ -413,7 +434,7 @@ client.on("interactionCreate", async (interaction) => {
           await interaction.reply({ content: tunnelNotOwnerMessage(), flags: MessageFlags.Ephemeral });
           return;
         }
-        await handlePreviewConfirmButton(interaction, previewConfirmControl.action, previewConfirmControl.id);
+        await handlePreviewConfirmButton(interaction, config, previewConfirmControl.action, previewConfirmControl.id);
         return;
       }
       if (!parseWorkroomButton(interaction.customId)) {
@@ -1187,7 +1208,12 @@ async function handlePreviewCommand(interaction: ChatInputCommandInteraction, ap
     return;
   }
 
-  // subcommand === "share": the only path that creates public exposure.
+  // subcommand === "share": the only path that creates public exposure. Safe
+  // mode blocks new exposure here, never the stop/status cleanup paths above.
+  if (appConfig.safeMode) {
+    await interaction.reply({ content: safeModeActionMessage("/preview share"), flags: MessageFlags.Ephemeral });
+    return;
+  }
   if (!appConfig.previewTunnelsEnabled) {
     await interaction.reply({ content: tunnelDisabledMessage(), flags: MessageFlags.Ephemeral });
     return;
@@ -1272,7 +1298,12 @@ async function handlePreviewStopButton(interaction: ButtonInteraction, id: strin
   console.log(`Preview tunnel stopped for ${stopped.projectName} (${id}) by ${interaction.user.tag}.`);
 }
 
-async function handlePreviewConfirmButton(interaction: ButtonInteraction, action: "start" | "cancel", id: string): Promise<void> {
+async function handlePreviewConfirmButton(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: "start" | "cancel",
+  id: string
+): Promise<void> {
   if (action === "cancel") {
     const cancelled = tunnelManager.cancelPending(id);
     await interaction.deferUpdate();
@@ -1285,8 +1316,28 @@ async function handlePreviewConfirmButton(interaction: ButtonInteraction, action
     return;
   }
 
-  if (!tunnelManager.getPending(id)) {
+  const pending = tunnelManager.getPending(id);
+  if (!pending) {
     await interaction.reply({ content: tunnelControlExpiredMessage(), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // Recheck the full authorization path at launch time, not just at reserve
+  // time: enablement, per-project policy, or project access may have changed
+  // while the confirmation sat unclicked. Fail closed by cancelling.
+  const project = appConfig.projects.find((entry) => entry.name === pending.projectName);
+  const launchBlocked =
+    !project ||
+    appConfig.safeMode ||
+    !appConfig.previewTunnelsEnabled ||
+    !appConfig.previewEnabledProjectNames.has(pending.projectName) ||
+    !isAllowedForProject(interaction, project);
+  if (launchBlocked) {
+    tunnelManager.cancelPending(id);
+    await interaction.reply({
+      content: `Preview tunnels are no longer allowed for \`${pending.projectName}\`; the pending request was cancelled.`,
+      flags: MessageFlags.Ephemeral
+    });
     return;
   }
 
@@ -1666,12 +1717,7 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
   const backendSummary = backends.length
     ? backends.map((backend) => `${backend.id === activeBackendId ? "*" : "-"} ${backend.id}: ${backend.installed ? backend.version ?? "installed" : "not installed"}${backend.experimental ? " (experimental)" : ""}${backend.capabilities.enforcesAnswerReadOnly ? "" : " (no read-only /ask)"}${backend.capabilities.confinesActionWorkspace ? "" : " (no /do actions)"}${backend.installed && !backend.compatible ? " (execution disabled)" : ""}`)
     : ["- backend detection unavailable"];
-  const cloudflaredPath = findCloudflaredPath();
-  const previewLine = !appConfig.previewTunnelsEnabled
-    ? "OFF    Preview tunnels - disabled (owner-only, opt-in via /setup preview action:enable)."
-    : cloudflaredPath
-      ? `READY  Preview tunnels - cloudflared found at ${cloudflaredPath}.`
-      : "FIX    Preview tunnels - cloudflared not found on PATH; install it with `brew install cloudflared`.";
+  const previewLine = await formatPreviewDoctorLine(appConfig);
   return [
     "Devbot doctor",
     `Readiness: ${passed}/${checks.length}`,
@@ -1718,6 +1764,20 @@ async function formatBackendReport(appConfig: AppConfig, requested?: string): Pr
     lines.push(`Active backend set to ${requested}.`);
   }
   return lines.join("\n");
+}
+
+async function formatPreviewDoctorLine(appConfig: AppConfig): Promise<string> {
+  if (!appConfig.previewTunnelsEnabled) {
+    return "OFF    Preview tunnels - disabled (owner-only, opt-in via /setup preview action:enable).";
+  }
+  const cloudflaredPath = findCloudflaredPath();
+  if (!cloudflaredPath) {
+    return "FIX    Preview tunnels - cloudflared not found on PATH; install it with `brew install cloudflared`.";
+  }
+  const version = await cloudflaredVersion(cloudflaredPath);
+  return version
+    ? `READY  Preview tunnels - ${version} at ${cloudflaredPath}.`
+    : `FIX    Preview tunnels - ${cloudflaredPath} exists but did not identify itself via \`cloudflared --version\`; reinstall it.`;
 }
 
 function formatSetupMentions(ids: string[]): string {
