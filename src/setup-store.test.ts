@@ -219,7 +219,7 @@ function appConfig(projects: ProjectEntry[]): AppConfig {
     coordinationChannelId: "bootstrap-room",
     projects,
     scanner: { maxIndexedFileBytes: 1, maxSnippetCharsPerFile: 1, maxPackedContextChars: 1, maxRankedFiles: 1 },
-    voice: { enabled: true }
+    voice: { enabled: true, messageContentIntent: true }
   };
 }
 

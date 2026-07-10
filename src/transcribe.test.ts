@@ -13,6 +13,8 @@ import {
   downloadBoundedAttachment,
   ffmpegArgs,
   findBinaryInDirs,
+  formatVoiceDoctorSection,
+  messageContentIntentSetupInstructions,
   isAllowedAttachmentUrl,
   isSupportedAudioAttachment,
   listModelCandidates,
@@ -27,6 +29,7 @@ import {
   smallestModelCandidate,
   transcribeAttachment,
   truncateTranscriptForReply,
+  voiceEnablementSetupResult,
   voiceSetupInstructions,
   whisperArgs
 } from "./transcribe.js";
@@ -306,6 +309,48 @@ test("voiceSetupInstructions lists exactly the missing pieces", () => {
   const onlyModelMissing = voiceSetupInstructions({ ffmpegBin: "/bin/ffmpeg", whisperBin: "/bin/whisper-cli" });
   assert.doesNotMatch(onlyModelMissing, /ffmpeg`/);
   assert.match(onlyModelMissing, /ggml-\*\.bin/);
+});
+
+test("messageContentIntentSetupInstructions names the Developer Portal toggle, the env flag, and Discord's exceptions", () => {
+  const message = messageContentIntentSetupInstructions();
+  assert.match(message, /Developer Portal/);
+  assert.match(message, /MESSAGE CONTENT INTENT/);
+  assert.match(message, /DEVBOT_MESSAGE_CONTENT_INTENT=true/);
+  assert.match(message, /DMs/);
+  assert.match(message, /@mention/);
+  assert.match(message, /bot's own messages/);
+  assert.match(message, /context-menu/);
+});
+
+test("voiceEnablementSetupResult refuses enable-voice-without-intent with the setup message", () => {
+  const refusal = voiceEnablementSetupResult({ enabled: true, messageContentIntent: false });
+  assert.equal(refusal, messageContentIntentSetupInstructions());
+  assert.equal(voiceEnablementSetupResult({ enabled: true, messageContentIntent: true }), undefined);
+  assert.equal(voiceEnablementSetupResult({ enabled: false, messageContentIntent: false }), undefined);
+});
+
+test("formatVoiceDoctorSection reports voice disabled regardless of intent", () => {
+  const section = formatVoiceDoctorSection({ enabled: false, messageContentIntent: false, detection: {} });
+  assert.match(section, /DISABLED/);
+  assert.doesNotMatch(section, /Message Content Intent/);
+});
+
+test("formatVoiceDoctorSection reports not-ready without the intent even when the pipeline is present", () => {
+  const detection = { ffmpegBin: "/bin/ffmpeg", whisperBin: "/bin/whisper-cli", modelPath: "/models/ggml-tiny.bin" };
+  const section = formatVoiceDoctorSection({ enabled: true, messageContentIntent: false, detection });
+  assert.match(section, /FIX {2}Message Content Intent/);
+  assert.match(section, /Developer Portal/);
+  assert.match(section, /DEVBOT_MESSAGE_CONTENT_INTENT=true/);
+});
+
+test("formatVoiceDoctorSection reports ready with the intent and a full local pipeline", () => {
+  const detection = { ffmpegBin: "/bin/ffmpeg", whisperBin: "/bin/whisper-cli", modelPath: "/models/ggml-tiny.bin" };
+  const section = formatVoiceDoctorSection({ enabled: true, messageContentIntent: true, detection });
+  assert.match(section, /READY {2}Message Content Intent/);
+  assert.match(section, /READY {2}ffmpeg/);
+  assert.match(section, /READY {2}whisper\.cpp/);
+  assert.match(section, /READY {2}Model/);
+  assert.doesNotMatch(section, /FIX/);
 });
 
 // A body stream that never closes and only ends when the download's abort deadline fires,

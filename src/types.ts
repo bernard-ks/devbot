@@ -29,6 +29,7 @@ export interface AppConfig {
 
 export interface VoiceConfig {
   enabled: boolean;
+  messageContentIntent: boolean;
 }
 
 export interface BotIdentity {

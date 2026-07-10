@@ -349,6 +349,62 @@ export function detectVoicePipeline(options: DetectVoicePipelineOptions = {}): V
   };
 }
 
+// Discord only delivers message content (including attachments) for guild messages when the
+// privileged Message Content Intent is enabled. The documented exceptions are DMs, messages that
+// @mention the bot, the bot's own messages, and context-menu targets. An ordinary native voice
+// note in the project room is none of these, so without the intent it arrives with no attachment
+// and the voice path silently sees nothing. Enabling it requires both the Developer Portal toggle
+// and the local env flag below.
+export function messageContentIntentSetupInstructions(): string {
+  return [
+    "Voice notes need Discord's Message Content Intent, which is privileged and off by default.",
+    "Without it, an ordinary voice message in the project room reaches Devbot with no attachment, so there is nothing to transcribe.",
+    "Enable it in both places, then restart Devbot:",
+    "1. Discord Developer Portal: your application -> Bot -> Privileged Gateway Intents -> enable MESSAGE CONTENT INTENT.",
+    "2. Set DEVBOT_MESSAGE_CONTENT_INTENT=true in Devbot's environment.",
+    "Discord still delivers content without this intent only for DMs, messages that @mention the bot, the bot's own messages, and context-menu targets, none of which covers a native voice note in the room."
+  ].join("\n");
+}
+
+export interface VoiceEnablementInput {
+  enabled: boolean;
+  messageContentIntent: boolean;
+}
+
+// Returns a setup message when voice is enabled but its gateway prerequisite is missing, otherwise
+// undefined. Voice enablement is refused (with an actionable message) unless the Message Content
+// Intent is also on.
+export function voiceEnablementSetupResult(input: VoiceEnablementInput): string | undefined {
+  if (input.enabled && !input.messageContentIntent) {
+    return messageContentIntentSetupInstructions();
+  }
+  return undefined;
+}
+
+export interface VoiceDoctorInput extends VoiceEnablementInput {
+  detection: VoicePipelineDetection;
+}
+
+export function formatVoiceDoctorSection(input: VoiceDoctorInput): string {
+  if (!input.enabled) {
+    return ["Voice notes", "DISABLED  Set DEVBOT_VOICE_ENABLED=true to allow voice-note transcription."].join("\n");
+  }
+  const detection = input.detection;
+  const lines = [
+    input.messageContentIntent
+      ? "READY  Message Content Intent: DEVBOT_MESSAGE_CONTENT_INTENT=true"
+      : "FIX  Message Content Intent - enable MESSAGE CONTENT INTENT in the Discord Developer Portal and set DEVBOT_MESSAGE_CONTENT_INTENT=true, or native voice notes arrive with no attachment.",
+    detection.ffmpegBin ? `READY  ffmpeg: \`${detection.ffmpegBin}\`` : "FIX  ffmpeg - install ffmpeg and add it to PATH.",
+    detection.whisperBin
+      ? `READY  whisper.cpp: \`${detection.whisperBin}\``
+      : "FIX  whisper.cpp - install whisper-cli/whisper-cpp/main or set DEVBOT_WHISPER_BIN.",
+    detection.modelPath
+      ? `READY  Model: \`${detection.modelPath}\``
+      : "FIX  Model - add a ggml-*.bin model under ~/whisper-models or set DEVBOT_WHISPER_MODEL."
+  ];
+  return ["Voice notes", ...lines].join("\n");
+}
+
 export function voiceSetupInstructions(detection: VoicePipelineDetection): string {
   const missing: string[] = [];
   if (!detection.ffmpegBin) {

@@ -127,6 +127,8 @@ import {
 import {
   audioGateMessage,
   detectVoicePipeline,
+  formatVoiceDoctorSection,
+  messageContentIntentSetupInstructions,
   quoteTranscript,
   selectVoiceAttachment,
   transcribeAttachment,
@@ -219,8 +221,13 @@ let slashCommandsReady = false;
 const runtimePidFile = runtimeLockPath(process.env.DEVBOT_RUNTIME_LOCK);
 markRuntimeRunning(runtimePidFile);
 const gatewayIntents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
-if (process.env.DEVBOT_MESSAGE_CONTENT_INTENT?.trim().toLowerCase() === "true") {
+if (config.voice.messageContentIntent) {
   gatewayIntents.push(GatewayIntentBits.MessageContent);
+}
+if (config.voice.enabled && !config.voice.messageContentIntent) {
+  console.warn(
+    "Voice notes are enabled but DEVBOT_MESSAGE_CONTENT_INTENT is not true; native voice messages in the project room will arrive without an attachment. Enable MESSAGE CONTENT INTENT in the Discord Developer Portal and set DEVBOT_MESSAGE_CONTENT_INTENT=true."
+  );
 }
 const client = new Client({
   intents: gatewayIntents,
@@ -1396,7 +1403,7 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
     "",
     passed === checks.length ? "Ready. Ask with @devbot, change with /do, and check with /status." : "No changes were made. Resolve FIX items, then run /setup doctor again.",
     "",
-    formatVoiceDoctorSection(appConfig)
+    voiceDoctorSection(appConfig)
   ].join("\n");
 }
 
@@ -1434,21 +1441,12 @@ async function formatBackendReport(appConfig: AppConfig, requested?: string): Pr
   return lines.join("\n");
 }
 
-function formatVoiceDoctorSection(appConfig: AppConfig): string {
-  if (!appConfig.voice.enabled) {
-    return ["Voice notes", "DISABLED  Set DEVBOT_VOICE_ENABLED=true to allow voice-note transcription."].join("\n");
-  }
-  const detection = detectVoicePipeline();
-  const lines = [
-    detection.ffmpegBin ? `READY  ffmpeg: \`${detection.ffmpegBin}\`` : "FIX  ffmpeg - install ffmpeg and add it to PATH.",
-    detection.whisperBin
-      ? `READY  whisper.cpp: \`${detection.whisperBin}\``
-      : "FIX  whisper.cpp - install whisper-cli/whisper-cpp/main or set DEVBOT_WHISPER_BIN.",
-    detection.modelPath
-      ? `READY  Model: \`${detection.modelPath}\``
-      : "FIX  Model - add a ggml-*.bin model under ~/whisper-models or set DEVBOT_WHISPER_MODEL."
-  ];
-  return ["Voice notes", ...lines].join("\n");
+function voiceDoctorSection(appConfig: AppConfig): string {
+  return formatVoiceDoctorSection({
+    enabled: appConfig.voice.enabled,
+    messageContentIntent: appConfig.voice.messageContentIntent,
+    detection: appConfig.voice.enabled ? detectVoicePipeline() : {}
+  });
 }
 
 function formatSetupMentions(ids: string[]): string {
@@ -2624,6 +2622,16 @@ async function maybeHandleVoiceMessage(message: OmitPartialGroupDMChannel<Messag
   }
   if (!isAllowedMessage(message, appConfig)) {
     await message.reply("You are not allowed to use this bot.");
+    return true;
+  }
+
+  // Voice intake depends on message.attachments, which Discord only populates under the privileged
+  // Message Content Intent (except for DMs, mentions, bot-authored, and context-menu targets). An
+  // attachment reached us here via one of those exceptions, but ordinary room voice notes would
+  // arrive empty without the intent, so refuse with an actionable setup message instead of a path
+  // that silently works for some messages and not others.
+  if (!appConfig.voice.messageContentIntent) {
+    await message.reply(messageContentIntentSetupInstructions());
     return true;
   }
 

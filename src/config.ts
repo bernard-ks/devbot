@@ -34,7 +34,10 @@ export function loadConfig(): AppConfig {
     coordinationChannelId: process.env.COORDINATION_CHANNEL_ID?.trim() || undefined,
     projects,
     scanner: DEFAULT_SCANNER,
-    voice: { enabled: parseBoolean(process.env.DEVBOT_VOICE_ENABLED, false) }
+    voice: {
+      enabled: parseBoolean(process.env.DEVBOT_VOICE_ENABLED, false),
+      messageContentIntent: parseBoolean(process.env.DEVBOT_MESSAGE_CONTENT_INTENT, false)
+    }
   };
 }
 
