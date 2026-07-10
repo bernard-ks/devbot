@@ -90,11 +90,12 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
 - Regression sentinel:
-  - `/sentinel on|off|status|interval|watch` runs an owner/controller-gated background watcher per project.
-  - Polls the auto-discovered dev-server URL, any manually added paths, and an optional configured fast command on a configurable interval (minimum 30s).
-  - A debounced up/down/idle state machine posts exactly one alert on a real regression (two consecutive bad checks) and edits that same message with a recovery note instead of spamming.
-  - A connection refusal after being up is treated as an intentional stop (idle), not a failure, so turning off a local dev server never triggers an alert.
-  - Alerts include the failing target, last known-good time, recent commits, and a live screenshot with console errors when Playwright can load the page, plus **Fix it** (starts a pre-filled write-capable task) and **Mute 1h** buttons.
+  - `/sentinel on|off|status|interval|watch|fast-command|expected-status` runs an owner/controller-gated background watcher per project.
+  - Polls the project's own approved dev-server origins, any manually added paths, and an optional read-only fast command (only commands in that project's `policy.readOnlyCommands` are eligible) on a configurable interval (minimum 30s).
+  - URL checks share the screenshot subsystem's approved-origin rule: credentials in a URL are rejected, redirects are followed manually and must stay on an approved origin, and a watch URL on an unapproved loopback port is never polled. Health defaults to 2xx/3xx (so a 404 fails); `/sentinel expected-status` can configure a different accepted range.
+  - A debounced up/down/idle state machine posts exactly one alert on a real regression (two consecutive bad checks, including a crash that makes a previously healthy target unreachable) and edits that same message with a recovery note instead of spamming. Idle is reserved for a target that was never observed healthy; an intentional stop is represented by disabling the sentinel (`/sentinel off`), not by guessing at a refusal.
+  - Alerts include the failing target, last known-good time, recent commits, and a live screenshot with console errors when Playwright can load the page, plus **Fix it** (starts a pre-filled write-capable task) and **Mute 1h** buttons. A project with its own narrower audience policy only alerts into its bound ambient room, or is suppressed if it has none.
+  - Sentinel state is stored owner-only (0600/0700) with schema-validated reload and credential redaction before persistence, matching the task/setup stores.
 
 ## Current Constraints
 

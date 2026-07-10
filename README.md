@@ -165,7 +165,9 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/sentinel on|off project:<optional>`: Enable or disable the regression sentinel background watcher for a project. Owner or controller only.
 - `/sentinel status project:<optional>`: Show sentinel configuration and the current state of each watch.
 - `/sentinel interval seconds:<n> project:<optional>`: Set the check interval, minimum 30 seconds.
-- `/sentinel watch action:<add|remove> path:<text> project:<optional>`: Add or remove an extra watched URL path beyond the auto-discovered dev-server root.
+- `/sentinel watch action:<add|remove> path:<text> project:<optional>`: Add or remove an extra watched URL path beyond the auto-discovered dev-server root. A full URL is only accepted if its origin matches one of the project's own approved dev-server origins.
+- `/sentinel fast-command command:<optional> project:<optional>`: Set the read-only command Sentinel runs each cycle, or clear it by omitting `command`. Only commands listed in the project's `.devbot/project.json` `policy.readOnlyCommands` are eligible.
+- `/sentinel expected-status status:<optional> project:<optional>`: Set the HTTP status codes considered healthy (a code, a range like `200-299`, or a comma list). Omit to reset to the default of 2xx/3xx.
 - `/refresh project:<name>`: Rebuild the in-memory file index for a project.
 - `/ask question:<text> project:<optional> include:<optional patterns>`: Ask the model a question with local project context.
 - `/do task:<text> project:<optional> include:<optional patterns>`: Ask local Codex to perform a focused project task. Requires owner or controller access.
@@ -190,7 +192,11 @@ Task history is stored locally in `.devbot/tasks.json` by default. Per-user proj
 
 ### Regression Sentinel
 
-`/sentinel on` starts a background watcher for a project: it checks the auto-discovered local dev-server URL (plus any paths added with `/sentinel watch add`) on an interval, and optionally a configured fast command. Two consecutive bad responses flip a watch from up to down and post one alert to the private room with the failing target, the last known-good time, recent commits, and a live screenshot with console errors when Playwright can load the page. Recovery edits the same message instead of posting a new one, so a flapping check never spams the room. A connection refusal after being up (the developer stopped the server on purpose) moves the watch to idle instead of alerting. Alerts carry **Fix it**, which starts an owner/controller `/do`-style task pre-filled with the failure detail, and **Mute 1h**, which silences that watch's alerts for an hour without stopping the checks.
+`/sentinel on` starts a background watcher for a project: it checks the auto-discovered local dev-server URL (plus any paths added with `/sentinel watch add`) on an interval, and optionally a read-only fast command set with `/sentinel fast-command`. Every URL check is bound to the project's own approved origins, the same rule the screenshot subsystem uses: credentials in a URL are rejected, redirects are followed manually and must stay on an approved origin, and a manual watch URL on some other loopback port that the project never exposed is never polled. Two consecutive bad responses (or a crash — see below) flip a watch from up to down and post one alert to the private room with the failing target, the last known-good time, recent commits, and a live screenshot with console errors when Playwright can load the page. Recovery edits the same message instead of posting a new one, so a flapping check never spams the room.
+
+By default a URL check is healthy on any 2xx/3xx response and unhealthy otherwise, so a route that starts 404ing is caught; use `/sentinel expected-status` if a project legitimately expects a different status. A dev server that goes from healthy to completely unreachable (the process crashed) debounces into the same down alert as a bad response — it is not silently written off as idle. Idle is reserved for a target that was never observed healthy in the first place; to stop watching a server you intentionally shut down, disable the sentinel for that project with `/sentinel off` instead of relying on the watcher to guess your intent.
+
+Alerts carry **Fix it**, which starts an owner/controller `/do`-style task pre-filled with the failure detail, and **Mute 1h**, which silences that watch's alerts for an hour without stopping the checks. A project with its own narrower `.devbot/project.json` audience policy only receives alerts in its bound ambient room (`/setup project-room`); if it has no bound room, alerts are suppressed rather than posted to the broader general private room.
 
 ## Owner Setup And Visibility
 
