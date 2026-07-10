@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { checkpointRefFor } from "./checkpoint.js";
 import {
   hardenPrivateDirectoryPermissions,
   hardenPrivateFilePermissions,
@@ -61,6 +62,7 @@ export interface TaskRecord {
   checkpointHeadSha?: string;
   checkpointBranch?: string;
   checkpointCreatedAt?: string;
+  checkpointPostTaskTree?: string;
   reverted?: boolean;
   revertedAt?: string;
   startedAt: string;
@@ -346,7 +348,16 @@ export class TaskStore {
       task.checkpointHeadSha = checkpoint.headSha;
       task.checkpointBranch = checkpoint.branch;
       task.checkpointCreatedAt = checkpoint.createdAt;
+      delete task.checkpointPostTaskTree;
       task.reverted = false;
+    });
+  }
+
+  /** Records the exact working-tree hash captured right after the task finished, so Undo can refuse on any later drift. */
+  async recordPostTaskTree(id: string, tree: string): Promise<void> {
+    await this.update(id, (task) => {
+      if (!task.checkpointRef) return;
+      task.checkpointPostTaskTree = tree;
     });
   }
 
@@ -669,6 +680,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
   const proposalRevision = positiveInteger(task.proposalRevision) ?? (status === "awaiting-approval" ? 1 : undefined);
   const approvedRevision = positiveInteger(task.approvedRevision);
   const accessScope = oneOf(task.accessScope, ["project", "workroom"] as const);
+  const checkpoint = normalizeCheckpointFields(task, task.id);
   return {
     id: task.id,
     status,
@@ -712,10 +724,56 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
     ...(stringValue(task.resultPreview) ? { resultPreview: stringValue(task.resultPreview)! } : {}),
     ...(stringValue(task.error) ? { error: stringValue(task.error)! } : {}),
     ...(stringValue(task.captureNote) ? { captureNote: stringValue(task.captureNote)! } : {}),
+    ...checkpoint,
     startedAt,
     updatedAt: validTimestamp(task.updatedAt) ?? startedAt,
     ...(validTimestamp(task.finishedAt) ? { finishedAt: validTimestamp(task.finishedAt)! } : {})
   };
+}
+
+type CheckpointFields = Pick<
+  TaskRecord,
+  "checkpointRef" | "checkpointHeadSha" | "checkpointBranch" | "checkpointCreatedAt" | "checkpointPostTaskTree" | "reverted" | "revertedAt"
+>;
+
+/**
+ * Checkpoint state gates Undo, a filesystem-mutating action, so a reload must
+ * only trust it when every field is well-formed and the ref exactly matches
+ * this task's own checkpoint namespace. Any drift (corruption, manual editing,
+ * a future format change) drops the whole checkpoint rather than partially
+ * trusting it — Undo simply becomes unavailable instead of risking a restore
+ * against a ref, branch, or tree the record no longer accurately describes.
+ */
+function normalizeCheckpointFields(task: Partial<TaskRecord>, taskId: string): Partial<CheckpointFields> {
+  const ref = stringValue(task.checkpointRef);
+  const branch = stringValue(task.checkpointBranch);
+  const createdAt = validTimestamp(task.checkpointCreatedAt);
+  const headSha = task.checkpointHeadSha;
+  const validHeadSha = headSha === "" || (typeof headSha === "string" && isGitObjectId(headSha));
+
+  if (!ref || ref !== checkpointRefFor(taskId) || !branch || !createdAt || !validHeadSha) {
+    return {};
+  }
+
+  const postTaskTree = typeof task.checkpointPostTaskTree === "string" && isGitObjectId(task.checkpointPostTaskTree)
+    ? task.checkpointPostTaskTree
+    : undefined;
+  const reverted = task.reverted === true;
+  const revertedAt = reverted ? validTimestamp(task.revertedAt) : undefined;
+
+  return {
+    checkpointRef: ref,
+    checkpointHeadSha: typeof headSha === "string" ? headSha : "",
+    checkpointBranch: branch,
+    checkpointCreatedAt: createdAt,
+    ...(postTaskTree ? { checkpointPostTaskTree: postTaskTree } : {}),
+    reverted,
+    ...(revertedAt ? { revertedAt } : {})
+  };
+}
+
+function isGitObjectId(value: string): boolean {
+  return /^[0-9a-f]{40}$/i.test(value) || /^[0-9a-f]{64}$/i.test(value);
 }
 
 function stringValue(value: unknown): string | undefined {
