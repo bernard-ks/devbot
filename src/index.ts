@@ -94,7 +94,7 @@ import {
   screenshotRequiresApproval
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord, type TaskStatus } from "./task-store.js";
-import { canAccessTaskRecord, taskSyncRefusal, type TaskSyncRefusal } from "./task-access.js";
+import { canAccessTaskRecord, canManageVoiceNote as canManageVoiceNoteRecord, taskSyncRefusal, type TaskSyncRefusal } from "./task-access.js";
 import {
   describeBranchFreshness,
   inspectBranchFreshness,
@@ -135,7 +135,7 @@ import {
 } from "./transcribe.js";
 import { UserPreferenceStore } from "./user-preferences.js";
 import { parseVoiceActModal, parseVoiceControl, voiceActModal, voiceControlRow } from "./voice-controls.js";
-import { VoiceStore } from "./voice-store.js";
+import { VoiceStore, type VoiceNoteRecord } from "./voice-store.js";
 import {
   buildFixTaskPrompt,
   canActOnScreenshotFix,
@@ -2590,6 +2590,10 @@ function canManageProposal(userId: string, task: TaskRecord, appConfig: AppConfi
   return task.requesterId === userId || isControllerUser(userId, appConfig);
 }
 
+function canManageVoiceNote(userId: string, record: VoiceNoteRecord, appConfig: AppConfig): boolean {
+  return canManageVoiceNoteRecord(record, { userId, controller: isControllerUser(userId, appConfig) });
+}
+
 function taskNeedsUser(task: TaskRecord, userId: string, appConfig: AppConfig): boolean {
   return isControllerUser(userId, appConfig) || task.requesterId === userId;
 }
@@ -2675,8 +2679,8 @@ async function maybeHandleVoiceMessage(message: OmitPartialGroupDMChannel<Messag
     requesterTag: message.author.tag,
     transcript
   });
-  const { preview, truncated } = truncateTranscriptForReply(transcript);
-  const files = truncated ? [new AttachmentBuilder(Buffer.from(transcript, "utf8"), { name: "transcript.txt" })] : [];
+  const { preview, truncated } = truncateTranscriptForReply(record.transcript);
+  const files = truncated ? [new AttachmentBuilder(Buffer.from(record.transcript, "utf8"), { name: "transcript.txt" })] : [];
   await message.reply({
     content: [
       "**Voice note transcript**",
@@ -2711,6 +2715,13 @@ async function handleVoiceControl(
   }
 
   if (action === "dismiss") {
+    if (!canManageVoiceNote(interaction.user.id, record, appConfig)) {
+      await interaction.reply({
+        content: "Only the person who sent this voice note, or an approved controller, can dismiss it.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
     await voiceStore.remove(record.id);
     await interaction.update({ components: [] });
     return;

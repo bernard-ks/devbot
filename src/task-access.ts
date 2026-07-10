@@ -1,4 +1,5 @@
 import type { TaskRecord } from "./task-store.js";
+import type { VoiceNoteRecord } from "./voice-store.js";
 
 export interface TaskAccessContext {
   userId: string;
@@ -27,4 +28,14 @@ export function taskSyncRefusal(task: TaskRecord, context: TaskAccessContext & {
   if (!context.controller && task.requesterId !== context.userId) return "requester-or-controller";
   if (context.safeMode) return "safe-mode";
   return undefined;
+}
+
+export interface OwnerAccessContext {
+  userId: string;
+  controller: boolean;
+}
+
+/** Only the original requester or an approved controller may mutate/consume a pending voice note. */
+export function canManageVoiceNote(record: Pick<VoiceNoteRecord, "requesterId">, context: OwnerAccessContext): boolean {
+  return context.controller || record.requesterId === context.userId;
 }

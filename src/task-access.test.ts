@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canAccessTaskRecord, isTaskListVisible, taskSyncRefusal } from "./task-access.js";
+import { canAccessTaskRecord, canManageVoiceNote, isTaskListVisible, taskSyncRefusal } from "./task-access.js";
 import type { TaskRecord } from "./task-store.js";
 
 test("workroom tasks are limited to their requester and project-authorized controllers", () => {
@@ -54,6 +54,13 @@ test("safe mode, missing branch evidence, and open tasks refuse branch sync", ()
   );
   assert.equal(taskSyncRefusal({ ...task, status: "running" }, context), "task-active");
   assert.equal(taskSyncRefusal({ ...task, status: "awaiting-approval" }, context), "task-active");
+});
+
+test("canManageVoiceNote restricts a pending transcript to its requester or an approved controller", () => {
+  const note = { requesterId: "requester" };
+  assert.equal(canManageVoiceNote(note, { userId: "requester", controller: false }), true);
+  assert.equal(canManageVoiceNote(note, { userId: "controller", controller: true }), true);
+  assert.equal(canManageVoiceNote(note, { userId: "other-viewer", controller: false }), false);
 });
 
 function record(overrides: Partial<TaskRecord>): TaskRecord {
