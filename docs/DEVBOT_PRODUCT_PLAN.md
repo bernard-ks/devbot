@@ -226,10 +226,22 @@ MVP multi-bot flow:
 - Add durable task queues.
 - Add reviewer assignment.
 - Add verification/check summarization.
-- Add cross-bot handoff threads. MVP implemented as `/lab handoff` cards and peer review-packet requests; Discord thread creation remains a next UI step.
+- Add cross-bot handoff threads. MVP implemented as `/lab handoff` cards and peer review-packet requests; lab sessions now create Discord audit threads where the channel supports them.
 - Add project dashboards in Discord. MVP implemented as `/dashboard`.
 - Add automatic stale task reminders. MVP implemented as `/task stale`; automatic timed reminders remain deferred to avoid surprise channel noise.
-- Add private devbot collaboration lab. MVP implemented with `/lab roundtable`, `/lab see`, `/lab handoff`, `/lab bossfight`, `/lab jam`, `/lab argue`, `/lab fix-from-snip`, `/lab campfire`, `/lab roster`, `/lab ritual`, `/lab recent`, `/lab events`, `/lab approve`, and `/lab safety`.
+- Add private devbot collaboration lab. MVP implemented with `/lab council`, `/lab roundtable`, `/lab see`, `/lab handoff`, `/lab bossfight`, `/lab jam`, `/lab argue`, `/lab fix-from-snip`, `/lab campfire`, `/lab roster`, `/lab ritual`, `/lab recent`, `/lab events`, `/lab approve`, and `/lab safety`.
+
+### Phase 5: Multiplayer Agent Workrooms
+
+- Add persistent workroom phases, stable participants, contribution records, decisions, and control-message references. Baseline implemented in collaboration state version 2.
+- Add independent sealed proposals before synthesis to reduce first-answer anchoring. Implemented with 2-4 parallel local council seats plus correlated peer contributions in `/lab council`.
+- Add native human controls for challenge, reveal, synthesis, approval, denial, and close. Implemented with Discord buttons; decisions do not execute mutations.
+- Correlate peer invitations and reject forged, duplicate, or late contributions. Implemented for council requests and results.
+- Publish the provider-neutral collaboration envelope and workroom contract. Baseline documented in `docs/COLLABORATION_PROTOCOL.md`.
+- Add bot capability passports and evidence-backed trust levels.
+- Add an experiment arena that compares isolated implementations and independent evaluation.
+- Add provenance-backed team memory and cross-repository contract negotiation.
+- Add adapters for coding agents beyond the local Codex runtime.
 
 ## Near-Term Backlog
 

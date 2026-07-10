@@ -19,6 +19,7 @@
   "policy": {
     "visibility": "team",
     "allowedUsers": [],
+    "allowedUsernames": [],
     "allowedRoles": [],
     "allowedPeers": [],
     "screenshotPolicy": "allow",

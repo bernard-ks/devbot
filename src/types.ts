@@ -12,6 +12,7 @@ export interface AppConfig {
   discordGuildId: string;
   codex: CodexConfig;
   allowedUserIds: Set<string>;
+  allowedUsernames: Set<string>;
   allowedRoleIds: Set<string>;
   safeMode: boolean;
   botIdentity: BotIdentity;
@@ -49,6 +50,7 @@ export interface ProjectCommands {
 export interface ProjectPolicy {
   visibility: "private" | "team" | "public";
   allowedUsers: string[];
+  allowedUsernames: string[];
   allowedRoles: string[];
   allowedPeers: string[];
   screenshotPolicy: "allow" | "approval" | "deny";

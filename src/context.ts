@@ -92,7 +92,12 @@ export class ProjectContextService {
     return files.length;
   }
 
-  async pack(project: ProjectEntry, question: string, includePatterns: string[] = []): Promise<PackedProjectContext> {
+  async pack(
+    project: ProjectEntry,
+    question: string,
+    includePatterns: string[] = [],
+    maxPackedContextChars = this.scanner.maxPackedContextChars
+  ): Promise<PackedProjectContext> {
     const indexed = this.cache.get(project.name) ?? (await this.indexAndCache(project));
     const filtered = includePatterns.length > 0 ? indexed.filter((file) => matchesAny(file.relativePath, includePatterns)) : indexed;
     const ranked = rankFiles(filtered, question).slice(0, this.scanner.maxRankedFiles);
@@ -103,7 +108,7 @@ export class ProjectContextService {
     for (const file of ranked) {
       const snippet = file.text.slice(0, this.scanner.maxSnippetCharsPerFile);
       const chunk = `--- FILE: ${file.relativePath} (${file.sizeBytes} bytes) ---\n${snippet}\n`;
-      if (totalChars + chunk.length > this.scanner.maxPackedContextChars) {
+      if (totalChars + chunk.length > maxPackedContextChars) {
         break;
       }
 
