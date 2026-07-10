@@ -60,3 +60,38 @@ export function isAccessSubjectAllowed(subject: AccessSubject, config: AccessAll
   }
   return (subject.roleIds ?? []).some((roleId) => config.allowedRoleIds.has(roleId));
 }
+
+export interface ProjectAccessPolicy {
+  allowedUsers: readonly string[];
+  allowedUsernames: readonly string[];
+  allowedRoles: readonly string[];
+}
+
+export interface ProjectAccessActor {
+  userId: string;
+  nameSource: DiscordNameSource;
+  roleIds: readonly string[];
+}
+
+/**
+ * A project's `.devbot` allowlist decision: an empty policy admits everyone
+ * the bot-level checks already admitted; a non-empty policy admits only the
+ * listed users, usernames, or roles — even a global controller is denied
+ * when excluded here.
+ */
+export function isAllowedByProjectPolicy(policy: ProjectAccessPolicy, actor: ProjectAccessActor): boolean {
+  const hasProjectAllowList = policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
+  if (!hasProjectAllowList) {
+    return true;
+  }
+
+  if (policy.allowedUsers.includes(actor.userId)) {
+    return true;
+  }
+
+  if (isApprovedDiscordUsername(actor.nameSource, policy.allowedUsernames)) {
+    return true;
+  }
+
+  return actor.roleIds.some((roleId) => policy.allowedRoles.includes(roleId));
+}

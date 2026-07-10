@@ -224,6 +224,15 @@ export class IntakeStore {
     return match ? cloneRecord(match) : undefined;
   }
 
+  /** Records in one of `statuses` whose triage card never reached a delivery room, newest first, for safe redelivery. */
+  async listUndelivered(statuses: readonly IntakeStatus[], limit = 10): Promise<IntakeRecord[]> {
+    const state = await this.readState();
+    return state.records
+      .filter((record) => !record.triageMessageId && statuses.includes(record.status))
+      .slice(0, Math.max(1, limit))
+      .map(cloneRecord);
+  }
+
   async listRecent(limit = 10): Promise<IntakeRecord[]> {
     const state = await this.readState();
     return state.records.slice(0, Math.max(1, Math.min(limit, this.maxRecords))).map(cloneRecord);
