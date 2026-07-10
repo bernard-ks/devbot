@@ -207,6 +207,8 @@ const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STO
 const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
 const activeWorkroomActions = new Set<string>();
+const RETRY_CLEANUP_BLOCKED_MESSAGE =
+  "This task can't be retried yet: Devbot couldn't confirm the previous run's worker process exited, so retrying now could run a second worker against the same workspace. It becomes retryable once cleanup is confirmed on a restart.";
 let verifiedPrivateRoomId: string | undefined;
 const verifiedProjectRoomAudiences = new Map<string, number>();
 let slashCommandsReady = false;
@@ -1733,13 +1735,26 @@ async function recordExecutionState(taskId: string, operation: Promise<void>): P
   }
 }
 
-function recordExecutionChild(taskId: string): (pid: number) => void {
-  return (pid) => {
-    void captureChildIdentity(pid)
-      .then(async (identity) => {
-        if (identity) await executionLedger.setChild(taskId, identity);
-      })
-      .catch((error) => console.warn(`Unable to record the worker process for ${taskId}: ${publicErrorMessage(error)}`));
+function recordExecutionChild(taskId: string): (pid: number) => Promise<void> {
+  return async (pid) => {
+    const identity = await captureChildIdentity(pid);
+    if (identity) {
+      // Persist the child identity durably before the caller sends work. A
+      // failed write throws, so the caller stops the child and the retained
+      // ledger record keeps this task's retry gate blocked.
+      await executionLedger.setChild(taskId, identity);
+      return;
+    }
+    if (process.platform === "win32") {
+      // Spawn identities cannot be probed here (no ps / process groups), so the
+      // recovery gate is derived from the record's running phase instead. Let
+      // the run proceed; reconciliation still treats the worker as unaccounted.
+      return;
+    }
+    // A supported platform could not capture a durable identity for a worker it
+    // just spawned. Fail closed: refuse to send work, so the caller stops the
+    // child and the retained record keeps retry blocked.
+    throw new Error(`Could not durably record the worker for task ${taskId} before sending work.`);
   };
 }
 
@@ -2925,6 +2940,13 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
       return;
     }
 
+    if (await executionLedger.hasUnresolvedWorker(task.id)) {
+      // Derived from the durable ledger so a dismissal or other status change
+      // cannot wash the gate away between restarts.
+      await interaction.editReply(RETRY_CLEANUP_BLOCKED_MESSAGE);
+      return;
+    }
+
     if (isWriteBlockedBySafeMode(appConfig, task.mode === "action" ? "action" : "answer")) {
       await interaction.editReply(safeModeActionMessage("/task retry"));
       return;
@@ -3145,10 +3167,12 @@ async function handleTaskControl(
     return;
   }
 
-  if ((action === "retry") && task.status === "interrupted" && task.cleanupPending) {
+  if (action === "retry" && (await executionLedger.hasUnresolvedWorker(task.id))) {
+    // Gate derived from the durable execution ledger, not the task's mutable
+    // status: a dismissed (now canceled) task still refuses retry while its
+    // ledger record holds an unresolved worker, and a restart re-derives it.
     await interaction.reply({
-      content:
-        "This interrupted task can't be retried yet: Devbot couldn't confirm the previous run's worker process exited, so retrying now could run a second worker against the same workspace. It becomes retryable once cleanup is confirmed on a restart.",
+      content: RETRY_CLEANUP_BLOCKED_MESSAGE,
       flags: MessageFlags.Ephemeral
     });
     return;
@@ -5558,7 +5582,7 @@ async function runCodex(
   mode: CodexRequestMode,
   route: RequestRoute,
   signal?: AbortSignal,
-  onSpawn?: (pid: number) => void
+  onSpawn?: (pid: number) => void | Promise<void>
 ): Promise<string> {
   return answerWithProjectContext({
     codex: appConfig.codex,

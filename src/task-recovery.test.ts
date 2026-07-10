@@ -538,6 +538,134 @@ test("an interrupted isolated worktree can be resumed only while its identity st
   assert.equal(filtered.reason, "unsafe_git_config");
 });
 
+test("dismissing an interrupted task cannot wash away the ledger-derived retry gate, and a restart re-derives it", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-recovery-dismissretry-"));
+  const taskFile = path.join(root, "tasks.json");
+  const ledgerFile = path.join(root, "executions.json");
+
+  const store = new TaskStore(taskFile);
+  const task = await store.start({
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    requesterId: "42",
+    text: "still writing"
+  });
+  const ledger = new ExecutionLedger(ledgerFile);
+  await ledger.record({
+    taskId: task.id,
+    projectName: "demo",
+    mode: "action",
+    requester: "tester",
+    startedAt: task.startedAt
+  });
+  await ledger.setPhase(task.id, "running-codex");
+  await ledger.setChild(task.id, { pid: 987654, startedAt: "Mon Jan  1 00:00:00 2001", command: "node" });
+
+  // Restart: the worker's exit stays unconfirmed, so the task is held with
+  // cleanup pending and the durable record is retained.
+  await reconcileInterruptedTasks({
+    ledger: new ExecutionLedger(ledgerFile),
+    tasks: new TaskStore(taskFile),
+    terminate: async () => "kill-unconfirmed"
+  });
+  assert.equal(await new ExecutionLedger(ledgerFile).hasUnresolvedWorker(task.id), true);
+  assert.equal((await new TaskStore(taskFile).get(task.id))?.cleanupPending, true);
+
+  // Dismiss converts the interrupted task to canceled and drops cleanupPending.
+  const dismissStore = new TaskStore(taskFile);
+  const dismissed = await dismissStore.dismiss(task.id, "tester");
+  assert.equal(dismissed?.status, "canceled");
+  assert.notEqual(dismissed?.cleanupPending, true);
+
+  // The retry gate is derived from the durable ledger, not the task status, so
+  // it still refuses retry even though the task is now canceled.
+  assert.equal(await new ExecutionLedger(ledgerFile).hasUnresolvedWorker(task.id), true);
+
+  // A later restart re-derives the same gate: the record is still retained and
+  // the worker stays unresolved. Dismissal did not clear the ledger.
+  const afterRestart = await reconcileInterruptedTasks({
+    ledger: new ExecutionLedger(ledgerFile),
+    tasks: new TaskStore(taskFile),
+    terminate: async () => "kill-unconfirmed"
+  });
+  assert.equal(afterRestart.staleRecordsCleared, 0);
+  assert.equal((await new ExecutionLedger(ledgerFile).listActive()).length, 1);
+  assert.equal(await new ExecutionLedger(ledgerFile).hasUnresolvedWorker(task.id), true);
+
+  // Only once cleanup is positively confirmed does the gate lift.
+  await reconcileInterruptedTasks({
+    ledger: new ExecutionLedger(ledgerFile),
+    tasks: new TaskStore(taskFile),
+    terminate: async () => "already-exited"
+  });
+  assert.equal((await new ExecutionLedger(ledgerFile).listActive()).length, 0);
+  assert.equal(await new ExecutionLedger(ledgerFile).hasUnresolvedWorker(task.id), false);
+});
+
+test("a worker spawned but never recorded (crash at spawn) keeps retry blocked and is not cleared as stale", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-recovery-crashspawn-"));
+  const taskFile = path.join(root, "tasks.json");
+  const ledgerFile = path.join(root, "executions.json");
+
+  const store = new TaskStore(taskFile);
+  const task = await store.start({
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    requesterId: "42",
+    text: "still writing"
+  });
+  // The runtime crashed after the worker was spawned but before its identity was
+  // written: the record reached running-codex with no captured child.
+  const ledger = new ExecutionLedger(ledgerFile);
+  await ledger.record({
+    taskId: task.id,
+    projectName: "demo",
+    mode: "action",
+    requester: "tester",
+    startedAt: task.startedAt
+  });
+  await ledger.setPhase(task.id, "running-codex");
+
+  let terminateCalls = 0;
+  const summary = await reconcileInterruptedTasks({
+    ledger: new ExecutionLedger(ledgerFile),
+    tasks: new TaskStore(taskFile),
+    terminate: async () => {
+      terminateCalls += 1;
+      return "already-exited";
+    }
+  });
+
+  // No child identity to signal, but the possibly-untracked worker must not be
+  // cleared as stale, and the task stays retry-blocked.
+  assert.equal(terminateCalls, 0);
+  assert.equal(summary.interruptedTasks, 1);
+  assert.equal(summary.staleRecordsCleared, 0);
+  const held = await new TaskStore(taskFile).get(task.id);
+  assert.equal(held?.status, "interrupted");
+  assert.equal(held?.cleanupPending, true);
+  assert.equal(taskActionMatchesState("dismiss", held!), true);
+  assert.equal(await new ExecutionLedger(ledgerFile).hasUnresolvedWorker(task.id), true);
+  assert.equal((await new ExecutionLedger(ledgerFile).listActive()).length, 1);
+
+  // A record that never reached the worker-spawn phase started no worker, so it
+  // is cleared as stale and does not block retry.
+  const noWorkerLedger = new ExecutionLedger(ledgerFile);
+  await noWorkerLedger.record({
+    taskId: "task-noworker",
+    projectName: "demo",
+    mode: "action",
+    requester: "tester",
+    startedAt: new Date().toISOString()
+  });
+  await noWorkerLedger.setPhase("task-noworker", "gathering-context");
+  assert.equal(await new ExecutionLedger(ledgerFile).hasUnresolvedWorker("task-noworker"), false);
+});
+
 function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile("git", ["-C", cwd, ...args], { encoding: "utf8" }, (error, stdout, stderr) => {

@@ -140,6 +140,20 @@ export class ExecutionLedger {
     return state.executions.map((record) => structuredClone(record));
   }
 
+  /**
+   * Authoritative retry gate: true while a durable record for this task still
+   * represents an unresolved worker (see executionWorkerUnresolved). Derived
+   * from the ledger rather than the task's status, so dismissing an interrupted
+   * task or any other status change cannot wash the gate away, and a restart
+   * re-derives the same answer from the same durable record.
+   */
+  async hasUnresolvedWorker(taskId: string): Promise<boolean> {
+    await this.mutationTail;
+    const state = await this.load();
+    const record = state.executions.find((item) => item.taskId === taskId);
+    return record ? executionWorkerUnresolved(record) : false;
+  }
+
   async loadIssues(): Promise<ExecutionLoadIssues> {
     await this.mutationTail;
     await this.load();
@@ -409,25 +423,52 @@ export async function reconcileInterruptedTasks(options: ReconcileOptions): Prom
       }
     }
 
-    // Fail closed: while a recorded worker's exit is unconfirmed the task's
-    // cleanup stays pending so retry/resume are refused; clear it once observed.
-    if (record?.child) {
-      await options.tasks.setCleanupPending(taskId, !exitObserved);
+    // A record that reached running-codex without a captured child identity may
+    // point at a worker that was spawned but never recorded (a crash between
+    // spawn and the identity write). It cannot be signaled, but it must not be
+    // cleared as stale.
+    const unaccountedWorker = !record?.child && record?.phase === "running-codex";
+    const cleanupUnresolved = record?.child ? !exitObserved : Boolean(unaccountedWorker);
+
+    // Fail closed: while a worker's cleanup is unresolved the task's cleanup
+    // stays pending so retry/resume are refused; clear it once cleanup resolves.
+    if (record?.child || unaccountedWorker) {
+      await options.tasks.setCleanupPending(taskId, cleanupUnresolved);
     }
 
     if (record) {
-      if (!record.child || exitObserved) {
+      if (!cleanupUnresolved) {
         await options.ledger.clear(taskId);
         if (!runningById.has(taskId)) {
           summary.staleRecordsCleared += 1;
         }
-      } else {
+      } else if (record.child) {
         log(`Kept the durable record of task ${taskId}; its worker exit was not observed (${childOutcome}).`);
+      } else {
+        log(`Kept the durable record of task ${taskId}; a worker may have been spawned before its identity was recorded, so retry stays blocked.`);
       }
     }
   }
 
   return summary;
+}
+
+/**
+ * True while a retained execution record still represents a worker whose cleanup
+ * is unresolved, and therefore must keep the task's retry/resume controls
+ * refused. Two cases qualify:
+ *   1. A captured child identity is present. The record is only cleared once the
+ *      worker's exit is observed during reconciliation, so a surviving record
+ *      with a child means the exit was never confirmed.
+ *   2. No child identity was captured but the record reached the running-codex
+ *      phase, where the worker process is spawned. This covers a crash between
+ *      spawn and the durable identity write: a worker may exist that was never
+ *      recorded, so it is treated as unaccounted rather than assumed absent.
+ * Records that never reached running-codex and have no child never started a
+ * worker, so they do not block retry.
+ */
+export function executionWorkerUnresolved(record: ExecutionRecord): boolean {
+  return Boolean(record.child) || record.phase === "running-codex";
 }
 
 /**

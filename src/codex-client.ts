@@ -32,7 +32,7 @@ export interface AnswerOptions {
   tier?: AgentModelTier;
   contextMode?: RequestContextMode;
   signal?: AbortSignal;
-  onSpawn?: (pid: number) => void;
+  onSpawn?: (pid: number) => void | Promise<void>;
 }
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
@@ -65,7 +65,7 @@ export interface CompleteCodexOptions {
   skipGitRepoCheck?: boolean;
   imagePaths?: string[];
   signal?: AbortSignal;
-  onSpawn?: (pid: number) => void;
+  onSpawn?: (pid: number) => void | Promise<void>;
 }
 
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
@@ -306,7 +306,11 @@ export function parseLocateResponse(raw: string): LocatedError {
   };
 }
 
-async function runBackend(spec: SpawnSpec, signal?: AbortSignal, onSpawn?: (pid: number) => void): Promise<string> {
+async function runBackend(
+  spec: SpawnSpec,
+  signal?: AbortSignal,
+  onSpawn?: (pid: number) => void | Promise<void>
+): Promise<string> {
   const stdout = await runSpec(spec, signal, onSpawn);
   if (spec.outputFile) {
     return (await readFile(spec.outputFile, "utf8")).trim();
@@ -314,7 +318,11 @@ async function runBackend(spec: SpawnSpec, signal?: AbortSignal, onSpawn?: (pid:
   return stdout;
 }
 
-function runSpec(spec: SpawnSpec, signal?: AbortSignal, onSpawn?: (pid: number) => void): Promise<string> {
+function runSpec(
+  spec: SpawnSpec,
+  signal?: AbortSignal,
+  onSpawn?: (pid: number) => void | Promise<void>
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(spec.bin, spec.args, {
       cwd: spec.cwd,
@@ -322,13 +330,6 @@ function runSpec(spec: SpawnSpec, signal?: AbortSignal, onSpawn?: (pid: number) 
       stdio: [spec.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });
-    if (child.pid && onSpawn) {
-      try {
-        onSpawn(child.pid);
-      } catch {
-        // Observers must not break the run.
-      }
-    }
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -374,9 +375,36 @@ function runSpec(spec: SpawnSpec, signal?: AbortSignal, onSpawn?: (pid: number) 
 
     signal?.addEventListener("abort", abort, { once: true });
 
-    if (spec.stdin !== undefined && child.stdin) {
-      child.stdin.end(spec.stdin);
-    }
+    // Durably record the worker before sending it any work. The spawn observer
+    // persists the child's identity to the execution ledger; awaiting it here
+    // means a task can never receive work through a worker that was not written
+    // to the durable ledger first. If the observer rejects (identity could not
+    // be persisted), the child is stopped and the run fails, leaving the task's
+    // retry gate blocked rather than sending work to an unrecorded worker.
+    // Residual window: a crash between spawn() returning and this write landing
+    // still leaves an unrecorded OS process, but no work was sent to it and the
+    // ledger record remains at its running phase, so reconciliation treats the
+    // worker as unaccounted and keeps retry blocked.
+    void (async () => {
+      if (child.pid && onSpawn) {
+        try {
+          await onSpawn(child.pid);
+        } catch (error) {
+          requestTermination(
+            error instanceof Error
+              ? error
+              : new Error("Failed to durably record the worker process before sending work.")
+          );
+          return;
+        }
+      }
+      if (settled || terminationError) {
+        return;
+      }
+      if (spec.stdin !== undefined && child.stdin) {
+        child.stdin.end(spec.stdin);
+      }
+    })();
 
     function requestTermination(error: Error): void {
       if (settled || terminationError) return;
