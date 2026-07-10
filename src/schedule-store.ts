@@ -1,13 +1,29 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import {
+  hardenPrivateDirectoryPermissions,
+  hardenPrivateFilePermissions,
+  neutralizeMentions,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+  redactSensitiveText
+} from "./security.js";
 
-export type ScheduleMode = "answer" | "action";
+/**
+ * Recurring schedules are read-only by design: an occurrence fires unattended, with
+ * nobody in the loop to approve that specific run, so it can never be write-capable
+ * (`action` mode). Write-capable work always goes through `/do` or `/queue`, both of
+ * which are single explicit commands a controller issues themselves.
+ */
+export type ScheduleMode = "answer";
 
 export type ScheduleSpec =
   | { kind: "daily"; hour: number; minute: number }
   | { kind: "weekdays"; hour: number; minute: number }
   | { kind: "every-hours"; hours: number };
+
+const SCHEDULE_ID_PATTERN = /^sched-[a-z0-9-]{1,64}$/i;
 
 export interface ScheduleEntry {
   id: string;
@@ -17,18 +33,21 @@ export interface ScheduleEntry {
   mode: ScheduleMode;
   enabled: boolean;
   addedBy: string;
+  addedById: string;
   createdAt: string;
   lastRun?: string;
   lastResult?: string;
   nextRun: string;
+  running: boolean;
+  runStartedAt?: string;
 }
 
 export interface AddScheduleInput {
   spec: string;
   project: string;
   taskText: string;
-  mode: ScheduleMode;
   addedBy: string;
+  addedById: string;
 }
 
 interface ScheduleStateFile {
@@ -129,12 +148,14 @@ export class ScheduleStore {
         id: newScheduleId(),
         spec: describeScheduleSpec(parsed),
         project: input.project,
-        taskText: input.taskText,
-        mode: input.mode,
+        taskText: sanitizeText(input.taskText),
+        mode: "answer",
         enabled: true,
         addedBy: input.addedBy,
+        addedById: input.addedById,
         createdAt: now.toISOString(),
-        nextRun: nextRunAfter(parsed, now).toISOString()
+        nextRun: nextRunAfter(parsed, now).toISOString(),
+        running: false
       };
       state.entries.push(entry);
       return { ...entry };
@@ -180,10 +201,31 @@ export class ScheduleStore {
     });
   }
 
+  /**
+   * Atomically claims every enabled, due, not-already-running entry by marking it
+   * `running` before the caller starts any execution side effect. A second tick that
+   * runs while the first execution is still in flight will not see the entry again,
+   * so the same occurrence can never fire twice concurrently.
+   */
+  async claimDue(now = new Date()): Promise<ScheduleEntry[]> {
+    return this.mutate((state) => {
+      const claimed: ScheduleEntry[] = [];
+      const nowIso = now.toISOString();
+      for (const entry of state.entries) {
+        if (entry.enabled && !entry.running && new Date(entry.nextRun).getTime() <= now.getTime()) {
+          entry.running = true;
+          entry.runStartedAt = nowIso;
+          claimed.push({ ...entry });
+        }
+      }
+      return claimed;
+    });
+  }
+
   async due(now = new Date()): Promise<ScheduleEntry[]> {
     const state = await this.readState();
     return state.entries
-      .filter((entry) => entry.enabled && new Date(entry.nextRun).getTime() <= now.getTime())
+      .filter((entry) => entry.enabled && !entry.running && new Date(entry.nextRun).getTime() <= now.getTime())
       .map((entry) => ({ ...entry }));
   }
 
@@ -194,11 +236,36 @@ export class ScheduleStore {
         return;
       }
       const parsed = parseScheduleSpec(entry.spec);
+      entry.running = false;
+      delete entry.runStartedAt;
       entry.lastRun = now.toISOString();
-      entry.lastResult = result;
+      entry.lastResult = sanitizeText(result);
       if (parsed) {
         entry.nextRun = nextRunAfter(parsed, now).toISOString();
       }
+    });
+  }
+
+  /**
+   * On boot, any entry left `running` belonged to a process that died mid-occurrence.
+   * Release the lease and make it due again promptly instead of silently losing the
+   * occurrence or leaving it permanently unclaimable.
+   */
+  async recoverInterrupted(reason: string): Promise<ScheduleEntry[]> {
+    return this.mutate((state) => {
+      const now = new Date();
+      const recovered: ScheduleEntry[] = [];
+      for (const entry of state.entries) {
+        if (!entry.running) {
+          continue;
+        }
+        entry.running = false;
+        delete entry.runStartedAt;
+        entry.lastResult = sanitizeText(reason);
+        entry.nextRun = now.toISOString();
+        recovered.push({ ...entry });
+      }
+      return recovered;
     });
   }
 
@@ -212,7 +279,7 @@ export class ScheduleStore {
   async reconcileOnBoot(): Promise<void> {
     await this.mutate((state) => {
       for (const entry of state.entries) {
-        if (!entry.enabled) {
+        if (!entry.enabled || entry.running) {
           continue;
         }
         const parsed = parseScheduleSpec(entry.spec);
@@ -254,8 +321,21 @@ export class ScheduleStore {
     }
 
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as ScheduleStateFile;
-      this.state = { version: 1, entries: Array.isArray(parsed.entries) ? parsed.entries : [] };
+      const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as unknown;
+      await hardenPrivateFilePermissions(this.stateFile);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Schedule state must be a JSON object.");
+      }
+      const raw = parsed as { version?: unknown; entries?: unknown };
+      if (raw.version !== undefined && raw.version !== 1) {
+        throw new Error(`Unsupported schedule state version: ${String(raw.version)}.`);
+      }
+      this.state = {
+        version: 1,
+        entries: Array.isArray(raw.entries)
+          ? raw.entries.map(normalizeLoadedEntry).filter((entry): entry is ScheduleEntry => entry !== undefined)
+          : []
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw new Error(`Unable to read schedule state at ${this.stateFile}: ${(error as Error).message}`, { cause: error });
@@ -271,11 +351,21 @@ export class ScheduleStore {
       return;
     }
 
-    await mkdir(path.dirname(this.stateFile), { recursive: true });
-    const tempFile = `${this.stateFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`);
+    const directory = path.dirname(this.stateFile);
+    await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    await hardenPrivateDirectoryPermissions(directory);
+    const tempFile = `${this.stateFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE
+    });
     await rename(tempFile, this.stateFile);
   }
+}
+
+function sanitizeText(value: string): string {
+  return neutralizeMentions(redactSensitiveText(value));
 }
 
 export function formatScheduleList(entries: ScheduleEntry[]): string {
@@ -285,10 +375,10 @@ export function formatScheduleList(entries: ScheduleEntry[]): string {
 
   return entries
     .map((entry) => {
-      const state = entry.enabled ? "enabled" : "paused";
+      const state = entry.running ? "running" : entry.enabled ? "enabled" : "paused";
       const last = entry.lastRun ? `, last run ${new Date(entry.lastRun).toLocaleString()}` : "";
       const next = entry.enabled ? `, next ${new Date(entry.nextRun).toLocaleString()}` : "";
-      return `- \`${entry.id}\` ${state} \`${entry.spec}\` ${entry.mode} on \`${entry.project}\` by ${entry.addedBy}${last}${next}\n  ${truncate(entry.taskText, 120)}`;
+      return `- \`${entry.id}\` ${state} \`${entry.spec}\` ask on \`${entry.project}\` by ${entry.addedBy}${last}${next}\n  ${truncate(entry.taskText, 120)}`;
     })
     .join("\n");
 }
@@ -297,10 +387,58 @@ function newScheduleId(): string {
   return `sched-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
 }
 
+export function isScheduleId(value: string): boolean {
+  return SCHEDULE_ID_PATTERN.test(value);
+}
+
 function truncate(value: string, maxLength: number): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) {
     return normalized;
   }
   return `${normalized.slice(0, maxLength - 1)}...`;
+}
+
+function normalizeLoadedEntry(value: unknown): ScheduleEntry | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const entry = value as Partial<ScheduleEntry>;
+  if (
+    typeof entry.id !== "string" ||
+    !isScheduleId(entry.id) ||
+    typeof entry.spec !== "string" ||
+    !parseScheduleSpec(entry.spec) ||
+    typeof entry.project !== "string" ||
+    typeof entry.taskText !== "string" ||
+    typeof entry.addedBy !== "string" ||
+    typeof entry.createdAt !== "string" ||
+    !Number.isFinite(Date.parse(entry.createdAt)) ||
+    typeof entry.nextRun !== "string" ||
+    !Number.isFinite(Date.parse(entry.nextRun))
+  ) {
+    return undefined;
+  }
+  return {
+    id: entry.id,
+    spec: entry.spec,
+    project: entry.project,
+    taskText: sanitizeText(entry.taskText),
+    mode: "answer",
+    enabled: entry.enabled === true,
+    addedBy: entry.addedBy,
+    addedById: stringValue(entry.addedById) ?? "unknown",
+    createdAt: entry.createdAt,
+    ...(validTimestamp(entry.lastRun) ? { lastRun: validTimestamp(entry.lastRun)! } : {}),
+    ...(stringValue(entry.lastResult) ? { lastResult: sanitizeText(stringValue(entry.lastResult)!) } : {}),
+    nextRun: entry.nextRun,
+    running: entry.running === true,
+    ...(validTimestamp(entry.runStartedAt) ? { runStartedAt: validTimestamp(entry.runStartedAt)! } : {})
+  };
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function validTimestamp(value: unknown): string | undefined {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : undefined;
 }

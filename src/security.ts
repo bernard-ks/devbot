@@ -163,6 +163,13 @@ export function redactSensitiveText(value: string, environment: NodeJS.ProcessEn
     );
 }
 
+/** Breaks Discord mention syntax so stored task text cannot ping anyone when it is later rendered in a digest or list. */
+export function neutralizeMentions(value: string): string {
+  return value
+    .replace(/@(everyone|here)/gi, "@​$1")
+    .replace(/<(@[!&]?\d+|#\d+)>/g, "<​$1>");
+}
+
 export function publicErrorMessage(error: unknown, maxLength = 800): string {
   const message = redactSensitiveText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim();
   if (!message) return "The operation failed without a safe error message.";
