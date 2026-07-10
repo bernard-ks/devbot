@@ -6,6 +6,7 @@ import type { DuelVerdictOverall, ReviewerIndependence, ResolvedDuelIssue } from
 import { hardenPrivateDirectoryPermissions, hardenPrivateFilePermissions, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "./security.js";
 
 export type DuelRunStatus = "running" | "succeeded" | "failed" | "canceled";
+export type DuelFixStatus = "accepting" | "accepted" | "failed-retryable";
 
 export interface DuelEvidenceSummary {
   baseRevision?: string;
@@ -17,6 +18,20 @@ export interface DuelEvidenceSummary {
   truncated: boolean;
 }
 
+export interface DuelSnapshotRecord {
+  ref: string;
+  commit: string;
+  tree: string;
+}
+
+export interface DuelFixState {
+  status: DuelFixStatus;
+  actor: string;
+  taskId?: string;
+  error?: string;
+  updatedAt: string;
+}
+
 export interface DuelRecord {
   id: string;
   taskId: string;
@@ -26,10 +41,12 @@ export interface DuelRecord {
   reviewerTier?: ModelTier;
   reviewerIndependence?: ReviewerIndependence;
   evidence?: DuelEvidenceSummary;
+  snapshot?: DuelSnapshotRecord;
   overall?: DuelVerdictOverall;
   issues: ResolvedDuelIssue[];
   dismissed: boolean;
   dismissedBy?: string;
+  fix?: DuelFixState;
   error?: string;
   createdAt: string;
   updatedAt: string;
@@ -89,6 +106,7 @@ export class DuelStore {
       reviewerTier: ModelTier;
       reviewerIndependence: ReviewerIndependence;
       evidence: DuelEvidenceSummary;
+      snapshot?: DuelSnapshotRecord;
       overall: DuelVerdictOverall;
       issues: ResolvedDuelIssue[];
     }
@@ -100,6 +118,7 @@ export class DuelStore {
       record.reviewerTier = result.reviewerTier;
       record.reviewerIndependence = result.reviewerIndependence;
       record.evidence = result.evidence;
+      if (result.snapshot) record.snapshot = result.snapshot;
       record.overall = result.overall;
       record.issues = boundIssues(result.issues);
       record.updatedAt = now;
@@ -121,12 +140,19 @@ export class DuelStore {
     return record ? cloneRecord(record) : undefined;
   }
 
+  async list(): Promise<DuelRecord[]> {
+    const state = await this.readState();
+    return state.duels.map(cloneRecord);
+  }
+
   /** Atomic compare-and-set: only the first dismissal of a succeeded duel gets `dismissed: true`;
-   *  duplicate submissions see the already-dismissed record. */
+   *  duplicate submissions see the already-dismissed record. A duel whose fix acceptance is in
+   *  flight or already recorded a fix task cannot be dismissed out from under it. */
   async dismiss(id: string, actor: string): Promise<{ dismissed: boolean; record: DuelRecord | undefined }> {
     let dismissed = false;
     const record = await this.update(id, (record, now) => {
       if (record.dismissed || record.status !== "succeeded") return;
+      if (record.fix && record.fix.status !== "failed-retryable") return;
       dismissed = true;
       record.dismissed = true;
       record.dismissedBy = actor;
@@ -135,15 +161,53 @@ export class DuelStore {
     return { dismissed, record };
   }
 
+  /** Atomic compare-and-set claim for "Accept & fix": exactly one caller may move a succeeded,
+   *  undismissed duel with a recorded snapshot into "accepting"; everyone else loses the claim.
+   *  A released ("failed-retryable") claim can be re-claimed. */
+  async claimAccept(id: string, actor: string): Promise<{ claimed: boolean; record: DuelRecord | undefined }> {
+    let claimed = false;
+    const record = await this.update(id, (record, now) => {
+      if (record.status !== "succeeded" || record.dismissed || !record.snapshot) return;
+      if (record.fix && record.fix.status !== "failed-retryable") return;
+      claimed = true;
+      record.fix = { status: "accepting", actor, updatedAt: now };
+    });
+    return { claimed, record };
+  }
+
+  /** Marks the claim accepted only once a fix task was durably created, recording its ID. */
+  async completeAccept(id: string, taskId: string): Promise<DuelRecord | undefined> {
+    return this.update(id, (record, now) => {
+      if (record.fix?.status !== "accepting") return;
+      record.fix = { status: "accepted", actor: record.fix.actor, taskId, updatedAt: now };
+      record.updatedAt = now;
+    });
+  }
+
+  /** Releases a failed claim as retryable so acceptance can be attempted again. */
+  async failAccept(id: string, error: string): Promise<DuelRecord | undefined> {
+    return this.update(id, (record, now) => {
+      if (record.fix?.status !== "accepting") return;
+      record.fix = { status: "failed-retryable", actor: record.fix.actor, error: error.slice(0, 800), updatedAt: now };
+      record.updatedAt = now;
+    });
+  }
+
   /** Marks every still-"running" duel as failed and returns their ids so the startup path can
    *  reconcile each one's side effects (a duel's id is its collaboration conversation id). A
    *  crash-interrupted duel otherwise leaves its collaboration conversation open forever, which
-   *  keeps consuming the collaboration limit. */
+   *  keeps consuming the collaboration limit. An in-flight ("accepting") fix claim is also
+   *  released to "failed-retryable" so Accept & fix can be retried, but its still-open duel
+   *  conversation is intentionally left alone (it is not a running duel to reconcile). */
   async interruptRunning(reason = "Interrupted when Devbot restarted."): Promise<string[]> {
     return this.mutate((state) => {
       const now = new Date().toISOString();
       const interrupted: string[] = [];
       for (const record of state.duels) {
+        if (record.fix?.status === "accepting") {
+          record.fix = { status: "failed-retryable", actor: record.fix.actor, error: reason, updatedAt: now };
+          record.updatedAt = now;
+        }
         if (record.status !== "running") continue;
         record.status = "failed";
         record.error = reason;
@@ -234,6 +298,7 @@ function boundIssues(issues: ResolvedDuelIssue[]): ResolvedDuelIssue[] {
 }
 
 const RUN_STATUSES: DuelRunStatus[] = ["running", "succeeded", "failed", "canceled"];
+const FIX_STATUSES: DuelFixStatus[] = ["accepting", "accepted", "failed-retryable"];
 
 /** Fail closed on persisted state: records that no longer match the typed schema are dropped on
  *  load rather than trusted, so a tampered or corrupted state file cannot smuggle in an
@@ -249,6 +314,8 @@ function isValidDuelRecord(candidate: unknown): candidate is DuelRecord {
     typeof record.projectName === "string" &&
     RUN_STATUSES.includes(record.status as DuelRunStatus) &&
     typeof record.dismissed === "boolean" &&
+    (record.snapshot === undefined || isValidSnapshot(record.snapshot)) &&
+    (record.fix === undefined || isValidFixState(record.fix)) &&
     Array.isArray(record.issues) &&
     record.issues.every(
       (issue) =>
@@ -263,6 +330,33 @@ function isValidDuelRecord(candidate: unknown): candidate is DuelRecord {
   );
 }
 
+function isValidSnapshot(candidate: unknown): candidate is DuelSnapshotRecord {
+  if (typeof candidate !== "object" || candidate === null) {
+    return false;
+  }
+  const snapshot = candidate as Record<string, unknown>;
+  return typeof snapshot.ref === "string" && typeof snapshot.commit === "string" && typeof snapshot.tree === "string";
+}
+
+function isValidFixState(candidate: unknown): candidate is DuelFixState {
+  if (typeof candidate !== "object" || candidate === null) {
+    return false;
+  }
+  const fix = candidate as Record<string, unknown>;
+  return (
+    FIX_STATUSES.includes(fix.status as DuelFixStatus) &&
+    typeof fix.actor === "string" &&
+    typeof fix.updatedAt === "string" &&
+    (fix.taskId === undefined || typeof fix.taskId === "string") &&
+    (fix.error === undefined || typeof fix.error === "string")
+  );
+}
+
 function cloneRecord(record: DuelRecord): DuelRecord {
-  return { ...record, issues: record.issues.map((issue) => ({ ...issue })) };
+  return {
+    ...record,
+    issues: record.issues.map((issue) => ({ ...issue })),
+    ...(record.snapshot ? { snapshot: { ...record.snapshot } } : {}),
+    ...(record.fix ? { fix: { ...record.fix } } : {})
+  };
 }
