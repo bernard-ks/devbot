@@ -40,6 +40,8 @@ The safety contract is explicit: only the requester or an approved controller ca
   - `/refresh` rebuilds the in-memory project file index.
   - `/ask` answers read-only project questions with local context.
   - `/do` asks local Codex to perform focused project work.
+  - `/queue add|list|remove|clear|start|stop|digest` stacks tasks for sequential, unattended execution through the same Ask/Do path, then posts one morning digest to the private room when the queue drains; runner state is durable and resumes cleanly across a restart.
+  - `/schedule add|list|remove|pause|resume` runs recurring owner-only tasks on a simple `daily HH:MM` / `weekdays HH:MM` / `every <N>h` spec, checked on a 30-second loop with restart-safe next-run math.
   - Guild command definitions synchronize automatically at startup.
 - Mention support:
   - Direct bot mentions can invoke the bot without requesting the privileged Message Content intent.

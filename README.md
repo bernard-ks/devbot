@@ -166,6 +166,8 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/ask question:<text> project:<optional> include:<optional patterns>`: Ask the model a question with local project context.
 - `/do task:<text> project:<optional> include:<optional patterns>`: Ask local Codex to perform a focused project task. Requires owner or controller access.
 - `/ship task:<task-id>`: Compose a 1200x675 shareable card for a completed `/do` task with the project name and task summary. Action tasks run in an isolated Git worktree with no managed preview, so their card is text-only with an explicit "visual proof unavailable" note; a live screenshot is only attempted for non-isolated tasks. Requires owner or controller access; also available as a "Ship it" button on completed action tasks.
+- `/queue add task:<text> project:<optional> mode:<ask|do>`, `/queue list`, `/queue remove position:<n>`, `/queue clear`, `/queue start stop-on-failure:<optional>`, `/queue stop`, `/queue digest`: Stack tasks before bed and run them one at a time through the same Ask/Do path, then post one morning digest to the private room when the queue drains. Requires owner or controller access, and survives a restart.
+- `/schedule add spec:<text> task:<text> project:<optional> mode:<ask|do>`, `/schedule list`, `/schedule remove id:<id>`, `/schedule pause id:<id>`, `/schedule resume id:<id>`: Owner-only recurring tasks using `daily HH:MM`, `weekdays HH:MM`, or `every <N>h` specs, checked every 30 seconds and restart-safe.
 
 You can also mention the bot in a channel:
 

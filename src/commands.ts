@@ -544,7 +544,88 @@ const commandBuilders = [
     .addStringOption((option) => option.setName("task").setDescription("Completed task ID.").setRequired(true).setAutocomplete(true)),
   new ContextMenuCommandBuilder()
     .setName("Start Devbot workroom")
-    .setType(ApplicationCommandType.Message)
+    .setType(ApplicationCommandType.Message),
+  new SlashCommandBuilder()
+    .setName("queue")
+    .setDescription("Stack overnight tasks and run them one at a time.")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("add")
+        .setDescription("Append a task to the queue.")
+        .addStringOption((option) => option.setName("task").setDescription("The task or question to queue.").setRequired(true))
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+        )
+        .addStringOption((option) =>
+          option
+            .setName("mode")
+            .setDescription("Ask (read-only) or do (write-capable). Defaults to do.")
+            .setRequired(false)
+            .addChoices({ name: "ask", value: "ask" }, { name: "do", value: "do" })
+        )
+    )
+    .addSubcommand((subcommand) => subcommand.setName("list").setDescription("List queued, running, and recently finished items."))
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("remove")
+        .setDescription("Remove a queued item by its list position.")
+        .addIntegerOption((option) => option.setName("position").setDescription("Position shown by /queue list.").setRequired(true).setMinValue(1))
+    )
+    .addSubcommand((subcommand) => subcommand.setName("clear").setDescription("Remove all pending queued items."))
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("start")
+        .setDescription("Begin running the queue sequentially, one item at a time.")
+        .addBooleanOption((option) =>
+          option.setName("stop-on-failure").setDescription("Halt the queue if an item fails. Defaults to false.").setRequired(false)
+        )
+    )
+    .addSubcommand((subcommand) => subcommand.setName("stop").setDescription("Stop the queue after the current item finishes."))
+    .addSubcommand((subcommand) => subcommand.setName("digest").setDescription("Re-post the morning digest for the current queue.")),
+  new SlashCommandBuilder()
+    .setName("schedule")
+    .setDescription("Owner-only recurring devbot tasks.")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("add")
+        .setDescription("Create a recurring task.")
+        .addStringOption((option) =>
+          option
+            .setName("spec")
+            .setDescription("daily HH:MM, weekdays HH:MM, or every <N>h, e.g. daily 07:00.")
+            .setRequired(true)
+        )
+        .addStringOption((option) => option.setName("task").setDescription("The task or question to run on schedule.").setRequired(true))
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+        )
+        .addStringOption((option) =>
+          option
+            .setName("mode")
+            .setDescription("Ask (read-only) or do (write-capable). Defaults to do.")
+            .setRequired(false)
+            .addChoices({ name: "ask", value: "ask" }, { name: "do", value: "do" })
+        )
+    )
+    .addSubcommand((subcommand) => subcommand.setName("list").setDescription("List scheduled tasks."))
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("remove")
+        .setDescription("Delete a scheduled task.")
+        .addStringOption((option) => option.setName("id").setDescription("Schedule ID from /schedule list.").setRequired(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("pause")
+        .setDescription("Pause a scheduled task.")
+        .addStringOption((option) => option.setName("id").setDescription("Schedule ID from /schedule list.").setRequired(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("resume")
+        .setDescription("Resume a paused scheduled task.")
+        .addStringOption((option) => option.setName("id").setDescription("Schedule ID from /schedule list.").setRequired(true))
+    )
 ] satisfies Array<Pick<SlashCommandBuilder, "toJSON"> | Pick<ContextMenuCommandBuilder, "toJSON">>;
 
 export const commandDefinitions = commandBuilders.map((command) => command.toJSON());
