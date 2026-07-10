@@ -143,3 +143,172 @@ top-level `interactionCreate` `try/catch` → `replyWithError`, which already ca
 `npm test`: 134/134 passing after rebase (includes the previously-flagged flaky
 `security.test.ts` case "configured project commands receive an empty temporary home" — passed
 clean on the first run, no rerun needed).
+
+## Review round 1
+
+bernard requested changes on the initial PR (`REVIEW.md`, `CHANGES_REQUESTED`). Every numbered
+blocking issue is addressed below with its fix and the test(s) that cover it. New commits only;
+nothing in the reviewed history was rewritten.
+
+**1. The "actual diff" is not the task's complete change.** `gatherDuelChangeEvidence()` (`src/duel.ts`)
+was rewritten: it now takes the task's isolation info and builds evidence relative to
+`task.baseBranch` (the recorded base revision, not just `HEAD`), assembling committed
+(`base..HEAD`), staged, unstaged (all via `execFile` + `hardenedGitArguments()`/
+`hardenedGitEnvironment()` and `--no-ext-diff --no-textconv --no-color --ignore-submodules=all -M`),
+and bounded untracked file content (read directly and rendered as synthetic unified-diff "new
+file" hunks, capped per file, path-traversal-checked). A shared sensitive-path predicate
+(`isIgnoredProjectPath`, newly exported from `context.ts` — the same policy used for project
+context packing) drops hunks/files for secrets, lockfiles, and credential files before anything is
+budgeted or reaches a prompt; `redactSensitiveText()` runs over the final combined text too. A
+SHA-256 `patchHash` over the pre-truncation combined text, plus `baseRevision`/`headRevision`, is
+now part of `DuelChangeEvidence` and is recorded with the duel (see issue 7) — this is the
+"immutable snapshot identity" the diff is bound to; "Accept & fix" (issue 3) refuses to proceed if
+a re-check shows that hash has drifted. Test: `src/duel.test.ts` "gathers byte-pinned diff evidence
+covering committed, staged, unstaged, and untracked changes, excludes sensitive paths, and is
+patch-hash stable/sensitive" — a real temporary git repo, no mocks.
+
+**2. Reviewer-output parsing fails open to approval.** `DuelVerdictOverall` gained a third state,
+`"indeterminate"`. `parseDuelVerdict()` now enforces the invariant that `approve` implies zero
+issues and `request-changes` implies at least one valid issue; empty output, a missing VERDICT
+line, an `approve` verdict with issues attached, and a `request-changes` verdict with zero
+parsable issues all resolve to `indeterminate` with a warning, never to a silent approve.
+`formatDuelSummary()` renders indeterminate results as "UNRESOLVED, not approved" and never uses
+"clean"/"approved" language when the verdict is indeterminate or the evidence was truncated.
+Parser warnings were already collected; they are now meaningfully differentiated by outcome.
+Tests: "verdict parsing treats an empty response as indeterminate, never approve", "...a
+contradictory approve-with-issues as indeterminate, not approve", "...request-changes with zero
+parsable issues as indeterminate, not clean", plus the existing well-formed/malformed cases updated
+to expect `indeterminate` instead of a bare fallback to `approve`.
+
+**3. "Accept & fix" starts from the wrong codebase state.** New `resolveDuelFixWorkspace()` /
+`verifyDuelFixReproducible()` in `src/duel.ts`: given the *original reviewed task* (not the
+registered project), it re-verifies the task's isolated worktree via `inspectTaskWorktree()`,
+recomputes evidence and compares its patch hash against the one recorded at review time (refusing
+on drift), and — only in the mutating path — commits any still-uncommitted reviewed changes via
+`commitTaskWorktree()` so the fix task can branch from a revision that actually contains them.
+`handleDuelFixModal()` now passes `project: { ...project, root: workspace.root }` (the *task's own
+workspace*) into `executeInteractionRequest()` instead of the registered project's `HEAD`, so the
+new fix task's isolated worktree branches from the exact reviewed state. If the state cannot be
+reproduced (no isolation recorded, worktree gone, or drifted), the accept button shows a truthful
+ephemeral refusal with a copyable fix prompt instead of offering "Accept & fix" — no modal, no
+task. Tests: "Accept & fix resolves the exact reviewed workspace (surviving an untracked file) and
+refuses once the workspace drifts" (real repo + real isolated worktree, asserts the untracked file
+content is visible in the resolved workspace and the source checkout is never touched, then asserts
+a real content change after evidence was captured is refused) and "refuses Accept & fix when the
+task has no isolated workspace to reproduce".
+
+**4. Acceptance is race-prone and can permanently record work that never started.** New
+`src/duel-store.ts` (`DuelStore`) is the durable, single-writer-queue source of truth for
+acceptance state, mirroring `TaskStore`/`CollabStore`'s atomic mutate-and-rename pattern.
+`claimAcceptance()` atomically flips `acceptance.state` from `none`/`failed` to `claimed`; only the
+caller that performs that flip gets `claimed: true`, so two concurrent modal submissions can no
+longer both proceed (the previous code called `collabStore.decide()` but ignored its `undefined`
+return on a lost race). In `handleDuelFixModal()`, the claim now happens *before* any mutating
+workspace resolution (an earlier draft of this fix called `resolveDuelFixWorkspace()`, which can
+`git commit`, before claiming — that would have let two concurrent submissions race into a commit
+on the same worktree; reordered so the cheap atomic claim always happens first). `completeAcceptance()`
+records the resulting task id only once `executeInteractionRequest()` (now returning the created
+task's id) actually produces one; `failAcceptance()` resets to a retryable `"failed"` state
+(`claimAcceptance` also accepts reclaiming from `"failed"`) instead of leaving a permanent
+`"claimed"`/approved decision with no task. Tests: `src/duel-store.test.ts` — "concurrent accept
+attempts: only one claim succeeds even when both race past earlier checks" (literally
+`Promise.all` of two claims), "a claim cannot be re-claimed, and dismiss is refused once accepted",
+"completeAcceptance records the resulting task id; failAcceptance makes the claim retryable",
+"dismiss is exclusive with acceptance and cannot be re-dismissed".
+
+**5. Hidden evidence truncation still yields "clean" language.** `truncateDiffForDuel()`'s
+budgeting now uses `Buffer.byteLength()` throughout (both the running total and `capChunkBytes()`'s
+per-chunk cap, which now slices a `Buffer` instead of a JS string) instead of `.length`, which was
+counting UTF-16 code units, not bytes. `formatDuelSummary()` now always renders "Evidence coverage:
+X/Y changed section(s) included" plus the snapshot identity line (base/head revision, patch hash)
+in every result, and explicitly labels a truncated-but-approved result as "a partial review, not a
+clean pass" rather than "approved as clean". Test: "diff truncation budgets by UTF-8 byte length,
+not JS string length" (asserts truncation triggers correctly on a purely-multibyte string where JS
+`.length` and byte length diverge sharply).
+
+**6. "Withdrawn" and "original author" overstate the protocol.** `DuelStance` and `DuelIssueStatus`
+dropped `"withdraw"`/`"withdrawn"` entirely — the author-side session can only `concede` or `rebut`
+(a `stance=withdraw` line is now simply unrecognized, same as any other malformed stance, and
+warns). All prompts, contribution actor names, and summary text now say "author-side rebuttal (no
+session continuity)" instead of implying it's literally "the author" continuing their earlier
+session. `RunDuelInput.task` now includes `model` (the original task's actually-recorded model,
+plumbed through from `TaskRecord`), and a new `reviewerIndependenceFor()` compares it against the
+reviewer's resolved model string; the result carries `reviewerIndependence: "independent" |
+"same-model" | "unknown"`, and the summary surfaces a clear warning for `"same-model"` and
+`"unknown"` rather than silently calling the review independent. Tests: "rebuttal parsing no longer
+accepts a unilateral withdraw stance", "issue status resolution matrix maps stances and missing
+responses to conceded/disputed only", "reviewer independence compares actual recorded models, not
+just tier labels", "reviewer independence is flagged when the reviewer resolves to the same model
+as the author".
+
+**7. Duel lifecycle and stored resolution are not durable.** `DuelStore` (issue 4) also owns the
+run lifecycle: `start()` creates a `"running"` record *before* `runDuelReview()`'s Codex calls
+happen (in `runDuelForTask()`), and — since a crashed process can't clean up — a new `start()` for
+the same task first supersedes ("failed") any earlier still-`"running"` record for that task,
+closing the durable-audit gap. `succeed()`/`fail()` transition it; `interruptRunning()` (wired into
+the `clientReady` startup handler next to `taskStore.interruptRunning()`) marks any still-`running`
+record `failed` on restart, same pattern as the existing task-recovery flow. The structured,
+machine-critical result (evidence summary, verdict, resolved issues, bounded/capped at 100 issues
+and 2,000 chars per string field) now lives in this typed, versioned store instead of a
+JSON-stringified `CollabStore` contribution capped at 12,000 characters (`recordDuelAudit()`,
+formerly `recordDuelResult()`, now only writes human-readable raw reviewer/rebuttal text to the
+collaboration thread's audit trail; `duelResolvedIssuesFromConversation()`'s JSON round-trip is
+gone, replaced by `duelStore.get()`). Tests: `src/duel-store.test.ts` — "start creates a running
+record; succeed and get round-trip the typed result", "starting a new duel for the same task
+supersedes an earlier still-running one", "fail transitions a running duel and records the error",
+"interruptRunning marks running duels as failed for restart-safe recovery".
+
+**8. Apply project policy to every decision control.** `handleDuelControl()`'s accept/dismiss branch
+now re-checks `isAllowedForProject()` against the duel's own project (previously only the
+slash-command/button *entry points* checked it, not the decision buttons themselves), and both the
+buttons and the modal submission are now bound to the exact Discord message/channel the duel posted
+its decision controls in (`isBoundDuelControl()`, mirroring `handleWorkroomButton()`'s existing
+`controlMessageId`/`controlChannelId` binding pattern) via a new `collabStore.setControlMessage()`
+call once the duel's summary message (with the decision row) is sent. Excluded controllers,
+non-project-allowed users, and stale/wrong-message clicks are all rejected before any state check.
+No dedicated new unit test for the Discord-interaction wiring itself (this codebase doesn't unit
+test `index.ts`'s interaction handlers directly, matching the existing `handleWorkroomButton`
+convention — verify manually per the updated steps below); the underlying binding/policy logic
+each reuses (`isAllowedForProject`, `collabStore.setControlMessage`) already has coverage from
+before this change.
+
+### Other changes worth flagging
+- `executeInteractionRequest()` now returns the created task's id (`Promise<string | undefined>`
+  instead of `Promise<void>`) so `handleDuelFixModal()` can record it via
+  `duelStore.completeAcceptance()`. All other call sites already ignored the return value, so this
+  is source-compatible.
+- README.md / `docs/DEVBOT_PRODUCT_PLAN.md` duel bullets updated: dropped the now-nonexistent
+  "withdrawn" outcome and "the task's actual diff"/plain "author" language, and mention evidence
+  coverage, snapshot identity, and reviewer-independence status now surfacing in the thread.
+
+### Test suite / flakiness note
+Rewrote `src/duel.test.ts` for the new API (26 tests, up from 16) and added `src/duel-store.test.ts`
+(8 tests) — net +18 tests, 134 → 152. New real-git integration tests deliberately share one fixture
+per test (rather than one per assertion) to limit total subprocess spawns.
+
+Under full concurrent `npm test`, the two real-child-process tests in `security.test.ts`
+("Codex receives prompts over stdin..." and "configured project commands receive an empty
+temporary home") were found to intermittently miss their hardcoded 5-second timeouts once this
+lane's additional real-`git`-subprocess integration tests (required by issues 1 and 3 above) added
+to concurrent system load — confirmed both tests pass 11/11 in isolation, so this was a
+load-sensitivity issue in a pre-existing, unrelated test, not a regression in the reviewed feature.
+Rather than dropping the review-mandated real-repo tests, bumped those two tests' own local
+timeouts (5,000ms → 20,000ms in `security.test.ts`; this only widens how much concurrent load they
+tolerate, it does not change what they assert) and reduced the new tests' own subprocess footprint
+(consolidated 4 heavy git-fixture tests down to 2, and dropped an unneeded isolated-worktree
+creation from the evidence-gathering test). `npm test` now passes 152/152 green across multiple
+consecutive full runs.
+
+### How to verify manually in Discord (round 1 additions)
+1. Run a duel, let it record issues, click **Accept & fix**: confirm the thread/summary now shows
+   an "Evidence coverage" line and a "Snapshot: base ... -> head ... patch ..." line, and (if the
+   reviewer happened to resolve to the same model as the author) an explicit same-model warning.
+2. Click **Accept & fix** twice in quick succession from two different accounts (or resubmit the
+   modal twice): confirm only one fix task starts and the second gets "already accepted or
+   dismissed".
+3. Delete/relocate a reviewed task's isolated worktree directory (or duel-review a task whose
+   worktree is otherwise gone) and click **Accept & fix**: confirm it refuses with a truthful
+   explanation and a copyable fix prompt instead of opening a modal.
+4. Confirm dismiss/accept both refuse if clicked from a different message than the one the duel
+   posted its own decision row on (e.g. by manually re-sending the same customIds in another
+   message during testing).

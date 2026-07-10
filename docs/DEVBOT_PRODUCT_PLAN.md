@@ -75,10 +75,10 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Uses restart-stable task controls for follow-up, review, validation, adjustment, retry, and cancellation.
   - Tracks task branch freshness and merged state against the local default branch (`/task freshness`, `/task show`) and rebases stale task branches inside their isolated worktrees on request (`/task sync`) with a backup ref, conflict-abort safety, and honest reporting.
 - Agent-vs-agent duel review:
-  - `/review duel task:<task-id>` and a **Duel review** button on completed action tasks let a fresh, different-tier Codex session adversarially review the task's actual diff.
-  - The reviewer must return a structured verdict citing file:line evidence, or state plainly that a clean diff has no substantive issues rather than inventing nits.
-  - The original author gets one rebuttal round to concede, rebut, or withdraw each issue; there is no third round.
-  - Results post to a dedicated thread with a resolved issue list (conceded / disputed / withdrawn) and owner **Accept & fix** (pre-fills a `/do` task from conceded issues) / **Dismiss** controls, recorded in the local collaboration store.
+  - `/review duel task:<task-id>` and a **Duel review** button on completed action tasks let a fresh, different-tier Codex session adversarially review evidence pinned to the task's recorded base revision (committed, staged, unstaged, and bounded untracked changes, sensitive paths excluded, patch-hashed for identity).
+  - The reviewer must return a structured, non-contradictory verdict citing file:line evidence; empty, malformed, or contradictory output is treated as indeterminate and is never presented as a clean approval.
+  - An author-side rebuttal round (a fresh session, not a continuation of the original one) concedes or rebuts each issue; there is no unilateral withdraw and no third round.
+  - Results post to a dedicated thread with evidence coverage, snapshot identity, reviewer-independence status, and a resolved issue list (conceded / disputed), plus owner/controller **Accept & fix** (re-seeds a `/do`-style task from the task's own reviewed workspace, not a fresh checkout) / **Dismiss** controls bound to that thread's message and gated by project policy; a durable duel record tracks the review and acceptance lifecycle independently of the collaboration store.
 - External local Codex awareness:
   - Detects local Codex app/CLI sessions whose working directory belongs to a configured project.
   - Separates confirmed external runs from open app sessions whose activity cannot be known.
