@@ -1,5 +1,12 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
+import {
+  hardenPrivateDirectoryPermissions,
+  hardenPrivateFilePermissions,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE
+} from "./security.js";
 import type { AppConfig, ProjectEntry } from "./types.js";
 
 export type PeerAction = "capabilities" | "status" | "snip" | "plan" | "review" | "validate";
@@ -84,6 +91,7 @@ export class PeerStore {
 
     try {
       const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as PeerStateFile;
+      await hardenPrivateFilePermissions(this.stateFile);
       this.state = { version: 1, peers: Array.isArray(parsed.peers) ? parsed.peers : [] };
     } catch {
       this.state = { version: 1, peers: [] };
@@ -96,9 +104,15 @@ export class PeerStore {
       return;
     }
 
-    await mkdir(path.dirname(this.stateFile), { recursive: true });
-    const tempFile = `${this.stateFile}.${process.pid}.tmp`;
-    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`);
+    const directory = path.dirname(this.stateFile);
+    await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    await hardenPrivateDirectoryPermissions(directory);
+    const tempFile = `${this.stateFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE
+    });
     await rename(tempFile, this.stateFile);
   }
 }

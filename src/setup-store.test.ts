@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -21,6 +21,7 @@ test("setup store persists access peers repositories defaults and room", async (
   await store.setPeer("peer-1", true);
   await store.setRepository("Web App", repoRoot);
   await store.setDefaultProject("web-app");
+  await store.bindProjectRoom("Web App", "project-room-1");
   await store.setPrivateChannel("channel-1");
   await store.setWorkspaceMessage("message-1");
 
@@ -30,8 +31,54 @@ test("setup store persists access peers repositories defaults and room", async (
   assert.deepEqual(reloaded.peerBotIds, ["peer-1"]);
   assert.equal(reloaded.repositories["web-app"], repoRoot);
   assert.equal(reloaded.defaultProjectName, "web-app");
+  assert.equal(reloaded.projectRoomIds["web-app"], "project-room-1");
   assert.equal(reloaded.privateChannelId, "channel-1");
   assert.equal(reloaded.workspaceMessageId, "message-1");
+});
+
+test("project room bindings are atomic, normalized, cloned, and removed with repositories", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-setup-project-rooms-"));
+  const filePath = path.join(root, "setup.json");
+  const store = new SetupStore(filePath);
+
+  await Promise.all([
+    store.bindProjectRoom("Web App", "room-1"),
+    store.bindProjectRoom("API", "room-2")
+  ]);
+  const bound = store.snapshot();
+  assert.deepEqual(bound.projectRoomIds, { api: "room-2", "web-app": "room-1" });
+  bound.projectRoomIds.api = "mutated";
+  assert.equal(store.snapshot().projectRoomIds.api, "room-2");
+
+  await store.bindProjectRoom("Web App", "room-2");
+  assert.deepEqual(store.snapshot().projectRoomIds, { "web-app": "room-2" });
+
+  await store.setRepository("Web App", path.join(root, "web-app"));
+  await store.removeRepository("web app");
+  assert.equal(store.snapshot().projectRoomIds["web-app"], undefined);
+
+  await store.unbindProjectRoom("API");
+  assert.deepEqual(store.snapshot().projectRoomIds, {});
+  assert.equal((await stat(filePath)).mode & 0o777, 0o600);
+});
+
+test("project room bindings migrate absent mappings and ignore malformed entries", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-setup-project-room-migration-"));
+  const legacyPath = path.join(root, "legacy.json");
+  await writeFile(legacyPath, JSON.stringify({ version: 1, repositories: { "Web App": "/tmp/web-app" } }));
+  assert.deepEqual(new SetupStore(legacyPath).snapshot().projectRoomIds, {});
+
+  const malformedPath = path.join(root, "malformed.json");
+  await writeFile(
+    malformedPath,
+    JSON.stringify({ projectRoomIds: { " Web App ": " room-1 ", blank: "  ", numeric: 42, nested: { id: "room-2" } } })
+  );
+  const store = new SetupStore(malformedPath);
+  assert.deepEqual(store.snapshot().projectRoomIds, { "web-app": "room-1" });
+
+  await store.bindProjectRoom("Other Project", "room-3");
+  const persisted = JSON.parse(await readFile(malformedPath, "utf8")) as SetupState;
+  assert.deepEqual(persisted.projectRoomIds, { "web-app": "room-1", "other-project": "room-3" });
 });
 
 test("setup access changes preserve controller-viewer invariants under concurrency", async () => {
@@ -60,6 +107,7 @@ test("runtime setup merges bootstrap and managed access while selecting a defaul
     controllerUserIds: ["controller"],
     peerBotIds: ["peer"],
     repositories: { second: "/tmp/second" },
+    projectRoomIds: {},
     defaultProjectName: "second",
     privateChannelId: "private-room"
   };
@@ -89,7 +137,16 @@ test("slash schema exposes owner setup and optional default-project commands", (
   const council = lab?.options?.find((option) => option.name === "council");
   const councilOptions = council && "options" in council ? council.options : [];
 
-  assert.deepEqual(setup?.options?.map((option) => option.name), ["wizard", "doctor", "show", "user", "devbot", "repo", "room"]);
+  assert.deepEqual(setup?.options?.map((option) => option.name), [
+    "wizard",
+    "doctor",
+    "show",
+    "user",
+    "devbot",
+    "repo",
+    "room",
+    "project-room"
+  ]);
   assert.equal(ask?.options?.find((option) => option.name === "project")?.required, false);
   assert.equal(doCommand?.options?.find((option) => option.name === "project")?.required, false);
   assert.equal(commandDefinitions.some((command) => command.name === "act"), false);
@@ -104,7 +161,8 @@ test("setup wizard renders resumable readiness and native controls", () => {
     viewerUserIds: [],
     controllerUserIds: [],
     peerBotIds: [],
-    repositories: {}
+    repositories: {},
+    projectRoomIds: {}
   };
   const incomplete = setupWizardView(emptyState, config, undefined);
   const incompleteRows = incomplete.components.map((row) => row.toJSON());

@@ -1,7 +1,14 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { CollabArtifact, CollabIntent, CollabMode } from "./collab-protocol.js";
 import { newCollabId } from "./collab-protocol.js";
+import {
+  hardenPrivateDirectoryPermissions,
+  hardenPrivateFilePermissions,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE
+} from "./security.js";
 
 export type WorkroomPhase = "collecting" | "deliberating" | "synthesized" | "decided" | "closed";
 export type ParticipantState = "active" | "invited" | "contributed";
@@ -102,6 +109,10 @@ export class CollabStore {
     threadId?: string;
   }): Promise<CollabConversation> {
     return this.mutate((state) => {
+      const openConversations = state.conversations.filter((conversation) => conversation.status === "open").length;
+      if (openConversations >= this.maxConversations) {
+        throw new Error("Devbot's open collaboration limit has been reached. Close existing workrooms before starting another.");
+      }
       const now = new Date().toISOString();
       const requesterId = input.requesterId ?? input.requester;
       const conversation: CollabConversation = {
@@ -488,6 +499,7 @@ export class CollabStore {
         contributions?: CollabContribution[];
         processedDeliveries?: string[];
       };
+      await hardenPrivateFilePermissions(this.stateFile);
       if (parsed.version !== undefined && parsed.version !== 1 && parsed.version !== 2) {
         throw new Error(`Unsupported collaboration state version: ${parsed.version}`);
       }
@@ -512,9 +524,15 @@ export class CollabStore {
       return;
     }
 
-    await mkdir(path.dirname(this.stateFile), { recursive: true });
-    const tempFile = `${this.stateFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`);
+    const directory = path.dirname(this.stateFile);
+    await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    await hardenPrivateDirectoryPermissions(directory);
+    const tempFile = `${this.stateFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE
+    });
     await rename(tempFile, this.stateFile);
   }
 }

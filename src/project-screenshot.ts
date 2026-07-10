@@ -2,10 +2,13 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { Page } from "playwright";
+import { minimalChildEnvironment } from "./security.js";
 import type { ProjectEntry } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_VIEWPORT = { width: 1440, height: 1000 };
+const MAX_CONCURRENT_SCREENSHOTS = 2;
+let activeScreenshots = 0;
 const VIEWPORTS = {
   desktop: DEFAULT_VIEWPORT,
   tablet: { width: 820, height: 1180 },
@@ -38,49 +41,71 @@ export async function captureProjectScreenshot(
   project: ProjectEntry,
   options: ProjectScreenshotOptions = {}
 ): Promise<ProjectScreenshot | undefined> {
-  const target = parseExplicitScreenshotTarget(options.requestText ?? "");
-  const urls = target.url ? [target.url] : await findProjectWebUrls(project);
-  const viewportName = options.viewport ?? "desktop";
-  const viewport = VIEWPORTS[viewportName];
+  if (activeScreenshots >= MAX_CONCURRENT_SCREENSHOTS) {
+    throw new Error("Devbot is at its screenshot execution limit. Try again after an active capture finishes.");
+  }
+  activeScreenshots += 1;
+  try {
+    const target = parseExplicitScreenshotTarget(options.requestText ?? "");
+    const projectUrls = await findProjectWebUrls(project);
+    const allowedOrigins = projectScreenshotOrigins(project, projectUrls);
+    const urls = target.url
+      ? (isApprovedProjectScreenshotUrl(target.url, projectUrls) ? [target.url] : [])
+      : projectUrls;
+    const viewportName = options.viewport ?? "desktop";
+    const viewport = VIEWPORTS[viewportName];
 
-  for (const url of urls) {
-    const startUrl = target.path ? withPath(url, target.path) : url;
-    if (!(await canReach(startUrl))) {
-      continue;
-    }
-
-    const { chromium } = await import("playwright");
-    const browser = await chromium.launch({ headless: true });
-    try {
-      const page = await browser.newPage({ viewport });
-      const diagnostics = collectScreenshotDiagnostics(page);
-      await page.goto(startUrl, { waitUntil: "networkidle", timeout: 20_000 });
-      if (!target.path && !target.url) {
-        await navigateByVisibleUi(page, options.requestText ?? "");
+    for (const url of urls) {
+      const startUrl = target.path ? withPath(url, target.path) : url;
+      if (!isAllowedScreenshotResource(startUrl, allowedOrigins) || !(await canReach(startUrl, allowedOrigins))) {
+        continue;
       }
 
-      const image = await page.screenshot({ type: "png", fullPage: false });
-      const finalUrl = page.url();
-      return {
-        image,
-        fileName: `${sanitizeFilePart(project.name)}-${sanitizeFilePart(new URL(finalUrl).pathname || "home")}-screenshot.png`,
-        url: finalUrl,
-        metadata: {
-          startUrl,
-          finalUrl,
-          viewport: viewportName,
-          capturedAt: new Date().toISOString(),
-          consoleErrors: diagnostics.consoleErrors,
-          failedRequests: diagnostics.failedRequests,
-          badResponses: diagnostics.badResponses
+      const { chromium } = await import("playwright");
+      const browser = await chromium.launch({ headless: true, env: definedEnvironment(minimalChildEnvironment()) });
+      try {
+        const page = await browser.newPage({ viewport });
+        await page.route("**/*", async (route) => {
+          if (isAllowedScreenshotResource(route.request().url(), allowedOrigins)) {
+            await route.continue();
+          } else {
+            await route.abort("blockedbyclient");
+          }
+        });
+        const diagnostics = collectScreenshotDiagnostics(page);
+        await page.goto(startUrl, { waitUntil: "networkidle", timeout: 20_000 });
+        if (!isAllowedScreenshotResource(page.url(), allowedOrigins)) {
+          continue;
         }
-      };
-    } finally {
-      await browser.close();
-    }
-  }
+        if (!target.path && !target.url) {
+          await navigateByVisibleUi(page, options.requestText ?? "");
+        }
 
-  return undefined;
+        const image = await page.screenshot({ type: "png", fullPage: false });
+        const finalUrl = safeReportedUrl(page.url());
+        return {
+          image,
+          fileName: `${sanitizeFilePart(project.name)}-${sanitizeFilePart(new URL(finalUrl).pathname || "home")}-screenshot.png`,
+          url: finalUrl,
+          metadata: {
+            startUrl,
+            finalUrl,
+            viewport: viewportName,
+            capturedAt: new Date().toISOString(),
+            consoleErrors: diagnostics.consoleErrors,
+            failedRequests: diagnostics.failedRequests,
+            badResponses: diagnostics.badResponses
+          }
+        };
+      } finally {
+        await browser.close();
+      }
+    }
+
+    return undefined;
+  } finally {
+    activeScreenshots = Math.max(0, activeScreenshots - 1);
+  }
 }
 
 export async function findProjectWebUrls(project: ProjectEntry): Promise<string[]> {
@@ -109,7 +134,10 @@ export function detectLocalWebUrlsFromPs(psOutput: string, project: ProjectEntry
 
 async function detectRunningProjectWebUrls(project: ProjectEntry): Promise<string[]> {
   try {
-    const { stdout } = await execFileAsync("ps", ["-axo", "command="], { maxBuffer: 2_000_000 });
+    const { stdout } = await execFileAsync("ps", ["-axo", "command="], {
+      env: minimalChildEnvironment(),
+      maxBuffer: 2_000_000
+    });
     return detectLocalWebUrlsFromPs(stdout, project);
   } catch {
     return [];
@@ -267,7 +295,8 @@ interface ExplicitScreenshotTarget {
 function parseExplicitScreenshotTarget(requestText: string): ExplicitScreenshotTarget {
   const explicitUrl = requestText.match(/\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/[^\s]*)?/i)?.[0];
   if (explicitUrl) {
-    return { url: normalizeLocalUrl(explicitUrl) };
+    const normalized = normalizeProjectUrl(explicitUrl);
+    return normalized ? { url: normalized } : {};
   }
 
   const explicitPath = extractExplicitPath(requestText);
@@ -331,15 +360,22 @@ function extractPort(command: string): number | undefined {
   return undefined;
 }
 
-async function canReach(url: string): Promise<boolean> {
+async function canReach(url: string, allowedOrigins: ReadonlySet<string>): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4_000);
 
   try {
     const response = await fetch(url, {
       method: "GET",
+      redirect: "manual",
       signal: controller.signal
     });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) return false;
+      const redirected = new URL(location, url).toString();
+      return isAllowedScreenshotResource(redirected, allowedOrigins);
+    }
     return response.status < 500;
   } catch {
     return false;
@@ -353,11 +389,11 @@ function localhostUrl(port: number): string {
 }
 
 function normalizeLocalUrl(url: string): string {
-  return url.replace("localhost", "127.0.0.1").replace("[::1]", "127.0.0.1");
+  return normalizeProjectUrl(url) ?? "";
 }
 
 function uniqueUrls(urls: string[]): string[] {
-  return [...new Set(urls.map((url) => normalizeLocalUrl(url.trim())).filter(Boolean))];
+  return [...new Set(urls.map((url) => normalizeProjectUrl(url)).filter((url): url is string => Boolean(url)))];
 }
 
 function uniqueWords(words: string[]): string[] {
@@ -370,6 +406,74 @@ function withPath(baseUrl: string, routePath: string): string {
   url.search = "";
   url.hash = "";
   return url.toString().replace(/\/$/, url.pathname === "/" ? "/" : "");
+}
+
+export function isApprovedProjectScreenshotUrl(candidate: string, projectUrls: readonly string[]): boolean {
+  const normalized = normalizeProjectUrl(candidate);
+  if (!normalized) return false;
+  const candidateOrigin = new URL(normalized).origin;
+  return projectUrls.some((value) => {
+    const approved = normalizeProjectUrl(value);
+    return Boolean(approved && new URL(approved).origin === candidateOrigin);
+  });
+}
+
+function projectScreenshotOrigins(project: ProjectEntry, projectUrls: readonly string[]): Set<string> {
+  const values = [...projectUrls, project.metadata.backendUrl ?? ""];
+  return new Set(
+    values
+      .map((value) => normalizeProjectUrl(value))
+      .filter((value): value is string => Boolean(value))
+      .map((value) => new URL(value).origin)
+  );
+}
+
+function isAllowedScreenshotResource(value: string, allowedOrigins: ReadonlySet<string>): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol === "data:" || url.protocol === "blob:" || url.protocol === "about:") return true;
+    return (url.protocol === "http:" || url.protocol === "https:")
+      && !url.username
+      && !url.password
+      && isLoopbackHost(url.hostname)
+      && allowedOrigins.has(url.origin);
+  } catch {
+    return false;
+  }
+}
+
+function normalizeProjectUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value.trim());
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password || !isLoopbackHost(url.hostname)) {
+      return undefined;
+    }
+    if (url.hostname === "localhost" || url.hostname === "[::1]") url.hostname = "127.0.0.1";
+    url.hash = "";
+    return url.toString().replace(/\/$/, url.pathname === "/" ? "" : "/");
+  } catch {
+    return undefined;
+  }
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function safeReportedUrl(value: string): string {
+  const url = new URL(value);
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function definedEnvironment(environment: NodeJS.ProcessEnv): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(environment).filter((entry): entry is [string, string] => typeof entry[1] === "string")
+  );
 }
 
 function normalizeRoutePath(routePath: string): string {

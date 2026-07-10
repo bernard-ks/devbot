@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { normalizeProjectName } from "./config.js";
+import { hardenPrivateDirectoryPermissions, PRIVATE_DIRECTORY_MODE } from "./security.js";
 
 interface UserPreferenceState {
   version: 1;
@@ -62,6 +63,7 @@ function loadState(filePath: string): UserPreferenceState {
   if (!existsSync(filePath)) {
     return cloneState(EMPTY_STATE);
   }
+  if (process.platform !== "win32") chmodSync(filePath, 0o600);
 
   let parsed: unknown;
   try {
@@ -81,7 +83,9 @@ function loadState(filePath: string): UserPreferenceState {
 }
 
 async function persistState(filePath: string, state: UserPreferenceState): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
+  const directory = path.dirname(filePath);
+  await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+  await hardenPrivateDirectoryPermissions(directory);
   const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   await rename(tempPath, filePath);

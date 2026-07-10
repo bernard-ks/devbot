@@ -1,5 +1,9 @@
 import { exec } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
+import { minimalChildEnvironment, redactSensitiveText } from "./security.js";
 import type { ProjectEntry } from "./types.js";
 
 const execAsync = promisify(exec);
@@ -47,20 +51,24 @@ export async function runConfiguredProjectCommand(
   }
 
   const startedAt = new Date().toISOString();
+  const runtimeHome = await mkdtemp(path.join(tmpdir(), "devbot-command-"));
+  const childEnvironment = minimalChildEnvironment();
+  childEnvironment.HOME = runtimeHome;
+  childEnvironment.USERPROFILE = runtimeHome;
   try {
     const { stdout, stderr } = await execAsync(command, {
       cwd: project.root,
       timeout: timeoutMs,
       maxBuffer: 2_000_000,
-      env: process.env
+      env: childEnvironment
     });
     return {
       projectName: project.name,
       kind: name,
-      command,
+      command: redactSensitiveText(command),
       ok: true,
       exitCode: 0,
-      output: trimOutput(`${stdout}${stderr ? `\n${stderr}` : ""}`),
+      output: trimOutput(redactSensitiveText(`${stdout}${stderr ? `\n${stderr}` : ""}`)),
       startedAt,
       finishedAt: new Date().toISOString()
     };
@@ -69,13 +77,15 @@ export async function runConfiguredProjectCommand(
     return {
       projectName: project.name,
       kind: name,
-      command,
+      command: redactSensitiveText(command),
       ok: false,
       exitCode: typeof err.code === "number" ? err.code : undefined,
-      output: trimOutput(`${err.stdout ?? ""}${err.stderr ? `\n${err.stderr}` : ""}` || err.message),
+      output: trimOutput(redactSensitiveText(`${err.stdout ?? ""}${err.stderr ? `\n${err.stderr}` : ""}` || err.message)),
       startedAt,
       finishedAt: new Date().toISOString()
     };
+  } finally {
+    await rm(runtimeHome, { force: true, recursive: true });
   }
 }
 

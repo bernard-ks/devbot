@@ -1,11 +1,12 @@
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { configuredCommandNames, formatProjectCommandResult, runConfiguredProjectCommand } from "./command-runner.js";
 import type { ProjectCommandResult } from "./command-runner.js";
+import { hardenedGitArguments, hardenedGitEnvironment, redactSensitiveText } from "./security.js";
 import type { TaskRecord } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 export interface ReviewPacket {
   project: ProjectEntry;
@@ -25,10 +26,11 @@ export interface MergeGateResult {
 
 export async function createReviewPacket(project: ProjectEntry, task?: TaskRecord): Promise<ReviewPacket> {
   const [branch, status, diffStat, lastCommit] = await Promise.all([
-    git(project, "rev-parse --abbrev-ref HEAD").catch(() => "unknown"),
-    git(project, "status --short").catch((error) => `Unable to read status: ${(error as Error).message}`),
-    git(project, "diff --stat HEAD").catch(() => ""),
-    git(project, "log -1 --oneline").catch(() => "unknown")
+    git(project, ["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => "unknown"),
+    git(project, ["status", "--short", "--untracked-files=all", "--ignore-submodules=all"])
+      .catch((error) => `Unable to read status: ${redactSensitiveText((error as Error).message)}`),
+    git(project, ["diff", "--stat", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "HEAD"]).catch(() => ""),
+    git(project, ["log", "--no-show-signature", "-1", "--oneline"]).catch(() => "unknown")
   ]);
 
   return {
@@ -56,7 +58,7 @@ export async function validateReview(project: ProjectEntry, commandNames?: strin
 }
 
 export async function evaluateMergeGates(project: ProjectEntry, commandNames?: string[]): Promise<MergeGateResult> {
-  const status = await git(project, "status --short").catch(() => "unknown");
+  const status = await git(project, ["status", "--short", "--untracked-files=all", "--ignore-submodules=all"]).catch(() => "unknown");
   const cleanWorkingTree = status.trim().length === 0;
   const validation = await validateReview(project, commandNames);
   return {
@@ -118,13 +120,13 @@ function defaultValidationCommands(project: ProjectEntry): string[] {
   return (["lint", "build", "test"] as const).filter((name) => commands[name].length > 0);
 }
 
-async function git(project: ProjectEntry, command: string): Promise<string> {
-  const { stdout, stderr } = await execAsync(`git ${command}`, {
-    cwd: project.root,
+async function git(project: ProjectEntry, args: string[]): Promise<string> {
+  const { stdout, stderr } = await execFileAsync("git", hardenedGitArguments(project.root, args), {
     timeout: 30_000,
-    maxBuffer: 1_000_000
+    maxBuffer: 1_000_000,
+    env: hardenedGitEnvironment()
   });
-  return `${stdout}${stderr ? `\n${stderr}` : ""}`;
+  return redactSensitiveText(`${stdout}${stderr ? `\n${stderr}` : ""}`);
 }
 
 function codeBlock(value: string): string {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -41,7 +41,7 @@ import {
   localCouncilSeats
 } from "./lab.js";
 import { renderStatusImage } from "./status-image.js";
-import { TaskStore } from "./task-store.js";
+import { formatTaskDetail, TaskStore } from "./task-store.js";
 import { parseTaskControl, taskActionMatchesState, taskActionRows, taskControlRow } from "./task-controls.js";
 import type { ProjectEntry } from "./types.js";
 import { filterWorkForProjects, formatWorkStatus, parseExternalCodexWork, scopeStatusToProject, WorkTracker } from "./work-status.js";
@@ -391,6 +391,130 @@ test("task store persists task lifecycle to disk", async () => {
   assert.equal(saved?.routeSource, "model");
   assert.equal(saved?.parentTaskId, "task-parent");
   assert.equal(recent[0]?.id, task.id);
+  assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
+});
+
+test("task store preserves proposals and their Discord workroom context", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-proposal-"));
+  const stateFile = path.join(root, "tasks.json");
+  const store = new TaskStore(stateFile);
+  const proposal = await store.propose({
+    source: "mention",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    requesterId: "user-1",
+    channelId: "channel-1",
+    text: "fix the failing test",
+    agentRoles: ["builder", "reviewer"]
+  });
+  await store.setDiscordContext(proposal.id, { threadId: "thread-1", controlMessageId: "message-1" });
+
+  const reloaded = new TaskStore(stateFile);
+  const saved = await reloaded.findByThread("thread-1");
+  assert.equal(saved?.status, "awaiting-approval");
+  assert.equal(saved?.approvalStatus, "pending");
+  assert.equal(saved?.attention, "approval");
+  assert.deepEqual(saved?.agentRoles, ["builder", "reviewer"]);
+  assert.equal(saved?.controlMessageId, "message-1");
+
+  const started = await reloaded.begin(proposal.id, { actor: "tester" });
+  assert.equal(started?.status, "running");
+  assert.equal(started?.approvalStatus, "approved");
+  assert.equal(started?.attention, undefined);
+});
+
+test("task store records branch evidence and review attention", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-evidence-"));
+  const store = new TaskStore(path.join(root, "tasks.json"));
+  const task = await store.start({
+    source: "workroom",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    requesterId: "user-1",
+    text: "implement the feature"
+  });
+  await store.setWorkspace(task.id, {
+    workspacePath: "/tmp/devbot-worktree",
+    branchName: "devbot/task-test",
+    baseBranch: "main",
+    isolated: true
+  });
+  await store.setEvidence(task.id, {
+    changedFiles: ["src/index.ts", "src/index.ts"],
+    diffStat: "1 file changed, 4 insertions(+)",
+    commitSha: "abc1234",
+    verification: ["npm test: passed"]
+  });
+  await store.succeed(task.id, { resultPreview: "Feature implemented." });
+
+  const needsAttention = await store.listNeedsAttention({ projectName: "demo" });
+  assert.deepEqual(needsAttention.map((item) => item.id), [task.id]);
+  assert.equal(needsAttention[0]?.attention, "review");
+  assert.deepEqual(needsAttention[0]?.changedFiles, ["src/index.ts"]);
+  assert.match(formatTaskDetail(needsAttention[0]!), /Branch: `devbot\/task-test` \(isolated\)/);
+  assert.match(formatTaskDetail(needsAttention[0]!), /npm test: passed/);
+
+  await store.markReviewed(task.id);
+  assert.deepEqual(await store.listNeedsAttention({ projectName: "demo" }), []);
+});
+
+test("task store denial clears proposal attention", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-denial-"));
+  const store = new TaskStore(path.join(root, "tasks.json"));
+  const proposal = await store.propose({
+    source: "context-menu",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    text: "remove the old route"
+  });
+  const denied = await store.deny(proposal.id, "tester");
+
+  assert.equal(denied?.status, "canceled");
+  assert.equal(denied?.approvalStatus, "denied");
+  assert.equal(denied?.attention, undefined);
+  assert.deepEqual(await store.listNeedsAttention(), []);
+});
+
+test("task store migration filters malformed optional fields", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-migration-"));
+  const stateFile = path.join(root, "tasks.json");
+  await writeFile(stateFile, JSON.stringify({
+    version: 1,
+    tasks: [{
+      id: "task-migrated",
+      status: "succeeded",
+      source: "legacy",
+      mode: "answer",
+      projectName: "demo",
+      requester: "tester",
+      text: "legacy task",
+      includePatterns: [42, "src/*", null],
+      agentRoles: [{ role: "builder" }, "builder"],
+      internal: "yes",
+      workspaceIsolated: "true",
+      attention: "unknown",
+      startedAt: "invalid",
+      updatedAt: "2026-07-10T00:00:00.000Z"
+    }]
+  }));
+
+  const task = await new TaskStore(stateFile).get("task-migrated");
+  assert.deepEqual(task?.includePatterns, ["src/*"]);
+  assert.deepEqual(task?.agentRoles, ["builder"]);
+  assert.equal(task?.internal, undefined);
+  assert.equal(task?.workspaceIsolated, undefined);
+  assert.equal(task?.attention, undefined);
+  assert.equal(task?.startedAt, new Date(0).toISOString());
+});
+
+test("task store rejects unknown state versions", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-version-"));
+  const stateFile = path.join(root, "tasks.json");
+  await writeFile(stateFile, JSON.stringify({ version: 2, tasks: [] }));
+  await assert.rejects(() => new TaskStore(stateFile).listRecent(), /Unsupported task state version/);
 });
 
 test("task store can mark running tasks as canceled", async () => {

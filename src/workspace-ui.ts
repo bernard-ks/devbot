@@ -13,7 +13,7 @@ import type { ProjectEntry } from "./types.js";
 const CONTROL_PREFIX = "devbot:workspace:";
 const MODAL_PREFIX = "devbot:workspace-modal:";
 
-export type WorkspaceAction = "open" | "ask" | "act" | "status" | "recent" | "refresh" | "project";
+export type WorkspaceAction = "open" | "ask" | "act" | "status" | "recent" | "inbox" | "refresh" | "project";
 export type WorkspaceModalAction = "ask" | "act";
 
 export interface WorkspaceControl {
@@ -33,6 +33,7 @@ export interface WorkspacePanelInput {
   safeMode: boolean;
   status: string;
   recentTasks: TaskRecord[];
+  needsAttentionCount?: number;
 }
 
 export function parseWorkspaceControl(customId: string): WorkspaceControl | undefined {
@@ -103,11 +104,17 @@ export function workspacePanelView(input: WorkspacePanelInput) {
       .setLabel("Recent")
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
+      .setCustomId(`${CONTROL_PREFIX}inbox:${input.selectedProject.name}`)
+      .setLabel(input.needsAttentionCount ? `Needs Me (${input.needsAttentionCount})` : "Needs Me")
+      .setStyle(input.needsAttentionCount ? ButtonStyle.Danger : ButtonStyle.Secondary)
+  );
+  const utilityControls = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
       .setCustomId(`${CONTROL_PREFIX}refresh:${input.selectedProject.name}`)
       .setLabel("Refresh")
       .setStyle(ButtonStyle.Secondary)
   );
-  const components: Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>> = [controls];
+  const components: Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>> = [controls, utilityControls];
 
   if (input.projects.length > 1) {
     const selectableProjects = [
@@ -134,7 +141,9 @@ export function workspacePanelView(input: WorkspacePanelInput) {
 }
 
 export function workspaceRecentTasks(tasks: TaskRecord[], limit = 3): TaskRecord[] {
-  return tasks.filter((task) => !task.source.startsWith("lab:council:")).slice(0, limit);
+  return tasks
+    .filter((task) => !task.source.startsWith("lab:council:") && !task.source.startsWith("workroom:agent:"))
+    .slice(0, limit);
 }
 
 export function workspaceRequestModal(action: WorkspaceModalAction, projectName: string): ModalBuilder {
@@ -191,6 +200,7 @@ function formatRecentTasks(tasks: TaskRecord[]): string {
 }
 
 function taskStatusLabel(task: TaskRecord): string {
+  if (task.status === "awaiting-approval") return "Approval needed";
   if (task.status === "succeeded") return "Done";
   if (task.status === "failed") return "Needs attention";
   if (task.status === "canceled") return "Canceled";
@@ -216,7 +226,7 @@ function sectionLines(status: string, heading: string): string[] {
 }
 
 function isWorkspaceAction(value: string | undefined): value is WorkspaceAction {
-  return value === "open" || value === "ask" || value === "act" || value === "status" || value === "recent" || value === "refresh" || value === "project";
+  return value === "open" || value === "ask" || value === "act" || value === "status" || value === "recent" || value === "inbox" || value === "refresh" || value === "project";
 }
 
 function isSafeProjectName(value: string): boolean {

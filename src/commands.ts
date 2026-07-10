@@ -1,6 +1,6 @@
-import { SlashCommandBuilder } from "discord.js";
+import { ApplicationCommandType, ContextMenuCommandBuilder, SlashCommandBuilder } from "discord.js";
 
-export const commandDefinitions = [
+const commandBuilders = [
   new SlashCommandBuilder().setName("projects").setDescription("List configured local projects."),
   new SlashCommandBuilder()
     .setName("setup")
@@ -68,6 +68,24 @@ export const commandDefinitions = [
         .addStringOption((option) =>
           option.setName("name").setDescription("Channel name used when creating the room.").setRequired(false).setMaxLength(80)
         )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("project-room")
+        .setDescription("Bind or remove a project's ambient Discord workroom.")
+        .addStringOption((option) =>
+          option
+            .setName("action")
+            .setDescription("Whether to bind or remove the project room.")
+            .setRequired(true)
+            .addChoices({ name: "bind", value: "bind" }, { name: "remove", value: "remove" })
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addChannelOption((option) =>
+          option.setName("channel").setDescription("Discord channel to use when binding the project room.").setRequired(false)
+        )
     ),
   new SlashCommandBuilder()
     .setName("status")
@@ -121,6 +139,7 @@ export const commandDefinitions = [
             .setRequired(false)
             .addChoices(
               { name: "running", value: "running" },
+              { name: "awaiting approval", value: "awaiting-approval" },
               { name: "succeeded", value: "succeeded" },
               { name: "failed", value: "failed" },
               { name: "canceled", value: "canceled" }
@@ -176,6 +195,15 @@ export const commandDefinitions = [
     .setDescription("Open your interactive project workspace.")
     .addStringOption((option) =>
       option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("inbox")
+    .setDescription("Show work that needs your attention across configured projects.")
+    .addStringOption((option) =>
+      option.setName("project").setDescription("Optional configured project name.").setRequired(false).setAutocomplete(true)
+    )
+    .addIntegerOption((option) =>
+      option.setName("limit").setDescription("Number of items to show, 1-25.").setRequired(false).setMinValue(1).setMaxValue(25)
     ),
   new SlashCommandBuilder()
     .setName("run")
@@ -475,5 +503,10 @@ export const commandDefinitions = [
         .setName("include")
         .setDescription("Optional comma-separated path patterns, e.g. src/*,README.md,*.json.")
         .setRequired(false)
-    )
-].map((command) => command.toJSON());
+    ),
+  new ContextMenuCommandBuilder()
+    .setName("Start Devbot workroom")
+    .setType(ApplicationCommandType.Message)
+] satisfies Array<Pick<SlashCommandBuilder, "toJSON"> | Pick<ContextMenuCommandBuilder, "toJSON">>;
+
+export const commandDefinitions = commandBuilders.map((command) => command.toJSON());

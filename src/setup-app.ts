@@ -6,6 +6,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import path from "node:path";
 import { normalizeProjectName, resolveCodexBin } from "./config.js";
 import { isRuntimeRunning, runtimeLockPath } from "./runtime-lock.js";
+import { minimalChildEnvironment, publicErrorMessage } from "./security.js";
 import {
   buildDiscordInstallUrl,
   finishInitialSetup,
@@ -17,6 +18,7 @@ import { renderSetupPage } from "./setup-page.js";
 
 const host = "127.0.0.1";
 const sessionToken = randomBytes(24).toString("base64url");
+const sessionExpiresAt = Date.now() + 10 * 60_000;
 const cwd = process.cwd();
 const session: { token?: string; identity?: DiscordBotIdentity; botProcess?: ChildProcess } = {
   ...(process.env.DISCORD_TOKEN?.trim() ? { token: process.env.DISCORD_TOKEN.trim() } : {})
@@ -25,10 +27,16 @@ let baseUrl = "";
 
 const server = createServer((request, response) => {
   void handleRequest(request, response).catch((error) => {
-    console.error(`Setup request failed: ${(error as Error).message}`);
+    console.error(`Setup request failed: ${publicErrorMessage(error)}`);
     sendJson(response, 500, { error: friendlyError(error) });
   });
 });
+const sessionExpiryTimer = setTimeout(() => {
+  delete session.token;
+  delete session.identity;
+  server.close();
+}, Math.max(0, sessionExpiresAt - Date.now()));
+sessionExpiryTimer.unref();
 
 server.listen(0, host, async () => {
   const address = server.address();
@@ -64,6 +72,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   const expectedHost = baseUrl ? new URL(baseUrl).host : undefined;
   if (!expectedHost || request.headers.host !== expectedHost) {
     sendJson(response, 403, { error: "This setup session only accepts its local address." });
+    return;
+  }
+  if (Date.now() > sessionExpiresAt) {
+    sendJson(response, 410, { error: "This setup session expired. Restart the setup command for a new link." });
     return;
   }
   if (request.method === "GET" && url.pathname === "/") {
@@ -147,6 +159,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     process.env.DEVBOT_OWNER_USER_ID = result.ownerId;
     const alreadyRunning = isRuntimeRunning(runtimeLockPath(process.env.DEVBOT_RUNTIME_LOCK));
     sendJson(response, 200, { ...result, alreadyRunning });
+    delete session.token;
+    delete session.identity;
+    clearTimeout(sessionExpiryTimer);
+    server.close();
     if (!alreadyRunning && process.env.DEVBOT_SETUP_NO_START !== "true") {
       setTimeout(startDevbot, 500);
     }
@@ -179,7 +195,7 @@ async function checkNode(): Promise<{ ready: boolean; version: string }> {
 async function checkCodex(): Promise<{ ready: boolean; label: string }> {
   const bin = resolveCodexBin(process.env.CODEX_BIN);
   return new Promise((resolve) => {
-    execFile(bin, ["--version"], { timeout: 5_000 }, (error, stdout) => {
+    execFile(bin, ["--version"], { env: minimalChildEnvironment(process.env, "codex"), timeout: 5_000 }, (error, stdout) => {
       if (error) {
         resolve({ ready: false, label: "Codex CLI not found" });
         return;
@@ -207,7 +223,7 @@ function startDevbot(): void {
 function openBrowser(url: string): void {
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
-  const child = spawn(command, args, { detached: true, stdio: "ignore" });
+  const child = spawn(command, args, { detached: true, env: setupUtilityEnvironment(), stdio: "ignore" });
   child.unref();
 }
 
@@ -224,7 +240,7 @@ async function chooseRepositoryFolder(): Promise<string> {
         ]
       : ["--file-selection", "--directory", "--title=Choose a repository for Devbot"];
   return new Promise((resolve, reject) => {
-    execFile(command, args, { timeout: 120_000 }, (error, stdout) => {
+    execFile(command, args, { env: setupUtilityEnvironment(), timeout: 120_000 }, (error, stdout) => {
       const selected = stdout.trim().replace(/[\\/]+$/, "");
       if (error || !selected) {
         reject(new Error("Folder selection was canceled or is unavailable. You can paste the path instead."));
@@ -233,6 +249,15 @@ async function chooseRepositoryFolder(): Promise<string> {
       resolve(path.resolve(selected));
     });
   });
+}
+
+function setupUtilityEnvironment(): NodeJS.ProcessEnv {
+  const environment = minimalChildEnvironment();
+  for (const key of ["DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"]) {
+    const value = process.env[key];
+    if (value) environment[key] = value;
+  }
+  return environment;
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -271,10 +296,11 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
 }
 
 function friendlyError(error: unknown): string {
-  return error instanceof Error ? error.message : "Setup failed unexpectedly.";
+  return publicErrorMessage(error);
 }
 
 function shutdown(): void {
+  clearTimeout(sessionExpiryTimer);
   if (session.botProcess && session.botProcess.exitCode === null) {
     session.botProcess.kill("SIGTERM");
   }

@@ -15,6 +15,7 @@ import type {
   GuildTextBasedChannel,
   Interaction,
   Message,
+  MessageContextMenuCommandInteraction,
   ModalSubmitInteraction,
   StringSelectMenuInteraction,
   UserSelectMenuInteraction
@@ -23,6 +24,19 @@ import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { isApprovedDiscordUsername } from "./access.js";
+import {
+  confirmToActProposalCard,
+  needsMeInbox,
+  parseAmbientCustomId,
+  parseAmbientRoleSelection,
+  parseProposalEntityId,
+  progressCard,
+  proofFirstCompletionCard,
+  proposalEntityId,
+  proposalEditModal,
+  type AmbientAction,
+  type AmbientRole
+} from "./ambient-ui.js";
 import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
 import {
   collabDeliveryKey,
@@ -39,6 +53,7 @@ import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
 import { parseMentionRequest, parseStatusRequest, statusDetailQuestion, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
+import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natural-intent.js";
 import { captureProjectScreenshot, type ProjectScreenshot } from "./project-screenshot.js";
 import { configuredCommandNames, formatProjectCommandResult, runConfiguredProjectCommand } from "./command-runner.js";
 import { syncCommandsIfChanged } from "./command-sync.js";
@@ -54,6 +69,7 @@ import {
 } from "./peer.js";
 import { createReviewPacket, evaluateMergeGates, formatMergeGateResult, formatReviewPacket, formatValidationResults, validateReview } from "./review.js";
 import { contextLimitForRoute, routeRequest, type RequestRoute } from "./request-router.js";
+import { publicErrorMessage, redactSensitiveText } from "./security.js";
 import {
   commandRequiresApproval,
   isPeerAllowedForProject,
@@ -62,7 +78,13 @@ import {
   safeModeActionMessage,
   screenshotRequiresApproval
 } from "./safety.js";
-import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskStatus } from "./task-store.js";
+import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord, type TaskStatus } from "./task-store.js";
+import { canAccessTaskRecord } from "./task-access.js";
+import {
+  createTaskWorktree,
+  inspectTaskWorktree,
+  type TaskWorktree
+} from "./task-worktree.js";
 import {
   parseTaskControl,
   taskActionMatchesState,
@@ -139,21 +161,27 @@ const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
 const activeWorkroomActions = new Set<string>();
 let verifiedPrivateRoomId: string | undefined;
+const verifiedProjectRoomAudiences = new Map<string, number>();
 let slashCommandsReady = false;
 const runtimePidFile = runtimeLockPath(process.env.DEVBOT_RUNTIME_LOCK);
+markRuntimeRunning(runtimePidFile);
+const gatewayIntents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
+if (process.env.DEVBOT_MESSAGE_CONTENT_INTENT?.trim().toLowerCase() === "true") {
+  gatewayIntents.push(GatewayIntentBits.MessageContent);
+}
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+  intents: gatewayIntents,
+  allowedMentions: { parse: [], repliedUser: false }
 });
 
 client.once("clientReady", async () => {
-  markRuntimeRunning(runtimePidFile);
   try {
     const interrupted = await taskStore.interruptRunning();
     if (interrupted > 0) {
       console.log(`Recovered ${interrupted} interrupted task${interrupted === 1 ? "" : "s"} from the previous runtime.`);
     }
   } catch (error) {
-    console.warn(`Unable to recover interrupted tasks: ${(error as Error).message}`);
+    console.warn(`Unable to recover interrupted tasks: ${publicErrorMessage(error)}`);
   }
   if (config.autoDeployCommands && client.application) {
     try {
@@ -165,7 +193,7 @@ client.once("clientReady", async () => {
       slashCommandsReady = true;
       console.log(`Slash commands: ${deployed ? "updated" : "current"}.`);
     } catch (error) {
-      console.warn(`Unable to synchronize slash commands: ${(error as Error).message}`);
+      console.warn(`Unable to synchronize slash commands: ${publicErrorMessage(error)}`);
     }
   }
   const startupSetupState = setupStore.snapshot();
@@ -180,7 +208,7 @@ client.once("clientReady", async () => {
       verifiedPrivateRoomId = configuredRoomId;
     } catch (error) {
       verifiedPrivateRoomId = undefined;
-      console.warn(`Private room access could not be synchronized; Devbot will remain unavailable: ${(error as Error).message}`);
+      console.warn(`Private room access could not be synchronized; Devbot will remain unavailable: ${publicErrorMessage(error)}`);
     }
   } else {
     verifiedPrivateRoomId = configuredRoomId;
@@ -195,7 +223,7 @@ client.once("clientReady", async () => {
   );
   if (verifiedPrivateRoomId && config.projects.length > 0) {
     await ensureWorkspaceLauncher(config).catch((error) => {
-      console.warn(`Unable to synchronize the workspace launcher: ${(error as Error).message}`);
+      console.warn(`Unable to synchronize the workspace launcher: ${publicErrorMessage(error)}`);
     });
   }
 });
@@ -205,8 +233,7 @@ process.once("exit", () => clearRuntimeLock(runtimePidFile));
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isAutocomplete()) {
-      const privateChannelId = effectivePrivateRoomId();
-      if (!privateChannelId || interaction.channelId !== privateChannelId) {
+      if (!(await isConfiguredRoomId(interaction.channelId))) {
         await interaction.respond([]);
         return;
       }
@@ -219,6 +246,16 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      const ambientControl = parseAmbientCustomId(interaction.customId);
+      if (ambientControl && ambientControl.action !== "team-select") {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) return;
+        await handleAmbientButton(interaction, config, ambientControl.action, ambientControl.entityId);
+        return;
+      }
       const workspaceControl = parseWorkspaceControl(interaction.customId);
       if (workspaceControl) {
         if (!isAllowed(interaction, config)) {
@@ -267,6 +304,16 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isUserSelectMenu() || interaction.isStringSelectMenu()) {
+      const ambientControl = parseAmbientCustomId(interaction.customId);
+      if (ambientControl?.action === "team-select" && interaction.isStringSelectMenu()) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) return;
+        await handleAmbientTeamSelect(interaction, config, ambientControl.entityId);
+        return;
+      }
       const workspaceControl = parseWorkspaceControl(interaction.customId);
       if (workspaceControl?.action === "project" && interaction.isStringSelectMenu()) {
         if (!isAllowed(interaction, config)) {
@@ -296,6 +343,16 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isModalSubmit()) {
+      const ambientControl = parseAmbientCustomId(interaction.customId);
+      if (ambientControl?.action === "proposal-edit") {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) return;
+        await handleAmbientProposalEdit(interaction, config, ambientControl.entityId);
+        return;
+      }
       const workspaceModal = parseWorkspaceModal(interaction.customId);
       if (workspaceModal) {
         if (!isAllowed(interaction, config)) {
@@ -332,6 +389,17 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (interaction.isMessageContextMenuCommand()) {
+      if (interaction.commandName !== "Start Devbot workroom") return;
+      if (!isAllowed(interaction, config)) {
+        await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (!(await ensureConfiguredRoom(interaction))) return;
+      await handleAmbientContextMenu(interaction, config);
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) {
       return;
     }
@@ -362,7 +430,7 @@ client.on("interactionCreate", async (interaction) => {
 
     await handleCommand(interaction, config);
   } catch (error) {
-    console.error(error);
+    console.error(publicErrorMessage(error));
     await replyWithError(interaction, error);
   }
 });
@@ -383,41 +451,47 @@ client.on("messageCreate", async (message) => {
       message.mentions.users.has(client.user.id) ||
       botRoleMentionIds.length > 0 ||
       message.content.toLowerCase().includes(`@${client.user.username.toLowerCase()}`);
-    if (!mentionsBot) {
+    const threadTask = message.channel.type === ChannelType.PrivateThread
+      ? await taskStore.findByThread(message.channelId)
+      : undefined;
+    if (!mentionsBot && !threadTask) {
+      return;
+    }
+    if (!mentionsBot && threadTask && !message.content.trim()) {
+      return;
+    }
+    if (!isAllowedMessage(message, config)) {
       return;
     }
 
-    const privateChannelId = effectivePrivateRoomId();
-    if (!privateChannelId) {
+    if (!effectivePrivateRoomId() && Object.keys(setupStore.snapshot().projectRoomIds).length === 0) {
       await message.reply("Devbot setup is not ready. Ask the owner to run `/setup wizard`.");
       return;
     }
-    if (message.channelId !== privateChannelId) {
-      await message.reply("Devbot is configured for its private room.");
+    if (!(await isConfiguredRoomId(message.channelId))) {
+      if (effectivePrivateRoomId()) {
+        await message.author.send(`Use Devbot in its configured private room: <#${effectivePrivateRoomId()}>.`).catch(() => undefined);
+      }
       return;
     }
 
-    if (!isAllowedMessage(message, config)) {
-      await message.reply("You are not allowed to use this bot.");
-      return;
-    }
+    const mentionText = mentionsBot ? stripBotMention(message.content, client.user.id, botRoleMentionIds) : message.content.trim();
+    console.log(`Mention request from user ${message.author.id} in channel ${message.channelId} (${mentionText.length} characters).`);
 
-    const mentionText = stripBotMention(message.content, client.user.id, botRoleMentionIds);
-    console.log(
-      `Mention from ${message.author.tag}: content=${JSON.stringify(truncateForLog(message.content))} text=${JSON.stringify(
-        truncateForLog(mentionText)
-      )}`
-    );
-
+    const roomProject = await projectForConfiguredRoom(message.channelId, config);
     const statusProjectRequest = parseOptionalProjectToken(mentionText, config.projects);
+    if (roomProject && statusProjectRequest.project && statusProjectRequest.project.name !== roomProject.name) {
+      await message.reply(`This room is dedicated to \`${roomProject.name}\`. Use that project's room for \`${statusProjectRequest.project.name}\`.`);
+      return;
+    }
     if (statusProjectRequest.project && !isAllowedMessageForProject(message, statusProjectRequest.project)) {
       await message.reply(`You are not allowed to use project \`${statusProjectRequest.project.name}\` under its .devbot policy.`);
       return;
     }
-    const visibleProjects = config.projects.filter((project) => isAllowedMessageForProject(message, project));
+    const visibleProjects = (roomProject ? [roomProject] : config.projects).filter((project) => isAllowedMessageForProject(message, project));
     const preferredProjects = projectsWithUserPreference(visibleProjects, message.author.id);
-    const preferredProject = statusProjectRequest.project ?? defaultProjectIfAvailable(preferredProjects);
-    if (preferredProject && hasProjectAudienceRestriction(preferredProject)) {
+    const preferredProject = roomProject ?? statusProjectRequest.project ?? defaultProjectIfAvailable(preferredProjects);
+    if (preferredProject && hasProjectAudienceRestriction(preferredProject) && !roomProject) {
       await message.reply(
         "This project has a scoped audience, so I will not post its results from a channel mention. Open the workspace or use `/ask` for a private response."
       );
@@ -432,7 +506,13 @@ client.on("messageCreate", async (message) => {
     if (statusRequest.isStatus) {
       await message.channel.sendTyping();
       console.log(`Status request from ${message.author.tag}: image=${statusRequest.wantsImage} question=${Boolean(statusRequest.question)}`);
-      const snapshot = await getStatusSnapshotResponse(visibleConfig, statusRequest.wantsImage, preferredProject, statusRequest.question);
+      const snapshot = await getStatusSnapshotResponse(
+        visibleConfig,
+        statusRequest.wantsImage,
+        preferredProject,
+        statusRequest.question,
+        message.author.tag
+      );
       await replyToMessageWithChunks(message, snapshot);
 
       if (statusRequest.question) {
@@ -458,13 +538,17 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    if (request.mode === "action" && !isControllerUser(message.author.id, config)) {
-      await message.reply("You have view access, but only the owner or an approved controller can run write-capable work.");
-      return;
-    }
-
-    if (isWriteBlockedBySafeMode(config, request.mode)) {
-      await message.reply(safeModeActionMessage("explicit action mentions"));
+    const naturalIntent = classifyNaturalIntent(request.text);
+    if (request.mode === "action" || naturalIntent.kind === "proposed-action") {
+      await createAmbientProposalFromMessage({
+        message,
+        appConfig: config,
+        project: request.project,
+        text: request.text,
+        includePatterns: request.includePatterns,
+        source: threadTask ? `thread:${threadTask.id}` : "mention",
+        ...(threadTask ? { parentTaskId: threadTask.id } : {})
+      });
       return;
     }
 
@@ -481,11 +565,14 @@ client.on("messageCreate", async (message) => {
       includePatterns: request.includePatterns,
       mode: request.mode,
       requester: message.author.tag,
-      source: "mention"
+      requesterId: message.author.id,
+      channelId: message.channelId,
+      ...(threadTask ? { threadId: message.channelId, parentTaskId: threadTask.id } : {}),
+      source: threadTask ? `thread:${threadTask.id}` : "mention"
     });
   } catch (error) {
-    console.error(error);
-    await message.reply(`Error: ${(error as Error).message}`);
+    console.error(publicErrorMessage(error));
+    await message.reply(`Error: ${publicErrorMessage(error)}`);
   }
 });
 
@@ -522,7 +609,13 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     }
     await userPreferences.setSelectedProject(interaction.user.id, project.name);
     const visibleConfig = { ...appConfig, projects: [project] };
-    const snapshot = await getStatusSnapshotResponse(visibleConfig, interaction.options.getBoolean("image") ?? false, project, question);
+    const snapshot = await getStatusSnapshotResponse(
+      visibleConfig,
+      interaction.options.getBoolean("image") ?? false,
+      project,
+      question,
+      interaction.user.tag
+    );
     await editInteractionWithChunks(interaction, snapshot, privateReply);
 
     if (question) {
@@ -547,6 +640,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
+    const screenshotPolicy = screenshotPolicyMessage(project, interaction.user.tag);
+    if (screenshotPolicy) {
+      await interaction.editReply(screenshotPolicy);
+      return;
+    }
     const screenshot = await captureProjectScreenshot(project, { requestText: target, viewport: viewport ?? "desktop" });
     if (!screenshot) {
       await interaction.editReply(`I could not find a running local web UI to screenshot for \`${project.name}\`.`);
@@ -568,6 +666,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
 
   if (interaction.commandName === "dashboard") {
     await handleDashboardCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "inbox") {
+    await handleNeedsMeCommand(interaction, appConfig);
     return;
   }
 
@@ -597,8 +700,9 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
   }
 
   if (interaction.commandName === "refresh") {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!(await ensureProjectAccess(interaction, project))) return;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const fileCount = await contextService.refresh(project);
     await interaction.editReply(`Refreshed \`${project.name}\` with ${fileCount} indexed files.`);
     return;
@@ -767,9 +871,73 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
     return;
   }
 
+  if (subcommand === "project-room") {
+    const action = interaction.options.getString("action", true);
+    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (action === "remove") {
+      const previousRoomId = setupStore.snapshot().projectRoomIds[project.name];
+      await setupStore.unbindProjectRoom(project.name);
+      if (previousRoomId) verifiedProjectRoomAudiences.delete(previousRoomId);
+      await interaction.editReply(`Removed the ambient room binding for \`${project.name}\`.`);
+      return;
+    }
+
+    const selectedChannel = interaction.options.getChannel("channel") ?? interaction.channel;
+    const channel = selectedChannel?.id && interaction.guild
+      ? await interaction.guild.channels.fetch(selectedChannel.id).catch(() => null)
+      : null;
+    if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread)) {
+      await interaction.editReply("Choose a private server text channel or private thread for this project.");
+      return;
+    }
+    if (!(await verifyPrivateRoom(channel.id))) {
+      await interaction.editReply(
+        "That room is not private. Deny `View Channel` to `@everyone`, or choose a private thread, then bind it again."
+      );
+      return;
+    }
+    const audienceProblem = await projectRoomAudienceProblem(channel, project, appConfig);
+    if (audienceProblem) {
+      await interaction.editReply(audienceProblem);
+      return;
+    }
+    await setupStore.bindProjectRoom(project.name, channel.id);
+    verifiedProjectRoomAudiences.set(channel.id, Date.now());
+    await interaction.editReply(`Bound \`${project.name}\` to its ambient room: <#${channel.id}>.`);
+    return;
+  }
+
   const channel = await createOrSyncPrivateRoom(interaction, appConfig, interaction.options.getString("name") ?? undefined);
   await ensureWorkspaceLauncher(appConfig);
   await interaction.editReply(`Private Devbot room ready: <#${channel.id}>.`);
+}
+
+async function projectRoomAudienceProblem(
+  channel: GuildTextBasedChannel,
+  project: ProjectEntry,
+  appConfig: AppConfig
+): Promise<string | undefined> {
+  const guildMembers = await channel.guild.members.fetch();
+  const visibleIds = channel.type === ChannelType.PrivateThread
+    ? new Set((await channel.members.fetch()).map((member) => member.id))
+    : new Set(
+        [...guildMembers.values()]
+          .filter((member) => channel.permissionsFor(member).has(PermissionFlagsBits.ViewChannel))
+          .map((member) => member.id)
+      );
+  const unauthorized = [...visibleIds].flatMap((memberId) => {
+    const member = guildMembers.get(memberId);
+    if (!member) return [memberId];
+    if (member.user.bot) {
+      return member.id === client.user?.id || (appConfig.peerBotIds.has(member.id) && isPeerAllowedForProject(project, member.id))
+        ? []
+        : [member.id];
+    }
+    return isAllowedGuildMember(member, appConfig) && isAllowedGuildMemberForProject(member, project) ? [] : [member.id];
+  });
+  if (unauthorized.length === 0) return undefined;
+  const examples = unauthorized.slice(0, 3).map((id) => `<@${id}>`).join(", ");
+  return `That room is private, but its visible audience exceeds the Devbot and project allowlists (${examples}${unauthorized.length > 3 ? ", ..." : ""}). Tighten the Discord permissions before binding it.`;
 }
 
 async function handleSetupWizardButton(
@@ -999,12 +1167,18 @@ function roomPermissionOverwrites(everyoneRoleId: string, state: SetupState, app
   const humanAllow = [
     PermissionFlagsBits.ViewChannel,
     PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.SendMessagesInThreads,
     PermissionFlagsBits.ReadMessageHistory,
     PermissionFlagsBits.UseApplicationCommands,
     PermissionFlagsBits.AttachFiles,
     PermissionFlagsBits.EmbedLinks
   ];
-  const peerAllow = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory];
+  const peerAllow = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.SendMessagesInThreads,
+    PermissionFlagsBits.ReadMessageHistory
+  ];
   const overwrites = [
     { id: everyoneRoleId, deny: [PermissionFlagsBits.ViewChannel] },
     ...[...humans].map((id) => ({ id, allow: humanAllow })),
@@ -1016,6 +1190,7 @@ function roomPermissionOverwrites(everyoneRoleId: string, state: SetupState, app
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.SendMessagesInThreads,
         PermissionFlagsBits.ReadMessageHistory,
         PermissionFlagsBits.ManageChannels,
         PermissionFlagsBits.ManageThreads,
@@ -1030,6 +1205,9 @@ function formatSetupSummary(state: SetupState, appConfig: AppConfig): string {
   const repositories = appConfig.projects.length
     ? appConfig.projects.map((project) => `- \`${project.name}\`${project.isDefault ? " (default)" : ""}: \`${project.root}\``).join("\n")
     : "- none";
+  const projectRooms = Object.entries(state.projectRoomIds).length
+    ? Object.entries(state.projectRoomIds).map(([projectName, roomId]) => `- \`${projectName}\`: <#${roomId}>`).join("\n")
+    : "- none";
   return [
     "Devbot owner setup",
     `Owner: <@${appConfig.ownerUserId}>`,
@@ -1040,7 +1218,10 @@ function formatSetupSummary(state: SetupState, appConfig: AppConfig): string {
     `Bootstrap user IDs still active: ${bootstrapConfig.allowedUserIds.size}`,
     "",
     "Project roots:",
-    repositories
+    repositories,
+    "",
+    "Project rooms:",
+    projectRooms
   ].join("\n");
 }
 
@@ -1103,6 +1284,15 @@ interface ProjectRequestOptions {
   contextCharLimit?: number;
   parentTaskId?: string;
   dedupeKey?: string;
+  existingTaskId?: string;
+  requesterId?: string;
+  accessScope?: "project" | "workroom";
+  internal?: boolean;
+  channelId?: string;
+  threadId?: string;
+  agentRoles?: AmbientRole[];
+  displayText?: string;
+  signal?: AbortSignal;
   onProgress?: (progress: TaskProgressEvent) => Promise<void>;
 }
 
@@ -1118,30 +1308,89 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     throw new Error(safeModeActionMessage(options.source));
   }
 
-  const task = await taskStore.start({
-    source: options.source,
-    mode: options.mode,
-    projectName: options.project.name,
-    requester: options.requester,
-    text: options.text,
-    includePatterns: options.includePatterns,
-    ...(options.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
-    ...(options.dedupeKey ? { dedupeKey: options.dedupeKey } : {})
-  });
-  const work = workTracker.start({
-    mode: options.mode,
-    projectName: options.project.name,
-    requester: options.requester,
-    text: options.text,
-    taskId: task.id
-  });
+  const task = options.existingTaskId
+    ? await requireRunningTask(options.existingTaskId, options.project.name)
+    : await taskStore.start({
+        source: options.source,
+        mode: options.mode,
+        projectName: options.project.name,
+        requester: options.requester,
+        text: options.text,
+        includePatterns: options.includePatterns,
+        ...(options.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
+        ...(options.dedupeKey ? { dedupeKey: options.dedupeKey } : {}),
+        ...(options.requesterId ? { requesterId: options.requesterId } : {}),
+        ...(options.accessScope ? { accessScope: options.accessScope } : {}),
+        ...(options.internal ? { internal: true } : {}),
+        ...(options.channelId ? { channelId: options.channelId } : {}),
+        ...(options.threadId ? { threadId: options.threadId } : {}),
+        ...(options.agentRoles?.length ? { agentRoles: options.agentRoles } : {})
+      });
   const controller = new AbortController();
+  const abortFromParent = (): void => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) abortFromParent();
+  else options.signal?.addEventListener("abort", abortFromParent, { once: true });
   activeTaskControllers.set(task.id, controller);
+  const releaseController = (): void => {
+    activeTaskControllers.delete(task.id);
+    options.signal?.removeEventListener("abort", abortFromParent);
+  };
+  let executionProject = options.project;
+  let isolatedWorktree: TaskWorktree | undefined;
+  try {
+    await ensureRequestStillActive();
+    if (options.mode === "action") {
+      const isolated = await createTaskWorktree({
+        sourcePath: options.project.root,
+        taskName: task.id,
+        baseRef: "HEAD"
+      });
+      await ensureRequestStillActive();
+      if (isolated.available) {
+        isolatedWorktree = isolated.worktree;
+        executionProject = { ...options.project, root: isolated.worktree.path };
+        contextService.invalidate(options.project.name);
+        await taskStore.setWorkspace(task.id, {
+          workspacePath: isolated.worktree.path,
+          branchName: isolated.worktree.branch,
+          baseBranch: isolated.worktree.baseRevision,
+          isolated: true
+        });
+        await ensureRequestStillActive();
+      } else {
+        await taskStore.setWorkspace(task.id, {
+          workspacePath: options.project.root,
+          baseBranch: options.project.metadata.defaultBranch ?? "HEAD",
+          isolated: false
+        });
+        const isolationError = new Error(`Action stopped before write access because branch isolation is unavailable: ${isolated.message}`);
+        await taskStore.setEvidence(task.id, {
+          verification: [`Branch isolation unavailable: ${isolated.message}`, "No source-checkout changes were allowed."]
+        });
+        await taskStore.fail(task.id, isolationError);
+        throw isolationError;
+      }
+    }
+  } catch (error) {
+    if (controller.signal.aborted) await taskStore.cancel(task.id, "Canceled by user request.");
+    else await taskStore.fail(task.id, error);
+    releaseController();
+    throw error;
+  }
+  const work = options.internal
+    ? undefined
+    : workTracker.start({
+        mode: options.mode,
+        projectName: options.project.name,
+        requester: options.requester,
+        text: options.displayText ?? options.text,
+        taskId: task.id
+      });
   const progressBase = {
     taskId: task.id,
     projectName: options.project.name,
     mode: options.mode,
-    text: options.text,
+    text: options.displayText ?? options.text,
     requester: options.requester,
     startedAt: task.startedAt
   };
@@ -1155,12 +1404,12 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       text: options.text,
       mode: options.mode,
       projectName: options.project.name,
-      projectRoot: options.project.root,
+      projectRoot: executionProject.root,
       hasExplicitIncludes: options.includePatterns.length > 0,
       signal: controller.signal
     });
     selectedRoute = route;
-    workTracker.update(work.id, {
+    if (work) workTracker.update(work.id, {
       phase: "gathering-context",
       modelTier: route.tier,
       contextMode: route.contextMode
@@ -1170,13 +1419,13 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       route,
       options.appConfig.scanner.maxPackedContextChars,
       options.appConfig.routing.focusedContextChars,
-      options.project.metadata.policy.maxContextChars,
+      executionProject.metadata.policy.maxContextChars,
       options.contextCharLimit
     );
     const context = contextCharLimit === 0
-      ? { project: options.project, files: [], packedText: "" }
-      : await contextService.pack(options.project, options.text, options.includePatterns, contextCharLimit);
-    workTracker.update(work.id, {
+      ? { project: executionProject, files: [], packedText: "" }
+      : await contextService.pack(executionProject, options.text, options.includePatterns, contextCharLimit);
+    if (work) workTracker.update(work.id, {
       phase: "running-codex",
       contextFileCount: context.files.length
     });
@@ -1187,6 +1436,9 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       contextFileCount: context.files.length
     });
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
+    if (isolatedWorktree) {
+      await recordTaskWorktreeEvidence(task.id, isolatedWorktree);
+    }
     const completed = await taskStore.succeed(task.id, {
       contextFileCount: context.files.length,
       resultPreview: answer,
@@ -1205,6 +1457,9 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     }
     return { answer, context, taskId: task.id, route };
   } catch (error) {
+    if (isolatedWorktree) {
+      await recordTaskWorktreeEvidence(task.id, isolatedWorktree, false).catch(() => undefined);
+    }
     if (controller.signal.aborted) {
       await taskStore.cancel(task.id, "Canceled by user request.");
       await reportTaskProgress(options, {
@@ -1219,14 +1474,67 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
         ...progressBase,
         phase: "failed",
         ...(selectedRoute ? { route: selectedRoute } : {}),
-        error: error instanceof Error ? error.message : String(error)
+        error: publicErrorMessage(error)
       });
     }
     throw error;
   } finally {
-    activeTaskControllers.delete(task.id);
-    workTracker.finish(work.id);
+    if (options.mode === "action") {
+      contextService.invalidate(options.project.name);
+    }
+    releaseController();
+    if (work) workTracker.finish(work.id);
   }
+
+  async function ensureRequestStillActive(): Promise<void> {
+    const current = await taskStore.get(task.id);
+    if (controller.signal.aborted || current?.status !== "running") {
+      throw new Error(current?.error ?? "Canceled by user request.");
+    }
+  }
+}
+
+async function requireRunningTask(taskId: string, projectName: string): Promise<TaskRecord> {
+  const task = await taskStore.get(taskId);
+  if (!task || task.status !== "running" || task.projectName !== projectName) {
+    throw new Error("The approved task is no longer available to run.");
+  }
+  return task;
+}
+
+async function recordTaskWorktreeEvidence(
+  taskId: string,
+  worktree: TaskWorktree,
+  completed = true
+): Promise<void> {
+  const inspection = await inspectTaskWorktree(worktree);
+  if (!inspection.available) {
+    await taskStore.setEvidence(taskId, {
+      verification: [`Isolated branch created, but evidence collection failed: ${inspection.message}`]
+    });
+    return;
+  }
+
+  const changedFiles = [...new Set(inspection.changes.map((change) => change.path))];
+  const verification = [
+    `Work isolated on branch ${worktree.branch}.`,
+    inspection.diff.truncated
+      ? "Git diff inspection exceeded 100 KB; only changed-file status was retained."
+      : "Inspected staged and unstaged Git diff without storing patch contents.",
+    "No configured validation command was run automatically."
+  ];
+  if (completed && changedFiles.length > 0) {
+    verification.push("Changes were left uncommitted on the isolated branch for human review.");
+  } else if (changedFiles.length === 0) {
+    verification.push("The action completed without file changes.");
+  } else {
+    verification.push("Partial changes were preserved without an automatic commit because the task did not complete.");
+  }
+  await taskStore.setEvidence(taskId, {
+    changedFiles,
+    diffStat: `${changedFiles.length} changed ${changedFiles.length === 1 ? "file" : "files"}`,
+    verification
+  });
 }
 
 async function reportTaskProgress(options: ProjectRequestOptions, progress: TaskProgressEvent): Promise<void> {
@@ -1236,7 +1544,7 @@ async function reportTaskProgress(options: ProjectRequestOptions, progress: Task
   try {
     await options.onProgress(progress);
   } catch (error) {
-    console.warn(`Unable to update Discord task progress for ${progress.taskId}: ${(error as Error).message}`);
+    console.warn(`Unable to update Discord task progress for ${progress.taskId}: ${publicErrorMessage(error)}`);
   }
 }
 
@@ -1277,7 +1585,7 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
     if (!progressRendered) {
       throw error;
     }
-    console.error(error);
+    console.error(publicErrorMessage(error));
   }
 }
 
@@ -1312,12 +1620,695 @@ async function executeMessageRequest(options: MessageRequestOptions): Promise<vo
     if (!progressRendered) {
       throw error;
     }
-    console.error(error);
+    console.error(publicErrorMessage(error));
   }
 }
 
 function taskStatusForProgress(progress: TaskProgressEvent): TaskStatus {
   return progress.phase === "failed" ? "failed" : progress.phase === "canceled" ? "canceled" : "running";
+}
+
+interface AmbientProposalRequest {
+  appConfig: AppConfig;
+  project: ProjectEntry;
+  text: string;
+  includePatterns: string[];
+  requester: string;
+  requesterId: string;
+  channelId: string;
+  channel: unknown;
+  source: string;
+  parentTaskId?: string;
+}
+
+async function createAmbientProposalFromMessage(
+  input: Omit<AmbientProposalRequest, "requester" | "requesterId" | "channelId" | "channel"> & { message: Message }
+): Promise<void> {
+  const result = await createAmbientProposal({
+    ...input,
+    requester: input.message.author.tag,
+    requesterId: input.message.author.id,
+    channelId: input.message.channelId,
+    channel: input.message.channel
+  });
+  if (result.threadId && result.threadId !== input.message.channelId) {
+    await input.message.reply({
+      content: `I opened a private workroom for this proposal: <#${result.threadId}>.`,
+      allowedMentions: { parse: [] }
+    });
+  }
+}
+
+async function createAmbientProposal(input: AmbientProposalRequest): Promise<TaskRecord> {
+  await userPreferences.setSelectedProject(input.requesterId, input.project.name);
+  const task = await taskStore.propose({
+    source: input.source,
+    mode: "action",
+    projectName: input.project.name,
+    requester: input.requester,
+    requesterId: input.requesterId,
+    accessScope: "workroom",
+    channelId: input.channelId,
+    text: input.text,
+    includePatterns: input.includePatterns,
+    agentRoles: ["builder", "reviewer", "verifier"],
+    ...(input.parentTaskId ? { parentTaskId: input.parentTaskId } : {})
+  });
+  const currentThread = input.parentTaskId && input.channelId
+    ? await taskStore.findByThread(input.channelId)
+    : undefined;
+  const thread = currentThread
+    ? input.channel
+    : await createAmbientTaskThread(input.channel, task, input.project, input.appConfig, input.requesterId);
+  if (!thread && hasProjectAudienceRestriction(input.project)) {
+    await taskStore.deny(task.id, "Devbot privacy guard");
+    throw new Error("Devbot could not create a private task thread, so the scoped project proposal was not published.");
+  }
+  const target = thread ?? input.channel;
+  let sent: { id?: string } | undefined;
+  try {
+    sent = (await sendToTextChannel(target, proposalCardForTask(task))) as { id?: string } | undefined;
+  } catch (error) {
+    await taskStore.deny(task.id, "Devbot delivery guard");
+    if (thread && !currentThread) {
+      await (thread as { delete?: (reason?: string) => Promise<unknown> }).delete?.("Unable to publish the Devbot proposal").catch(() => undefined);
+    }
+    throw error;
+  }
+  const threadId = (thread as { id?: string } | undefined)?.id;
+  await taskStore.setDiscordContext(task.id, {
+    ...(threadId ? { threadId } : {}),
+    ...(sent?.id ? { controlMessageId: sent.id } : {})
+  });
+  return (await taskStore.get(task.id)) ?? task;
+}
+
+async function createAmbientTaskThread(
+  channel: unknown,
+  task: TaskRecord,
+  project: ProjectEntry,
+  appConfig: AppConfig,
+  requesterId: string
+): Promise<unknown | undefined> {
+  const source = channel as {
+    type?: ChannelType;
+    parent?: unknown;
+    threads?: {
+      create?: (options: {
+        name: string;
+        type: ChannelType.PrivateThread;
+        invitable: false;
+        autoArchiveDuration: ThreadAutoArchiveDuration;
+        reason: string;
+      }) => Promise<{
+        id: string;
+        members?: { add?: (id: string) => Promise<unknown> };
+        delete?: (reason?: string) => Promise<unknown>;
+      }>;
+    };
+  };
+  const parent = source.type === ChannelType.PrivateThread ? source.parent : source;
+  const threaded = parent as typeof source;
+  if (!threaded?.threads?.create) return undefined;
+
+  let thread: {
+    id: string;
+    members?: { add?: (id: string) => Promise<unknown> };
+    delete?: (reason?: string) => Promise<unknown>;
+  } | undefined;
+  try {
+    const audience = await resolveAmbientThreadAudience(parent, project, appConfig, requesterId);
+    if (audience.controllerIds.size === 0) {
+      throw new Error("No project-authorized controller is available for this workroom.");
+    }
+    thread = await threaded.threads.create({
+      name: ambientThreadName(task, project),
+      type: ChannelType.PrivateThread,
+      invitable: false,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      reason: `Private Devbot task workroom requested by ${task.requester}`
+    });
+    if (!thread.members?.add) throw new Error("Private thread membership is unavailable.");
+    await thread.members.add(requesterId);
+    let controllerAdded = audience.controllerIds.has(requesterId);
+    for (const controllerId of audience.controllerIds) {
+      if (controllerId === requesterId) continue;
+      try {
+        await thread.members.add(controllerId);
+        controllerAdded = true;
+      } catch (error) {
+        console.warn(`Unable to add controller ${controllerId} to task workroom ${thread.id}: ${publicErrorMessage(error)}`);
+      }
+    }
+    if (!controllerAdded) {
+      throw new Error("No project-authorized controller could be added to the private workroom.");
+    }
+    const threadId = thread.id;
+    for (const memberId of audience.memberIds) {
+      if (memberId === requesterId || audience.controllerIds.has(memberId)) continue;
+      await thread.members.add(memberId).catch((error) => {
+        console.warn(`Unable to add ${memberId} to task workroom ${threadId}: ${publicErrorMessage(error)}`);
+      });
+    }
+    return thread;
+  } catch (error) {
+    await thread?.delete?.("Unable to establish the required private workroom audience").catch(() => undefined);
+    console.warn(`Unable to create a private task thread for ${task.id}: ${publicErrorMessage(error)}`);
+    return undefined;
+  }
+}
+
+async function resolveAmbientThreadAudience(
+  channel: unknown,
+  project: ProjectEntry,
+  appConfig: AppConfig,
+  requesterId: string
+): Promise<{ memberIds: Set<string>; controllerIds: Set<string> }> {
+  const guild = (channel as GuildTextBasedChannel | undefined)?.guild;
+  if (!guild) {
+    throw new Error("A server guild is required to resolve private workroom membership.");
+  }
+  const guildMembers = await guild.members.fetch();
+  const memberIds = new Set<string>([requesterId]);
+  const controllerIds = new Set<string>();
+  for (const member of guildMembers.values()) {
+    if (member.user.bot || !isAllowedGuildMember(member, appConfig) || !isAllowedGuildMemberForProject(member, project)) {
+      continue;
+    }
+    memberIds.add(member.id);
+    if (isControllerUser(member.id, appConfig)) controllerIds.add(member.id);
+  }
+  for (const botId of appConfig.peerBotIds) {
+    if (isPeerAllowedForProject(project, botId)) memberIds.add(botId);
+  }
+  return { memberIds, controllerIds };
+}
+
+function isAllowedGuildMember(member: GuildMember, appConfig: AppConfig): boolean {
+  if (isOwner(member.id, appConfig)) return true;
+  const hasAllowList = appConfig.allowedUserIds.size > 0 || appConfig.allowedUsernames.size > 0 || appConfig.allowedRoleIds.size > 0;
+  if (!hasAllowList) return true;
+  return appConfig.allowedUserIds.has(member.id)
+    || isApprovedDiscordUsername({
+      username: member.user.username,
+      globalName: member.user.globalName,
+      tag: member.user.tag,
+      displayName: member.displayName
+    }, appConfig.allowedUsernames)
+    || member.roles.cache.some((role) => appConfig.allowedRoleIds.has(role.id));
+}
+
+function isAllowedGuildMemberForProject(member: GuildMember, project: ProjectEntry): boolean {
+  const policy = project.metadata.policy;
+  const hasAllowList = policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
+  if (!hasAllowList) return true;
+  return policy.allowedUsers.includes(member.id)
+    || isApprovedDiscordUsername({
+      username: member.user.username,
+      globalName: member.user.globalName,
+      tag: member.user.tag,
+      displayName: member.displayName
+    }, policy.allowedUsernames)
+    || member.roles.cache.some((role) => policy.allowedRoles.includes(role.id));
+}
+
+function ambientThreadName(task: TaskRecord, project: ProjectEntry): string {
+  const summary = task.text.replace(/[`*_~|>#[\]\n\r]/g, " ").replace(/\s+/g, " ").trim().slice(0, 62);
+  const suffix = task.id.split("-").at(-1) ?? task.id;
+  return `${project.name} | ${summary || "task"} | ${suffix}`.slice(0, 100);
+}
+
+function proposalCardForTask(task: TaskRecord) {
+  const intent = classifyNaturalIntent(task.text);
+  return confirmToActProposalCard({
+    proposalId: proposalEntityId(task.id, task.proposalRevision ?? 1),
+    project: task.projectName,
+    title: intent.summary.replace(/^Proposed action:\s*/i, "") || "Proposed project change",
+    proposal: task.text,
+    rationale: `Devbot read this as a ${intent.risk}-risk project change. Nothing will be edited until a controller approves it.`,
+    scope: task.includePatterns.length ? task.includePatterns : ["Selected project only", "Dedicated task branch"],
+    requestedBy: task.requester,
+    selectedRoles: ambientRolesForTask(task),
+    disabled: task.status !== "awaiting-approval"
+  });
+}
+
+async function handleAmbientContextMenu(
+  interaction: MessageContextMenuCommandInteraction,
+  appConfig: AppConfig
+): Promise<void> {
+  const project = (await projectForConfiguredRoom(interaction.channelId, appConfig))
+    ?? preferredProjectForInteraction(appConfig, interaction);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "No configured project is available to you in this room.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const text = interaction.targetMessage.content.trim();
+  if (!text) {
+    await interaction.reply({ content: "That message has no text to turn into a workroom proposal.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const parentTask = await taskStore.findByThread(interaction.channelId);
+  const task = await createAmbientProposal({
+    appConfig,
+    project,
+    text,
+    includePatterns: [],
+    requester: interaction.user.tag,
+    requesterId: interaction.user.id,
+    channelId: interaction.channelId,
+    channel: interaction.channel,
+    source: "context-menu",
+    ...(parentTask ? { parentTaskId: parentTask.id } : {})
+  });
+  await userPreferences.setSelectedProject(interaction.user.id, project.name);
+  await interaction.editReply(
+    task.threadId ? `Private workroom ready: <#${task.threadId}>.` : `Proposal \`${task.id}\` is ready in this room.`
+  );
+}
+
+async function handleAmbientButton(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: AmbientAction,
+  entityId: string
+): Promise<void> {
+  if (action === "inbox-refresh") {
+    await interaction.deferUpdate();
+    await interaction.editReply(await needsMePayload(interaction, appConfig));
+    return;
+  }
+  const proposalReference = parseProposalEntityId(entityId);
+  const task = await taskStore.get(proposalReference?.taskId ?? entityId);
+  if (!task) {
+    await interaction.reply({ content: "That task is no longer available.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, task.projectName);
+  if (!project || !canAccessTask(interaction, task, appConfig)) {
+    await interaction.reply({ content: "That task's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (action.startsWith("proposal-") && proposalReference?.revision !== task.proposalRevision) {
+    await interaction.reply({
+      content: "This proposal changed after these controls were rendered. Reopen the latest proposal before deciding.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (action === "proposal-edit") {
+    if (!canManageProposal(interaction.user.id, task, appConfig)) {
+      await interaction.reply({ content: "Only the requester or a controller can edit this proposal.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.showModal(proposalEditModal(entityId, task.text));
+    return;
+  }
+  if (action === "proposal-decline") {
+    if (!canManageProposal(interaction.user.id, task, appConfig)) {
+      await interaction.reply({ content: "Only the requester or a controller can decline this proposal.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferUpdate();
+    const denied = await taskStore.deny(task.id, interaction.user.tag, proposalReference?.revision);
+    if (!denied) {
+      await interaction.followUp({ content: `This proposal is already ${task.status}.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.editReply(proofFirstCompletionCard({
+      taskId: task.id,
+      project: task.projectName,
+      title: "Proposal declined",
+      summary: `No project work was started. Declined by ${interaction.user.tag}.`,
+      proof: [{ label: "Safety boundary", detail: "The proposal was closed before Codex received write access.", status: "info" }],
+      showProofButton: false
+    }));
+    return;
+  }
+  if (action === "proposal-confirm") {
+    if (!isControllerUser(interaction.user.id, appConfig)) {
+      await interaction.reply({ content: "Only the owner or an approved controller can approve write-capable work.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (isWriteBlockedBySafeMode(appConfig, "action")) {
+      await interaction.reply({ content: safeModeActionMessage("this proposal"), flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await executeApprovedAmbientTask(interaction, appConfig, task, project, "action", proposalReference?.revision);
+    return;
+  }
+  if (action === "proposal-readonly") {
+    if (!canManageProposal(interaction.user.id, task, appConfig)) {
+      await interaction.reply({ content: "Only the requester or a controller can choose how this proposal proceeds.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await executeApprovedAmbientTask(interaction, appConfig, task, project, "answer", proposalReference?.revision);
+    return;
+  }
+  if (action === "progress-cancel") {
+    if (!isControllerUser(interaction.user.id, appConfig)) {
+      await interaction.reply({ content: "Only the owner or an approved controller can cancel work.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const canceled = await taskStore.cancel(task.id, `Canceled by ${interaction.user.tag}.`);
+    activeTaskControllers.get(task.id)?.abort();
+    await interaction.editReply(
+      canceled?.status === "canceled" ? "Task canceled. Its isolated workspace was preserved." : `This task is already ${canceled?.status ?? "unavailable"}.`
+    );
+    return;
+  }
+  if (action === "completion-proof") {
+    await interaction.reply({ content: formatTaskDetail(task), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (action === "completion-reviewed") {
+    if (!taskNeedsUser(task, interaction.user.id, appConfig)) {
+      await interaction.reply({ content: "Only the requester or a controller can close this review item.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await taskStore.markReviewed(task.id);
+    await interaction.editReply("Marked reviewed and removed from Needs Me.");
+    return;
+  }
+  if (action === "inbox-open") {
+    await interaction.reply({
+      content: [task.threadId ? `Workroom: <#${task.threadId}>` : undefined, formatTaskDetail(task)].filter(Boolean).join("\n\n"),
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] }
+    });
+  }
+}
+
+async function handleAmbientTeamSelect(
+  interaction: StringSelectMenuInteraction,
+  appConfig: AppConfig,
+  entityId: string
+): Promise<void> {
+  const proposalReference = parseProposalEntityId(entityId);
+  const task = await taskStore.get(proposalReference?.taskId ?? entityId);
+  const roles = parseAmbientRoleSelection(interaction.values);
+  if (!task || !roles || task.status !== "awaiting-approval" || proposalReference?.revision !== task.proposalRevision) {
+    await interaction.reply({ content: "That proposal or team selection is no longer available.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, task.projectName);
+  if (!project || !canAccessTask(interaction, task, appConfig) || !canManageProposal(interaction.user.id, task, appConfig)) {
+    await interaction.reply({ content: "You cannot change this proposal's team.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferUpdate();
+  const updated = await taskStore.updateProposal(task.id, {
+    agentRoles: roles,
+    ...(proposalReference ? { expectedRevision: proposalReference.revision } : {})
+  });
+  if (!updated) {
+    await interaction.followUp({ content: "That proposal changed before the team update was saved.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.editReply(proposalCardForTask(updated));
+}
+
+async function handleAmbientProposalEdit(
+  interaction: ModalSubmitInteraction,
+  appConfig: AppConfig,
+  entityId: string
+): Promise<void> {
+  const proposalReference = parseProposalEntityId(entityId);
+  const task = await taskStore.get(proposalReference?.taskId ?? entityId);
+  if (
+    !task
+    || task.status !== "awaiting-approval"
+    || proposalReference?.revision !== task.proposalRevision
+    || !canManageProposal(interaction.user.id, task, appConfig)
+  ) {
+    await interaction.reply({ content: "That proposal can no longer be edited.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, task.projectName);
+  if (!project || !canAccessTask(interaction, task, appConfig)) {
+    await interaction.reply({ content: "That task's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferUpdate();
+  const updated = await taskStore.updateProposal(task.id, {
+    text: interaction.fields.getTextInputValue("request").trim(),
+    ...(proposalReference ? { expectedRevision: proposalReference.revision } : {})
+  });
+  if (!updated) {
+    await interaction.followUp({ content: "That proposal changed before the edit was saved.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.editReply(proposalCardForTask(updated));
+}
+
+async function executeApprovedAmbientTask(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  task: TaskRecord,
+  project: ProjectEntry,
+  mode: CodexRequestMode,
+  expectedRevision: number | undefined
+): Promise<void> {
+  await interaction.deferUpdate();
+  const started = await taskStore.begin(task.id, {
+    mode,
+    actor: interaction.user.tag,
+    ...(expectedRevision !== undefined ? { expectedRevision } : {})
+  });
+  if (!started) {
+    await interaction.followUp({
+      content: "This proposal changed or was already handled. Review the latest revision before trying again.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  await interaction.editReply(progressCard({
+    taskId: task.id,
+    project: project.name,
+    title: task.text,
+    phase: mode === "action" ? "Assembling workroom" : "Reading project",
+    detail: mode === "action"
+      ? `${ambientRolesForTask(started).map(agentRole).join(", ") || "Devbot"} ${ambientRolesForTask(started).length === 1 ? "is" : "are"} preparing a shared brief.`
+      : "Devbot is keeping this request read-only.",
+    roles: mode === "action" ? ambientRolesForTask(started) : [],
+    percent: 5,
+    canCancel: mode === "action"
+  }));
+
+  const workroomController = new AbortController();
+  activeTaskControllers.set(started.id, workroomController);
+  try {
+    const preflight = mode === "action"
+      ? await runAgentWorkroomPreflight(started, project, appConfig, workroomController.signal)
+      : [];
+    const current = await taskStore.get(started.id);
+    if (workroomController.signal.aborted || current?.status !== "running") {
+      throw new Error(current?.error ?? "Canceled by user request.");
+    }
+    const executionText = preflight.length ? ambientExecutionPrompt(started.text, preflight) : started.text;
+    const result = await runProjectRequest({
+      appConfig,
+      project,
+      text: executionText,
+      displayText: started.text,
+      includePatterns: started.includePatterns,
+      mode,
+      requester: started.requester,
+      ...(started.requesterId ? { requesterId: started.requesterId } : {}),
+      ...(started.channelId ? { channelId: started.channelId } : {}),
+      ...(started.threadId ? { threadId: started.threadId } : {}),
+      source: `ambient:${started.source}`,
+      existingTaskId: started.id,
+      agentRoles: ambientRolesForTask(started),
+      signal: workroomController.signal,
+      onProgress: async (progress) => {
+        await interaction.editReply(progressCardForEvent(progress, started));
+      }
+    });
+    const completed = (await taskStore.get(started.id)) ?? started;
+    await interaction.editReply(completionCardForTask(completed, result.answer, result.route));
+  } catch (error) {
+    const failed = (await taskStore.get(started.id)) ?? started;
+    const canceled = failed.status === "canceled";
+    await interaction.editReply(progressCard({
+      taskId: failed.id,
+      project: failed.projectName,
+      title: failed.text,
+      phase: canceled ? "Canceled" : "Needs attention",
+      detail: canceled
+        ? "The task was canceled. Its isolated workspace and any partial evidence were preserved."
+        : "The task stopped before completion. Its branch and any partial evidence were preserved.",
+      ...(!canceled ? { blocker: error instanceof Error ? error.message : String(error) } : {}),
+      roles: ambientRolesForTask(failed),
+      percent: 100,
+      canCancel: false
+    }));
+  } finally {
+    if (activeTaskControllers.get(started.id) === workroomController) {
+      activeTaskControllers.delete(started.id);
+    }
+  }
+}
+
+async function runAgentWorkroomPreflight(
+  task: TaskRecord,
+  project: ProjectEntry,
+  appConfig: AppConfig,
+  signal: AbortSignal
+): Promise<Array<{ role: AmbientRole; answer: string }>> {
+  const roles = ambientRolesForTask(task);
+  const results = await Promise.allSettled(
+    roles.map(async (role) => {
+      const result = await runProjectRequest({
+        appConfig,
+        project,
+        text: buildAgentPrompt(task.text, agentRole(role)),
+        includePatterns: task.includePatterns,
+        mode: "answer",
+        requester: `${task.requester} (${role})`,
+        ...(task.requesterId ? { requesterId: task.requesterId } : {}),
+        accessScope: "workroom",
+        internal: true,
+        source: `workroom:agent:${role}`,
+        parentTaskId: task.id,
+        signal
+      });
+      return { role, answer: result.answer };
+    })
+  );
+  return results.flatMap((result, index) => {
+    if (result.status === "fulfilled") return [result.value];
+    const role = roles[index];
+    return role ? [{ role, answer: `This seat was unavailable: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}` }] : [];
+  });
+}
+
+function ambientExecutionPrompt(request: string, contributions: Array<{ role: AmbientRole; answer: string }>): string {
+  return [
+    "Implement the approved developer request below.",
+    "Use the workroom contributions as advisory context, verify their claims against the repository, and keep the final scope focused.",
+    "",
+    "Approved request:",
+    request,
+    "",
+    "Workroom contributions:",
+    ...contributions.map(({ role, answer }) => `\n[${role.toUpperCase()}]\n${answer.slice(0, 4_000)}`)
+  ].join("\n");
+}
+
+function progressCardForEvent(progress: TaskProgressEvent, task: TaskRecord) {
+  const details: Record<TaskProgressEvent["phase"], { phase: string; detail: string; percent: number }> = {
+    routing: { phase: "Choosing an approach", detail: "Selecting Luna, Terra, or Sol and the right amount of project context.", percent: 15 },
+    "gathering-context": { phase: "Reading the project", detail: "Gathering the repository context needed for this task.", percent: 35 },
+    "running-codex": { phase: "Working", detail: "The approved task is running in its dedicated workspace.", percent: 60 },
+    failed: { phase: "Needs attention", detail: "The task failed before completion.", percent: 100 },
+    canceled: { phase: "Canceled", detail: "The task was canceled before completion.", percent: 100 }
+  };
+  const current = details[progress.phase];
+  return progressCard({
+    taskId: progress.taskId,
+    project: progress.projectName,
+    title: task.text,
+    phase: current.phase,
+    detail: current.detail,
+    ...(progress.error ? { blocker: progress.error } : {}),
+    roles: ambientRolesForTask(task),
+    percent: current.percent,
+    canCancel: progress.phase !== "failed" && progress.phase !== "canceled"
+  });
+}
+
+function completionCardForTask(task: TaskRecord, answer: string, route: RequestRoute) {
+  const proof = [
+    ...(task.verification ?? []).map((detail) => ({
+      label: proofStatusForEvidence(detail) === "failed" ? "Attention" : "Recorded evidence",
+      detail,
+      status: proofStatusForEvidence(detail)
+    })),
+    { label: "Model route", detail: formatRoute(route), status: "info" as const }
+  ];
+  return proofFirstCompletionCard({
+    taskId: task.id,
+    project: task.projectName,
+    title: task.text,
+    summary: answer,
+    proof,
+    ...(task.changedFiles ? { changedFiles: task.changedFiles } : {}),
+    roles: ambientRolesForTask(task),
+    showProofButton: true
+  });
+}
+
+function proofStatusForEvidence(detail: string): "passed" | "failed" | "info" {
+  if (/\b(unavailable|failed|uncommitted|partial changes)\b/i.test(detail)) return "failed";
+  if (/^No\b|\bnot run\b/i.test(detail)) return "info";
+  return "passed";
+}
+
+async function handleNeedsMeCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const projectName = interaction.options.getString("project") ?? undefined;
+  if (projectName) {
+    const project = mustFindProject(appConfig.projects, projectName);
+    if (!isAllowedForProject(interaction, project)) {
+      await interaction.reply({ content: `You are not allowed to use project \`${project.name}\`.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+  }
+  const payload = await needsMePayload(interaction, appConfig, projectName, interaction.options.getInteger("limit") ?? 10);
+  await interaction.reply({
+    ...payload,
+    flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2
+  });
+}
+
+async function needsMePayload(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  appConfig: AppConfig,
+  projectName?: string,
+  limit = 10
+) {
+  const allowedProjects = new Set(
+    appConfig.projects.filter((project) => isAllowedForProject(interaction, project)).map((project) => project.name)
+  );
+  const tasks = (await taskStore.listNeedsAttention({ limit: Math.max(limit, 25), ...(projectName ? { projectName } : {}) }))
+    .filter((task) => allowedProjects.has(task.projectName) && taskNeedsUser(task, interaction.user.id, appConfig))
+    .slice(0, limit);
+  return needsMeInbox({
+    inboxId: `inbox-${interaction.user.id}`,
+    items: tasks.map((task) => ({
+      id: task.id,
+      project: task.projectName,
+      title: task.text,
+      reason: task.attention === "approval"
+        ? "Approve, edit, keep read-only, or decline this proposed action."
+        : task.attention === "blocked"
+          ? task.error ?? "This task is blocked and needs a decision."
+          : "Review the saved proof and choose the next step.",
+      urgency: task.attention === "blocked" ? "high" as const : "normal" as const
+    }))
+  });
+}
+
+function canManageProposal(userId: string, task: TaskRecord, appConfig: AppConfig): boolean {
+  return task.requesterId === userId || isControllerUser(userId, appConfig);
+}
+
+function taskNeedsUser(task: TaskRecord, userId: string, appConfig: AppConfig): boolean {
+  return isControllerUser(userId, appConfig) || task.requesterId === userId;
+}
+
+function ambientRolesForTask(task: TaskRecord): AmbientRole[] {
+  return (task.agentRoles ?? []).filter(
+    (role): role is AmbientRole => role === "builder" || role === "reviewer" || role === "verifier"
+  );
+}
+
+function agentRole(role: AmbientRole): AgentRole {
+  return role === "builder" ? "Builder" : role === "reviewer" ? "Reviewer" : "Verifier";
 }
 
 async function getWorkStatusMessage(appConfig: AppConfig, requestedProject?: ProjectEntry): Promise<string> {
@@ -1362,12 +2353,17 @@ async function getStatusSnapshotResponse(
   appConfig: AppConfig,
   wantsImage: boolean,
   requestedProject?: ProjectEntry,
-  requestText = ""
+  requestText = "",
+  actor = "requester"
 ): Promise<BotResponse> {
   let content = await getWorkStatusMessage(appConfig, requestedProject);
 
   if (wantsImage) {
     const project = requestedProject ?? defaultProject(appConfig.projects);
+    const screenshotPolicy = screenshotPolicyMessage(project, actor);
+    if (screenshotPolicy) {
+      return { content: `${content}\n\n${screenshotPolicy}` };
+    }
     const screenshot = await captureProjectScreenshot(project, { requestText });
 
     if (screenshot) {
@@ -1433,7 +2429,9 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     }
 
     const tasks = await taskStore.listRecent(filters);
-    await interaction.editReply(formatTaskList(tasks.filter((task) => allowedProjectNames.has(task.projectName))));
+    await interaction.editReply(
+      formatTaskList(tasks.filter((task) => !task.internal && allowedProjectNames.has(task.projectName) && canAccessTask(interaction, task, appConfig)))
+    );
     return;
   }
 
@@ -1442,7 +2440,9 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     const id = interaction.options.getString("id", true);
     const task = await taskStore.get(id);
     await interaction.editReply(
-      task && allowedProjectNames.has(task.projectName) ? formatTaskDetail(task) : `No accessible saved task found for \`${id}\`.`
+      task && allowedProjectNames.has(task.projectName) && canAccessTask(interaction, task, appConfig)
+        ? formatTaskDetail(task)
+        : `No accessible saved task found for \`${id}\`.`
     );
     return;
   }
@@ -1452,7 +2452,9 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     const id = interaction.options.getString("id", true);
     const task = await taskStore.get(id);
     await interaction.editReply(
-      task && allowedProjectNames.has(task.projectName) ? formatTaskLogs(task) : `No accessible saved task found for \`${id}\`.`
+      task && allowedProjectNames.has(task.projectName) && canAccessTask(interaction, task, appConfig)
+        ? formatTaskLogs(task)
+        : `No accessible saved task found for \`${id}\`.`
     );
     return;
   }
@@ -1461,7 +2463,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const id = interaction.options.getString("id", true);
     const existing = await taskStore.get(id);
-    if (!existing || !allowedProjectNames.has(existing.projectName)) {
+    if (!existing || !allowedProjectNames.has(existing.projectName) || !canAccessTask(interaction, existing, appConfig)) {
       await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
       return;
     }
@@ -1479,7 +2481,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
       await interaction.editReply(`No saved task found for \`${id}\`.`);
       return;
     }
-    if (!allowedProjectNames.has(task.projectName)) {
+    if (!allowedProjectNames.has(task.projectName) || !canAccessTask(interaction, task, appConfig)) {
       await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
       return;
     }
@@ -1502,6 +2504,8 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
       includePatterns: task.includePatterns,
       mode: task.mode === "action" ? "action" : "answer",
       requester: interaction.user.tag,
+      requesterId: task.requesterId ?? interaction.user.id,
+      ...(task.accessScope ? { accessScope: task.accessScope } : {}),
       source: `retry:${task.id}`,
       parentTaskId: task.id,
       dedupeKey: `task-retry:${task.id}`,
@@ -1526,7 +2530,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     });
     const cutoff = Date.now() - minutes * 60_000;
     const stale = running.filter(
-      (task) => allowedProjectNames.has(task.projectName) && new Date(task.startedAt).getTime() < cutoff
+      (task) => !task.internal && allowedProjectNames.has(task.projectName) && canAccessTask(interaction, task, appConfig) && new Date(task.startedAt).getTime() < cutoff
     );
     await interaction.editReply(stale.length ? formatTaskList(stale) : `No running tasks older than ${minutes}m.`);
   }
@@ -1544,7 +2548,7 @@ async function handleTaskControl(
     return;
   }
   const project = findProject(appConfig.projects, task.projectName);
-  if (!project || !isAllowedForProject(interaction, project)) {
+  if (!project || !canAccessTask(interaction, task, appConfig)) {
     await interaction.reply({ content: "That task's project is unavailable to you.", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -1612,7 +2616,7 @@ async function handleTaskControl(
 
   if (action === "review") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const packet = await createReviewPacket(project, task);
+    const packet = await createReviewPacket(await projectForTaskWorkspace(project, task), task);
     await editButtonReplyWithChunks(interaction, formatReviewPacket(packet));
     return;
   }
@@ -1646,7 +2650,8 @@ async function handleTaskControl(
     }
     await runTaskActionOnce(interaction, `${task.id}:validate`, async () => {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const results = await validateReview(project);
+      const reviewProject = await projectForTaskWorkspace(project, task);
+      const results = await validateReview(reviewProject);
       await editButtonReplyWithChunks(interaction, formatValidationResults(project, results));
     });
     return;
@@ -1677,6 +2682,8 @@ async function handleTaskControl(
       includePatterns: task.includePatterns,
       mode,
       requester: interaction.user.tag,
+      requesterId: task.requesterId ?? interaction.user.id,
+      ...(task.accessScope ? { accessScope: task.accessScope } : {}),
       source: `button:retry:${task.id}`,
       ephemeral: true,
       parentTaskId: task.id,
@@ -1710,7 +2717,7 @@ async function handleTaskModal(
     return;
   }
   const project = findProject(appConfig.projects, task.projectName);
-  if (!project || !isAllowedForProject(interaction, project)) {
+  if (!project || !canAccessTask(interaction, task, appConfig)) {
     await interaction.reply({ content: "That task's project is unavailable to you.", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -1745,6 +2752,8 @@ async function handleTaskModal(
     includePatterns: action === "adjust" ? task.includePatterns : [],
     mode,
     requester: interaction.user.tag,
+    requesterId: task.requesterId ?? interaction.user.id,
+    ...(task.accessScope ? { accessScope: task.accessScope } : {}),
     source: `task:${action}:${task.id}`,
     parentTaskId: task.id,
     ...(mode === "action" ? { dedupeKey: `task-${action}:${task.id}` } : {}),
@@ -1799,6 +2808,12 @@ async function handleWorkspaceButton(
     return;
   }
 
+  if (action === "inbox") {
+    const payload = await needsMePayload(interaction, appConfig, project.name);
+    await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2 });
+    return;
+  }
+
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   if (action === "status") {
     const status = await getStatusSnapshotResponse(scopeStatusToProject(appConfig, project), false, project);
@@ -1806,7 +2821,8 @@ async function handleWorkspaceButton(
     return;
   }
   if (action === "recent") {
-    const tasks = await taskStore.listRecent({ projectName: project.name, limit: 10 });
+    const tasks = (await taskStore.listRecent({ projectName: project.name, limit: 10 }))
+      .filter((task) => !task.internal && canAccessTask(interaction, task, appConfig));
     await editButtonReplyWithChunks(interaction, formatTaskList(tasks));
   }
 }
@@ -1870,14 +2886,18 @@ async function buildWorkspacePanel(
 ) {
   const projects = appConfig.projects.filter((entry) => isAllowedForProject(interaction, entry));
   const status = await getWorkStatusMessage(scopeStatusToProject(appConfig, project), project);
-  const recentTasks = await taskStore.listRecent({ projectName: project.name, limit: 25 });
+  const recentTasks = (await taskStore.listRecent({ projectName: project.name, limit: 25 }))
+    .filter((task) => !task.internal && canAccessTask(interaction, task, appConfig));
+  const needsAttentionCount = (await taskStore.listNeedsAttention({ projectName: project.name, limit: 25 }))
+    .filter((task) => taskNeedsUser(task, interaction.user.id, appConfig)).length;
   return workspacePanelView({
     projects,
     selectedProject: project,
     canControl: isControllerUser(interaction.user.id, appConfig),
     safeMode: appConfig.safeMode,
     status,
-    recentTasks
+    recentTasks,
+    needsAttentionCount
   });
 }
 
@@ -1928,11 +2948,11 @@ async function handleReviewCommand(interaction: ChatInputCommandInteraction, app
     await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
     const taskId = interaction.options.getString("task") ?? undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
-    if (task && task.projectName !== project.name) {
-      await interaction.editReply(`Task \`${task.id}\` does not belong to project \`${project.name}\`.`);
+    if (task && (task.projectName !== project.name || !canAccessTask(interaction, task, appConfig))) {
+      await interaction.editReply(`No accessible saved task found for \`${task.id}\`.`);
       return;
     }
-    const packet = await createReviewPacket(project, task);
+    const packet = await createReviewPacket(await projectForTaskWorkspace(project, task), task);
     await editInteractionWithChunks(interaction, { content: formatReviewPacket(packet) }, privateReply);
     return;
   }
@@ -2034,7 +3054,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
         .then(() => interaction.editReply(formatCouncilProgress(conversation.id, seats, seatStatuses)))
         .then(() => undefined)
         .catch((error) => {
-          console.warn(`Unable to update council progress for ${conversation.id}: ${(error as Error).message}`);
+          console.warn(`Unable to update council progress for ${conversation.id}: ${publicErrorMessage(error)}`);
         });
     };
     await interaction.editReply(formatCouncilProgress(conversation.id, seats, seatStatuses));
@@ -2059,7 +3079,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
             conversationId: conversation.id,
             type: "note",
             actor: `${appConfig.botIdentity.displayName} ${seat.name}`,
-            summary: `Local council seat failed: ${(error as Error).message.slice(0, 240)}`,
+            summary: `Local council seat failed: ${publicErrorMessage(error, 240)}`,
             mode: "think"
           });
           updateSeatProgress(seat.id, "failed");
@@ -2165,7 +3185,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   if (subcommand === "approve") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const id = interaction.options.getString("id", true);
     const decision = interaction.options.getString("decision", true);
     const action = interaction.options.getString("action") ?? "record";
@@ -2257,7 +3277,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   if (subcommand === "roster") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const peers = await allowedPeerRecords(appConfig);
     const conversation = await startLabConversation(interaction, subcommand, undefined, "Capability Trading Cards");
     await collabStore.addEvent({
@@ -2272,7 +3292,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   if (subcommand === "campfire") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const minutes = interaction.options.getInteger("minutes") ?? 30;
     const projectName = interaction.options.getString("project") ?? undefined;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
@@ -2285,7 +3305,9 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
       ...(project ? { projectName: project.name } : {})
     });
     const cutoff = Date.now() - minutes * 60_000;
-    const stale = running.filter((task) => new Date(task.startedAt).getTime() < cutoff);
+    const stale = running.filter(
+      (task) => !task.internal && canAccessTask(interaction, task, appConfig) && new Date(task.startedAt).getTime() < cutoff
+    );
     const conversation = await startLabConversation(interaction, subcommand, project, `Stale Task Campfire (${minutes}m)`);
     await collabStore.addEvent({
       conversationId: conversation.id,
@@ -2299,7 +3321,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   if (subcommand === "roundtable" || subcommand === "jam" || subcommand === "argue") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
@@ -2347,7 +3369,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   if (subcommand === "see") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const projectName = interaction.options.getString("project");
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : defaultProject(appConfig.projects);
     if (!(await ensureProjectAccess(interaction, project))) {
@@ -2393,7 +3415,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   if (subcommand === "handoff") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
@@ -2401,11 +3423,11 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
     const target = interaction.options.getString("target", true);
     const taskId = interaction.options.getString("task") ?? undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
-    if (task && task.projectName !== project.name) {
-      await interaction.editReply(`Task \`${task.id}\` does not belong to project \`${project.name}\`.`);
+    if (task && (task.projectName !== project.name || !canAccessTask(interaction, task, appConfig))) {
+      await interaction.editReply(`No accessible saved task found for \`${task.id}\`.`);
       return;
     }
-    const packet = await createReviewPacket(project, task);
+    const packet = await createReviewPacket(await projectForTaskWorkspace(project, task), task);
     const conversation = await startLabConversation(interaction, subcommand, project, `Baton Pass to ${target}`);
     await collabStore.addEvent({
       conversationId: conversation.id,
@@ -2427,22 +3449,25 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   if (subcommand === "bossfight") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
     const taskId = interaction.options.getString("task") ?? undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
-    if (task && task.projectName !== project.name) {
-      await interaction.editReply(`Task \`${task.id}\` does not belong to project \`${project.name}\`.`);
+    if (task && (task.projectName !== project.name || !canAccessTask(interaction, task, appConfig))) {
+      await interaction.editReply(`No accessible saved task found for \`${task.id}\`.`);
       return;
     }
-    const packet = await createReviewPacket(project, task);
+    const packet = await createReviewPacket(await projectForTaskWorkspace(project, task), task);
     const conversation = await startLabConversation(interaction, subcommand, project, "Boss Fight Review");
     const commandNames = parseCommandNames(interaction.options.getString("commands"));
     const commandApprovalRequired = commandsNeedApproval(project, commandNames);
-    const gates = appConfig.safeMode || commandApprovalRequired ? undefined : await evaluateMergeGates(project, commandNames).then((result) => formatMergeGateResult(project, result));
+    const reviewProject = await projectForTaskWorkspace(project, task);
+    const gates = appConfig.safeMode || commandApprovalRequired
+      ? undefined
+      : await evaluateMergeGates(reviewProject, commandNames).then((result) => formatMergeGateResult(reviewProject, result));
     const approval = appConfig.safeMode || commandApprovalRequired
       ? formatApprovalCard({
           action: "Run local merge gates",
@@ -2485,7 +3510,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   if (subcommand === "fix-from-snip") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
@@ -2530,19 +3555,20 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
   }
 
   if (subcommand === "ritual") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
     const taskId = interaction.options.getString("task") ?? undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
-    if (task && task.projectName !== project.name) {
-      await interaction.editReply(`Task \`${task.id}\` does not belong to project \`${project.name}\`.`);
+    if (task && (task.projectName !== project.name || !canAccessTask(interaction, task, appConfig))) {
+      await interaction.editReply(`No accessible saved task found for \`${task.id}\`.`);
       return;
     }
-    const packet = await createReviewPacket(project, task);
-    const recentTasks = await taskStore.listRecent({ limit: 5, projectName: project.name });
+    const packet = await createReviewPacket(await projectForTaskWorkspace(project, task), task);
+    const recentTasks = (await taskStore.listRecent({ limit: 5, projectName: project.name }))
+      .filter((item) => !item.internal && canAccessTask(interaction, item, appConfig));
     const conversation = await startLabConversation(interaction, subcommand, project, "Merge Ritual Thread");
     await collabStore.addEvent({
       conversationId: conversation.id,
@@ -2784,7 +3810,7 @@ async function publishWorkroomPanel(
       }
       return;
     } catch (error) {
-      console.warn(`Unable to publish workroom panel in thread ${conversation.threadId}: ${(error as Error).message}`);
+      console.warn(`Unable to publish workroom panel in thread ${conversation.threadId}: ${publicErrorMessage(error)}`);
     }
   }
 
@@ -2840,7 +3866,7 @@ async function refreshStoredWorkroomPanel(conversationId: string): Promise<void>
       await refreshWorkroomPanelMessage(message, conversationId);
     }
   } catch (error) {
-    console.warn(`Unable to refresh workroom panel ${conversation.controlMessageId}: ${(error as Error).message}`);
+    console.warn(`Unable to refresh workroom panel ${conversation.controlMessageId}: ${publicErrorMessage(error)}`);
   }
 }
 
@@ -2859,7 +3885,7 @@ async function sendWorkroomText(
       }
       return;
     } catch (error) {
-      console.warn(`Unable to send workroom update to ${channelId}: ${(error as Error).message}`);
+      console.warn(`Unable to send workroom update to ${channelId}: ${publicErrorMessage(error)}`);
     }
   }
 
@@ -2884,15 +3910,19 @@ async function archiveWorkroomThread(conversation: CollabConversation): Promise<
     try {
       await channel.setLocked(true, "Devbot workroom closed");
     } catch (error) {
-      console.warn(`Unable to lock workroom thread ${conversation.threadId}: ${(error as Error).message}`);
+      console.warn(`Unable to lock workroom thread ${conversation.threadId}: ${publicErrorMessage(error)}`);
     }
   } catch (error) {
-    console.warn(`Unable to archive workroom thread ${conversation.threadId}: ${(error as Error).message}`);
+    console.warn(`Unable to archive workroom thread ${conversation.threadId}: ${publicErrorMessage(error)}`);
   }
 }
 
 async function maybeHandlePeerMessage(message: Message, appConfig: AppConfig): Promise<void> {
-  if (!client.user || !appConfig.peerBotIds.has(message.author.id)) {
+  if (
+    !client.user
+    || !appConfig.peerBotIds.has(message.author.id)
+    || !(await isAuthorizedPeerChannel(message, appConfig))
+  ) {
     return;
   }
 
@@ -2915,7 +3945,11 @@ async function maybeHandlePeerMessage(message: Message, appConfig: AppConfig): P
     return;
   }
 
-  if (!message.mentions.users.has(client.user.id)) {
+  if (envelope.from !== message.author.id || !message.mentions.users.has(client.user.id)) {
+    return;
+  }
+
+  if (!(await collabStore.claimDelivery(`legacy:${message.author.id}:${envelope.requestId}`))) {
     return;
   }
 
@@ -3022,6 +4056,18 @@ async function maybeHandlePeerMessage(message: Message, appConfig: AppConfig): P
       files: screenshot ? [new AttachmentBuilder(screenshot.image, { name: screenshot.fileName })] : []
     });
   }
+}
+
+async function isAuthorizedPeerChannel(message: Message, appConfig: AppConfig): Promise<boolean> {
+  const coordinationChannelId = appConfig.coordinationChannelId ?? effectivePrivateRoomId();
+  if (
+    !coordinationChannelId
+    || message.guildId !== appConfig.discordGuildId
+    || message.channelId !== coordinationChannelId
+  ) {
+    return false;
+  }
+  return (await verifyPrivateRoom(coordinationChannelId)) === coordinationChannelId;
 }
 
 async function maybeHandleCollabPeerMessage(
@@ -3156,11 +4202,11 @@ async function maybeHandleCollabPeerMessage(
   if (envelope.capability === "review.packet") {
     const taskId = typeof envelope.payload.taskId === "string" ? envelope.payload.taskId : undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
-    if (task && task.projectName !== project.name) {
-      await replyWithCollabResult(message, appConfig, envelope, false, `Task ${task.id} does not belong to project ${project.name}.`);
+    if (task && (task.projectName !== project.name || task.accessScope === "workroom" || task.internal)) {
+      await replyWithCollabResult(message, appConfig, envelope, false, `Task ${task.id} is not accessible for this peer request.`);
       return;
     }
-    const packet = await createReviewPacket(project, task);
+    const packet = await createReviewPacket(await projectForTaskWorkspace(project, task), task);
     await replyWithCollabResult(message, appConfig, envelope, true, formatReviewPacket(packet), undefined, [
       eventArtifact("review-packet", "peer review packet", project.name)
     ]);
@@ -3392,7 +4438,7 @@ function parseBotId(value: string): string {
 }
 
 async function sendPeerMessage(
-  interaction: ChatInputCommandInteraction,
+  _interaction: ChatInputCommandInteraction,
   appConfig: AppConfig,
   content: string,
   targetBotId?: string
@@ -3401,26 +4447,24 @@ async function sendPeerMessage(
     content,
     allowedMentions: targetBotId ? { parse: [] as const, users: [targetBotId] } : { parse: [] as const }
   };
-  if (appConfig.coordinationChannelId) {
-    const channel = await client.channels.fetch(appConfig.coordinationChannelId);
-    if (!channel?.isTextBased()) {
-      throw new Error(`Configured coordination channel ${appConfig.coordinationChannelId} is not text-based.`);
-    }
-    if (channel.isThread()) {
-      if (channel.archived) {
-        await channel.setArchived(false, "Devbot peer coordination resumed");
-      }
-      if (targetBotId && channel.type === ChannelType.PrivateThread) {
-        await channel.members.add(targetBotId);
-      }
-    }
-    await sendToTextChannel(channel, payload);
-    return;
+  const coordinationChannelId = appConfig.coordinationChannelId ?? effectivePrivateRoomId();
+  if (!coordinationChannelId || (await verifyPrivateRoom(coordinationChannelId)) !== coordinationChannelId) {
+    throw new Error("Peer coordination requires a configured private text channel or private thread.");
   }
-
-  const channel = interaction.channel;
-  if (!channel?.isTextBased()) {
-    throw new Error("This command must be used in a text channel or COORDINATION_CHANNEL_ID must be configured.");
+  const channel = await client.channels.fetch(coordinationChannelId);
+  if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread)) {
+    throw new Error(`Configured coordination channel ${coordinationChannelId} is not a private text room.`);
+  }
+  if (channel.guild.id !== appConfig.discordGuildId) {
+    throw new Error("The peer coordination room must belong to the configured Discord server.");
+  }
+  if (channel.isThread()) {
+    if (channel.archived) {
+      await channel.setArchived(false, "Devbot peer coordination resumed");
+    }
+    if (targetBotId && channel.type === ChannelType.PrivateThread) {
+      await channel.members.add(targetBotId);
+    }
   }
   await sendToTextChannel(channel, payload);
 }
@@ -3456,11 +4500,12 @@ async function startLabConversation(
   });
   const sharedRoomThread =
     intent === "council" &&
+    (!project || !hasProjectAudienceRestriction(project)) &&
     interaction.channelId === setupStore.snapshot().privateChannelId &&
     interaction.channel?.type === ChannelType.PrivateThread
       ? interaction.channel
       : undefined;
-  const thread = sharedRoomThread ?? (await createLabThread(interaction, conversation.id, intent, title));
+  const thread = sharedRoomThread ?? (await createLabThread(interaction, conversation.id, intent, title, project));
   if (!thread) {
     return conversation;
   }
@@ -3480,7 +4525,7 @@ async function startLabConversation(
     if (!sharedRoomThread) {
       await thread.delete?.("Unable to initialize the Devbot workroom").catch(() => undefined);
     }
-    console.warn(`Unable to initialize lab thread ${thread.id}: ${(error as Error).message}`);
+    console.warn(`Unable to initialize lab thread ${thread.id}: ${publicErrorMessage(error)}`);
     return conversation;
   }
   return (await collabStore.setThread(conversation.id, thread.id)) ?? withThread;
@@ -3490,7 +4535,8 @@ async function createLabThread(
   interaction: ChatInputCommandInteraction,
   conversationId: string,
   intent: CollabIntent,
-  title: string
+  title: string,
+  project: ProjectEntry | undefined
 ): Promise<{
   id: string;
   send?: (message: unknown) => Promise<unknown>;
@@ -3520,35 +4566,34 @@ async function createLabThread(
   }
 
   try {
-    const privateCouncil = intent === "council";
+    const privateWorkroom = intent === "council" || Boolean(project);
     const thread = await threaded.threads.create({
       name: labThreadName(conversationId, intent, title),
       autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-      ...(privateCouncil ? { type: ChannelType.PrivateThread, invitable: false } : {}),
+      ...(privateWorkroom ? { type: ChannelType.PrivateThread, invitable: false } : {}),
       reason: "Devbot collaboration lab session"
     });
-    if (privateCouncil) {
+    if (privateWorkroom) {
       try {
         if (!thread.members?.add) {
           throw new Error("Private thread membership API is unavailable.");
         }
-        await thread.members.add(interaction.user.id);
-        for (const userId of config.allowedUserIds) {
-          if (userId === interaction.user.id) {
-            continue;
-          }
+        const memberIds = project
+          ? (await resolveAmbientThreadAudience(interaction.channel, project, config, interaction.user.id)).memberIds
+          : new Set([interaction.user.id, ...config.allowedUserIds]);
+        for (const userId of memberIds) {
           await thread.members.add(userId).catch((error) => {
-            console.warn(`Unable to add configured viewer ${userId} to council thread ${thread.id}: ${(error as Error).message}`);
+            console.warn(`Unable to add authorized viewer ${userId} to lab thread ${thread.id}: ${publicErrorMessage(error)}`);
           });
         }
       } catch (error) {
-        await thread.delete?.("Unable to add the council requester to the private workroom").catch(() => undefined);
+        await thread.delete?.("Unable to establish the authorized private lab audience").catch(() => undefined);
         throw error;
       }
     }
     return thread;
   } catch (error) {
-    console.warn(`Unable to create lab thread for ${conversationId}: ${(error as Error).message}`);
+    console.warn(`Unable to create lab thread for ${conversationId}: ${publicErrorMessage(error)}`);
     return undefined;
   }
 }
@@ -3764,7 +4809,12 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, appConfi
     const project = findProjectFromAutocomplete(interaction, allowedProjects);
     const tasks = await taskStore.listRecent({ limit: 25, ...(project ? { projectName: project.name } : {}) });
     const allowedProjectNames = new Set(allowedProjects.map((item) => item.name));
-    await interaction.respond(taskChoices(tasks.filter((task) => allowedProjectNames.has(task.projectName)), value));
+    await interaction.respond(
+      taskChoices(
+        tasks.filter((task) => !task.internal && allowedProjectNames.has(task.projectName) && canAccessTask(interaction, task, appConfig)),
+        value
+      )
+    );
     return;
   }
 
@@ -3798,6 +4848,23 @@ function findProject(projects: ProjectEntry[], name: string): ProjectEntry | und
       entry.metadata.aliases.includes(normalized) ||
       entry.metadata.canonicalName?.toLowerCase() === normalized
   );
+}
+
+async function projectForTaskWorkspace(project: ProjectEntry, task: TaskRecord | undefined): Promise<ProjectEntry> {
+  if (!task?.workspaceIsolated || !task.workspacePath) return project;
+  if (!task.branchName || !task.baseBranch) {
+    throw new Error(`Task ${task.id} is missing isolated workspace identity evidence.`);
+  }
+  const inspection = await inspectTaskWorktree({
+    sourcePath: project.root,
+    path: task.workspacePath,
+    branch: task.branchName,
+    baseRevision: task.baseBranch
+  }, 0);
+  if (!inspection.available) {
+    throw new Error(`Task ${task.id} workspace cannot be trusted: ${inspection.message}`);
+  }
+  return { ...project, root: task.workspacePath };
 }
 
 function parseOptionalProjectToken(text: string, projects: ProjectEntry[]): { text: string; project: ProjectEntry | undefined } {
@@ -3848,9 +4915,18 @@ function selectedProjectForInteraction(
 
 function preferredProjectForInteraction(
   appConfig: AppConfig,
-  interaction: ChatInputCommandInteraction | ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
+  interaction:
+    | ChatInputCommandInteraction
+    | MessageContextMenuCommandInteraction
+    | ButtonInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction
 ): ProjectEntry | undefined {
   const allowedProjects = appConfig.projects.filter((project) => isAllowedForProject(interaction, project));
+  const roomProjectName = Object.entries(setupStore.snapshot().projectRoomIds).find(([, roomId]) => roomId === interaction.channelId)?.[0];
+  if (roomProjectName) {
+    return allowedProjects.find((project) => project.name === roomProjectName);
+  }
   const preferredName = userPreferences.selectedProject(interaction.user.id);
   return allowedProjects.find((project) => project.name === preferredName) ?? defaultProjectIfAvailable(allowedProjects);
 }
@@ -3879,7 +4955,7 @@ function parseFallbackStatusRequest(text: string): { isStatus: boolean; question
 }
 
 function truncateForLog(value: string): string {
-  const compact = value.replace(/\s+/g, " ").trim();
+  const compact = redactSensitiveText(value).replace(/\s+/g, " ").trim();
   return compact.length > 220 ? `${compact.slice(0, 217)}...` : compact;
 }
 
@@ -3909,7 +4985,13 @@ async function ensureProjectAccess(interaction: ChatInputCommandInteraction, pro
 }
 
 function isAllowed(
-  interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
+  interaction:
+    | ChatInputCommandInteraction
+    | MessageContextMenuCommandInteraction
+    | ButtonInteraction
+    | AutocompleteInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction,
   appConfig: AppConfig
 ): boolean {
   if (!appConfig.ownerUserId) {
@@ -3946,7 +5028,13 @@ function isAllowed(
 }
 
 function isAllowedForProject(
-  interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
+  interaction:
+    | ChatInputCommandInteraction
+    | MessageContextMenuCommandInteraction
+    | ButtonInteraction
+    | AutocompleteInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction,
   project: ProjectEntry
 ): boolean {
   const policy = project.metadata.policy;
@@ -3978,6 +5066,25 @@ function isAllowedForProject(
 function hasProjectAudienceRestriction(project: ProjectEntry): boolean {
   const policy = project.metadata.policy;
   return policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
+}
+
+function canAccessTask(
+  interaction:
+    | ChatInputCommandInteraction
+    | MessageContextMenuCommandInteraction
+    | ButtonInteraction
+    | AutocompleteInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction,
+  task: TaskRecord,
+  appConfig: AppConfig
+): boolean {
+  const project = findProject(appConfig.projects, task.projectName);
+  return canAccessTaskRecord(task, {
+    userId: interaction.user.id,
+    projectAllowed: Boolean(project && isAllowedForProject(interaction, project)),
+    controller: isControllerUser(interaction.user.id, appConfig)
+  });
 }
 
 function isAllowedMessage(message: Message, appConfig: AppConfig): boolean {
@@ -4027,7 +5134,7 @@ function commandRequiresController(interaction: ChatInputCommandInteraction): bo
   if (interaction.commandName === "task") {
     return subcommand === "cancel" || subcommand === "retry";
   }
-  return interaction.commandName === "lab" && subcommand === "approve";
+  return interaction.commandName === "lab" && (subcommand === "approve" || subcommand === "bossfight");
 }
 
 async function ensureControllerAccess(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<boolean> {
@@ -4042,9 +5149,17 @@ async function ensureControllerAccess(interaction: ChatInputCommandInteraction, 
 }
 
 async function ensureConfiguredRoom(
-  interaction: ChatInputCommandInteraction | ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
+  interaction:
+    | ChatInputCommandInteraction
+    | MessageContextMenuCommandInteraction
+    | ButtonInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction
 ): Promise<boolean> {
   const privateChannelId = effectivePrivateRoomId();
+  if (await isConfiguredRoomId(interaction.channelId)) {
+    return true;
+  }
   if (!privateChannelId) {
     await interaction.reply({
       content: "Devbot setup is not ready. The owner must run `/setup wizard` first.",
@@ -4052,14 +5167,45 @@ async function ensureConfiguredRoom(
     });
     return false;
   }
-  if (interaction.channelId === privateChannelId) {
-    return true;
-  }
   await interaction.reply({
     content: `Devbot is configured for its private room: <#${privateChannelId}>.`,
     flags: MessageFlags.Ephemeral
   });
   return false;
+}
+
+async function isConfiguredRoomId(channelId: string | null): Promise<boolean> {
+  if (!channelId) return false;
+  if (channelId === effectivePrivateRoomId()) return true;
+  const state = setupStore.snapshot();
+  const projectRoom = Object.entries(state.projectRoomIds).find(([, roomId]) => roomId === channelId);
+  if (projectRoom) {
+    if (!(await verifyPrivateRoom(channelId))) return false;
+    const lastVerified = verifiedProjectRoomAudiences.get(channelId) ?? 0;
+    if (Date.now() - lastVerified < 60_000) return true;
+    const project = findProject(config.projects, projectRoom[0]);
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!project || !channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread)) return false;
+    const problem = await projectRoomAudienceProblem(channel, project, config);
+    if (problem) {
+      console.warn(`Project room ${channelId} failed its audience check: ${problem}`);
+      return false;
+    }
+    verifiedProjectRoomAudiences.set(channelId, Date.now());
+    return true;
+  }
+  const task = await taskStore.findByThread(channelId);
+  return Boolean(task && (await verifyPrivateRoom(channelId)));
+}
+
+async function projectForConfiguredRoom(channelId: string, appConfig: AppConfig): Promise<ProjectEntry | undefined> {
+  const state = setupStore.snapshot();
+  const projectEntry = Object.entries(state.projectRoomIds).find(([, roomId]) => roomId === channelId);
+  if (projectEntry) {
+    return findProject(appConfig.projects, projectEntry[0]);
+  }
+  const task = await taskStore.findByThread(channelId);
+  return task ? findProject(appConfig.projects, task.projectName) : undefined;
 }
 
 function effectivePrivateRoomId(): string | undefined {
@@ -4148,7 +5294,13 @@ function canAccessConversation(
 }
 
 function interactionNameSource(
-  interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
+  interaction:
+    | ChatInputCommandInteraction
+    | MessageContextMenuCommandInteraction
+    | ButtonInteraction
+    | AutocompleteInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction
 ) {
   return {
     username: interaction.user.username,
@@ -4172,8 +5324,17 @@ async function replyWithError(interaction: Interaction, error: unknown): Promise
     return;
   }
 
-  const message = `Error: ${(error as Error).message}`;
-  if (interaction.replied || interaction.deferred) {
+  const message = `Error: ${publicErrorMessage(error)}`;
+  if (interaction.deferred && !interaction.replied) {
+    try {
+      await interaction.editReply({ content: message, components: [] });
+      return;
+    } catch {
+      await interaction.followUp({ content: message, flags: MessageFlags.Ephemeral });
+      return;
+    }
+  }
+  if (interaction.replied) {
     await interaction.followUp({ content: message, flags: MessageFlags.Ephemeral });
     return;
   }

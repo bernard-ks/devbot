@@ -27,9 +27,9 @@ export function isScreenshotBlocked(project: ProjectEntry): boolean {
 
 export function commandRequiresApproval(project: ProjectEntry, commandName: string): boolean {
   const normalized = commandName.trim().toLowerCase();
-  if (project.metadata.policy.readOnlyCommands.includes(normalized)) {
-    return false;
+  if (project.metadata.policy.approvalRequiredCommands.includes(normalized)) {
+    return true;
   }
 
-  return project.metadata.policy.approvalRequiredCommands.includes(normalized);
+  return !project.metadata.policy.readOnlyCommands.includes(normalized);
 }
