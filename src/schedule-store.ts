@@ -401,8 +401,12 @@ function truncate(value: string, maxLength: number): string {
 
 function normalizeLoadedEntry(value: unknown): ScheduleEntry | undefined {
   if (!value || typeof value !== "object") return undefined;
-  const entry = value as Partial<ScheduleEntry>;
+  const entry = value as Partial<ScheduleEntry> & { mode?: unknown };
   if (
+    // Fail closed on legacy/foreign records that claim any mode other than read-only:
+    // they are dropped rather than coerced, so a persisted write-capable schedule can
+    // never execute.
+    (entry.mode !== undefined && entry.mode !== "answer") ||
     typeof entry.id !== "string" ||
     !isScheduleId(entry.id) ||
     typeof entry.spec !== "string" ||

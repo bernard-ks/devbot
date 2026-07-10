@@ -13,6 +13,14 @@ export function safeModeActionMessage(surface: string): string {
   ].join("\n");
 }
 
+export function safeModeScheduleMessage(surface: string): string {
+  return [
+    `Safe mode is on, so ${surface} cannot set up recurring background work — schedules stay off (even read-only ones) until safe mode is lifted.`,
+    "Existing schedules keep their state; pausing and removing them still works.",
+    "Set `DEVBOT_SAFE_MODE=false` and restart devbot to create or resume schedules."
+  ].join("\n");
+}
+
 export function isPeerAllowedForProject(project: ProjectEntry, peerBotId: string): boolean {
   return project.metadata.policy.allowedPeers.length === 0 || project.metadata.policy.allowedPeers.includes(peerBotId);
 }

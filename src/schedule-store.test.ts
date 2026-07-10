@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -126,6 +126,42 @@ test("schedule drops malformed records and rejects an unsupported version on loa
   await assert.rejects(() => new ScheduleStore(badVersionFile).list(), /Unsupported schedule state version/);
 });
 
+test("schedule load fails closed on a legacy write-capable record", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-schedule-legacy-"));
+  const filePath = path.join(root, "schedule.json");
+  const now = new Date().toISOString();
+  const record = (mode: string) => ({
+    id: `sched-legacy-${mode}`,
+    spec: "daily 07:00",
+    project: "web",
+    taskText: "x",
+    mode,
+    enabled: true,
+    addedBy: "tom",
+    addedById: "user-1",
+    createdAt: now,
+    nextRun: now,
+    running: false
+  });
+  await writeFile(filePath, JSON.stringify({ version: 1, entries: [record("action"), record("answer")] }));
+
+  const store = new ScheduleStore(filePath);
+  const entries = await store.list();
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0]?.id, "sched-legacy-answer");
+  assert.equal((await store.claimDue(new Date(Date.now() + 1000))).length, 1);
+});
+
+test("schedule state directory and file are owner-only", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-schedule-perms-"));
+  const dir = path.join(root, "state");
+  const filePath = path.join(dir, "schedule.json");
+  const store = new ScheduleStore(filePath);
+  await store.add(addInput());
+  assert.equal((await stat(filePath)).mode & 0o777, 0o600);
+  assert.equal((await stat(dir)).mode & 0o777, 0o700);
+});
+
 test("schedule redacts secrets and neutralizes mentions in stored text", async () => {
   const store = await tempStore();
   const entry = await store.add(addInput({ taskText: "ping @everyone about sk-abcdefghijklmnopqrst" }));
@@ -174,11 +210,12 @@ test("claimDue atomically marks entries running so a concurrent tick cannot clai
   assert.equal(firstTick.length, 1);
   assert.equal(firstTick[0]?.running, true);
 
-  // Simulates a second 30s tick firing while the first occurrence is still in flight
-  // (in-flight for well over 30 seconds): it must not see the entry as due again.
-  const secondTick = await store.claimDue(laterNow);
+  // Simulates a second tick firing more than one 30s interval later while the first
+  // occurrence is still in flight: it must not see the entry as due again, so the
+  // occurrence executes exactly once.
+  const secondTick = await store.claimDue(new Date(laterNow.getTime() + 31_000));
   assert.equal(secondTick.length, 0);
-  assert.equal((await store.due(laterNow)).length, 0);
+  assert.equal((await store.due(new Date(laterNow.getTime() + 31_000))).length, 0);
 
   const current = await store.get(entry.id);
   assert.equal(current?.running, true);

@@ -76,6 +76,7 @@ import {
   isScreenshotBlocked,
   isWriteBlockedBySafeMode,
   safeModeActionMessage,
+  safeModeScheduleMessage,
   screenshotRequiresApproval
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord, type TaskStatus } from "./task-store.js";
@@ -2490,17 +2491,26 @@ async function handleQueueCommand(interaction: ChatInputCommandInteraction, appC
   }
 
   if (subcommand === "digest") {
-    await interaction.deferReply();
+    // Ephemeral so the audience is exactly the (already project-filtered) invoker, and one
+    // digest per project so differently scoped projects are never combined in one message.
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const allowedProjectNames = new Set(
       appConfig.projects.filter((project) => isAllowedForProject(interaction, project)).map((project) => project.name)
     );
     const items = (await queueStore.list()).filter((item) => allowedProjectNames.has(item.project));
-    const roomId = effectivePrivateRoomId();
-    const digest = formatQueueDigest(items, { guildId: appConfig.discordGuildId, channelId: roomId ?? interaction.channelId });
-    const chunks = splitDiscordMessage(digest);
+    const chunks: string[] = [];
+    for (const [projectName, projectItems] of groupQueueItemsByProject(items)) {
+      const project = findProject(appConfig.projects, projectName);
+      const channel = project ? await scopedRoomChannel(appConfig, project) : undefined;
+      const digest = formatQueueDigest(projectItems, {
+        guildId: appConfig.discordGuildId,
+        channelId: channel?.id ?? interaction.channelId
+      });
+      chunks.push(...splitDiscordMessage(`Project \`${projectName}\`:\n${digest}`));
+    }
     await interaction.editReply(chunks.shift() ?? "Nothing to report.");
     for (const chunk of chunks) {
-      await interaction.followUp(chunk);
+      await interaction.followUp({ content: chunk, flags: MessageFlags.Ephemeral });
     }
     return;
   }
@@ -2510,6 +2520,10 @@ async function handleScheduleCommand(interaction: ChatInputCommandInteraction, a
   const subcommand = interaction.options.getSubcommand();
 
   if (subcommand === "add") {
+    if (appConfig.safeMode) {
+      await interaction.reply({ content: safeModeScheduleMessage("/schedule add"), flags: MessageFlags.Ephemeral });
+      return;
+    }
     const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
@@ -2553,6 +2567,10 @@ async function handleScheduleCommand(interaction: ChatInputCommandInteraction, a
   }
 
   if (subcommand === "pause" || subcommand === "resume") {
+    if (subcommand === "resume" && appConfig.safeMode) {
+      await interaction.reply({ content: safeModeScheduleMessage("/schedule resume"), flags: MessageFlags.Ephemeral });
+      return;
+    }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const id = interaction.options.getString("id", true).trim();
     if (!isScheduleId(id)) {
@@ -2795,6 +2813,13 @@ async function tickSchedules(appConfig: AppConfig): Promise<void> {
 }
 
 async function runScheduledEntry(appConfig: AppConfig, entry: ScheduleEntry): Promise<void> {
+  // Schedules are read-only-only. The store already rejects write-capable records at
+  // creation and on load, but an occurrence is the last gate before unattended execution,
+  // so fail closed here too if a legacy/corrupted record ever slips through.
+  if (String(entry.mode) !== "answer") {
+    await scheduleStore.markRun(entry.id, "Skipped: schedules are read-only; write-capable schedule records are not supported.");
+    return;
+  }
   const project = findProject(appConfig.projects, entry.project);
   const privateChannel = await privateRoomChannel();
   if (!project || !privateChannel) {
