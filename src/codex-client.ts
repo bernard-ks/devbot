@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { CodexConfig, PackedProjectContext } from "./types.js";
+import type { RequestContextMode } from "./request-router.js";
 
 export type CodexRequestMode = "answer" | "action";
 
@@ -11,33 +12,67 @@ export interface AnswerOptions {
   question: string;
   context: PackedProjectContext;
   mode?: CodexRequestMode;
+  model?: string;
+  reasoningEffort?: string;
+  contextMode?: RequestContextMode;
   signal?: AbortSignal;
 }
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
+  const mode = options.mode ?? "answer";
+  const prompt = buildPrompt(options.context, options.question, mode, options.contextMode ?? "full");
+  return completeCodexPrompt({
+    codex: options.codex,
+    prompt,
+    cwd: options.context.project.root,
+    sandbox: mode === "action" ? options.codex.actionSandbox : options.codex.sandbox,
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+    ...(options.signal ? { signal: options.signal } : {})
+  });
+}
+
+export interface CompleteCodexOptions {
+  codex: CodexConfig;
+  prompt: string;
+  cwd: string;
+  sandbox?: CodexConfig["sandbox"];
+  model?: string;
+  reasoningEffort?: string;
+  timeoutMs?: number;
+  skipGitRepoCheck?: boolean;
+  signal?: AbortSignal;
+}
+
+export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
   const tempDir = await mkdtemp(path.join(tmpdir(), "devbot-codex-"));
   const outputFile = path.join(tempDir, "answer.txt");
 
   try {
-    const mode = options.mode ?? "answer";
-    const prompt = buildPrompt(options.context, options.question, mode);
     const args = [
       "exec",
       "--ephemeral",
       "--sandbox",
-      mode === "action" ? options.codex.actionSandbox : options.codex.sandbox,
+      options.sandbox ?? "read-only",
       "--cd",
-      options.context.project.root,
+      options.cwd,
       "--output-last-message",
       outputFile,
-      prompt
+      options.prompt
     ];
-
-    if (options.codex.model) {
-      args.splice(1, 0, "--model", options.codex.model);
+    if (options.skipGitRepoCheck) {
+      args.splice(args.length - 1, 0, "--skip-git-repo-check");
     }
 
-    await runCodex(options.codex.bin, args, options.codex.timeoutMs, options.signal);
+    const model = options.model ?? options.codex.model;
+    if (model) {
+      args.splice(1, 0, "--model", model);
+    }
+    if (options.reasoningEffort) {
+      args.splice(1, 0, "--config", `model_reasoning_effort=${JSON.stringify(options.reasoningEffort)}`);
+    }
+
+    await runCodex(options.codex.bin, args, options.timeoutMs ?? options.codex.timeoutMs, options.signal);
     const answer = (await readFile(outputFile, "utf8")).trim();
     return answer || "Codex did not produce a final text answer.";
   } finally {
@@ -45,7 +80,17 @@ export async function answerWithProjectContext(options: AnswerOptions): Promise<
   }
 }
 
-function buildPrompt(context: PackedProjectContext, question: string, mode: CodexRequestMode): string {
+function buildPrompt(
+  context: PackedProjectContext,
+  question: string,
+  mode: CodexRequestMode,
+  contextMode: RequestContextMode
+): string {
+  const contextInstruction = contextMode === "none"
+    ? "This request was routed without project context. Do not inspect project files unless the user explicitly asks for project-specific evidence."
+    : contextMode === "focused"
+      ? "Use the focused preselected snippets first; inspect additional project files only when needed to answer accurately."
+      : "Use the supplied broad project context and inspect additional project files when useful.";
   if (mode === "action") {
     return [
       "You are handling a Discord request for a local developer through a bot.",
@@ -53,6 +98,7 @@ function buildPrompt(context: PackedProjectContext, question: string, mode: Code
       "You may inspect files and make focused project edits when needed by the request.",
       "Do not make destructive changes, delete unrelated files, modify secrets, or change files outside the selected project.",
       "Prefer the project's existing patterns. Keep changes tight and verify with targeted commands when practical.",
+      contextInstruction,
       "Respond with this fixed structure:",
       "Project: <project name>",
       "Request: <one sentence>",
@@ -75,6 +121,7 @@ function buildPrompt(context: PackedProjectContext, question: string, mode: Code
   return [
     "You are answering a Discord slash-command request for a local developer.",
     "Use the selected project directory as your primary source of truth.",
+    contextInstruction,
     "You may inspect local project files, but this run is read-only: do not edit files, install packages, start servers, or run destructive commands.",
     "Be direct and practical. Cite file paths when making codebase-specific claims.",
     "If the supplied snippets and readable project files are insufficient, say what is missing.",

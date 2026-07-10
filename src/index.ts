@@ -5,9 +5,23 @@ import {
   GatewayIntentBits,
   GuildMember,
   MessageFlags,
+  PermissionFlagsBits,
   ThreadAutoArchiveDuration,
 } from "discord.js";
-import type { AutocompleteInteraction, ButtonInteraction, ChatInputCommandInteraction, Interaction, Message } from "discord.js";
+import type {
+  AutocompleteInteraction,
+  ButtonInteraction,
+  ChatInputCommandInteraction,
+  GuildTextBasedChannel,
+  Interaction,
+  Message,
+  ModalSubmitInteraction,
+  StringSelectMenuInteraction,
+  UserSelectMenuInteraction
+} from "discord.js";
+import { stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import path from "node:path";
 import { isApprovedDiscordUsername } from "./access.js";
 import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
 import {
@@ -20,13 +34,15 @@ import {
 import type { CollabCapability, CollabEnvelopeV2, CollabIntent, CollabMode } from "./collab-protocol.js";
 import { CollabStore, formatCollabRecent } from "./collab-store.js";
 import type { CollabContribution, CollabConversation } from "./collab-store.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, normalizeProjectName } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
 import { parseMentionRequest, parseStatusRequest, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { captureProjectScreenshot, type ProjectScreenshot } from "./project-screenshot.js";
 import { configuredCommandNames, formatProjectCommandResult, runConfiguredProjectCommand } from "./command-runner.js";
+import { syncCommandsIfChanged } from "./command-sync.js";
+import { commandDefinitions } from "./commands.js";
 import {
   buildCapabilities,
   createPeerEnvelope,
@@ -37,6 +53,7 @@ import {
   PeerStore
 } from "./peer.js";
 import { createReviewPacket, evaluateMergeGates, formatMergeGateResult, formatReviewPacket, formatValidationResults, validateReview } from "./review.js";
+import { contextLimitForRoute, routeRequest, type RequestRoute } from "./request-router.js";
 import {
   commandRequiresApproval,
   isPeerAllowedForProject,
@@ -46,8 +63,13 @@ import {
   screenshotRequiresApproval
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskStatus } from "./task-store.js";
+import { parseTaskControl, taskControlRow, type TaskControlAction } from "./task-controls.js";
 import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
+import { applySetupState, captureBootstrapConfig, isSetupController } from "./runtime-setup.js";
+import { clearRuntimeLock, markRuntimeRunning, runtimeLockPath } from "./runtime-lock.js";
+import { SetupStore, type SetupState, type SetupUserPermission } from "./setup-store.js";
+import { parseSetupWizardAction, setupRepositoryModal, setupWizardView, type SetupWizardAction } from "./setup-wizard.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
 import {
   councilChallengePrompt,
@@ -73,6 +95,9 @@ import {
 } from "./lab.js";
 
 const config = loadConfig();
+const setupStore = new SetupStore(process.env.DEVBOT_SETUP_STORE?.trim() || undefined);
+const bootstrapConfig = captureBootstrapConfig(config);
+applySetupState(config, bootstrapConfig, setupStore.snapshot());
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
@@ -80,19 +105,65 @@ const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefin
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const activeTaskControllers = new Map<string, AbortController>();
 const activeWorkroomActions = new Set<string>();
+let verifiedPrivateRoomId: string | undefined;
+let slashCommandsReady = false;
+const runtimePidFile = runtimeLockPath(process.env.DEVBOT_RUNTIME_LOCK);
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
 client.once("clientReady", async () => {
+  markRuntimeRunning(runtimePidFile);
+  if (config.autoDeployCommands && client.application) {
+    try {
+      const deployed = await syncCommandsIfChanged({
+        definitions: commandDefinitions,
+        guildId: config.discordGuildId,
+        setCommands: (definitions, guildId) => client.application!.commands.set(definitions, guildId)
+      });
+      slashCommandsReady = true;
+      console.log(`Slash commands: ${deployed ? "updated" : "current"}.`);
+    } catch (error) {
+      console.warn(`Unable to synchronize slash commands: ${(error as Error).message}`);
+    }
+  }
+  const startupSetupState = setupStore.snapshot();
+  const configuredRoomId = await verifyPrivateRoom(startupSetupState.privateChannelId ?? bootstrapConfig.coordinationChannelId);
+  if (configuredRoomId && startupSetupState.privateChannelId) {
+    try {
+      const channel = await client.channels.fetch(configuredRoomId);
+      if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread)) {
+        throw new Error("The configured room is no longer a private text room.");
+      }
+      await syncPrivateRoomChannel(channel, channel.guild.roles.everyone.id, startupSetupState, config);
+      verifiedPrivateRoomId = configuredRoomId;
+    } catch (error) {
+      verifiedPrivateRoomId = undefined;
+      console.warn(`Private room access could not be synchronized; Devbot will remain unavailable: ${(error as Error).message}`);
+    }
+  } else {
+    verifiedPrivateRoomId = configuredRoomId;
+  }
   console.log(`Logged in as ${client.user?.tag ?? "unknown bot"}.`);
   console.log(`Devbot identity: ${config.botIdentity.displayName} owned by ${config.botIdentity.owner}. Safe mode: ${config.safeMode ? "on" : "off"}.`);
   console.log(`Configured projects: ${config.projects.map((project) => project.name).join(", ")}`);
+  console.log(`Owner setup: ${config.ownerUserId ? "enabled" : "disabled (set DEVBOT_OWNER_USER_ID)"}.`);
+  console.log(
+    `Request routing: ${config.routing.enabled ? "enabled" : "fallback only"} ` +
+      `(fast=${config.routing.fastModel ?? "default"}, standard=${config.routing.standardModel ?? "default"}, deep=${config.routing.deepModel ?? "default"}).`
+  );
 });
+
+process.once("exit", () => clearRuntimeLock(runtimePidFile));
 
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isAutocomplete()) {
+      const privateChannelId = effectivePrivateRoomId();
+      if (!privateChannelId || interaction.channelId !== privateChannelId) {
+        await interaction.respond([]);
+        return;
+      }
       if (!isAllowed(interaction, config)) {
         await interaction.respond([]);
         return;
@@ -102,6 +173,27 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      const setupAction = parseSetupWizardAction(interaction.customId);
+      if (setupAction) {
+        if (!isOwner(interaction.user.id, config)) {
+          await interaction.reply({ content: "Only the configured Devbot owner can use setup controls.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        await handleSetupWizardButton(interaction, config, setupAction);
+        return;
+      }
+      const taskControl = parseTaskControl(interaction.customId);
+      if (taskControl) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleTaskControl(interaction, config, taskControl.action, taskControl.taskId);
+        return;
+      }
       if (!parseWorkroomButton(interaction.customId)) {
         return;
       }
@@ -109,7 +201,40 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
         return;
       }
+      if (!(await ensureConfiguredRoom(interaction))) {
+        return;
+      }
       await handleWorkroomButton(interaction, config);
+      return;
+    }
+
+    if (interaction.isUserSelectMenu() || interaction.isStringSelectMenu()) {
+      const setupAction = parseSetupWizardAction(interaction.customId);
+      if (!setupAction) {
+        return;
+      }
+      if (!isOwner(interaction.user.id, config)) {
+        await interaction.reply({ content: "Only the configured Devbot owner can use setup controls.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (interaction.isUserSelectMenu()) {
+        await handleSetupUserSelect(interaction, config, setupAction);
+      } else {
+        await handleSetupProjectSelect(interaction, config, setupAction);
+      }
+      return;
+    }
+
+    if (interaction.isModalSubmit()) {
+      const setupAction = parseSetupWizardAction(interaction.customId);
+      if (!setupAction) {
+        return;
+      }
+      if (!isOwner(interaction.user.id, config)) {
+        await interaction.reply({ content: "Only the configured Devbot owner can use setup controls.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await handleSetupRepoModal(interaction, config, setupAction);
       return;
     }
 
@@ -117,8 +242,27 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === "setup") {
+      if (!config.ownerUserId) {
+        await interaction.reply({
+          content: "Devbot has no configured owner. Set `DEVBOT_OWNER_USER_ID` locally, restart, then run `/setup wizard`.",
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+      if (!isOwner(interaction.user.id, config)) {
+        await interaction.reply({ content: "Only the configured Devbot owner can run `/setup`.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await handleSetupCommand(interaction, config);
+      return;
+    }
+
     if (!isAllowed(interaction, config)) {
       await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!(await ensureConfiguredRoom(interaction))) {
       return;
     }
 
@@ -146,6 +290,16 @@ client.on("messageCreate", async (message) => {
       botRoleMentionIds.length > 0 ||
       message.content.toLowerCase().includes(`@${client.user.username.toLowerCase()}`);
     if (!mentionsBot) {
+      return;
+    }
+
+    const privateChannelId = effectivePrivateRoomId();
+    if (!privateChannelId) {
+      await message.reply("Devbot setup is not ready. Ask the owner to run `/setup wizard`.");
+      return;
+    }
+    if (message.channelId !== privateChannelId) {
+      await message.reply("Devbot is configured for its private room.");
       return;
     }
 
@@ -193,7 +347,7 @@ client.on("messageCreate", async (message) => {
 
     const request = parseMentionRequest(message.content, client.user.id, visibleProjects, botRoleMentionIds);
     if (!request.text) {
-      await message.reply("Tell me what to do after the mention. Example: `@devbot fix the failing tests`");
+      await message.reply("Ask me a project question after the mention. Use `/do` when you want an intentional code change.");
       return;
     }
 
@@ -202,25 +356,33 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
+    if (request.mode === "action" && !isControllerUser(message.author.id, config)) {
+      await message.reply("You have view access, but only the owner or an approved controller can run write-capable work.");
+      return;
+    }
+
     if (isWriteBlockedBySafeMode(config, request.mode)) {
-      await message.reply(safeModeActionMessage("action-style mentions"));
+      await message.reply(safeModeActionMessage("explicit action mentions"));
       return;
     }
 
     await message.channel.sendTyping();
-    const pending = await message.reply(`Working on \`${request.project.name}\`...`);
-    const { answer, taskId } = await runProjectRequest({
+    const pending = await message.reply("Routing request...");
+    const { answer, route, taskId } = await runProjectRequest({
       appConfig: config,
       project: request.project,
       text: request.text,
       includePatterns: request.includePatterns,
       mode: request.mode,
       requester: message.author.tag,
-      source: "mention"
+      source: "mention",
+      onRoute: async (selected) => {
+        await pending.edit(formatRouteProgress(selected, request.project, request.mode));
+      }
     });
 
-    const chunks = splitDiscordMessage(`Task: \`${taskId}\`\n\n${answer}`);
-    await pending.edit(chunks[0] ?? "No answer generated.");
+    const chunks = splitDiscordMessage(`${answer}\n\n${formatResultFooter(request.project, route, request.mode)}`);
+    await pending.edit({ content: chunks[0] ?? "No answer generated.", components: [taskControlRow(taskId)] });
 
     for (const chunk of chunks.slice(1)) {
       await message.reply(chunk);
@@ -234,6 +396,10 @@ client.on("messageCreate", async (message) => {
 await client.login(config.discordToken);
 
 async function handleCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  if (commandRequiresController(interaction) && !(await ensureControllerAccess(interaction, appConfig))) {
+    return;
+  }
+
   if (interaction.commandName === "projects") {
     const projects = appConfig.projects.filter((project) => isAllowedForProject(interaction, project));
     await interaction.reply({
@@ -336,13 +502,13 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
 
   if (interaction.commandName === "ask") {
     await interaction.deferReply();
-    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
     const question = interaction.options.getString("question", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
-    const { answer, context, taskId } = await runProjectRequest({
+    const { answer, route, taskId } = await runProjectRequest({
       appConfig,
       project,
       text: question,
@@ -352,16 +518,8 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
       source: "slash:ask"
     });
 
-    const header = [
-      `Project: \`${project.name}\``,
-      `Task: \`${taskId}\``,
-      `Context files: ${context.files.length}`,
-      includePatterns.length > 0 ? `Include: \`${includePatterns.join(", ")}\`` : undefined
-    ]
-      .filter(Boolean)
-      .join("\n");
-    const chunks = splitDiscordMessage(`${header}\n\n${answer}`);
-    await interaction.editReply(chunks[0] ?? "No answer generated.");
+    const chunks = splitDiscordMessage(`${answer}\n\n${formatResultFooter(project, route, "answer")}`);
+    await interaction.editReply({ content: chunks[0] ?? "No answer generated.", components: [taskControlRow(taskId)] });
 
     for (const chunk of chunks.slice(1)) {
       await interaction.followUp(chunk);
@@ -370,35 +528,479 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     return;
   }
 
-  if (interaction.commandName === "act") {
+  if (interaction.commandName === "do") {
     await interaction.deferReply();
     if (isWriteBlockedBySafeMode(appConfig, "action")) {
-      await interaction.editReply(safeModeActionMessage("/act"));
+      await interaction.editReply(safeModeActionMessage("/do"));
       return;
     }
 
-    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
     const task = interaction.options.getString("task", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
-    const { answer, taskId } = await runProjectRequest({
+    const { answer, route, taskId } = await runProjectRequest({
       appConfig,
       project,
       text: task,
       includePatterns,
       mode: "action",
       requester: interaction.user.tag,
-      source: "slash:act"
+      source: "slash:do"
     });
-    const chunks = splitDiscordMessage(`Task: \`${taskId}\`\n\n${answer}`);
-    await interaction.editReply(chunks[0] ?? "No answer generated.");
+    const chunks = splitDiscordMessage(`${answer}\n\n${formatResultFooter(project, route, "action")}`);
+    await interaction.editReply({ content: chunks[0] ?? "No answer generated.", components: [taskControlRow(taskId)] });
 
     for (const chunk of chunks.slice(1)) {
       await interaction.followUp(chunk);
     }
   }
+}
+
+async function handleSetupCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  if (!appConfig.ownerUserId) {
+    await interaction.reply({
+      content: "Owner setup is disabled. Set `DEVBOT_OWNER_USER_ID` in the local environment and restart Devbot.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const subcommand = interaction.options.getSubcommand();
+  if (subcommand === "wizard") {
+    await interaction.editReply(setupWizardView(setupStore.snapshot(), appConfig, effectivePrivateRoomId()));
+    return;
+  }
+  if (subcommand === "doctor") {
+    await interaction.editReply(await formatSetupDoctor(appConfig));
+    return;
+  }
+  if (subcommand === "show") {
+    await interaction.editReply(formatSetupSummary(setupStore.snapshot(), appConfig));
+    return;
+  }
+
+  if (subcommand === "user") {
+    const action = interaction.options.getString("action", true);
+    const user = interaction.options.getUser("user", true);
+    const permission = interaction.options.getString("permission", true) as SetupUserPermission;
+    if (user.bot) {
+      await interaction.editReply("Use `/setup devbot` for bot accounts.");
+      return;
+    }
+    if (user.id === appConfig.ownerUserId && action === "remove") {
+      await interaction.editReply("The configured owner cannot be removed through Discord setup.");
+      return;
+    }
+
+    const state = await setupStore.setUser(user.id, permission, action === "add");
+    applySetupState(appConfig, bootstrapConfig, state);
+    await syncPrivateRoomPermissions(interaction, state, appConfig);
+    await interaction.editReply(
+      `${action === "add" ? "Granted" : "Removed"} ${permission} access ${action === "add" ? "to" : "from"} <@${user.id}>.`
+    );
+    return;
+  }
+
+  if (subcommand === "devbot") {
+    const action = interaction.options.getString("action", true);
+    const bot = interaction.options.getUser("bot", true);
+    if (!bot.bot || bot.id === client.user?.id) {
+      await interaction.editReply("Choose another Discord bot account as the peer Devbot.");
+      return;
+    }
+
+    const state = await setupStore.setPeer(bot.id, action === "add");
+    applySetupState(appConfig, bootstrapConfig, state);
+    await syncPrivateRoomPermissions(interaction, state, appConfig);
+    await interaction.editReply(`${action === "add" ? "Added" : "Removed"} peer Devbot <@${bot.id}>.`);
+    return;
+  }
+
+  if (subcommand === "repo") {
+    const action = interaction.options.getString("action", true);
+    const rawName = interaction.options.getString("name", true);
+    const name = normalizeProjectName(rawName);
+    if (!/[a-z0-9_]/.test(name)) {
+      await interaction.editReply("Repository name must contain a letter, number, underscore, or hyphen.");
+      return;
+    }
+
+    if (action === "add") {
+      const pathValue = interaction.options.getString("path");
+      if (!pathValue) {
+        await interaction.editReply("`path` is required when adding or updating a repository.");
+        return;
+      }
+      const root = resolveSetupPath(pathValue);
+      const rootStats = await stat(root).catch(() => undefined);
+      if (!rootStats?.isDirectory()) {
+        await interaction.editReply(`Local repository root does not exist or is not a directory: \`${root}\``);
+        return;
+      }
+
+      const state = await setupStore.setRepository(name, root);
+      contextService.invalidate(name);
+      applySetupState(appConfig, bootstrapConfig, state);
+      await interaction.editReply(`Registered \`${name}\` at \`${root}\`.`);
+      return;
+    }
+
+    if (action === "remove") {
+      const managed = setupStore.snapshot().repositories[name];
+      if (!managed) {
+        await interaction.editReply(`\`${name}\` is not managed by Discord setup; static env/config projects cannot be removed here.`);
+        return;
+      }
+      const state = await setupStore.removeRepository(name);
+      contextService.invalidate(name);
+      applySetupState(appConfig, bootstrapConfig, state);
+      await interaction.editReply(`Removed setup-managed repository \`${name}\`.`);
+      return;
+    }
+
+    if (!findProject(appConfig.projects, name)) {
+      await interaction.editReply(`Unknown repository: \`${name}\`. Add it before selecting it as default.`);
+      return;
+    }
+    const state = await setupStore.setDefaultProject(name);
+    applySetupState(appConfig, bootstrapConfig, state);
+    await interaction.editReply(`Selected \`${name}\` as Devbot's default project root.`);
+    return;
+  }
+
+  const channel = await createOrSyncPrivateRoom(interaction, appConfig, interaction.options.getString("name") ?? undefined);
+  await interaction.editReply(`Private Devbot room ready: <#${channel.id}>.`);
+}
+
+async function handleSetupWizardButton(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: SetupWizardAction
+): Promise<void> {
+  if (action === "repo") {
+    await interaction.showModal(setupRepositoryModal());
+    return;
+  }
+
+  await interaction.deferUpdate();
+  if (action === "room") {
+    await createOrSyncPrivateRoom(interaction, appConfig);
+  }
+  await interaction.editReply(
+    setupWizardView(setupStore.snapshot(), appConfig, effectivePrivateRoomId(), action === "finish")
+  );
+}
+
+async function handleSetupUserSelect(
+  interaction: UserSelectMenuInteraction,
+  appConfig: AppConfig,
+  action: SetupWizardAction
+): Promise<void> {
+  if (action !== "viewer" && action !== "controller" && action !== "peer") {
+    return;
+  }
+  await interaction.deferUpdate();
+  const selected = [...interaction.users.values()];
+  const accepted = action === "peer"
+    ? selected.filter((user) => user.bot && user.id !== client.user?.id)
+    : selected.filter((user) => !user.bot);
+  let state = setupStore.snapshot();
+  for (const user of accepted) {
+    state = action === "peer"
+      ? await setupStore.setPeer(user.id, true)
+      : await setupStore.setUser(user.id, action === "viewer" ? "view" : "control", true);
+  }
+  applySetupState(appConfig, bootstrapConfig, state);
+  await syncPrivateRoomPermissions(interaction, state, appConfig);
+  await interaction.editReply(setupWizardView(state, appConfig, effectivePrivateRoomId()));
+  if (accepted.length !== selected.length) {
+    await interaction.followUp({
+      content: action === "peer" ? "Only other Discord bot accounts can be added as peer Devbots." : "Bot accounts cannot be added as viewers or controllers.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+}
+
+async function handleSetupProjectSelect(
+  interaction: StringSelectMenuInteraction,
+  appConfig: AppConfig,
+  action: SetupWizardAction
+): Promise<void> {
+  if (action !== "default") {
+    return;
+  }
+  await interaction.deferUpdate();
+  const projectName = interaction.values[0];
+  if (!projectName || !findProject(appConfig.projects, projectName)) {
+    throw new Error("The selected repository is no longer configured. Refresh the setup wizard.");
+  }
+  const state = await setupStore.setDefaultProject(projectName);
+  applySetupState(appConfig, bootstrapConfig, state);
+  await interaction.editReply(setupWizardView(state, appConfig, effectivePrivateRoomId()));
+}
+
+async function handleSetupRepoModal(
+  interaction: ModalSubmitInteraction,
+  appConfig: AppConfig,
+  action: SetupWizardAction
+): Promise<void> {
+  if (action !== "repo-modal") {
+    return;
+  }
+  if (!interaction.isFromMessage()) {
+    await interaction.reply({ content: "Reopen `/setup wizard` and add the repository from its button.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferUpdate();
+  const state = await registerSetupRepository(
+    interaction.fields.getTextInputValue("name"),
+    interaction.fields.getTextInputValue("path"),
+    appConfig
+  );
+  await interaction.editReply(setupWizardView(state, appConfig, effectivePrivateRoomId()));
+}
+
+async function registerSetupRepository(rawName: string, pathValue: string, appConfig: AppConfig): Promise<SetupState> {
+  const name = normalizeProjectName(rawName);
+  if (!/[a-z0-9_]/.test(name)) {
+    throw new Error("Repository name must contain a letter, number, underscore, or hyphen.");
+  }
+  const root = resolveSetupPath(pathValue);
+  const rootStats = await stat(root).catch(() => undefined);
+  if (!rootStats?.isDirectory()) {
+    throw new Error("That local repository path does not exist or is not a directory.");
+  }
+  const hadDefault = appConfig.projects.some((project) => project.isDefault);
+  let state = await setupStore.setRepository(name, root);
+  contextService.invalidate(name);
+  applySetupState(appConfig, bootstrapConfig, state);
+  if (!hadDefault) {
+    state = await setupStore.setDefaultProject(name);
+    applySetupState(appConfig, bootstrapConfig, state);
+  }
+  return state;
+}
+
+async function createOrSyncPrivateRoom(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  appConfig: AppConfig,
+  roomName?: string
+) {
+  const guild = interaction.guild;
+  if (!guild) {
+    throw new Error("`/setup room` must be run inside the configured Discord server.");
+  }
+
+  let state = setupStore.snapshot();
+  let channel = state.privateChannelId ? await guild.channels.fetch(state.privateChannelId).catch(() => null) : null;
+  if (channel && channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread) {
+    throw new Error("The saved private room is no longer a Discord text channel or private thread.");
+  }
+
+  if (!channel) {
+    const requestedName = roomName ?? "devbot-private";
+    const name = requestedName.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "devbot-private";
+    if (interaction.channel?.type === ChannelType.PrivateThread) {
+      channel = interaction.channel;
+    } else if (guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      const parentId = (interaction.channel as { parentId?: string | null } | null)?.parentId ?? undefined;
+      channel = await guild.channels.create({
+        name,
+        type: ChannelType.GuildText,
+        ...(parentId ? { parent: parentId } : {}),
+        permissionOverwrites: roomPermissionOverwrites(guild.roles.everyone.id, state, appConfig),
+        reason: `Private Devbot room created by owner ${interaction.user.tag}`
+      });
+    } else if (interaction.channel?.type === ChannelType.GuildText) {
+      channel = await interaction.channel.threads.create({
+        name,
+        type: ChannelType.PrivateThread,
+        invitable: false,
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+        reason: `Private Devbot room created by owner ${interaction.user.tag}`
+      });
+    } else {
+      throw new Error("Run `/setup room` in a server text channel or private thread. Devbot cannot manage channels, so it needs a thread-capable parent.");
+    }
+    state = await setupStore.setPrivateChannel(channel.id);
+    applySetupState(appConfig, bootstrapConfig, state);
+  }
+
+  await syncPrivateRoomChannel(channel, guild.roles.everyone.id, state, appConfig);
+  verifiedPrivateRoomId = channel.id;
+  return channel;
+}
+
+async function syncPrivateRoomPermissions(
+  interaction: ChatInputCommandInteraction | UserSelectMenuInteraction,
+  state: SetupState,
+  appConfig: AppConfig
+): Promise<void> {
+  const roomId = state.privateChannelId ?? effectivePrivateRoomId();
+  if (!roomId || !interaction.guild) {
+    return;
+  }
+  const channel = await interaction.guild.channels.fetch(roomId).catch(() => null);
+  if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread)) {
+    throw new Error("The configured private Devbot room is missing or is not a private text room.");
+  }
+  await syncPrivateRoomChannel(channel, interaction.guild.roles.everyone.id, state, appConfig);
+}
+
+async function syncPrivateRoomChannel(
+  channel: GuildTextBasedChannel,
+  everyoneRoleId: string,
+  state: SetupState,
+  appConfig: AppConfig
+): Promise<void> {
+  if (channel.type === ChannelType.GuildText) {
+    await channel.permissionOverwrites.set(
+      roomPermissionOverwrites(everyoneRoleId, state, appConfig),
+      "Synchronize Devbot viewers, controllers, and peer bots"
+    );
+    return;
+  }
+  if (channel.type !== ChannelType.PrivateThread) {
+    throw new Error("The configured Devbot room must be a text channel or private thread.");
+  }
+
+  if (channel.archived) {
+    await channel.setArchived(false, "Devbot private room resumed");
+  }
+  const desired = new Set([...appConfig.allowedUserIds, ...appConfig.peerBotIds]);
+  if (appConfig.ownerUserId) {
+    desired.add(appConfig.ownerUserId);
+  }
+  if (client.user) {
+    desired.add(client.user.id);
+  }
+  const members = await channel.members.fetch();
+  for (const userId of desired) {
+    if (!members.has(userId)) {
+      await channel.members.add(userId);
+    }
+  }
+  for (const member of members.values()) {
+    if (!desired.has(member.id)) {
+      await channel.members.remove(member.id);
+    }
+  }
+}
+
+function roomPermissionOverwrites(everyoneRoleId: string, state: SetupState, appConfig: AppConfig) {
+  const humans = new Set([...appConfig.allowedUserIds, ...state.viewerUserIds, ...state.controllerUserIds]);
+  if (appConfig.ownerUserId) {
+    humans.add(appConfig.ownerUserId);
+  }
+  const peers = new Set([...appConfig.peerBotIds, ...state.peerBotIds]);
+  const humanAllow = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ReadMessageHistory,
+    PermissionFlagsBits.UseApplicationCommands,
+    PermissionFlagsBits.AttachFiles,
+    PermissionFlagsBits.EmbedLinks
+  ];
+  const peerAllow = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory];
+  const overwrites = [
+    { id: everyoneRoleId, deny: [PermissionFlagsBits.ViewChannel] },
+    ...[...humans].map((id) => ({ id, allow: humanAllow })),
+    ...[...peers].filter((id) => !humans.has(id)).map((id) => ({ id, allow: peerAllow }))
+  ];
+  if (client.user && !humans.has(client.user.id) && !peers.has(client.user.id)) {
+    overwrites.push({
+      id: client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.ManageThreads,
+        PermissionFlagsBits.CreatePrivateThreads
+      ]
+    });
+  }
+  return overwrites;
+}
+
+function formatSetupSummary(state: SetupState, appConfig: AppConfig): string {
+  const repositories = appConfig.projects.length
+    ? appConfig.projects.map((project) => `- \`${project.name}\`${project.isDefault ? " (default)" : ""}: \`${project.root}\``).join("\n")
+    : "- none";
+  return [
+    "Devbot owner setup",
+    `Owner: <@${appConfig.ownerUserId}>`,
+    `Private room: ${effectivePrivateRoomId() ? `<#${effectivePrivateRoomId()}>` : "not ready"}`,
+    `Managed viewers: ${formatSetupMentions(state.viewerUserIds)}`,
+    `Managed controllers: ${formatSetupMentions(state.controllerUserIds)}`,
+    `Managed peer Devbots: ${formatSetupMentions(state.peerBotIds)}`,
+    `Bootstrap user IDs still active: ${bootstrapConfig.allowedUserIds.size}`,
+    "",
+    "Project roots:",
+    repositories
+  ].join("\n");
+}
+
+async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
+  const defaultProject = appConfig.projects.find((project) => project.isDefault);
+  const repoReady = defaultProject ? Boolean((await stat(defaultProject.root).catch(() => undefined))?.isDirectory()) : false;
+  const codexReady = path.isAbsolute(appConfig.codex.bin)
+    ? Boolean((await stat(appConfig.codex.bin).catch(() => undefined))?.isFile())
+    : Boolean(appConfig.codex.bin);
+  const checks = [
+    [Boolean(appConfig.ownerUserId), "Owner identity", "Set DEVBOT_OWNER_USER_ID locally and restart."],
+    [Boolean(effectivePrivateRoomId()), "Private room", "Run /setup wizard and choose Use private room."],
+    [repoReady, "Default repository", "Add or repair a repository in /setup wizard."],
+    [codexReady, "Codex executable", "Set CODEX_BIN to an installed Codex CLI."],
+    [appConfig.routing.enabled && Boolean(appConfig.routing.fastModel && appConfig.routing.standardModel && appConfig.routing.deepModel), "Luna / Terra / Sol routing", "Check CODEX_ROUTER_MODEL and tier model settings."],
+    [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."]
+  ] as const;
+  const passed = checks.filter(([ready]) => ready).length;
+  return [
+    "Devbot doctor",
+    `Readiness: ${passed}/${checks.length}`,
+    "",
+    ...checks.map(([ready, label, fix]) => `${ready ? "READY" : "FIX"}  ${label}${ready ? "" : ` - ${fix}`}`),
+    "",
+    passed === checks.length ? "Ready. Ask with @devbot, change with /do, and check with /status." : "No changes were made. Resolve FIX items, then run /setup doctor again."
+  ].join("\n");
+}
+
+function formatSetupMentions(ids: string[]): string {
+  return ids.length ? ids.map((id) => `<@${id}>`).join(", ") : "none";
+}
+
+function resolveSetupPath(value: string): string {
+  const trimmed = value.trim();
+  const expanded = trimmed === "~" ? homedir() : trimmed.startsWith("~/") ? path.join(homedir(), trimmed.slice(2)) : trimmed;
+  return path.resolve(expanded);
+}
+
+function formatRoute(route: RequestRoute): string {
+  const context = route.contextMode === "none" ? "direct" : route.contextMode === "focused" ? "focused" : "deep context";
+  return `${routeName(route)} / ${context}`;
+}
+
+function formatRouteProgress(route: RequestRoute, project: ProjectEntry, mode: CodexRequestMode): string {
+  if (route.contextMode === "none") {
+    return `Answering directly with ${routeName(route)}...`;
+  }
+  if (route.contextMode === "full") {
+    return `Taking a deeper look at \`${project.name}\` with ${routeName(route)}...`;
+  }
+  return `${mode === "action" ? "Working" : "Looking"} in \`${project.name}\` with ${routeName(route)}...`;
+}
+
+function routeName(route: RequestRoute): "Luna" | "Terra" | "Sol" {
+  return route.tier === "fast" ? "Luna" : route.tier === "standard" ? "Terra" : "Sol";
+}
+
+function formatResultFooter(project: ProjectEntry, route: RequestRoute, mode: CodexRequestMode): string {
+  return `${project.name} | ${mode === "action" ? "write-capable" : "read-only"} | ${formatRoute(route)}`;
 }
 
 interface ProjectRequestOptions {
@@ -410,12 +1012,14 @@ interface ProjectRequestOptions {
   requester: string;
   source: string;
   contextCharLimit?: number;
+  onRoute?: (route: RequestRoute) => Promise<void>;
 }
 
 interface ProjectRequestResult {
   answer: string;
   context: PackedProjectContext;
   taskId: string;
+  route: RequestRoute;
 }
 
 async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
@@ -441,18 +1045,38 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
   activeTaskControllers.set(task.id, controller);
 
   try {
-    const context = await contextService.pack(
-      options.project,
-      options.text,
-      options.includePatterns,
+    const route = await routeRequest({
+      codex: options.appConfig.codex,
+      routing: options.appConfig.routing,
+      text: options.text,
+      mode: options.mode,
+      projectName: options.project.name,
+      projectRoot: options.project.root,
+      hasExplicitIncludes: options.includePatterns.length > 0,
+      signal: controller.signal
+    });
+    await options.onRoute?.(route);
+    const contextCharLimit = contextLimitForRoute(
+      route,
+      options.appConfig.scanner.maxPackedContextChars,
+      options.appConfig.routing.focusedContextChars,
+      options.project.metadata.policy.maxContextChars,
       options.contextCharLimit
     );
-    const answer = await runCodex(options.appConfig, options.text, context, options.mode, controller.signal);
+    const context = contextCharLimit === 0
+      ? { project: options.project, files: [], packedText: "" }
+      : await contextService.pack(options.project, options.text, options.includePatterns, contextCharLimit);
+    const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
     await taskStore.succeed(task.id, {
       contextFileCount: context.files.length,
-      resultPreview: answer
+      resultPreview: answer,
+      ...(route.model ? { model: route.model } : {}),
+      modelTier: route.tier,
+      contextMode: route.contextMode,
+      routeReason: route.reason,
+      routeSource: route.source
     });
-    return { answer, context, taskId: task.id };
+    return { answer, context, taskId: task.id, route };
   } catch (error) {
     if (controller.signal.aborted) {
       await taskStore.cancel(task.id, "Canceled by user request.");
@@ -651,6 +1275,64 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
   }
 }
 
+async function handleTaskControl(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: TaskControlAction,
+  taskId: string
+): Promise<void> {
+  const task = await taskStore.get(taskId);
+  if (!task) {
+    await interaction.reply({ content: "That saved task is no longer available.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, task.projectName);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That task's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (action === "details") {
+    await interaction.reply({
+      content: formatTaskDetail(task),
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  const mode: CodexRequestMode = task.mode === "action" ? "action" : "answer";
+  if (mode === "action" && !isControllerUser(interaction.user.id, appConfig)) {
+    await interaction.reply({
+      content: "Only the owner or an approved controller can retry write-capable work.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  if (isWriteBlockedBySafeMode(appConfig, mode)) {
+    await interaction.reply({ content: safeModeActionMessage("this retry"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const result = await runProjectRequest({
+    appConfig,
+    project,
+    text: task.text,
+    includePatterns: task.includePatterns,
+    mode,
+    requester: interaction.user.tag,
+    source: `button:retry:${task.id}`
+  });
+  const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(project, result.route, mode)}`);
+  await interaction.editReply({
+    content: chunks.shift() ?? "Retry completed without a response.",
+    components: [taskControlRow(result.taskId)]
+  });
+  for (const chunk of chunks) {
+    await interaction.followUp({ content: chunk, flags: MessageFlags.Ephemeral });
+  }
+}
+
 async function handleDashboardCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   await interaction.deferReply();
   const projectName = interaction.options.getString("project") ?? undefined;
@@ -690,7 +1372,7 @@ async function handleRunCommand(interaction: ChatInputCommandInteraction, appCon
     return;
   }
 
-  const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+  const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
   if (!(await ensureProjectAccess(interaction, project))) {
     return;
   }
@@ -801,7 +1483,7 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
 
   if (subcommand === "council") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
@@ -956,8 +1638,8 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
       await interaction.editReply(`Unknown lab session: \`${id}\`.`);
       return;
     }
-    if (conversation.requesterId && conversation.requesterId !== interaction.user.id) {
-      await interaction.editReply(`Only the human who opened lab session \`${id}\` can record its decision.`);
+    if (conversation.requesterId && conversation.requesterId !== interaction.user.id && !isControllerUser(interaction.user.id, appConfig)) {
+      await interaction.editReply(`Only the requester, owner, or an approved controller can decide lab session \`${id}\`.`);
       return;
     }
     const projectName = interaction.options.getString("project") ?? conversation.projectName;
@@ -1349,15 +2031,22 @@ async function handleWorkroomButton(interaction: ButtonInteraction, appConfig: A
   if (!parsed) {
     return;
   }
+  if ((parsed.action === "approve" || parsed.action === "deny") && !isControllerUser(interaction.user.id, appConfig)) {
+    await interaction.reply({
+      content: "Only the owner or an approved controller can record approval decisions.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
 
   const conversation = await collabStore.get(parsed.conversationId);
   if (!conversation) {
     await interaction.reply({ content: "This workroom no longer exists in the local collaboration store.", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (conversation.requesterId && conversation.requesterId !== interaction.user.id) {
+  if (conversation.requesterId && conversation.requesterId !== interaction.user.id && !isControllerUser(interaction.user.id, appConfig)) {
     await interaction.reply({
-      content: `Only the human who opened workroom \`${conversation.id}\` can operate its decision controls.`,
+      content: `Only the requester, owner, or an approved controller can operate workroom \`${conversation.id}\`.`,
       flags: MessageFlags.Ephemeral
     });
     return;
@@ -1646,7 +2335,7 @@ async function sendWorkroomText(
 }
 
 async function archiveWorkroomThread(conversation: CollabConversation): Promise<void> {
-  if (!conversation.threadId) {
+  if (!conversation.threadId || conversation.threadId === setupStore.snapshot().privateChannelId) {
     return;
   }
 
@@ -2097,7 +2786,7 @@ function formatDiagnosticList(label: string, values: string[]): string {
 function formatProjectSummary(project: ProjectEntry): string {
   const commands = configuredCommandNames(project);
   const details = [
-    `- \`${project.name}\` -> \`${project.root}\``,
+    `- \`${project.name}\`${project.isDefault ? " (default)" : ""} -> \`${project.root}\``,
     project.metadata.frontendUrl ? `frontend: ${project.metadata.frontendUrl}` : undefined,
     commands.length > 0 ? `commands: ${commands.map((command) => `\`${command}\``).join(", ")}` : undefined,
     project.metadata.ownerBot ? `owner bot: ${project.metadata.ownerBot}` : undefined
@@ -2112,19 +2801,21 @@ function formatDevbotHelp(appConfig: AppConfig): string {
     `Safe mode: ${appConfig.safeMode ? "on" : "off"}`,
     "",
     "Common workflows:",
-    "- Check work: `/status` or `/dashboard`.",
-    "- Ask read-only questions: `/ask project:<name> question:<text>`.",
+    "- Ask: mention `@devbot` or use `/ask` for a read-only answer.",
+    "- Do: use `/do` for an intentional project change.",
+    "- Check: use `/status` for current work and `/dashboard` for the full view.",
     "- Capture UI: `/snip project:<name> target:<page or path>`.",
     "- Inspect tasks: `/task recent`, `/task show`, `/task logs`, `/task retry`.",
     "- Run configured validation: `/run project:<name> command:<preset>` or `/review validate`.",
     "- Prepare handoff: `/review packet project:<name> task:<task-id>`.",
     "- Coordinate peers: `/devbot announce`, `/devbot peers`, `/peer status`, `/peer snip`.",
-    "- Open a sealed agent council: `/lab council project:<name> prompt:<decision>`.",
+    "- Open a sealed agent council: `/lab council prompt:<decision>`.",
+    "- Owner setup: start with `/setup wizard`; use `/setup doctor` when something feels off.",
     "- Collaborate in the private lab: `/lab roundtable`, `/lab see`, `/lab bossfight`, `/lab ritual`, `/lab safety`.",
     "",
     appConfig.safeMode
-      ? "Write-capable actions are disabled while safe mode is on: `/act`, action-style mentions, `/run`, and review validation."
-      : "Write-capable actions are enabled for allowed users: `/act`, action-style mentions, `/run`, and review validation."
+      ? "Write-capable actions are disabled while safe mode is on: `/do`, explicit action retries, `/run`, and review validation."
+      : "Write-capable actions are enabled for the owner and approved controllers: `/do`, explicit action retries, `/run`, and review validation."
   ].join("\n");
 }
 
@@ -2200,7 +2891,13 @@ async function startLabConversation(
     ...(brief ? { brief } : {}),
     ...(project ? { projectName: project.name } : {})
   });
-  const thread = await createLabThread(interaction, conversation.id, intent, title);
+  const sharedRoomThread =
+    intent === "council" &&
+    interaction.channelId === setupStore.snapshot().privateChannelId &&
+    interaction.channel?.type === ChannelType.PrivateThread
+      ? interaction.channel
+      : undefined;
+  const thread = sharedRoomThread ?? (await createLabThread(interaction, conversation.id, intent, title));
   if (!thread) {
     return conversation;
   }
@@ -2217,7 +2914,9 @@ async function startLabConversation(
       allowedMentions: { parse: [] }
     });
   } catch (error) {
-    await thread.delete?.("Unable to initialize the Devbot workroom").catch(() => undefined);
+    if (!sharedRoomThread) {
+      await thread.delete?.("Unable to initialize the Devbot workroom").catch(() => undefined);
+    }
     console.warn(`Unable to initialize lab thread ${thread.id}: ${(error as Error).message}`);
     return conversation;
   }
@@ -2271,6 +2970,14 @@ async function createLabThread(
           throw new Error("Private thread membership API is unavailable.");
         }
         await thread.members.add(interaction.user.id);
+        for (const userId of config.allowedUserIds) {
+          if (userId === interaction.user.id) {
+            continue;
+          }
+          await thread.members.add(userId).catch((error) => {
+            console.warn(`Unable to add configured viewer ${userId} to council thread ${thread.id}: ${(error as Error).message}`);
+          });
+        }
       } catch (error) {
         await thread.delete?.("Unable to add the council requester to the private workroom").catch(() => undefined);
         throw error;
@@ -2459,6 +3166,7 @@ async function runCodex(
   text: string,
   context: PackedProjectContext,
   mode: CodexRequestMode,
+  route: RequestRoute,
   signal?: AbortSignal
 ): Promise<string> {
   return answerWithProjectContext({
@@ -2466,6 +3174,9 @@ async function runCodex(
     question: text,
     context,
     mode,
+    ...(route.model ? { model: route.model } : {}),
+    ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
+    contextMode: route.contextMode,
     ...(signal ? { signal } : {})
   });
 }
@@ -2504,7 +3215,7 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, appConfi
 
 function findProjectFromAutocomplete(interaction: AutocompleteInteraction, projects: ProjectEntry[]): ProjectEntry | undefined {
   const projectName = interaction.options.getString("project");
-  return projectName ? findProject(projects, projectName) : undefined;
+  return projectName ? findProject(projects, projectName) : projects.find((project) => project.isDefault) ?? (projects.length === 1 ? projects[0] : undefined);
 }
 
 function mustFindProject(projects: ProjectEntry[], name: string): ProjectEntry {
@@ -2539,11 +3250,22 @@ function parseOptionalProjectToken(text: string, projects: ProjectEntry[]): { te
 }
 
 function defaultProject(projects: ProjectEntry[]): ProjectEntry {
+  const selected = projects.find((project) => project.isDefault);
+  if (selected) {
+    return selected;
+  }
   if (projects.length === 1 && projects[0]) {
     return projects[0];
   }
 
-  throw new Error("Multiple projects are configured. Add `project:<name>` to the request.");
+  if (projects.length === 0) {
+    throw new Error("No projects are configured. Ask the owner to run `/setup repo`.");
+  }
+  throw new Error("Multiple projects are configured. Choose one explicitly or ask the owner to select a default with `/setup repo`.");
+}
+
+function selectedProject(projects: ProjectEntry[], requestedName: string | null): ProjectEntry {
+  return requestedName ? mustFindProject(projects, requestedName) : defaultProject(projects);
 }
 
 function parseFallbackStatusRequest(text: string): { isStatus: boolean; question: string | undefined; wantsImage: boolean } {
@@ -2584,6 +3306,12 @@ async function ensureProjectAccess(interaction: ChatInputCommandInteraction, pro
 }
 
 function isAllowed(interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction, appConfig: AppConfig): boolean {
+  if (!appConfig.ownerUserId) {
+    return false;
+  }
+  if (isOwner(interaction.user.id, appConfig)) {
+    return true;
+  }
   const hasUserAllowList = appConfig.allowedUserIds.size > 0;
   const hasUsernameAllowList = appConfig.allowedUsernames.size > 0;
   const hasRoleAllowList = appConfig.allowedRoleIds.size > 0;
@@ -2642,6 +3370,12 @@ function isAllowedForProject(
 }
 
 function isAllowedMessage(message: Message, appConfig: AppConfig): boolean {
+  if (!appConfig.ownerUserId) {
+    return false;
+  }
+  if (isOwner(message.author.id, appConfig)) {
+    return true;
+  }
   const hasUserAllowList = appConfig.allowedUserIds.size > 0;
   const hasUsernameAllowList = appConfig.allowedUsernames.size > 0;
   const hasRoleAllowList = appConfig.allowedRoleIds.size > 0;
@@ -2658,6 +3392,83 @@ function isAllowedMessage(message: Message, appConfig: AppConfig): boolean {
   }
 
   return message.member?.roles.cache.some((role) => appConfig.allowedRoleIds.has(role.id)) ?? false;
+}
+
+function isOwner(userId: string, appConfig: Pick<AppConfig, "ownerUserId">): boolean {
+  return Boolean(appConfig.ownerUserId && userId === appConfig.ownerUserId);
+}
+
+function isControllerUser(userId: string, appConfig: AppConfig): boolean {
+  if (!appConfig.ownerUserId) {
+    return false;
+  }
+  return isSetupController(setupStore.snapshot(), appConfig.ownerUserId, userId);
+}
+
+function commandRequiresController(interaction: ChatInputCommandInteraction): boolean {
+  if (interaction.commandName === "do" || interaction.commandName === "run") {
+    return true;
+  }
+  const subcommand = interaction.options.getSubcommand(false);
+  if (interaction.commandName === "review") {
+    return subcommand === "validate" || subcommand === "gates";
+  }
+  if (interaction.commandName === "task") {
+    return subcommand === "cancel" || subcommand === "retry";
+  }
+  return interaction.commandName === "lab" && subcommand === "approve";
+}
+
+async function ensureControllerAccess(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<boolean> {
+  if (isControllerUser(interaction.user.id, appConfig)) {
+    return true;
+  }
+  await interaction.reply({
+    content: "You have view access, but only the owner or an approved controller can run this command.",
+    flags: MessageFlags.Ephemeral
+  });
+  return false;
+}
+
+async function ensureConfiguredRoom(interaction: ChatInputCommandInteraction | ButtonInteraction): Promise<boolean> {
+  const privateChannelId = effectivePrivateRoomId();
+  if (!privateChannelId) {
+    await interaction.reply({
+      content: "Devbot setup is not ready. The owner must run `/setup wizard` first.",
+      flags: MessageFlags.Ephemeral
+    });
+    return false;
+  }
+  if (interaction.channelId === privateChannelId) {
+    return true;
+  }
+  await interaction.reply({
+    content: `Devbot is configured for its private room: <#${privateChannelId}>.`,
+    flags: MessageFlags.Ephemeral
+  });
+  return false;
+}
+
+function effectivePrivateRoomId(): string | undefined {
+  return verifiedPrivateRoomId;
+}
+
+async function verifyPrivateRoom(channelId: string | undefined): Promise<string | undefined> {
+  if (!channelId) {
+    return undefined;
+  }
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (channel?.type === ChannelType.PrivateThread) {
+    return channel.id;
+  }
+  if (channel?.type === ChannelType.GuildText) {
+    const everyone = channel.permissionOverwrites.cache.get(channel.guild.roles.everyone.id);
+    if (everyone?.deny.has(PermissionFlagsBits.ViewChannel)) {
+      return channel.id;
+    }
+  }
+  console.warn(`Configured Devbot room ${channelId} is missing or is not private.`);
+  return undefined;
 }
 
 function isAllowedMessageForProject(message: Message, project: ProjectEntry): boolean {
@@ -2680,7 +3491,12 @@ function canAccessConversation(
   conversation: CollabConversation,
   appConfig: AppConfig
 ): boolean {
-  if (conversation.intent === "council" && conversation.requesterId && conversation.requesterId !== interaction.user.id) {
+  if (
+    conversation.intent === "council" &&
+    conversation.requesterId &&
+    conversation.requesterId !== interaction.user.id &&
+    !isControllerUser(interaction.user.id, appConfig)
+  ) {
     return false;
   }
   if (!conversation.projectName) {

@@ -1,39 +1,67 @@
 # Devbot
 
-A local Discord bot that lets you ask development questions and request focused project actions from Discord while the bot pulls context from configured projects on the machine where it is running.
+Devbot is a private, local-first Discord workspace for building software with Codex. It connects a Discord room to the repositories on your own machine, automatically chooses Luna, Terra, or Sol for each request, and can invite approved people and peer Devbots into the same workspace.
 
-It uses:
+The everyday model is intentionally small:
 
-- Discord slash commands for `/ask`, `/act`, `/status`, `/snip`, `/task`, `/dashboard`, `/run`, `/review`, `/devbot`, `/peer`, `/lab`, `/projects`, and `/refresh`
-- `@devbot` mentions for action-style requests
-- the local Codex CLI for model answers
-- Local project scanning with default ignores for `.git`, `node_modules`, build output, lock artifacts, and secret-looking files
+- **Ask:** mention `@devbot` for a read-only answer.
+- **Do:** use `/do` for an intentional project change.
+- **Check:** use `/status` to see what is happening.
 
-This does not require an OpenAI API key. Each request runs `codex exec` locally, using your signed-in Codex app/CLI setup.
+Devbot uses your signed-in local Codex CLI or app session and does not need a separate OpenAI API key or hosted Devbot backend. Selected project context is handled through that Codex session; Discord messages still travel through Discord.
 
-## Setup
+## One-Command Setup
 
-1. Install Node.js 20 or newer.
-2. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, and `DISCORD_GUILD_ID`.
-3. Copy `config/projects.example.json` to `config/projects.json` and map project names to env-backed local paths on the machine running devbot. For quick one-off setup, you can instead set `PROJECTS_JSON` in `.env`.
-4. Optionally copy `.devbot/project.example.json` into each target project at `<project>/.devbot/project.json` and customize URLs, aliases, and validation commands.
-5. Install dependencies:
+Prerequisites: Node.js 20 or newer, a signed-in Codex CLI or app, and a Discord account that can add apps to the target server.
+
+1. Install dependencies and launch the local setup tool:
 
    ```bash
    npm install
+   npm run setup
    ```
 
-6. Deploy slash commands to your test Discord server:
+2. The setup page opens in your browser. Discord requires one manual platform step: create an application in the [Developer Portal](https://discord.com/developers/applications), open **Bot**, reset the token, and paste that token into the local setup page. Devbot then:
 
-   ```bash
-   npm run commands:deploy
-   ```
+![Dark Devbot setup showing the local system check and Discord application connection](docs/images/setup-connect-dark.png)
 
-7. Start the bot:
+*Connect the Discord application without exposing the bot token in the repository.*
 
-   ```bash
-   npm run dev
-   ```
+   - validates the bot directly with Discord
+   - opens the correct server-install prompt with the required scopes and permissions
+   - discovers the server after installation
+   - uses the Discord server owner as the initial Devbot owner
+   - registers the local repository with a native folder picker
+   - creates a deny-by-default `devbot-private` room
+   - deploys slash commands and posts the Ask / Do / Check quickstart
+   - writes the ignored local `.env` and `.devbot/setup.json` with owner-only file permissions
+   - starts Devbot in the same terminal, or reuses an already-running local process
+
+![Dark Devbot setup showing server discovery, native repository selection, and the final setup action](docs/images/setup-workspace-dark.png)
+
+*Choose the Discord server and local repository; the remaining bootstrap work is automatic.*
+
+The setup page binds only to `127.0.0.1`, validates its loopback host, protects its API with a per-run session secret, clears the pasted token field after validation, and never returns the token in an API response.
+
+The Discord application itself cannot be created by Devbot: Discord's [application API](https://docs.discord.com/developers/resources/application) exposes read and edit operations for the current app, while creation and bot-token retrieval remain in the Developer Portal. Everything after that token is automated.
+
+## Manual Setup
+
+For advanced or headless environments, copy `.env.example` to `.env`, fill in `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_GUILD_ID`, and `DEVBOT_OWNER_USER_ID`, then run `npm run dev`. Devbot synchronizes guild commands automatically. In Discord, `/setup wizard` creates or repairs the room, repositories, and approved access.
+
+Then use it:
+
+```text
+@devbot explain how authentication works in this repo
+/do task:fix the failing authentication test
+/status
+```
+
+![Dark Devbot setup completion screen showing Ask, Do, and Check examples](docs/images/setup-ready-dark.png)
+
+*The completion screen opens the private room and leaves users with the three everyday actions.*
+
+Answers include **Details** and **Retry** buttons. Internal task IDs, model IDs, and routing tiers stay out of the normal conversation and remain available in task details when needed.
 
 For production, run:
 
@@ -42,8 +70,20 @@ npm run build
 npm start
 ```
 
-## Discord Commands
+## Everyday Use
 
+- **Ask:** `@devbot <question>` or `/ask question:<text>` keeps the request read-only.
+- **Do:** `/do task:<text>` is the intentional write-capable path for the owner and controllers.
+- **Check:** `/status` reports current work; `/dashboard` opens the denser operator view.
+- **Set up:** `/setup wizard` is owner-only and resumable; `/setup doctor` diagnoses the full path.
+
+## Advanced Command Reference
+
+- `/setup show`: Show owner-managed viewers, controllers, peer bots, private room, and project roots. Every `/setup` command is restricted to `DEVBOT_OWNER_USER_ID`.
+- `/setup user action:<add|remove> user:<user> permission:<view|control>`: Manage private-room viewers. Controllers can also invoke write-capable commands; granting control automatically grants view access.
+- `/setup devbot action:<add|remove> bot:<bot>`: Manage peer Devbots and their private-room access.
+- `/setup repo action:<add|remove|default> name:<name> path:<required for add>`: Register a local project root or select the default used when a command omits `project`.
+- `/setup room name:<optional>`: Create or resync the private Devbot room. It uses a deny-by-default text channel when Devbot can manage channels, otherwise it adopts or creates an invite-only private thread.
 - `/projects`: List configured projects.
 - `/status project:<optional> question:<optional> image:<optional>`: Show Codex dev work currently running through this bot process, plus local Codex sessions detected for configured project paths. Add a question for a deeper read-only status update, and set `image:true` to attach a live project UI screenshot when a local web app is detected.
 - `/snip project:<optional> target:<text>`: Attach a live project UI screenshot by opening the running app and navigating visible UI controls from the target text. Explicit paths and local URLs are also supported.
@@ -55,7 +95,7 @@ npm start
 - `/task retry id:<task-id>`: Retry a saved task with the same project, mode, text, and include patterns.
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
 - `/dashboard project:<optional>`: Show active work, recent tasks, project metadata, and configured commands.
-- `/run project:<name> command:<name>`: Run a configured command from `<project>/.devbot/project.json`, such as `test`, `build`, `lint`, `verify`, or a named preset.
+- `/run command:<name> project:<optional>`: Run a configured command from `<project>/.devbot/project.json`, using the selected default project when omitted.
 - `/review packet project:<name> task:<optional>`: Create a provider-neutral review handoff packet from git status, diff stat, last commit, and optional task context.
 - `/review validate project:<name> commands:<optional>`: Run configured validation commands.
 - `/review gates project:<name> commands:<optional>`: Check merge gates without merging: clean working tree plus validation pass.
@@ -64,7 +104,7 @@ npm start
 - `/devbot peers`: List peer devbots that have announced themselves.
 - `/peer status bot:<id-or-mention> project:<optional>`: Ask an allow-listed peer bot for read-only status.
 - `/peer snip bot:<id-or-mention> target:<text> project:<optional>`: Ask an allow-listed peer bot for a live UI screenshot.
-- `/lab council project:<name> prompt:<text> seats:<optional 2-4>`: Open a persistent workroom with three independent local agent seats by default, plus invited peer bots, before the human reveals, challenges, synthesizes, approves, denies, or closes the room.
+- `/lab council prompt:<text> project:<optional> seats:<optional 2-4>`: Open a persistent workroom on the selected default or explicit project with three independent local agent seats by default, plus invited peer bots, before the human reveals, challenges, synthesizes, approves, denies, or closes the room.
 - `/lab roundtable project:<name> prompt:<text>`: Start a private devbot strategy room with role-based product, frontend, backend, testing, and risk angles.
 - `/lab see target:<text> project:<optional>`: Collect a local screenshot plus peer screenshot requests for the same target.
 - `/lab handoff project:<name> target:<human-or-bot> task:<optional>`: Create a baton-pass review handoff card and send a peer review-packet request when the target is an allow-listed bot.
@@ -80,25 +120,31 @@ npm start
 - `/lab approve id:<collab-id> decision:<approve|deny|read-only> action:<record|validate|gates> project:<optional> commands:<optional> note:<optional>`: Record a human approval, denial, or read-only decision, optionally running validation or gates after approval.
 - `/lab safety project:<optional>`: Show active collaboration safety rules and approval boundaries.
 - `/refresh project:<name>`: Rebuild the in-memory file index for a project.
-- `/ask project:<name> question:<text> include:<optional patterns>`: Ask the model a question with local project context.
-- `/act project:<name> task:<text> include:<optional patterns>`: Ask local Codex to perform a focused project task and return a fixed `Project / Request / Actions / Verification / Result` summary.
+- `/ask question:<text> project:<optional> include:<optional patterns>`: Ask the model a question with local project context.
+- `/do task:<text> project:<optional> include:<optional patterns>`: Ask local Codex to perform a focused project task. Requires owner or controller access.
 
 You can also mention the bot in a channel:
 
 ```text
-@devbot fix the failing test
-@devbot project:api include:src/* add logging around failed webhooks
+@devbot explain why the failing test is failing
+@devbot project:api include:src/* where are failed webhooks handled?
 @devbot what's currently in progress
 @devbot what's the status on the web build, send me a snip of the browse page
 ```
 
-If only one project is configured, mentions default to that project. If multiple projects are configured, include `project:<name>`.
+Mentions are read-only by default and use the project selected in `/setup wizard`. This keeps ordinary conversation safe; write-capable work is a deliberate `/do`. With no selected default, a single configured project is used automatically; multiple projects require `project:<name>`.
 
 Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@devbot what's currently in progress` do not invoke Codex. They return the bot's active in-memory work tracker plus sanitized local Codex process matches for configured project paths, or `No Codex dev work is currently in progress.` when idle. If a status mention includes a deeper question, the bot runs a read-only Codex status update. If the message asks for a snip, screenshot, image, or picture, the bot tries to attach a live project UI screenshot. Page hints such as `browse page` or `watchlist` are handled by opening the running app and navigating through visible UI controls instead of reading framework routes from disk. Explicit paths like `/cards/op01-016` are still supported when you want an exact target.
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Peer registry state is stored in `.devbot/peers.json`, and collaboration workrooms, participants, contributions, decisions, and event history are stored in `.devbot/collab.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PEER_STORE`, or `DEVBOT_COLLAB_STORE` to use different files; relative paths resolve from the devbot process working directory.
+Task history is stored locally in `.devbot/tasks.json` by default. Peer registry state is stored in `.devbot/peers.json`, collaboration workrooms are stored in `.devbot/collab.json`, and owner-managed setup is stored in `.devbot/setup.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, or `DEVBOT_SETUP_STORE` to use different files; relative paths resolve from the devbot process working directory.
+
+## Owner Setup And Visibility
+
+`DEVBOT_OWNER_USER_ID` is the immutable bootstrap authority for `/setup`; it cannot be changed from Discord. Once `/setup room` creates the private room, normal slash commands and mentions are accepted only there. A managed text channel denies `ViewChannel` to `@everyone`; the no-`Manage Channels` fallback uses private-thread membership. Both grant access to effective ID-based viewers, controllers, the owner, the bot itself, and allow-listed peer bots. This is the layer that controls who can actually see Devbot messages. Ordinary messages previously posted in other Discord channels cannot be retroactively hidden.
+
+Environment allowlists and static project maps remain bootstrap inputs. Discord setup augments them and never edits `.env`. Removing a user or repo from setup does not remove an equivalent entry still present in `.env`, `PROJECTS_JSON`, or `config/projects.json`.
 
 ## Project Metadata
 
@@ -131,7 +177,7 @@ Each target project can define optional metadata at `<project>/.devbot/project.j
 }
 ```
 
-Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables write-capable work: `/act`, action-style mentions, `/task retry` for action tasks, `/run`, `/review validate`, and `/review gates`.
+Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables write-capable work: `/do`, action-task retries, `/run`, `/review validate`, and `/review gates`.
 
 Global access can be limited with `ALLOWED_USER_IDS`, `ALLOWED_USERNAMES`, and `ALLOWED_ROLE_IDS`. User IDs are the most stable option. Account usernames are matched case-insensitively; mutable global display names and guild nicknames are intentionally ignored.
 
@@ -139,7 +185,7 @@ Project policy lets each repo narrow collaboration behavior. `allowedUsers`, `al
 
 ## Peer Bots
 
-For multi-dev servers, each developer can run a separate bot application and add the other bot user IDs to `PEER_BOT_IDS`.
+For multi-dev servers, each developer can run a separate bot application and add the other bot accounts with `/setup devbot`. `PEER_BOT_IDS` remains available as a bootstrap configuration.
 
 Use `/devbot announce` to publish capabilities. Basic peer requests are sent as structured Discord messages for capabilities, status, and screenshots. The `/lab` workflows add versioned collaboration envelopes for planning, review packets, screenshot requests, approval cards, and event recording.
 
@@ -149,12 +195,22 @@ The safety boundary is deliberate: peer bots can ask, observe, plan, review, and
 
 ## Project Context Behavior
 
+Before a project request runs, Devbot can use a separate read-only routing model to choose both model capacity and prepacked context:
+
+- **Luna / direct:** greetings, pings, and generic questions without repository context.
+- **Terra / focused:** targeted questions and ordinary scoped work with ranked project snippets.
+- **Sol / deep context:** architecture, security, migrations, broad diagnosis, and consequential changes.
+
+The friendly route is shown while Devbot works; concrete model IDs and routing diagnostics are kept in task details. The routing model cannot change answer/action mode, grant controller access, or loosen the Codex sandbox. Deterministic validation prevents an action from being routed below Terra with focused context, and a local fallback policy takes over if the router times out or returns malformed output.
+
+Configure the family with `CODEX_ROUTER_MODEL`, `CODEX_FAST_MODEL`, `CODEX_STANDARD_MODEL`, and `CODEX_DEEP_MODEL`. Reasoning effort and the focused context budget have separate environment controls; see `.env.example`.
+
 The scanner ranks files by path and content matches against your question or task, then passes a bounded set of relevant snippets to local Codex.
 
 By default:
 
 - `/ask` uses `CODEX_SANDBOX=read-only`.
-- `/act` and mentions use `CODEX_ACTION_SANDBOX=workspace-write`.
+- `/do` uses `CODEX_ACTION_SANDBOX=workspace-write`.
 
 Defaults are conservative:
 
@@ -176,4 +232,4 @@ In the Discord Developer Portal, create an application, add a bot, enable the bo
 - `bot`
 - `applications.commands`
 
-The bot needs permission to read and send messages in the channels where you use it. Mention support also requires the `Message Content Intent` toggle under the bot's privileged gateway intents.
+The bot needs permission to read and send messages in the channels where you use it. `/setup room` prefers `Manage Channels`, but can adopt or create a private thread when it has `Create Private Threads`. Directly mentioned messages are one of Discord's documented [Message Content intent exceptions](https://docs.discord.com/developers/events/gateway#message-content-intent), so Devbot does not request that privileged intent.

@@ -4,13 +4,17 @@ export interface ProjectEntry {
   name: string;
   root: string;
   metadata: ProjectMetadata;
+  isDefault?: boolean;
 }
 
 export interface AppConfig {
   discordToken: string;
   discordClientId: string;
   discordGuildId: string;
+  ownerUserId: string | undefined;
+  autoDeployCommands: boolean;
   codex: CodexConfig;
+  routing: RoutingConfig;
   allowedUserIds: Set<string>;
   allowedUsernames: Set<string>;
   allowedRoleIds: Set<string>;
@@ -65,6 +69,20 @@ export interface CodexConfig {
   sandbox: "read-only" | "workspace-write" | "danger-full-access";
   actionSandbox: "read-only" | "workspace-write" | "danger-full-access";
   timeoutMs: number;
+}
+
+export interface RoutingConfig {
+  enabled: boolean;
+  routerModel: string | undefined;
+  routerReasoningEffort: string | undefined;
+  routerTimeoutMs: number;
+  fastModel: string | undefined;
+  fastReasoningEffort: string | undefined;
+  standardModel: string | undefined;
+  standardReasoningEffort: string | undefined;
+  deepModel: string | undefined;
+  deepReasoningEffort: string | undefined;
+  focusedContextChars: number;
 }
 
 export interface ScannerConfig {

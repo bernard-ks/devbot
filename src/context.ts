@@ -92,6 +92,10 @@ export class ProjectContextService {
     return files.length;
   }
 
+  invalidate(projectName: string): void {
+    this.cache.delete(projectName);
+  }
+
   async pack(
     project: ProjectEntry,
     question: string,

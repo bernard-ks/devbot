@@ -2,11 +2,22 @@
 
 ## Local Start
 
+For a first installation:
+
 ```bash
 npm install
-npm run commands:deploy
+npm run setup
+```
+
+The local browser tool validates Discord, opens the bot install flow, discovers the selected server, chooses the server owner as the bootstrap owner, registers a repository, creates the private room, writes ignored local state, deploys commands, and starts Devbot.
+
+For an already-configured installation:
+
+```bash
 npm run dev
 ```
+
+Guild slash commands synchronize automatically on startup. `npm run commands:deploy` remains available as a manual recovery command.
 
 Use production mode when you do not need hot reload:
 
@@ -20,10 +31,28 @@ npm start
 - `DISCORD_TOKEN`
 - `DISCORD_CLIENT_ID`
 - `DISCORD_GUILD_ID`
+- `DEVBOT_OWNER_USER_ID` for owner-only Discord setup
 
-The Discord application needs the `bot` and `applications.commands` scopes. Mention support requires the Message Content Intent.
+The Discord application needs the `bot` and `applications.commands` scopes. Devbot only processes ordinary messages that directly mention it, which Discord documents as an exception to the privileged Message Content intent; no privileged intent toggle is required.
 
 ## Project Setup
+
+The recommended flow is the private, resumable owner wizard:
+
+```text
+/setup wizard
+```
+
+It creates or adopts the private room, registers local repository paths, chooses the default repository, and adds optional viewers, controllers, and peer Devbots with native Discord selectors. For scripted recovery or advanced maintenance, the equivalent commands remain available:
+
+```text
+/setup repo action:add name:webapp path:/absolute/path/to/webapp
+/setup repo action:add name:api path:/absolute/path/to/api
+/setup repo action:default name:webapp
+/projects
+```
+
+The default repo is used by mentions and by `/ask`, `/do`, `/run`, and `/lab council` when their optional `project` field is omitted. Other project-aware commands retain autocomplete so an operator can choose a different root per request.
 
 Configure project roots with `config/projects.json`:
 
@@ -73,21 +102,41 @@ For global bot access, set one or more of:
 
 ```bash
 ALLOWED_USER_IDS=123456789012345678
-ALLOWED_USERNAMES=bernard-ks,team lead
+ALLOWED_USERNAMES=alex-dev,team-lead
 ALLOWED_ROLE_IDS=234567890123456789
 ```
 
 If any global allow-list is configured, a Discord user must match at least one configured ID, account username, or role. User IDs are the most stable option. Account usernames are case-insensitive; mutable global display names and guild nicknames are intentionally ignored.
+
+## Owner-Managed Private Setup
+
+`npm run setup` handles the first room and repository automatically. After the bot starts, `/setup wizard` manages additional people, peer Devbots, rooms, and repositories. The owner can also configure the server with individual commands:
+
+```text
+/setup user action:add user:@alex permission:view
+/setup user action:add user:@casey permission:control
+/setup devbot action:add bot:@casey-devbot
+/setup room name:devbot-private
+/setup show
+```
+
+- `view` allows read-only questions, status, screenshots, and planning workflows.
+- `control` includes view access and enables `/do`, action-task retries, `/run`, task cancel, review validation/gates, and `/lab approve`.
+- Only `DEVBOT_OWNER_USER_ID` can run `/setup`.
+- `/setup room` creates a text channel that denies visibility to `@everyone` when the bot has `Manage Channels`. Otherwise it adopts the current private thread or creates an invite-only one with `Create Private Threads`, then synchronizes member IDs directly.
+- Once a setup room exists, Devbot rejects normal commands and mentions outside it. `/setup` remains available to the owner from another channel for recovery.
+- Discord `/setup` commands only mutate the local setup store. The initial `npm run setup` tool writes the Discord bootstrap values to the ignored `.env` once.
 
 ## Common Commands
 
 ```bash
 npm run build
 npm test
+npm run setup
 npm run commands:deploy
 ```
 
-Slash commands are guild-scoped. After changing `src/commands.ts`, run:
+Slash commands are guild-scoped and hash-synchronized at startup. To force a manual refresh after changing `src/commands.ts`, run:
 
 ```bash
 npm run commands:deploy
@@ -100,17 +149,42 @@ By default, devbot writes local runtime state under `.devbot/` in this repo:
 - `.devbot/tasks.json`
 - `.devbot/peers.json`
 - `.devbot/collab.json`
+- `.devbot/setup.json`
+- `.devbot/runtime.pid`
 
 Override these paths with:
 
 - `DEVBOT_TASK_STORE`
 - `DEVBOT_PEER_STORE`
 - `DEVBOT_COLLAB_STORE`
+- `DEVBOT_SETUP_STORE`
+- `DEVBOT_RUNTIME_LOCK`
 
 Relative override paths are resolved from the devbot process working directory.
 Use absolute paths if you want state stored outside this repo.
 
 These files are intentionally not committed.
+
+## Request Routing
+
+Recommended local routing configuration:
+
+```bash
+CODEX_ROUTING_ENABLED=true
+CODEX_ROUTER_MODEL=gpt-5.6-luna
+CODEX_ROUTER_REASONING_EFFORT=low
+CODEX_FAST_MODEL=gpt-5.6-luna
+CODEX_FAST_REASONING_EFFORT=low
+CODEX_STANDARD_MODEL=gpt-5.6-terra
+CODEX_STANDARD_REASONING_EFFORT=medium
+CODEX_DEEP_MODEL=gpt-5.6-sol
+CODEX_DEEP_REASONING_EFFORT=ultra
+CODEX_FOCUSED_CONTEXT_CHARS=24000
+```
+
+Luna handles direct requests, Terra handles ordinary focused project work, and Sol is reserved for broad or consequential reasoning. Normal replies use these friendly names; task details and logs retain the concrete model, context mode, route source, and reason.
+
+Routing is not an authorization layer. Mention parsing, owner/controller checks, safe mode, and sandbox selection happen outside the router. Write requests are deterministically clamped to at least Terra with focused context, even if model output says otherwise. If routing is disabled, unavailable, malformed, or timed out, Devbot uses the deterministic fallback policy.
 
 ## Safe Mode
 
@@ -120,7 +194,7 @@ Set this to disable configured command execution and review validation:
 DEVBOT_SAFE_MODE=true
 ```
 
-Safe mode still allows read-only status, ask, screenshots, task reads, dashboards, and peer read-only coordination. It blocks `/act`, action-style mentions, `/task retry` for action tasks, `/run`, `/review validate`, and `/review gates`.
+Safe mode still allows read-only mentions, status, ask, screenshots, task reads, dashboards, and peer read-only coordination. It blocks `/do`, `/task retry` for action tasks, `/run`, `/review validate`, and `/review gates`.
 
 ## Screenshot Troubleshooting
 
@@ -209,8 +283,8 @@ Peer lab requests use versioned envelopes. Read-only peer actions can return sta
 
 Recommended flow:
 
-1. Ask devbot to implement with `/act`.
-2. Inspect `/task show <id>`.
+1. Ask Devbot to implement with `/do`.
+2. Open the response's **Details** button or use `/task show <id>`.
 3. Generate `/review packet project:<name> task:<id>`.
 4. Run `/review validate project:<name>`.
 5. Run `/review gates project:<name>`.

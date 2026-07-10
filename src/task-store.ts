@@ -14,6 +14,11 @@ export interface TaskRecord {
   text: string;
   includePatterns: string[];
   contextFileCount?: number;
+  model?: string;
+  modelTier?: string;
+  contextMode?: string;
+  routeReason?: string;
+  routeSource?: string;
   resultPreview?: string;
   error?: string;
   startedAt: string;
@@ -66,7 +71,15 @@ export class TaskStore {
     });
   }
 
-  async succeed(id: string, result: { contextFileCount?: number; resultPreview?: string }): Promise<void> {
+  async succeed(id: string, result: {
+    contextFileCount?: number;
+    resultPreview?: string;
+    model?: string;
+    modelTier?: string;
+    contextMode?: string;
+    routeReason?: string;
+    routeSource?: string;
+  }): Promise<void> {
     await this.update(id, (task, now) => {
       task.status = "succeeded";
       if (result.contextFileCount !== undefined) {
@@ -75,6 +88,11 @@ export class TaskStore {
       if (result.resultPreview !== undefined) {
         task.resultPreview = result.resultPreview;
       }
+      if (result.model !== undefined) task.model = result.model;
+      if (result.modelTier !== undefined) task.modelTier = result.modelTier;
+      if (result.contextMode !== undefined) task.contextMode = result.contextMode;
+      if (result.routeReason !== undefined) task.routeReason = result.routeReason;
+      if (result.routeSource !== undefined) task.routeSource = result.routeSource;
       task.finishedAt = now;
     });
   }
@@ -208,7 +226,8 @@ export function formatTaskList(tasks: TaskRecord[]): string {
   return tasks
     .map((task) => {
       const finished = task.finishedAt ? `, finished ${formatTime(task.finishedAt)}` : "";
-      return `- \`${task.id}\` ${task.status} ${task.mode} via ${task.source} on \`${task.projectName}\` for ${task.requester}${finished}: ${truncate(task.text, 90)}`;
+      const route = task.modelTier ? `, ${task.modelTier}/${task.contextMode ?? "unknown"}` : "";
+      return `- \`${task.id}\` ${task.status} ${task.mode}${route} via ${task.source} on \`${task.projectName}\` for ${task.requester}${finished}: ${truncate(task.text, 90)}`;
     })
     .join("\n");
 }
@@ -217,6 +236,9 @@ export function formatTaskLogs(task: TaskRecord): string {
   return [
     `Task \`${task.id}\` logs`,
     `Status: ${task.status}`,
+    task.modelTier ? `Route: ${task.modelTier} / ${task.contextMode ?? "unknown"} via ${task.routeSource ?? "unknown"}` : undefined,
+    task.model ? `Model: ${task.model}` : undefined,
+    task.routeReason ? `Reason: ${task.routeReason}` : undefined,
     "",
     "Request:",
     truncate(task.text, 1_500),
@@ -233,6 +255,9 @@ export function formatTaskDetail(task: TaskRecord): string {
     `Status: ${task.status}`,
     `Project: \`${task.projectName}\``,
     `Mode: ${task.mode} via ${task.source}`,
+    task.modelTier ? `Route: ${task.modelTier} / ${task.contextMode ?? "unknown"} via ${task.routeSource ?? "unknown"}` : undefined,
+    task.model ? `Model: ${task.model}` : undefined,
+    task.routeReason ? `Route reason: ${task.routeReason}` : undefined,
     `Requester: ${task.requester}`,
     `Started: ${formatTime(task.startedAt)}`,
     task.finishedAt ? `Finished: ${formatTime(task.finishedAt)}` : undefined,
