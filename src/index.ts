@@ -21,10 +21,10 @@ import type {
   StringSelectMenuInteraction,
   UserSelectMenuInteraction
 } from "discord.js";
-import { stat } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { isAccessSubjectAllowed, isApprovedDiscordUsername } from "./access.js";
+import { isAccessSubjectAllowed, isAllowedByProjectPolicy, isApprovedDiscordUsername } from "./access.js";
 import {
   confirmToActProposalCard,
   needsMeInbox,
@@ -53,6 +53,7 @@ import { loadConfig, normalizeProjectName } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import {
   answerWithProjectContext,
+  completeCodexPrompt,
   locateErrorInProject,
   parseLocateResponse,
   parseTranscription,
@@ -132,14 +133,17 @@ import {
   type IntakeControlAction
 } from "./intake-controls.js";
 import {
+  applyIntakeRateLimit,
   askReporterFollowup,
+  attachmentsUnsupportedNote,
   boundEvidence,
   buildReproQuestion,
   buildTriageCard,
-  checkIntakeRateLimit,
+  chooseIntakeDeliveryRoom,
   classifyIntakeReport,
   createConcurrencyLimiter,
   INTAKE_CHANNEL_LIMIT,
+  INTAKE_TRIGGER_PREFIX,
   INTAKE_USER_LIMIT,
   isIntakeRecordOpen,
   loggedForTriageReply,
@@ -147,12 +151,12 @@ import {
   missingInfoReply,
   normalizeReportSignature,
   OPEN_INTAKE_STATUSES,
+  parseIntakeTrigger,
   parseReproResponse,
   recordedWithoutDeliveryReply,
-  recordIntakeAttempt,
   type IntakeReproStatus
 } from "./intake.js";
-import { IntakeStore, type IntakeChannelConfig, type IntakeRecord } from "./intake-store.js";
+import { IntakeStore, type IntakeChannelConfig, type IntakeRecord, type IntakeStatus } from "./intake-store.js";
 import { UserPreferenceStore } from "./user-preferences.js";
 import {
   buildFixTaskPrompt,
@@ -309,6 +313,14 @@ client.once("clientReady", async () => {
     await ensureWorkspaceLauncher(config).catch((error) => {
       console.warn(`Unable to synchronize the workspace launcher: ${publicErrorMessage(error)}`);
     });
+  }
+  try {
+    const redelivered = await retryUndeliveredIntakeCards(config);
+    if (redelivered > 0) {
+      console.log(`Redelivered ${redelivered} pending intake triage card${redelivered === 1 ? "" : "s"}.`);
+    }
+  } catch (error) {
+    console.warn(`Unable to redeliver intake triage cards: ${publicErrorMessage(error)}`);
   }
 });
 
@@ -5706,12 +5718,15 @@ async function handleIntakeCommand(interaction: ChatInputCommandInteraction, app
   }
 
   await intakeStore.setChannel(channel.id, project.name);
+  const redelivered = await retryUndeliveredIntakeCards(appConfig).catch(() => 0);
   await interaction.editReply(
     [
       `Community bug intake is on in <#${channel.id}> for project \`${project.name}\`.`,
+      `Reports must start with \`${INTAKE_TRIGGER_PREFIX}\`; other messages in the channel are ignored.`,
       `Triage cards will be delivered to <#${deliveryRoomId}>.`,
       `Rate limits: ${INTAKE_USER_LIMIT} reports/hour per user, ${INTAKE_CHANNEL_LIMIT} reports/hour channel-wide.`,
-      "Complete reports get a read-only repro attempt, then a triage card in that room."
+      "Complete reports get a read-only repro attempt, then a triage card in that room.",
+      ...(redelivered > 0 ? [`Redelivered ${redelivered} previously undelivered triage card${redelivered === 1 ? "" : "s"}.`] : [])
     ].join("\n")
   );
 }
@@ -5748,13 +5763,44 @@ function missingBotChannelPermissions(channel: GuildTextBasedChannel): string[] 
 async function resolveIntakeDeliveryRoomId(project: ProjectEntry): Promise<string | undefined> {
   const state = setupStore.snapshot();
   const boundRoomId = state.projectRoomIds[project.name];
-  if (boundRoomId) {
-    return (await isConfiguredRoomId(boundRoomId)) ? boundRoomId : undefined;
+  const privateRoomId = effectivePrivateRoomId();
+  return chooseIntakeDeliveryRoom({
+    ...(boundRoomId ? { boundRoomId } : {}),
+    boundRoomVerified: Boolean(boundRoomId && (await isConfiguredRoomId(boundRoomId))),
+    audienceRestricted: hasProjectAudienceRestriction(project),
+    ...(privateRoomId ? { privateRoomId } : {})
+  });
+}
+
+const INTAKE_DELIVERABLE_STATUSES: readonly IntakeStatus[] = ["pending", "confirmed", "unconfirmed", "needs-info"];
+
+function intakeMessageUrl(record: IntakeRecord): string {
+  return `https://discord.com/channels/${config.discordGuildId}/${record.channelId}/${record.messageId}`;
+}
+
+/**
+ * Redelivers triage cards that never reached a delivery room (startup and
+ * `/intake set`). Safe to repeat: only records with no persisted triage
+ * message are retried, and a successful post persists it immediately.
+ */
+async function retryUndeliveredIntakeCards(appConfig: AppConfig): Promise<number> {
+  const state = await intakeStore.snapshot();
+  if (!state.channel) {
+    return 0;
   }
-  if (hasProjectAudienceRestriction(project)) {
-    return undefined;
+  const undelivered = await intakeStore.listUndelivered(INTAKE_DELIVERABLE_STATUSES);
+  let delivered = 0;
+  for (const record of undelivered) {
+    const project = findProject(appConfig.projects, record.projectName);
+    if (!project) {
+      continue;
+    }
+    const duplicate = record.duplicateOfId ? await intakeStore.get(record.duplicateOfId) : undefined;
+    if (await postIntakeTriageCard(project, record, duplicate, intakeMessageUrl(record))) {
+      delivered += 1;
+    }
   }
-  return effectivePrivateRoomId();
+  return delivered;
 }
 
 async function formatIntakeStatus(): Promise<string> {
@@ -5767,6 +5813,7 @@ async function formatIntakeStatus(): Promise<string> {
   const recent = await intakeStore.listRecent(5);
   const lines = [
     `Community bug intake is on in <#${state.channel.channelId}> for project \`${state.channel.projectName}\`.`,
+    `Reports must start with \`${INTAKE_TRIGGER_PREFIX}\`; other messages in the channel are ignored.`,
     deliveryRoomId
       ? `Triage delivery room: <#${deliveryRoomId}>.`
       : "Triage delivery room: none verified right now — reports are recorded but not delivered. Check /setup.",
@@ -5799,24 +5846,33 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
   const referencedMessageId = message.reference?.messageId;
   const followupOf = referencedMessageId ? await intakeStore.findByFollowupPrompt(referencedMessageId) : undefined;
 
+  // Ordinary chatter never reaches the pipeline: a new report needs the explicit trigger
+  // prefix, and only the trigger (or a correlated follow-up reply) spends any quota.
+  const triggeredText = followupOf ? undefined : parseIntakeTrigger(message.content);
+  if (!followupOf && triggeredText === undefined) {
+    return;
+  }
+
   if (!followupOf) {
     const now = Date.now();
     const limitState = await intakeStore.getRateLimitState(message.channelId);
-    const check = checkIntakeRateLimit(limitState, message.author.id, now);
-    await intakeStore.setRateLimitState(message.channelId, recordIntakeAttempt(limitState, message.author.id, now));
-    if (check.limited) {
+    const limit = applyIntakeRateLimit(limitState, message.author.id, now);
+    if (limit.limited) {
+      // Deliberately not persisted: attempts made while limited never extend the lockout.
       await message.react("⏳").catch(() => undefined);
       return;
     }
+    await intakeStore.setRateLimitState(message.channelId, limit.state);
   }
 
   await message.react("👀").catch(() => undefined);
 
-  const reportText = followupOf ? mergeIntakeFollowup(followupOf.text, message.content) : message.content;
+  const attachmentNote = message.attachments.size > 0 ? `\n${attachmentsUnsupportedNote()}` : "";
+  const reportText = followupOf ? mergeIntakeFollowup(followupOf.text, message.content) : triggeredText ?? "";
   const classification = classifyIntakeReport(reportText);
 
   if (!classification.complete) {
-    const reply = await message.reply(missingInfoReply(classification.missing)).catch(() => undefined);
+    const reply = await message.reply(`${missingInfoReply(classification.missing)}${attachmentNote}`).catch(() => undefined);
     if (followupOf) {
       await intakeStore.updateRecord(followupOf.id, {
         text: reportText,
@@ -5866,20 +5922,27 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
 
   let assessment: { status: IntakeReproStatus; evidence: string };
   try {
-    // Context is capped far below the default packing budget: reporter text may steer which
-    // files get ranked in, but never past a small bounded window, and a dedicated
-    // low-concurrency gate keeps public reports from crowding out owner Codex work.
+    // The report can steer which snippets rank into the small bounded window, but never past
+    // it — and the model itself runs tool-less in an empty directory outside the project, so
+    // public text never gets an agent with repository access, only these preselected snippets
+    // and redacted evidence. A dedicated low-concurrency gate keeps public reports from
+    // crowding out owner Codex work.
     const packed = await contextService.pack(project, reportText, [], INTAKE_MAX_CONTEXT_CHARS);
-    const raw = await intakeCodexGate.run(() =>
-      answerWithProjectContext({
-        codex: appConfig.codex,
-        question: buildReproQuestion(reportText, evidence),
-        context: packed,
-        mode: "answer",
-        contextMode: "focused"
-      })
-    );
-    assessment = parseReproResponse(raw);
+    const neutralDirectory = await mkdtemp(path.join(tmpdir(), "devbot-intake-"));
+    try {
+      const raw = await intakeCodexGate.run(() =>
+        completeCodexPrompt({
+          codex: appConfig.codex,
+          prompt: buildReproQuestion(reportText, evidence, packed.packedText),
+          cwd: neutralDirectory,
+          sandbox: "read-only",
+          skipGitRepoCheck: true
+        })
+      );
+      assessment = parseReproResponse(raw);
+    } finally {
+      await rm(neutralDirectory, { force: true, recursive: true });
+    }
   } catch (error) {
     console.warn(`Intake repro assessment failed: ${(error as Error).message}`);
     assessment = { status: "needs-info", evidence: "Automated repro assessment failed to run." };
@@ -5916,16 +5979,18 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
     return;
   }
 
-  const delivered = await postIntakeTriageCard(project, record, duplicate, message, screenshot);
-  await message.reply(delivered ? loggedForTriageReply(assessment.status) : recordedWithoutDeliveryReply(assessment.status)).catch(() => undefined);
+  const delivered = await postIntakeTriageCard(project, record, duplicate, message.url, screenshot);
+  await message
+    .reply(`${delivered ? loggedForTriageReply(assessment.status) : recordedWithoutDeliveryReply(assessment.status)}${attachmentNote}`)
+    .catch(() => undefined);
 }
 
 async function postIntakeTriageCard(
   project: ProjectEntry,
   record: IntakeRecord,
   duplicate: IntakeRecord | undefined,
-  sourceMessage: Message,
-  screenshot: ProjectScreenshot | undefined
+  messageUrl: string,
+  screenshot?: ProjectScreenshot
 ): Promise<boolean> {
   const deliveryRoomId = await resolveIntakeDeliveryRoomId(project);
   if (!deliveryRoomId) {
@@ -5937,7 +6002,7 @@ async function postIntakeTriageCard(
     return false;
   }
   const payload: { content: string; components: unknown[]; allowedMentions: { parse: [] }; files?: AttachmentBuilder[] } = {
-    content: buildTriageCard({ record, ...(duplicate ? { duplicateOf: duplicate } : {}), messageUrl: sourceMessage.url }),
+    content: buildTriageCard({ record, ...(duplicate ? { duplicateOf: duplicate } : {}), messageUrl }),
     components: [intakeControlRow(record.id)],
     allowedMentions: { parse: [] }
   };
@@ -6182,30 +6247,17 @@ function isAllowedForProject(
     | ModalSubmitInteraction,
   project: ProjectEntry
 ): boolean {
-  const policy = project.metadata.policy;
-  const hasProjectAllowList = policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
-  if (!hasProjectAllowList) {
-    return true;
-  }
-
-  if (policy.allowedUsers.includes(interaction.user.id)) {
-    return true;
-  }
-
-  if (isApprovedDiscordUsername(interactionNameSource(interaction), policy.allowedUsernames)) {
-    return true;
-  }
-
-  if (interaction.member instanceof GuildMember) {
-    return interaction.member.roles.cache.some((role) => policy.allowedRoles.includes(role.id));
-  }
-
-  const memberRoles = interaction.member?.roles;
-  if (Array.isArray(memberRoles)) {
-    return memberRoles.some((roleId) => policy.allowedRoles.includes(roleId));
-  }
-
-  return false;
+  const roleIds =
+    interaction.member instanceof GuildMember
+      ? [...interaction.member.roles.cache.keys()]
+      : Array.isArray(interaction.member?.roles)
+        ? interaction.member.roles
+        : [];
+  return isAllowedByProjectPolicy(project.metadata.policy, {
+    userId: interaction.user.id,
+    nameSource: interactionNameSource(interaction),
+    roleIds
+  });
 }
 
 function hasProjectAudienceRestriction(project: ProjectEntry): boolean {
