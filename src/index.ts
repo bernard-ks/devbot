@@ -38,7 +38,7 @@ import {
   type AmbientAction,
   type AmbientRole
 } from "./ambient-ui.js";
-import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
+import { commandChoices, memoryChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
 import {
   collabDeliveryKey,
   createCollabEnvelope,
@@ -66,6 +66,9 @@ import {
   setActiveBackendId,
   type BackendAvailability
 } from "./agent-backend.js";
+import { executeMemoryCommand, type MemoryCommandRequest } from "./memory-commands.js";
+import { formatMemoryRecallBlock } from "./memory-recall.js";
+import { checkMemoryStoreHealth, MemoryStore, type MemoryAccessContext, type MemoryKind } from "./memory-store.js";
 import { parseMentionRequest, parseStatusRequest, statusDetailQuestion, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natural-intent.js";
@@ -146,9 +149,11 @@ import {
 } from "./screenshot-fix.js";
 import { ScreenshotFixStore } from "./screenshot-fix-store.js";
 import {
+  changedPaths,
   filterWorkForProjects,
   findExternalCodexWork,
   formatWorkStatus,
+  isSensitivePath,
   scopeStatusToProject,
   WorkTracker,
   type ProjectWorkSnapshot
@@ -199,6 +204,13 @@ setActiveBackendId(process.env.DEVBOT_AGENT_BACKEND?.trim() || setupStore.snapsh
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
+const memoryStore = new MemoryStore(
+  process.env.DEVBOT_MEMORY_STORE?.trim() || undefined,
+  undefined,
+  undefined,
+  undefined,
+  taskStore
+);
 const executionLedger = new ExecutionLedger(process.env.DEVBOT_EXECUTION_STORE?.trim() || undefined);
 const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
@@ -667,7 +679,8 @@ client.on("messageCreate", async (message) => {
       requesterId: message.author.id,
       channelId: message.channelId,
       ...(threadTask ? { threadId: message.channelId, parentTaskId: threadTask.id } : {}),
-      source: threadTask ? `thread:${threadTask.id}` : "mention"
+      source: threadTask ? `thread:${threadTask.id}` : "mention",
+      recallMemory: true
     });
   } catch (error) {
     console.error(publicErrorMessage(error));
@@ -823,7 +836,9 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
       includePatterns,
       mode: "answer",
       requester: interaction.user.tag,
+      requesterId: interaction.user.id,
       source: "slash:ask",
+      recallMemory: true,
       ephemeral: hasProjectAudienceRestriction(project)
     });
     return;
@@ -850,7 +865,9 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
       includePatterns,
       mode: "action",
       requester: interaction.user.tag,
+      requesterId: interaction.user.id,
       source: "slash:do",
+      recallMemory: true,
       ephemeral: hasProjectAudienceRestriction(project)
     });
     return;
@@ -858,6 +875,30 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
 
   if (interaction.commandName === "ship") {
     await handleShipCommand(interaction, appConfig);
+    return;
+  }
+
+  if (interaction.commandName === "remember") {
+    const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const text = interaction.options.getString("text", true);
+    const kind = (interaction.options.getString("kind") as MemoryKind | null) ?? "decision";
+    const entry = await memoryStore.add(project, {
+      kind,
+      text,
+      source: "manual",
+      author: interaction.user.tag,
+      actorId: interaction.user.id
+    });
+    await interaction.editReply(`Recorded ${entry.kind} \`${entry.id}\` for \`${project.name}\`.`);
+    return;
+  }
+
+  if (interaction.commandName === "memory") {
+    await handleMemoryCommand(interaction, appConfig);
     return;
   }
 }
@@ -971,6 +1012,9 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
       const state = await setupStore.removeRepository(name);
       contextService.invalidate(name);
       applySetupState(appConfig, bootstrapConfig, state);
+      await memoryStore.purgeProject({ root: managed, name }).catch((error: unknown) => {
+        console.warn(`Unable to purge project memory for removed repository \`${name}\`: ${(error as Error).message}`);
+      });
       await interaction.editReply(`Removed setup-managed repository \`${name}\`.`);
       return;
     }
@@ -1348,6 +1392,9 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
   const backendReady = Boolean(activeBackend?.installed && activeBackend.compatible);
   const answerReadOnly = activeBackend ? activeBackend.capabilities.enforcesAnswerReadOnly : true;
   const actionConfined = activeBackend ? activeBackend.capabilities.confinesActionWorkspace : true;
+  const memoryHealth = defaultProject
+    ? await checkMemoryStoreHealth(defaultProject, memoryStore.root)
+    : { readable: false, writable: false, quarantinedCount: 0 };
   const checks = [
     [Boolean(appConfig.ownerUserId), "Owner identity", "Set DEVBOT_OWNER_USER_ID locally and restart."],
     [Boolean(effectivePrivateRoomId()), "Private room", "Run /setup wizard and choose Use private room."],
@@ -1356,7 +1403,14 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
     [answerReadOnly, `Read-only answers (${activeBackendId})`, "This backend cannot guarantee read-only /ask runs; switch to codex or claude with /setup backend."],
     [actionConfined, `Workspace-confined actions (${activeBackendId})`, "This backend cannot confine /do writes to the task workspace; switch to codex with /setup backend."],
     [appConfig.routing.enabled && Boolean(appConfig.routing.fastModel && appConfig.routing.standardModel && appConfig.routing.deepModel), "Luna / Terra / Sol routing", "Check CODEX_ROUTER_MODEL and tier model settings."],
-    [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."]
+    [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."],
+    [
+      memoryHealth.readable && memoryHealth.writable && memoryHealth.quarantinedCount === 0,
+      "Project memory store",
+      memoryHealth.quarantinedCount > 0
+        ? `${memoryHealth.quarantinedCount} corrupt record(s) quarantined; inspect Devbot's memory store under .devbot/memory.`
+        : "Check permissions on Devbot's memory store under .devbot/memory (not the project checkout)."
+    ]
   ] as const;
   const passed = checks.filter(([ready]) => ready).length;
   const backendSummary = backends.length
@@ -1453,6 +1507,8 @@ interface ProjectRequestOptions {
   displayText?: string;
   resumeWorkspace?: { workspacePath: string; branchName: string; baseBranch: string };
   signal?: AbortSignal;
+  /** Only intentional, user-initiated ask/action routes should recall project memory into the prompt. */
+  recallMemory?: boolean;
   onProgress?: (progress: TaskProgressEvent) => Promise<void>;
   /** Fires once the task record is durably created, before any work that can fail. Used to consume a caller-owned pending record only after there is something to retry against. */
   onTaskStarted?: (taskId: string) => Promise<void>;
@@ -1631,13 +1687,18 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     });
     await reportTaskProgress(options, { ...progressBase, phase: "gathering-context", route });
     await recordExecutionState(task.id, executionLedger.setPhase(task.id, "gathering-context"));
-    const contextCharLimit = contextLimitForRoute(
+    const baseContextCharLimit = contextLimitForRoute(
       route,
       options.appConfig.scanner.maxPackedContextChars,
       options.appConfig.routing.focusedContextChars,
       executionProject.metadata.policy.maxContextChars,
       options.contextCharLimit
     );
+    const recall = options.recallMemory
+      ? await recallMemoryForRequest(options, task.id)
+      : { block: undefined, memoryIds: [] as string[] };
+    const historyBlock = recall.block;
+    const contextCharLimit = Math.max(0, baseContextCharLimit - (historyBlock?.length ?? 0));
     const context = contextCharLimit === 0
       ? { project: executionProject, files: [], packedText: "" }
       : await contextService.pack(executionProject, options.text, options.includePatterns, contextCharLimit);
@@ -1662,6 +1723,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       options.mode,
       route,
       controller.signal,
+      historyBlock,
       recordExecutionChild(task.id),
       recordExecutionExit(task.id)
     );
@@ -1694,6 +1756,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       }
       throw new Error(current?.error ?? `Task stopped while ${current?.status ?? "unavailable"}.`);
     }
+    await recordActionOutcome(options, task.id, "succeeded", answer);
     return {
       answer,
       context,
@@ -1721,6 +1784,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
         ...(selectedRoute ? { route: selectedRoute } : {}),
         error: publicErrorMessage(error)
       });
+      await recordActionOutcome(options, task.id, "failed", error instanceof Error ? error.message : String(error));
     }
     throw error;
   } finally {
@@ -1886,6 +1950,86 @@ async function reportTaskProgress(options: ProjectRequestOptions, progress: Task
     await options.onProgress(progress);
   } catch (error) {
     console.warn(`Unable to update Discord task progress for ${progress.taskId}: ${publicErrorMessage(error)}`);
+  }
+}
+
+/**
+ * Access context for the requester of the *current* runProjectRequest call. Callers that pass
+ * `recallMemory: true` (slash `/ask`, `/do`, and direct mention answers) have already verified
+ * project access for this requester before reaching here, so `projectAllowed` is always true;
+ * this only decides whether workroom/internal-scoped entries authored by someone else are hidden.
+ */
+function requestMemoryAccess(options: ProjectRequestOptions): MemoryAccessContext {
+  const userId = options.requesterId ?? options.requester;
+  return {
+    userId,
+    projectAllowed: true,
+    controller: options.requesterId ? isControllerUser(options.requesterId, options.appConfig) : false
+  };
+}
+
+async function recallMemoryForRequest(
+  options: ProjectRequestOptions,
+  taskId: string
+): Promise<{ block: string | undefined; memoryIds: string[] }> {
+  try {
+    const entries = await memoryStore.recallFor(options.project, options.text, requestMemoryAccess(options));
+    const block = formatMemoryRecallBlock(entries);
+    if (entries.length > 0) {
+      await taskStore.setEvidence(taskId, { memoryIds: entries.map((entry) => entry.id) });
+    }
+    return { block: block || undefined, memoryIds: entries.map((entry) => entry.id) };
+  } catch (error) {
+    console.warn(`Unable to recall project memory for \`${options.project.name}\`: ${(error as Error).message}`);
+    return { block: undefined, memoryIds: [] };
+  }
+}
+
+async function recordActionOutcome(
+  options: ProjectRequestOptions,
+  taskId: string,
+  status: "succeeded" | "failed",
+  detail: string
+): Promise<void> {
+  if (options.mode !== "action") {
+    return;
+  }
+
+  try {
+    const task = await taskStore.get(taskId);
+    const reviewProject = await projectForTaskWorkspace(options.project, task).catch(() => options.project);
+    const packet = await createReviewPacket(reviewProject, task).catch(() => undefined);
+    const files = packet
+      ? changedPaths(packet.status)
+          .filter((changed) => !isSensitivePath(changed))
+          .slice(0, 5)
+      : [];
+    const summary = [
+      `${status}: ${truncateForLog(options.text)}`,
+      files.length > 0 ? `Files: ${files.join(", ")}` : undefined,
+      `Detail: ${truncateForLog(detail)}`
+    ]
+      .filter((part) => part !== undefined)
+      .join(" | ");
+    // Task-scoped outcomes carry the originating task's visibility so a private workroom
+    // task's result cannot be recovered by a project viewer or peer who could not see the task
+    // itself; they also start proposed/untrusted since the branch is unmerged and the detail
+    // text can contain model output influenced by untrusted repository content.
+    const requesterId = task?.requesterId ?? options.requesterId;
+    await memoryStore.add(options.project, {
+      kind: "outcome",
+      text: summary,
+      source: "task",
+      taskId,
+      author: options.requester,
+      tags: [status],
+      ...(requesterId ? { actorId: requesterId, requesterId } : {}),
+      ...(task?.accessScope ? { accessScope: task.accessScope } : {}),
+      ...(task?.internal ? { internal: true } : {}),
+      ...(task?.branchName ? { branch: task.branchName } : {})
+    });
+  } catch (error) {
+    console.warn(`Unable to record memory outcome for task ${taskId}: ${(error as Error).message}`);
   }
 }
 
@@ -2742,14 +2886,18 @@ async function getWorkStatusMessage(appConfig: AppConfig, requestedProject?: Pro
   const relevantProjects = appConfig.projects.filter((project) => relevantProjectNames.has(project.name));
   const projectSnapshots: ProjectWorkSnapshot[] = await Promise.all(
     relevantProjects.map(async (project) => {
-      const packet = await createReviewPacket(project);
+      const [packet, memoryCount] = await Promise.all([
+        createReviewPacket(project),
+        memoryStore.count(project).catch(() => 0)
+      ]);
       return {
         projectName: project.name,
         branch: packet.branch,
         defaultBranch: packet.defaultBranch,
         status: packet.status,
         diffStat: packet.diffStat,
-        lastCommit: packet.lastCommit
+        lastCommit: packet.lastCommit,
+        memoryCount
       };
     })
   );
@@ -2822,6 +2970,60 @@ async function getDetailedStatusResponse(options: StatusResponseOptions): Promis
     source: "status-detail"
   });
   return { content: [`Repository assessment for \`${project.name}\`:`, answer].join("\n") };
+}
+
+function memoryAccessContextFor(interaction: ChatInputCommandInteraction, project: ProjectEntry, appConfig: AppConfig): MemoryAccessContext {
+  return {
+    userId: interaction.user.id,
+    projectAllowed: isAllowedForProject(interaction, project),
+    controller: isControllerUser(interaction.user.id, appConfig)
+  };
+}
+
+async function replyChunked(interaction: ChatInputCommandInteraction, content: string): Promise<void> {
+  const chunks = splitDiscordMessage(content);
+  await interaction.editReply(chunks.shift() ?? content);
+  for (const chunk of chunks) {
+    await interaction.followUp({ content: chunk, flags: MessageFlags.Ephemeral });
+  }
+}
+
+async function handleMemoryCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const subcommand = interaction.options.getSubcommand();
+  const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!(await ensureProjectAccess(interaction, project))) {
+    return;
+  }
+  const request = memoryCommandRequestFrom(interaction, subcommand);
+  if (!request) {
+    await interaction.editReply(`Unknown memory subcommand \`${subcommand}\`.`);
+    return;
+  }
+  const actor = {
+    access: memoryAccessContextFor(interaction, project, appConfig),
+    owner: isOwner(interaction.user.id, appConfig)
+  };
+  await replyChunked(interaction, await executeMemoryCommand(memoryStore, project, actor, request));
+}
+
+function memoryCommandRequestFrom(interaction: ChatInputCommandInteraction, subcommand: string): MemoryCommandRequest | undefined {
+  if (subcommand === "list") {
+    const kind = (interaction.options.getString("kind") as MemoryKind | null) ?? undefined;
+    const limit = interaction.options.getInteger("limit") ?? undefined;
+    return { subcommand, ...(kind ? { kind } : {}), ...(limit ? { limit } : {}) };
+  }
+  if (subcommand === "search") {
+    return { subcommand, query: interaction.options.getString("query", true) };
+  }
+  if (subcommand === "promote" || subcommand === "forget") {
+    return { subcommand, id: interaction.options.getString("id", true) };
+  }
+  if (subcommand === "purge") {
+    const confirm = interaction.options.getString("confirm") ?? undefined;
+    return { subcommand, ...(confirm ? { confirm } : {}) };
+  }
+  return undefined;
 }
 
 async function handleTaskCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
@@ -5631,6 +5833,7 @@ async function runCodex(
   mode: CodexRequestMode,
   route: RequestRoute,
   signal?: AbortSignal,
+  history?: string,
   onSpawn?: (pid: number) => void | Promise<void>,
   onExit?: () => void | Promise<void>
 ): Promise<string> {
@@ -5643,6 +5846,7 @@ async function runCodex(
     ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
     tier: route.tier,
     contextMode: route.contextMode,
+    ...(history ? { history } : {}),
     ...(signal ? { signal } : {}),
     ...(onSpawn ? { onSpawn } : {}),
     ...(onExit ? { onExit } : {})
@@ -5662,6 +5866,18 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, appConfi
   if (focused.name === "command" || focused.name === "commands") {
     const project = findProjectFromAutocomplete(interaction, allowedProjects);
     await interaction.respond(commandChoices(project, value));
+    return;
+  }
+
+  if (focused.name === "id" && interaction.commandName === "memory") {
+    const project = findProjectFromAutocomplete(interaction, allowedProjects);
+    const access: MemoryAccessContext = {
+      userId: interaction.user.id,
+      projectAllowed: Boolean(project && isAllowedForProject(interaction, project)),
+      controller: isControllerUser(interaction.user.id, appConfig)
+    };
+    const entries = project ? await memoryStore.list(project, { access, limit: 25 }) : [];
+    await interaction.respond(memoryChoices(entries, value));
     return;
   }
 
@@ -5963,7 +6179,12 @@ function isControllerUser(userId: string, appConfig: AppConfig): boolean {
 }
 
 function commandRequiresController(interaction: ChatInputCommandInteraction): boolean {
-  if (interaction.commandName === "do" || interaction.commandName === "run" || interaction.commandName === "ship") {
+  if (
+    interaction.commandName === "do" ||
+    interaction.commandName === "run" ||
+    interaction.commandName === "ship" ||
+    interaction.commandName === "remember"
+  ) {
     return true;
   }
   const subcommand = interaction.options.getSubcommand(false);
@@ -5972,6 +6193,9 @@ function commandRequiresController(interaction: ChatInputCommandInteraction): bo
   }
   if (interaction.commandName === "task") {
     return subcommand === "cancel" || subcommand === "retry";
+  }
+  if (interaction.commandName === "memory") {
+    return subcommand === "promote";
   }
   return interaction.commandName === "lab" && (subcommand === "approve" || subcommand === "bossfight");
 }

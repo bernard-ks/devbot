@@ -545,7 +545,82 @@ const commandBuilders = [
     .addStringOption((option) => option.setName("task").setDescription("Completed task ID.").setRequired(true).setAutocomplete(true)),
   new ContextMenuCommandBuilder()
     .setName("Start Devbot workroom")
-    .setType(ApplicationCommandType.Message)
+    .setType(ApplicationCommandType.Message),
+  new SlashCommandBuilder()
+    .setName("remember")
+    .setDescription("Record a project decision or note for Devbot to recall later.")
+    .addStringOption((option) => option.setName("text").setDescription("What to remember.").setRequired(true).setMaxLength(500))
+    .addStringOption((option) =>
+      option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("kind")
+        .setDescription("Decision or note. Defaults to decision.")
+        .setRequired(false)
+        .addChoices({ name: "decision", value: "decision" }, { name: "note", value: "note" })
+    ),
+  new SlashCommandBuilder()
+    .setName("memory")
+    .setDescription("Inspect Devbot's recorded project memory.")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("list")
+        .setDescription("List recent memory entries.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+        )
+        .addStringOption((option) =>
+          option
+            .setName("kind")
+            .setDescription("Filter by kind.")
+            .setRequired(false)
+            .addChoices({ name: "decision", value: "decision" }, { name: "note", value: "note" }, { name: "outcome", value: "outcome" })
+        )
+        .addIntegerOption((option) =>
+          option.setName("limit").setDescription("Number of entries to show, 1-25.").setRequired(false).setMinValue(1).setMaxValue(25)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("search")
+        .setDescription("Search memory entries by relevance to a query.")
+        .addStringOption((option) =>
+          option.setName("query").setDescription("What to search for.").setRequired(true).setMaxLength(200)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("promote")
+        .setDescription("Owner/controller-only: mark an automatically captured outcome as approved for recall.")
+        .addStringOption((option) => option.setName("id").setDescription("Memory entry ID.").setRequired(true).setAutocomplete(true))
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("forget")
+        .setDescription("Owner-only: permanently delete a memory entry.")
+        .addStringOption((option) => option.setName("id").setDescription("Memory entry ID.").setRequired(true).setAutocomplete(true))
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("purge")
+        .setDescription("Owner-only: permanently delete every memory entry for a project.")
+        .addStringOption((option) =>
+          option.setName("confirm").setDescription("Type the project name to confirm the purge.").setRequired(true).setMaxLength(100)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+        )
+    )
 ] satisfies Array<Pick<SlashCommandBuilder, "toJSON"> | Pick<ContextMenuCommandBuilder, "toJSON">>;
 
 export const commandDefinitions = commandBuilders.map((command) => command.toJSON());

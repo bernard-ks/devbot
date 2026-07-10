@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
+import { scoreTextMatches, tokenizeQuery } from "./relevance.js";
 import { redactSensitiveText } from "./security.js";
 import type { IndexedFile, PackedProjectContext, ProjectEntry, ScannerConfig } from "./types.js";
 
@@ -253,7 +254,7 @@ function isWithinRoot(candidate: string, root: string): boolean {
 }
 
 function rankFiles(files: IndexedFile[], question: string): IndexedFile[] {
-  const terms = tokenize(question);
+  const terms = tokenizeQuery(question);
   return [...files]
     .map((file) => ({ file, score: scoreFile(file, terms) }))
     .sort((a, b) => b.score - a.score || a.file.relativePath.localeCompare(b.file.relativePath))
@@ -269,12 +270,9 @@ function scoreFile(file: IndexedFile, terms: string[]): number {
     if (lowerPath.includes(term)) {
       score += 12;
     }
-
-    const matches = lowerText.split(term).length - 1;
-    score += Math.min(matches, 8);
   }
 
-  return score;
+  return score + scoreTextMatches(lowerText, terms);
 }
 
 function priorityPathScore(relativePath: string): number {
@@ -295,18 +293,6 @@ function priorityPathScore(relativePath: string): number {
   }
 
   return 0;
-}
-
-function tokenize(question: string): string[] {
-  return Array.from(
-    new Set(
-      question
-        .toLowerCase()
-        .split(/[^a-z0-9_-]+/)
-        .map((term) => term.trim())
-        .filter((term) => term.length >= 3)
-    )
-  );
 }
 
 function matchesAny(relativePath: string, patterns: string[]): boolean {

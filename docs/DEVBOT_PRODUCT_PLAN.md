@@ -40,6 +40,7 @@ The safety contract is explicit: only the requester or an approved controller ca
   - `/refresh` rebuilds the in-memory project file index.
   - `/ask` answers read-only project questions with local context.
   - `/do` asks local Codex to perform focused project work.
+  - `/remember`, `/memory list`, `/memory search`, `/memory promote`, `/memory forget`, and `/memory purge` record, recall, approve, and delete per-project decisions, notes, and task outcomes.
   - Guild command definitions synchronize automatically at startup.
 - Mention support:
   - Direct bot mentions can invoke the bot without requesting the privileged Message Content intent.
@@ -89,6 +90,14 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Screenshots wait for two consecutive identical frames (animations/transitions disabled, `prefers-reduced-motion` emulated) before being used, so loading spinners and blinking carets don't get misread as content.
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
+- Project memory:
+  - Persists decisions, manual notes, and completed action-task outcomes in a central Devbot-owned store (`.devbot/memory/<project-key>.jsonl`, owner-only permissions) outside the managed project checkout, keyed by the project's canonical (resolved) root so it survives repository renames within setup.
+  - Carries the originating task's access scope, requester, and internal flag onto every automatically captured outcome, and applies the same access rule used for task records to every list/search/recall/autocomplete path, so workroom-private or internal task results stay restricted to their requester and controllers.
+  - Automatically records a terse outcome (result, changed files, detail) when an action task succeeds or fails; automatic outcomes start `proposed`/`untrusted` and are excluded from automatic recall until a controller runs `/memory promote` to mark them `active`/`trusted`. Manual `/remember` decisions and notes are `active`/`trusted` immediately.
+  - Redacts secrets from entry text, tags, and author at write time and again defensively on read/output/recall; validates and normalizes every entry against a versioned schema, quarantining (never silently destroying) corrupt or invalid lines.
+  - Only the intentional `/ask`, `/do`, and direct-mention answer routes recall memory into a prompt (status, labs, council, and peer routes do not); recall is access-filtered, restricted to active/trusted entries, uses exact-token relevance with a generic-term stoplist, and its rendered size is reserved out of the route's context budget. Entries are HTML-escaped before insertion so they cannot forge or close the prompt's delimiter tags, and the influencing memory IDs are recorded on the task.
+  - `/status` and `/setup doctor` surface memory entry counts and store health without ever touching the managed project's checkout; `/setup repo remove` purges that project's memory file, and the owner can purge a project's memory on demand with `/memory purge` (confirmed by retyping the project name).
+  - Migrates any `.devbot/memory.jsonl` a pre-release build wrote inside a managed checkout into the central store on first access (entries stay untrusted until promoted, invalid lines are quarantined) and retires the stray file; symlinked or oversized legacy files are left untouched.
 
 ## Current Constraints
 

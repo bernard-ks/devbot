@@ -6,12 +6,30 @@ export interface TaskAccessContext {
   controller: boolean;
 }
 
-export function canAccessTaskRecord(task: TaskRecord, context: TaskAccessContext): boolean {
+/**
+ * Shared shape for any durable record (task, memory entry, ...) whose
+ * visibility must be restricted to its originating requester and
+ * project-authorized controllers once it is marked workroom-scoped or
+ * internal. Kept generic so every subsystem that copies data out of a task
+ * (memory, review, etc.) can apply the exact same access rule instead of
+ * re-deriving it and drifting out of sync.
+ */
+export interface AccessScopedRecord {
+  accessScope?: "project" | "workroom";
+  internal?: boolean;
+  requesterId?: string;
+}
+
+export function canAccessScopedRecord(record: AccessScopedRecord, context: TaskAccessContext): boolean {
   if (!context.projectAllowed) return false;
-  if (task.accessScope === "workroom" || task.internal) {
-    return context.controller || task.requesterId === context.userId;
+  if (record.accessScope === "workroom" || record.internal) {
+    return context.controller || record.requesterId === context.userId;
   }
   return true;
+}
+
+export function canAccessTaskRecord(task: TaskRecord, context: TaskAccessContext): boolean {
+  return canAccessScopedRecord(task, context);
 }
 
 export function isTaskListVisible(task: TaskRecord, context: TaskAccessContext): boolean {
