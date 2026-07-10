@@ -107,13 +107,20 @@ const commandBuilders = [
     .addSubcommand((subcommand) =>
       subcommand
         .setName("preview")
-        .setDescription("Enable or disable owner-only public preview tunnels (default off).")
+        .setDescription("Enable or disable owner-only public preview tunnels (default off), globally or per project.")
         .addStringOption((option) =>
           option
             .setName("action")
             .setDescription("Whether to enable or disable preview tunnels.")
             .setRequired(true)
             .addChoices({ name: "enable", value: "enable" }, { name: "disable", value: "disable" })
+        )
+        .addStringOption((option) =>
+          option
+            .setName("project")
+            .setDescription("Limit this change to one project. Omit to toggle the global kill-switch (also stops active tunnels).")
+            .setRequired(false)
+            .setAutocomplete(true)
         )
     ),
   new SlashCommandBuilder()

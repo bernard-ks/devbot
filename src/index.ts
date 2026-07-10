@@ -85,7 +85,7 @@ import {
 } from "./peer.js";
 import { createReviewPacket, evaluateMergeGates, formatMergeGateResult, formatReviewPacket, formatValidationResults, validateReview } from "./review.js";
 import { contextLimitForRoute, routeRequest, type RequestRoute } from "./request-router.js";
-import { minimalChildEnvironment, publicErrorMessage, redactSensitiveText } from "./security.js";
+import { publicErrorMessage, redactSensitiveText } from "./security.js";
 import {
   commandRequiresApproval,
   isPeerAllowedForProject,
@@ -127,23 +127,33 @@ import {
 } from "./task-ui.js";
 import {
   clampTtlMinutes,
+  describeProjectRevision,
   findCloudflaredPath,
-  findRunningProjectPort,
-  previewGateReason,
+  findRunningProjectOrigin,
+  previewOwnerGateReason,
+  projectPreviewGateReason,
   TunnelManager,
   type ActiveTunnel,
+  type PendingExpireReason,
+  type PendingTunnel,
   type TunnelExpireReason
 } from "./tunnel.js";
 import {
   formatTunnelStatusList,
+  parsePreviewConfirmControl,
   parseTunnelControl,
   tunnelBinaryMissingMessage,
+  tunnelConfirmExpiredMessage,
+  tunnelConfirmMessage,
+  tunnelControlExpiredMessage,
   tunnelDisabledMessage,
   tunnelExpiredMessage,
   tunnelNoOwnerMessage,
   tunnelNoServerMessage,
   tunnelNotOwnerMessage,
-  tunnelShareMessage
+  tunnelProjectDisabledMessage,
+  tunnelShareMessage,
+  tunnelWrongRoomMessage
 } from "./tunnel-ui.js";
 import { UserPreferenceStore } from "./user-preferences.js";
 import {
@@ -220,7 +230,7 @@ const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefin
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
 const tunnelManager = new TunnelManager({
-  spawnFn: (command, args) => spawn(command, args, { env: minimalChildEnvironment() }),
+  spawnFn: (command, args, env) => spawn(command, args, { env }),
   findCloudflaredPath: () => findCloudflaredPath()
 });
 const activeTaskControllers = new Map<string, AbortController>();
@@ -307,7 +317,7 @@ client.once("clientReady", async () => {
 process.once("exit", () => clearRuntimeLock(runtimePidFile));
 
 async function shutdownPreviewTunnels(): Promise<void> {
-  const stopped = tunnelManager.stopAll();
+  const stopped = await tunnelManager.stopAll("shutdown");
   await Promise.all(stopped.map((tunnel) => editTunnelMessageExpired(tunnel, "shutdown")));
 }
 
@@ -394,7 +404,16 @@ client.on("interactionCreate", async (interaction) => {
           await interaction.reply({ content: tunnelNotOwnerMessage(), flags: MessageFlags.Ephemeral });
           return;
         }
-        await handlePreviewStopButton(interaction, config, previewControl.projectName);
+        await handlePreviewStopButton(interaction, previewControl.id);
+        return;
+      }
+      const previewConfirmControl = parsePreviewConfirmControl(interaction.customId);
+      if (previewConfirmControl) {
+        if (!isOwner(interaction.user.id, config)) {
+          await interaction.reply({ content: tunnelNotOwnerMessage(), flags: MessageFlags.Ephemeral });
+          return;
+        }
+        await handlePreviewConfirmButton(interaction, previewConfirmControl.action, previewConfirmControl.id);
         return;
       }
       if (!parseWorkroomButton(interaction.customId)) {
@@ -1056,11 +1075,31 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
 
   if (subcommand === "preview") {
     const action = interaction.options.getString("action", true);
-    const state = await setupStore.setPreviewTunnelsEnabled(action === "enable");
+    const enabled = action === "enable";
+    const projectName = interaction.options.getString("project");
+
+    if (projectName) {
+      const project = mustFindProject(appConfig.projects, projectName);
+      const state = await setupStore.setProjectPreviewEnabled(project.name, enabled);
+      applySetupState(appConfig, bootstrapConfig, state);
+      if (!enabled) {
+        await stopOrCancelPreviewForProject(project.name, "disabled");
+      }
+      await interaction.editReply(
+        `Preview tunnels for \`${project.name}\` are now ${enabled ? "enabled (the global switch must also be on)" : "disabled"}.`
+      );
+      return;
+    }
+
+    const state = await setupStore.setPreviewTunnelsEnabled(enabled);
     applySetupState(appConfig, bootstrapConfig, state);
+    if (!enabled) {
+      const stopped = await tunnelManager.stopAll("disabled");
+      await Promise.all(stopped.map((tunnel) => editTunnelMessageExpired(tunnel, "disabled")));
+    }
     await interaction.editReply(
       `Preview tunnels are now ${state.previewTunnelsEnabled ? "enabled" : "disabled"}. Owner-only \`/preview share\` ${
-        state.previewTunnelsEnabled ? "can now start tunnels." : "is refused while disabled."
+        state.previewTunnelsEnabled ? "can now start tunnels for projects individually allowed via /setup preview action:enable project:<name>." : "is refused while disabled."
       }`
     );
     return;
@@ -1099,17 +1138,33 @@ async function projectRoomAudienceProblem(
   return `That room is private, but its visible audience exceeds the Devbot and project allowlists (${examples}${unauthorized.length > 3 ? ", ..." : ""}). Tighten the Discord permissions before binding it.`;
 }
 
+function boundProjectNameForRoom(channelId: string): string | undefined {
+  return Object.entries(setupStore.snapshot().projectRoomIds).find(([, roomId]) => roomId === channelId)?.[0];
+}
+
+async function stopOrCancelPreviewForProject(projectName: string, reason: TunnelExpireReason): Promise<void> {
+  const stopped = await tunnelManager.stopByProject(projectName, reason);
+  if (!stopped) return;
+  if (stopped.kind === "active") {
+    await editTunnelMessageExpired(stopped.tunnel, reason);
+  } else {
+    await editPendingMessageExpired(stopped.tunnel, "cancel");
+  }
+}
+
 async function handlePreviewCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
-  const gate = previewGateReason(appConfig, interaction.user.id);
-  if (gate) {
-    const content =
-      gate === "no-owner" ? tunnelNoOwnerMessage() : gate === "not-owner" ? tunnelNotOwnerMessage() : tunnelDisabledMessage();
+  const ownerGate = previewOwnerGateReason(appConfig, interaction.user.id);
+  if (ownerGate) {
+    const content = ownerGate === "no-owner" ? tunnelNoOwnerMessage() : tunnelNotOwnerMessage();
     await interaction.reply({ content, flags: MessageFlags.Ephemeral });
     return;
   }
 
   const subcommand = interaction.options.getSubcommand();
 
+  // Owner stop/status must keep working regardless of the enablement flag or
+  // a project's audience policy changing after a tunnel started; only
+  // starting a new tunnel enforces the full project-authorization path below.
   if (subcommand === "status") {
     await interaction.reply({ content: formatTunnelStatusList(tunnelManager.list()), flags: MessageFlags.Ephemeral });
     return;
@@ -1117,69 +1172,154 @@ async function handlePreviewCommand(interaction: ChatInputCommandInteraction, ap
 
   if (subcommand === "stop") {
     const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
-    const stopped = tunnelManager.stop(project.name);
+    const stopped = await tunnelManager.stopByProject(project.name, "stop");
     if (!stopped) {
-      await interaction.reply({ content: `No active preview tunnel for \`${project.name}\`.`, flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: `No active or pending preview tunnel for \`${project.name}\`.`, flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.reply({ content: `Stopped the preview tunnel for \`${project.name}\`.`, flags: MessageFlags.Ephemeral });
-    await editTunnelMessageExpired(stopped, "stop");
+    if (stopped.kind === "active") {
+      await editTunnelMessageExpired(stopped.tunnel, "stop");
+    } else {
+      await editPendingMessageExpired(stopped.tunnel, "cancel");
+    }
     console.log(`Preview tunnel stopped for ${project.name} by ${interaction.user.tag}.`);
     return;
   }
 
+  // subcommand === "share": the only path that creates public exposure.
+  if (!appConfig.previewTunnelsEnabled) {
+    await interaction.reply({ content: tunnelDisabledMessage(), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
   const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
-  if (tunnelManager.hasActive(project.name)) {
-    await interaction.reply({
-      content: `Project \`${project.name}\` already has an active preview tunnel. Use \`/preview stop\` first.`,
-      flags: MessageFlags.Ephemeral
-    });
+
+  const boundProjectName = boundProjectNameForRoom(interaction.channelId);
+  if (boundProjectName && boundProjectName !== project.name) {
+    await interaction.reply({ content: tunnelWrongRoomMessage(boundProjectName), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (projectPreviewGateReason(appConfig.previewEnabledProjectNames.has(project.name))) {
+    await interaction.reply({ content: tunnelProjectDisabledMessage(project.name), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const privateReply = hasProjectAudienceRestriction(project);
+  await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
+  if (!(await ensureProjectAccess(interaction, project))) {
+    return;
+  }
+
+  if (tunnelManager.hasActiveForProject(project.name)) {
+    await interaction.editReply(`Project \`${project.name}\` already has an active or pending preview tunnel. Use \`/preview stop\` first.`);
     return;
   }
 
   const cloudflaredPath = findCloudflaredPath();
   if (!cloudflaredPath) {
-    await interaction.reply({ content: tunnelBinaryMissingMessage(), flags: MessageFlags.Ephemeral });
+    await interaction.editReply(tunnelBinaryMissingMessage());
     return;
   }
 
-  await interaction.deferReply();
-  const port = await findRunningProjectPort(project);
-  if (!port) {
+  const detected = await findRunningProjectOrigin(project);
+  if (!detected) {
     await interaction.editReply(tunnelNoServerMessage(project.name));
     return;
   }
 
   const ttlMinutes = clampTtlMinutes(interaction.options.getInteger("minutes") ?? undefined);
+  let pending: PendingTunnel;
   try {
-    const tunnel = await tunnelManager.start({
+    pending = tunnelManager.reserve({
       projectName: project.name,
-      port,
+      origin: detected.origin,
+      port: detected.port,
       ttlMinutes,
-      startedBy: interaction.user.id,
+      requestedBy: interaction.user.id,
       channelId: interaction.channelId,
-      onExpire: (expiredTunnel, reason) => {
-        void editTunnelMessageExpired(expiredTunnel, reason);
+      onPendingExpire: (expiredPending, reason) => {
+        void editPendingMessageExpired(expiredPending, reason);
       }
     });
-    const message = tunnelShareMessage(tunnel);
-    const reply = await interaction.editReply(message);
-    tunnelManager.attachMessage(project.name, reply.id);
-    console.log(`Preview tunnel started for ${project.name} by ${interaction.user.tag}, expires ${tunnel.expiresAt}.`);
   } catch (error) {
     await interaction.editReply(publicErrorMessage(error));
+    return;
   }
+
+  const revision = await describeProjectRevision(project);
+  const reply = await interaction.editReply({
+    ...tunnelConfirmMessage(pending, revision),
+    flags: MessageFlags.SuppressEmbeds
+  });
+  tunnelManager.attachMessage(pending.id, reply.id);
+  console.log(`Preview tunnel confirmation pending for ${project.name} (${pending.id}) by ${interaction.user.tag}.`);
 }
 
-async function handlePreviewStopButton(interaction: ButtonInteraction, _appConfig: AppConfig, projectName: string): Promise<void> {
-  const stopped = tunnelManager.stop(projectName);
-  if (!stopped) {
-    await interaction.reply({ content: `No active preview tunnel for \`${projectName}\`.`, flags: MessageFlags.Ephemeral });
+async function handlePreviewStopButton(interaction: ButtonInteraction, id: string): Promise<void> {
+  if (!tunnelManager.get(id)) {
+    await interaction.reply({ content: tunnelControlExpiredMessage(), flags: MessageFlags.Ephemeral });
     return;
   }
   await interaction.deferUpdate();
+  const stopped = await tunnelManager.stop(id, "stop");
+  if (!stopped) {
+    await interaction.editReply({ content: tunnelControlExpiredMessage(), components: [] });
+    return;
+  }
   await interaction.editReply(tunnelStoppedButtonUpdate(stopped, "stop"));
-  console.log(`Preview tunnel stopped for ${projectName} by ${interaction.user.tag}.`);
+  console.log(`Preview tunnel stopped for ${stopped.projectName} (${id}) by ${interaction.user.tag}.`);
+}
+
+async function handlePreviewConfirmButton(interaction: ButtonInteraction, action: "start" | "cancel", id: string): Promise<void> {
+  if (action === "cancel") {
+    const cancelled = tunnelManager.cancelPending(id);
+    await interaction.deferUpdate();
+    if (!cancelled) {
+      await interaction.editReply({ content: tunnelControlExpiredMessage(), components: [] });
+      return;
+    }
+    await interaction.editReply({ content: tunnelConfirmExpiredMessage(cancelled, "cancel"), components: [] });
+    console.log(`Preview tunnel confirmation cancelled for ${cancelled.projectName} (${id}) by ${interaction.user.tag}.`);
+    return;
+  }
+
+  if (!tunnelManager.getPending(id)) {
+    await interaction.reply({ content: tunnelControlExpiredMessage(), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferUpdate();
+  try {
+    const tunnel = await tunnelManager.launch(id, (expiredTunnel, reason) => {
+      void editTunnelMessageExpired(expiredTunnel, reason);
+    });
+
+    // Recheck the tunnel is still the live one before publishing: a concurrent
+    // stop/disable/shutdown could have raced launch() to completion.
+    if (!tunnelManager.get(tunnel.id)) {
+      await interaction.editReply({
+        content: `Preview tunnel for \`${tunnel.projectName}\` was stopped before it could be shared.`,
+        components: []
+      });
+      return;
+    }
+
+    try {
+      const message = tunnelShareMessage(tunnel);
+      const reply = await interaction.editReply({ ...message, flags: MessageFlags.SuppressEmbeds });
+      tunnelManager.attachMessage(tunnel.id, reply.id);
+      console.log(`Preview tunnel started for ${tunnel.projectName} (${tunnel.id}) by ${interaction.user.tag}, expires ${tunnel.expiresAt}.`);
+    } catch (publishError) {
+      console.error(
+        `Unable to publish preview tunnel share message for ${tunnel.projectName} (${tunnel.id}); stopping it: ${publicErrorMessage(publishError)}`
+      );
+      await tunnelManager.stop(tunnel.id, "stop");
+    }
+  } catch (error) {
+    await interaction.editReply(publicErrorMessage(error));
+  }
 }
 
 function tunnelStoppedButtonUpdate(tunnel: ActiveTunnel, reason: TunnelExpireReason): { content: string; components: [] } {
@@ -1199,6 +1339,22 @@ async function editTunnelMessageExpired(tunnel: ActiveTunnel, reason: TunnelExpi
     await message.edit(tunnelStoppedButtonUpdate(tunnel, reason));
   } catch (error) {
     console.warn(`Unable to update expired preview tunnel message for ${tunnel.projectName}: ${publicErrorMessage(error)}`);
+  }
+}
+
+async function editPendingMessageExpired(pending: PendingTunnel, reason: PendingExpireReason): Promise<void> {
+  if (!pending.messageId) {
+    return;
+  }
+  try {
+    const channel = await client.channels.fetch(pending.channelId);
+    if (!channel || !("messages" in channel)) {
+      return;
+    }
+    const message = await (channel as GuildTextBasedChannel).messages.fetch(pending.messageId);
+    await message.edit({ content: tunnelConfirmExpiredMessage(pending, reason), components: [] });
+  } catch (error) {
+    console.warn(`Unable to update expired preview tunnel confirmation for ${pending.projectName}: ${publicErrorMessage(error)}`);
   }
 }
 
@@ -1510,11 +1666,18 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
   const backendSummary = backends.length
     ? backends.map((backend) => `${backend.id === activeBackendId ? "*" : "-"} ${backend.id}: ${backend.installed ? backend.version ?? "installed" : "not installed"}${backend.experimental ? " (experimental)" : ""}${backend.capabilities.enforcesAnswerReadOnly ? "" : " (no read-only /ask)"}${backend.capabilities.confinesActionWorkspace ? "" : " (no /do actions)"}${backend.installed && !backend.compatible ? " (execution disabled)" : ""}`)
     : ["- backend detection unavailable"];
+  const cloudflaredPath = findCloudflaredPath();
+  const previewLine = !appConfig.previewTunnelsEnabled
+    ? "OFF    Preview tunnels - disabled (owner-only, opt-in via /setup preview action:enable)."
+    : cloudflaredPath
+      ? `READY  Preview tunnels - cloudflared found at ${cloudflaredPath}.`
+      : "FIX    Preview tunnels - cloudflared not found on PATH; install it with `brew install cloudflared`.";
   return [
     "Devbot doctor",
     `Readiness: ${passed}/${checks.length}`,
     "",
     ...checks.map(([ready, label, fix]) => `${ready ? "READY" : "FIX"}  ${label}${ready ? "" : ` - ${fix}`}`),
+    previewLine,
     "",
     "Coding-agent backends:",
     ...backendSummary,
