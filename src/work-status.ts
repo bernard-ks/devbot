@@ -50,6 +50,7 @@ export interface ProjectWorkSnapshot {
   status: string;
   diffStat: string;
   lastCommit: string;
+  memoryCount?: number;
 }
 
 export function scopeStatusToProject<T extends { projects: ProjectEntry[] }>(
@@ -188,21 +189,29 @@ function formatProjectSnapshot(snapshot: ProjectWorkSnapshot): string {
   const lastCommit = snapshot.lastCommit === "unknown"
     ? "last commit unavailable"
     : `last commit \`${inlineCode(truncate(snapshot.lastCommit, 90))}\``;
+  const memory = formatMemorySuffix(snapshot.memoryCount);
 
   if (statusUnavailable) {
-    return `- \`${inlineCode(snapshot.projectName)}\`: ${branch}; working-tree state unavailable; ${lastCommit}.`;
+    return `- \`${inlineCode(snapshot.projectName)}\`: ${branch}; working-tree state unavailable; ${lastCommit}${memory}.`;
   }
 
   const paths = changedPaths(snapshot.status);
   if (paths.length === 0) {
-    return `- \`${inlineCode(snapshot.projectName)}\`: ${branch}; working tree clean; ${lastCommit}.`;
+    return `- \`${inlineCode(snapshot.projectName)}\`: ${branch}; working tree clean; ${lastCommit}${memory}.`;
   }
 
   const visiblePaths = paths.slice(0, 4).map(formatChangedPath);
   const remainder = paths.length > visiblePaths.length ? `, +${paths.length - visiblePaths.length} more` : "";
   const diffSummary = formatDiffSummary(snapshot.diffStat);
   const scope = diffSummary ? `; \`${inlineCode(diffSummary)}\`` : "";
-  return `- \`${inlineCode(snapshot.projectName)}\`: ${branch}; ${paths.length} changed ${paths.length === 1 ? "path" : "paths"}: ${visiblePaths.join(", ")}${remainder}${scope}; ${lastCommit}.`;
+  return `- \`${inlineCode(snapshot.projectName)}\`: ${branch}; ${paths.length} changed ${paths.length === 1 ? "path" : "paths"}: ${visiblePaths.join(", ")}${remainder}${scope}; ${lastCommit}${memory}.`;
+}
+
+function formatMemorySuffix(memoryCount: number | undefined): string {
+  if (!memoryCount) {
+    return "";
+  }
+  return `; ${memoryCount} memory ${memoryCount === 1 ? "entry" : "entries"}`;
 }
 
 function formatRisks(activeWork: ActiveWork[], snapshots: ProjectWorkSnapshot[], now: Date): string[] {
@@ -312,7 +321,7 @@ function findOverlappingProject(work: ActiveWork[]): string | undefined {
   return undefined;
 }
 
-function changedPaths(status: string): string[] {
+export function changedPaths(status: string): string[] {
   if (!status.trim() || status.startsWith("Unable to read status:")) {
     return [];
   }
@@ -334,7 +343,7 @@ function formatChangedPath(value: string): string {
   return `\`${inlineCode(truncate(value, 72))}\``;
 }
 
-function isSensitivePath(value: string): boolean {
+export function isSensitivePath(value: string): boolean {
   return value.split(" -> ").some((candidate) => {
     const cleaned = candidate.replace(/^"|"$/g, "");
     const baseName = cleaned.split(/[\\/]/).at(-1) ?? cleaned;
