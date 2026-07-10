@@ -66,6 +66,13 @@ export interface BackendCapabilities {
   promptTransport: "stdin" | "input-file";
   /** Where the final answer is read from. */
   outputTransport: "output-file" | "stdout";
+  /**
+   * The command builder actually transports supplied image paths to the CLI.
+   * A backend that leaves this false must never be handed images: the call
+   * boundary fails closed instead of silently asking a model to inspect an
+   * image it never receives.
+   */
+  acceptsImageInput: boolean;
 }
 
 export interface BackendAvailability {
@@ -113,6 +120,16 @@ export class UnconfinedActionError extends Error {
         `action-mode (/do) requests on it. Switch to a workspace-confining backend with /setup backend id:codex.`
     );
     this.name = "UnconfinedActionError";
+  }
+}
+
+export class ImageInputUnsupportedError extends Error {
+  constructor(displayName: string) {
+    super(
+      `${displayName} cannot receive image input, so Devbot cannot transcribe or inspect attached screenshots on it. ` +
+        `Switch to an image-capable backend with /setup backend id:codex.`
+    );
+    this.name = "ImageInputUnsupportedError";
   }
 }
 
@@ -299,7 +316,9 @@ const CODEX_CAPABILITIES: BackendCapabilities = {
   confinesActionWorkspace: true,
   supportsCancellation: true,
   promptTransport: "stdin",
-  outputTransport: "output-file"
+  outputTransport: "output-file",
+  // buildCodexArgs threads imagePaths into the exec argv as `-i <path>` pairs.
+  acceptsImageInput: true
 };
 
 function buildCodexArgs(
@@ -491,7 +510,10 @@ export function createClaudeBackend(env: NodeJS.ProcessEnv = process.env, probe:
         confinesActionWorkspace: false,
         supportsCancellation: true,
         promptTransport: "stdin",
-        outputTransport: "stdout"
+        outputTransport: "stdout",
+        // The Claude answer builder consumes no image paths, so images must
+        // never be routed here; the call boundary fails closed instead.
+        acceptsImageInput: false
       },
       buildAnswerCommand: (options) => {
         if (!options.runtimeDir) {
@@ -536,7 +558,8 @@ const UNVERIFIED_CAPABILITIES: BackendCapabilities = {
   confinesActionWorkspace: false,
   supportsCancellation: true,
   promptTransport: "stdin",
-  outputTransport: "stdout"
+  outputTransport: "stdout",
+  acceptsImageInput: false
 };
 
 /**

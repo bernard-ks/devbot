@@ -5,7 +5,7 @@ import path from "node:path";
 import { redactSensitiveText } from "./security.js";
 import type { CodexConfig, PackedProjectContext } from "./types.js";
 import type { RequestContextMode } from "./request-router.js";
-import { buildImageExecArgs, getActiveBackend, type AgentModelTier, type BuildCommandOptions, type SpawnSpec } from "./agent-backend.js";
+import { buildImageExecArgs, getActiveBackend, ImageInputUnsupportedError, type AgentModelTier, type BuildCommandOptions, type SpawnSpec } from "./agent-backend.js";
 
 export { buildImageExecArgs };
 
@@ -67,6 +67,9 @@ export interface CompleteCodexOptions {
 
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
   const backend = getActiveBackend(options.codex);
+  if (options.imagePaths?.length && !backend.capabilities.acceptsImageInput) {
+    throw new ImageInputUnsupportedError(backend.displayName);
+  }
   const releaseSlot = await acquireCodexRunSlot(options.signal);
   try {
     const tempDir = backend.usesOutputFile || backend.usesRuntimeHome

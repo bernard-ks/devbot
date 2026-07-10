@@ -3,8 +3,8 @@ import test, { after, before } from "node:test";
 import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { clearDetectionCache, setActiveBackendId } from "./agent-backend.js";
-import { completeCodexPrompt } from "./codex-client.js";
+import { BACKEND_ORDER, clearDetectionCache, setActiveBackendId, type BackendId } from "./agent-backend.js";
+import { completeCodexPrompt, transcribeErrorImages } from "./codex-client.js";
 import type { CodexConfig } from "./types.js";
 
 const isWindows = process.platform === "win32";
@@ -12,8 +12,10 @@ const isWindows = process.platform === "win32";
 const CODEX_SHIM = `#!/bin/sh
 out=""
 prev=""
+imgs=""
 for arg in "$@"; do
   if [ "$prev" = "--output-last-message" ]; then out="$arg"; fi
+  if [ "$prev" = "-i" ]; then imgs="$imgs $arg"; fi
   prev="$arg"
 done
 prompt=$(cat)
@@ -23,7 +25,11 @@ esac
 case "$prompt" in
   *SMOKE_FAIL*) echo "synthetic backend failure" >&2; exit 7 ;;
 esac
-printf 'codex-echo:%s' "$prompt" > "$out"
+if [ -n "$imgs" ]; then
+  printf 'codex-echo:%s images:%s' "$prompt" "$imgs" > "$out"
+else
+  printf 'codex-echo:%s' "$prompt" > "$out"
+fi
 exit 0
 `;
 
@@ -123,6 +129,32 @@ test("smoke: claude action mode fails closed", { skip: isWindows }, async () => 
       completeCodexPrompt({ codex: shimCodex, prompt: "write something", cwd: shimDir, mode: "action" }),
       /task workspace/i
     );
+  } finally {
+    setActiveBackendId("codex");
+  }
+});
+
+test("smoke: screenshot transcription over every backend either transports the image or refuses honestly", { skip: isWindows }, async () => {
+  const imagePath = path.join(shimDir, "screenshot.png");
+  await writeFile(imagePath, "fake-png-bytes", "utf8");
+  const imageCapable = new Set<BackendId>(["codex"]);
+
+  try {
+    for (const id of BACKEND_ORDER) {
+      setActiveBackendId(id);
+      const run = transcribeErrorImages({ codex: shimCodex, imagePaths: [imagePath], cwd: shimDir });
+      if (imageCapable.has(id)) {
+        const output = await run;
+        // The shim only echoes the image path when it actually arrived in the
+        // child's argv, so this proves genuine transport rather than a silent drop.
+        assert.match(output, new RegExp(`images:.*${imagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+      } else {
+        // Fail closed: the backend cannot receive the image, so the request is
+        // refused with an honest error instead of asking the model to inspect
+        // an image it never got.
+        await assert.rejects(run, /image input/i);
+      }
+    }
   } finally {
     setActiveBackendId("codex");
   }

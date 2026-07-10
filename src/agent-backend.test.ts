@@ -179,7 +179,8 @@ test("claude backend declares an honest capability contract: read-only answers, 
     confinesActionWorkspace: false,
     supportsCancellation: true,
     promptTransport: "stdin",
-    outputTransport: "stdout"
+    outputTransport: "stdout",
+    acceptsImageInput: false
   });
 });
 
