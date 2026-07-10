@@ -1,3 +1,7 @@
+export function neutralizeMentions(value: string): string {
+  return value.replace(/@/g, "@\u200b");
+}
+
 export function splitDiscordMessage(message: string, maxLength = 1900): string[] {
   if (message.length <= maxLength) {
     return [message];

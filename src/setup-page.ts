@@ -1,5 +1,4 @@
-export function renderSetupPage(sessionToken: string): string {
-  const encodedSession = JSON.stringify(sessionToken);
+export function renderSetupPage(nonce: string): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -7,7 +6,7 @@ export function renderSetupPage(sessionToken: string): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Devbot Setup</title>
-  <style>
+  <style nonce="${nonce}">
     :root {
       color-scheme: dark;
       --ink: #f4f6f8;
@@ -249,15 +248,14 @@ export function renderSetupPage(sessionToken: string): string {
   </main>
   <footer>Bound to 127.0.0.1 for this setup session.</footer>
 
-  <script>
-    const sessionToken = ${encodedSession};
+  <script nonce="${nonce}">
     const state = { identity: null, guilds: [], finished: false };
     const byId = (id) => document.getElementById(id);
 
     async function api(route, options) {
       const response = await fetch(route, {
         ...(options || {}),
-        headers: { "Content-Type": "application/json", "X-Devbot-Setup": sessionToken, ...((options && options.headers) || {}) }
+        headers: { "Content-Type": "application/json", ...((options && options.headers) || {}) }
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || "Setup request failed.");

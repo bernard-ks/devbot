@@ -1,7 +1,7 @@
 import "dotenv/config";
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { normalizeProjectName, resolveCodexBin } from "./config.js";
@@ -17,13 +17,14 @@ import {
 import { renderSetupPage } from "./setup-page.js";
 
 const host = "127.0.0.1";
-const sessionToken = randomBytes(24).toString("base64url");
 const sessionExpiresAt = Date.now() + 10 * 60_000;
+const pageCookieName = "devbot_setup";
 const cwd = process.cwd();
 const session: { token?: string; identity?: DiscordBotIdentity; botProcess?: ChildProcess } = {
   ...(process.env.DISCORD_TOKEN?.trim() ? { token: process.env.DISCORD_TOKEN.trim() } : {})
 };
 let baseUrl = "";
+let pageClaim: string | undefined;
 
 const server = createServer((request, response) => {
   void handleRequest(request, response).catch((error) => {
@@ -44,14 +45,13 @@ server.listen(0, host, async () => {
     throw new Error("Unable to determine the local setup address.");
   }
   baseUrl = `http://${host}:${address.port}`;
-  const setupUrl = `${baseUrl}/?session=${sessionToken}`;
   console.log("");
   console.log("Devbot setup is ready in your browser:");
-  console.log(setupUrl);
+  console.log(baseUrl);
   console.log("");
   console.log("The setup page is bound to this machine only. Press Ctrl+C to stop it.");
   if (process.env.DEVBOT_SETUP_NO_BROWSER !== "true") {
-    openBrowser(setupUrl);
+    openBrowser(baseUrl);
   }
 });
 
@@ -59,13 +59,14 @@ process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 
 async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const cspNonce = randomBytes(16).toString("base64");
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("Referrer-Policy", "no-referrer");
   response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
   response.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https://cdn.discordapp.com data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    `default-src 'self'; script-src 'nonce-${cspNonce}'; style-src 'nonce-${cspNonce}'; img-src 'self' https://cdn.discordapp.com data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`
   );
 
   const url = new URL(request.url ?? "/", baseUrl || `http://${host}`);
@@ -79,13 +80,20 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     return;
   }
   if (request.method === "GET" && url.pathname === "/") {
-    if (url.searchParams.get("session") !== sessionToken) {
-      sendJson(response, 404, { error: "This setup link is not valid." });
+    const presented = readCookie(request.headers.cookie, pageCookieName);
+    if (pageClaim && !safeEqual(presented, pageClaim)) {
+      sendJson(response, 403, {
+        error: "This setup session was already opened in another window. Restart the setup command to try again."
+      });
       return;
+    }
+    if (!pageClaim) {
+      pageClaim = randomBytes(24).toString("base64url");
+      response.setHeader("Set-Cookie", `${pageCookieName}=${pageClaim}; Path=/; HttpOnly; SameSite=Strict`);
     }
     response.statusCode = 200;
     response.setHeader("Content-Type", "text/html; charset=utf-8");
-    response.end(renderSetupPage(sessionToken));
+    response.end(renderSetupPage(cspNonce));
     return;
   }
   if (request.method === "GET" && url.pathname === "/favicon.ico") {
@@ -93,10 +101,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     response.end();
     return;
   }
-  if (
-    !url.pathname.startsWith("/api/") ||
-    request.headers["x-devbot-setup"] !== sessionToken
-  ) {
+  if (!url.pathname.startsWith("/api/") || !hasClaimedSession(request)) {
     sendJson(response, 404, { error: "Not found." });
     return;
   }
@@ -286,6 +291,28 @@ function stringField(body: Record<string, unknown>, name: string): string {
     throw new Error(`Missing setup value: ${name}.`);
   }
   return value.trim();
+}
+
+function hasClaimedSession(request: IncomingMessage): boolean {
+  if (!pageClaim) return false;
+  return safeEqual(readCookie(request.headers.cookie, pageCookieName), pageClaim);
+}
+
+function safeEqual(provided: string | string[] | undefined, expected: string): boolean {
+  if (typeof provided !== "string") return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function readCookie(header: string | undefined, name: string): string | undefined {
+  if (!header) return undefined;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return undefined;
 }
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
