@@ -89,6 +89,12 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Screenshots wait for two consecutive identical frames (animations/transitions disabled, `prefers-reduced-motion` emulated) before being used, so loading spinners and blinking carets don't get misread as content.
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
+- Regression sentinel:
+  - `/sentinel on|off|status|interval|watch` runs an owner/controller-gated background watcher per project.
+  - Polls the auto-discovered dev-server URL, any manually added paths, and an optional configured fast command on a configurable interval (minimum 30s).
+  - A debounced up/down/idle state machine posts exactly one alert on a real regression (two consecutive bad checks) and edits that same message with a recovery note instead of spamming.
+  - A connection refusal after being up is treated as an intentional stop (idle), not a failure, so turning off a local dev server never triggers an alert.
+  - Alerts include the failing target, last known-good time, recent commits, and a live screenshot with console errors when Playwright can load the page, plus **Fix it** (starts a pre-filled write-capable task) and **Mute 1h** buttons.
 
 ## Current Constraints
 

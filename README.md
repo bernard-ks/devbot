@@ -162,6 +162,10 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/lab events id:<collab-id>`: Show recent events for a lab session.
 - `/lab approve id:<collab-id> decision:<approve|deny|read-only> action:<record|validate|gates> project:<optional> commands:<optional> note:<optional>`: Record a human approval, denial, or read-only decision, optionally running validation or gates after approval.
 - `/lab safety project:<optional>`: Show active collaboration safety rules and approval boundaries.
+- `/sentinel on|off project:<optional>`: Enable or disable the regression sentinel background watcher for a project. Owner or controller only.
+- `/sentinel status project:<optional>`: Show sentinel configuration and the current state of each watch.
+- `/sentinel interval seconds:<n> project:<optional>`: Set the check interval, minimum 30 seconds.
+- `/sentinel watch action:<add|remove> path:<text> project:<optional>`: Add or remove an extra watched URL path beyond the auto-discovered dev-server root.
 - `/refresh project:<name>`: Rebuild the in-memory file index for a project.
 - `/ask question:<text> project:<optional> include:<optional patterns>`: Ask the model a question with local project context.
 - `/do task:<text> project:<optional> include:<optional patterns>`: Ask local Codex to perform a focused project task. Requires owner or controller access.
@@ -182,7 +186,11 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, and owner-managed setup in `.devbot/setup.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, or `DEVBOT_SETUP_STORE` to use different files; relative paths resolve from the devbot process working directory.
+Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, owner-managed setup in `.devbot/setup.json`, and sentinel watch state in `.devbot/sentinel.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, `DEVBOT_SETUP_STORE`, or `DEVBOT_SENTINEL_STORE` to use different files; relative paths resolve from the devbot process working directory.
+
+### Regression Sentinel
+
+`/sentinel on` starts a background watcher for a project: it checks the auto-discovered local dev-server URL (plus any paths added with `/sentinel watch add`) on an interval, and optionally a configured fast command. Two consecutive bad responses flip a watch from up to down and post one alert to the private room with the failing target, the last known-good time, recent commits, and a live screenshot with console errors when Playwright can load the page. Recovery edits the same message instead of posting a new one, so a flapping check never spams the room. A connection refusal after being up (the developer stopped the server on purpose) moves the watch to idle instead of alerting. Alerts carry **Fix it**, which starts an owner/controller `/do`-style task pre-filled with the failure detail, and **Mute 1h**, which silences that watch's alerts for an hour without stopping the checks.
 
 ## Owner Setup And Visibility
 

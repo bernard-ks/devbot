@@ -83,7 +83,95 @@ Appended as new commits on top of the reviewed branch; existing commits were not
 5. **`/setup doctor` had an unconditional Codex executable check.**
    - Fix: removed the codex-specific "Codex executable" readiness line from `formatSetupDoctor` in `src/index.ts`. Readiness is now generalized around the active backend (`Agent backend (<id>)`) plus a new `Read-only answers (<id>)` capability check driven by `capabilities.enforcesAnswerReadOnly`. The backend summary and `/setup backend` report annotate any backend that cannot serve read-only `/ask`.
 
-### Residual notes for the maintainer
-- gemini and opencode remain **experimental** and are only wired for `/do` (action) after the fail-closed answer refusal; they still need a real-CLI smoke test for action/cancellation/timeout/output parsing before promotion. No real third-party CLI is spawned in tests.
-- claude `--strict-mcp-config` blocks ambient MCP/plugin extensions, but the CLI has no flag to fully ignore `~/.claude/settings.json`; in `plan`/read-only answer mode this cannot grant writes, and action mode stays scoped to the project dir. Documented rather than assumed.
-- `npm test` → **133 pass / 0 fail** (rerun once: the first run's single failure was the known flaky child-process timeout in `security.test.ts`, green on rerun).
+3. **Dynamic UI noise (animations/carets/loading state) inflates diffs.** Added to the one shared screenshot primitive (`captureProjectScreenshot`, `src/project-screenshot.ts`) so it benefits `/ship`'s live path and any future preview-based diffing: `page.emulateMedia({ reducedMotion: "reduce" })`, a CSS override pausing/zeroing all animations and transitions and hiding carets (`freezeDynamicUi`), and `captureStableScreenshot`, which re-screenshots up to 3 times at 200ms intervals until two consecutive frames are byte-identical (bounded added latency ~600ms worst case). This is the "compare multiple stabilized frames" option from the review rather than per-project masks (masks not implemented — noted as a limitation below).
+
+4. **Canvas-size changes undercounted.** `commonCanvasSize` (`visual-diff.ts`) now returns the *union* of both dimensions (was: the smaller overlap), and `diffImages` pads each image onto that union canvas with `fit: "contain", position: "left top"` (no stretching) instead of stretching both to a common size. Any pixel that exists in only one image (the grown/shrunk strip) is unconditionally counted as changed. `composeBeforeAfter` uses the same padding so panels aren't distorted. New test: `diffImages counts a dimension change as a changed region instead of dropping it` (`visual-diff.test.ts`) — before 160x120, after 160x200 with identical top content, asserts the added 80-row strip shows up as a changed region, not silently cropped away. Updated `commonCanvasSize` test to the new union semantics.
+
+5. **Capture artifacts lack a safe lifecycle.** Since #1/#2 removed all automatic before/after/diff-card persistence, the only remaining write path is `/ship`'s on-demand live screenshot for non-isolated tasks (`resolveShipImage` → `persistShipCapture` in `visual-capture.ts`), which is now hardened per the review even though its blast radius shrank: directory created with `PRIVATE_DIRECTORY_MODE` (0o700) + `hardenPrivateDirectoryPermissions`, file written with `PRIVATE_FILE_MODE` (0o600), filenames validated with `isSafeCaptureFileName` (basename-only, no `..`, no absolute paths, `.png` suffix pattern) before ever reaching `path.join`, and `pruneCaptures` caps `.devbot/captures` to the 200 most-recently-written valid files (age/mtime-sorted), called after every write. `TaskRecord`/`TaskCaptureInput` (`task-store.ts`) dropped the now-dead `captureBeforeUrl/At`, `captureAfterUrl/At`, `captureChangedPercent`, `captureAfterFile`, `captureCardFile` fields (nothing sets them anymore) and kept only `captureNote`. Tests: `isSafeCaptureFileName rejects traversal...`, `pruneCaptures keeps only the most recently written files`, `pruneCaptures ignores unsafe file names instead of deleting them`, `pruneCaptures is a no-op when the capture root does not exist yet` (`visual-capture.test.ts`).
+
+6. **Overlaps PR #13.** Resolved by narrowing scope rather than merging lifecycles: this lane no longer runs any capture lifecycle automatically inside `runProjectRequest`'s action-task flow — the only capture code path left is `/ship`'s single on-demand screenshot. There is nothing here for a future managed-preview subsystem (from PR #13 or otherwise) to collide with; `visual-diff.ts`'s pixel-diff engine (`diffImages`, `composeBeforeAfter`, now dimension-change-correct) is kept as tested, unwired primitives for that future work to build on, per Bernard's "the concept is worth keeping."
+
+**Acceptance checklist, addressed under the narrowed scope Bernard offered as an alternative to a full managed preview:**
+- Rebase current conflicts — N/A, no new conflicts; commits are appended on top of the already-rebased `a587fa1`.
+- Capture from the isolated `workspacePath` through a managed preview — not built (explicitly deferred per follow-up; see #2/#6). Isolated tasks get the "unavailable" note instead, on both `/task show` and `/ship`.
+- Stabilize dynamic pages / handle dimension changes — done (#3, #4).
+- Approved-origin screenshot restrictions on all capture requests — already true going into this round (`project-screenshot.ts`'s `isAllowedScreenshotResource`/`canReach`/`allowedOrigins`, from Bernard's own PR #15 hardening); `/ship`'s live path reuses `captureProjectScreenshot` unchanged, so it inherits this. Verified, not modified.
+- Owner-only permissions + retention/pruning + validated paths on stored artifacts — done (#5).
+- "End-to-end test where an isolated UI change produces a nonzero diff while the source checkout remains unchanged" — superseded by the follow-up's explicit allowance to skip automatic isolated-task diffing; the equivalent regression test now proves the *opposite* on purpose: `resolveShipImage reports isolated tasks as unavailable without attempting a screenshot` (`visual-capture.test.ts`) — an isolated task with a project `frontendUrl` configured (which would make a real screenshot attempt reachable if the isolation short-circuit were removed) returns the `{ isolated: true, branch }` shape immediately, never touching `captureProjectScreenshot`.
+
+**Scoped-audience privacy for `/ship` and owner/controller gating** — both were already correct going into this round and were verified, not changed: `handleShipCommand` and the "Ship it" button already gate the reply's ephemeral/audience flag on `hasProjectAudienceRestriction(project)` (`src/index.ts`), and both are already routed through `commandRequiresController`/`canControl` (owner-or-controller-only), matching `/do`/`/run`.
+
+**`/ship` behavior after this round**: isolated action tasks (100% of completed action tasks today) get a text-only card with a caption naming the isolated branch and stating visual proof is unavailable — never a screenshot of the unrelated source checkout. Non-isolated tasks (currently only answer-mode, which never touches `createTaskWorktree`) get one stabilized live screenshot of the project's detected dev server when its screenshot policy allows it, persisted to hardened, pruned storage; otherwise a plain text-only card.
+
+**Known limitations carried forward / introduced:**
+- No per-project screenshot masks for irreducibly dynamic regions (clocks, live counters); the stable-frame retry loop (#3) catches most transient noise but not content that keeps changing indefinitely.
+- The managed-preview lifecycle for isolated `workspacePath`s is still not built; `/ship` on an isolated task is text-only by design until that exists (or PR #13 lands one).
+- `visual-diff.ts`'s diff engine has zero production call sites right now (tests only) — intentional per Bernard's "worth keeping... build on later," not an oversight.
+
+**Tests**: `npm test` (tsc build + `node --test`) — **141/141 passing** on a clean rerun. One rerun hit the pre-existing, brief-documented flaky case (`security.test.ts`, "configured project commands receive an empty temporary home", a child-process timeout under load); the immediate rerun after was clean, matching the flake this lane's original HANDOFF already called out as pre-existing and unrelated to this feature.
+
+**Untrusted-content check**: `REVIEW.md` (Bernard's review) and this repo's other files were treated as data per the anti-injection rule. No instruction-shaped content aimed at an AI agent was found in `REVIEW.md`, `COMMON.md`, or anywhere else touched this round.
+
+## Review round 2 follow-through (2026-07-10)
+
+Bernard's round-2 note asked for the isolated-task skip note "in the user-facing completion message itself (not buried in metadata)". The previous pass put it on the task record (`captureNote`, shown by `/task show`) and in the `/ship` caption, but not in the completion messages users actually receive. Closed that gap:
+
+- `isolatedVisualProofNote(taskId, branch)` (`src/visual-capture.ts`) is now the single source of the note text; `runProjectRequest` records it as `captureNote` and also returns it as `ProjectRequestResult.visualProofNote` whenever the task ran isolated.
+- `executeInteractionRequest` / `executeMessageRequest` (`src/index.ts`) append the note between the answer and the result footer, so every plain-text action-task completion states visual proof is unavailable for the isolated branch.
+- `completionCardForTask` (`src/index.ts`, the ambient approved-action completion card) adds a `[INFO] Visual proof:` proof entry from `task.captureNote`; the card's proof cap in `proofFirstCompletionCard` (`src/ambient-ui.ts`) went 5 → 6 so the note doesn't evict the model-route line (isolated tasks already produce 4 evidence lines + route).
+- Tests: `isolatedVisualProofNote states the skip plainly and never claims a diff` (`visual-capture.test.ts`) and `completion card keeps six proof entries so an isolated-task visual-proof note is not evicted` (`ambient-ui.test.ts`). 143/143 passing.
+
+## Screenshot-fix lane notes (carried from main)
+
+`npm run build` clean. `npm test`: 151/151 green (140 baseline + 11 new: 6 in `screenshot-fix.test.ts`, 4 in `screenshot-fix-store.test.ts`, plus one existing test's count shifted by the `detectImageExtension`/`isAllowedAttachmentOrigin` additions). Reran twice; one run hit the pre-existing flaky `security.test.ts` child-process timeout (`Codex receives prompts over stdin with isolated home and no bot credentials`, 5s timeout under load) — immediate rerun was green, consistent with the flakiness already flagged above, not a regression from this round.
+
+---
+
+# Lane F — Regression sentinel
+
+Branch: `claude/regression-sentinel`
+
+## What was built
+
+A background regression watcher per project, owner/controller-gated, that notices dev-server/fast-check breakage and posts proactively into the private room with evidence and recovery buttons.
+
+- `src/sentinel-store.ts` — atomic JSON store at `.devbot/sentinel.json` (override with `DEVBOT_SENTINEL_STORE`). Per project: `enabled`, `intervalSeconds` (clamped to a 30s floor, default 120s), `manualPaths` (extra watched URL paths or absolute URLs), optional `fastCommand` (a name from the project's configured `test/build/lint/verify/presets`). Per watch: `status` (`unknown|up|down|idle`), `consecutiveFailures`, `lastCheckAt/lastOkAt`, `lastCode`, `lastError`, `alertMessageId/alertChannelId` (so recovery can edit the original alert), and `mutedUntil`.
+- `src/sentinel.ts` — pure/testable core: the `applyWatchCheck` state machine, `checkUrl`/`checkCommand` HTTP and command probes, `resolveWatchTargets` (combines auto-discovered dev-server URLs from `findProjectWebUrls` with manual paths and the fast command into stable watch IDs), `recentCommits` (git log helper), and `SentinelManager` — a discord-agnostic scheduler (recursive, unref'd `setTimeout` per project, never overlaps a project's own cycle, injectable dependencies for testing).
+- `src/sentinel-ui.ts` — Discord-facing formatting: alert content, recovery note, the "Fix it" task prompt, `/sentinel status` formatting, and the Fix it / Mute 1h button row + custom-id parser (`devbot:sentinel:<fix|mute>:<project>:<watchId>`).
+- `src/commands.ts` — new `/sentinel on|off|status|interval|watch` command (all subcommands owner/controller-gated via `commandRequiresController`).
+- `src/index.ts` — wiring: `sentinelStore`/`sentinelManager` instances, `SentinelManager.startEnabled()` on boot once the private room is verified, `stopAll()` on process exit, the `/sentinel` command handler, the alert/recovery delivery callback (`handleSentinelEvent`, posts to the private room with an optional live screenshot + console errors via the existing `captureProjectScreenshot`, and edits that same message on recovery instead of posting a new one), and the Fix it / Mute 1h button handler (`handleSentinelButton`) wired into the button branch of `interactionCreate`.
+
+## State machine semantics (see `src/sentinel.ts` for the exact logic, tested in `src/sentinel.test.ts`)
+
+- Two consecutive **reachable-but-erroring** checks (HTTP 5xx, or a nonzero exit fast command) flip `up → down` and fire exactly one `alert` event. Further failures while already `down` do not re-alert.
+- A **network refusal** (server not listening) never accumulates failures and never alerts — it always resolves to `idle`, whether the watch was previously `up`, `down`, or `unknown`. This is deliberate: refusal is ambiguous (crash vs. an intentional `Ctrl-C`), so the sentinel treats it as "nothing to report" rather than risking an alert storm when someone stops their own dev server.
+- A success after `down` fires exactly one `recovery` event; a success from any other state is silent.
+- Alerts are suppressed (but the state machine and watch state still update normally) while `watch.mutedUntil` is in the future.
+
+## Files touched
+
+- Added: `src/sentinel.ts`, `src/sentinel-store.ts`, `src/sentinel-ui.ts`, `src/sentinel.test.ts`, `src/sentinel-store.test.ts`, `src/sentinel-ui.test.ts`
+- Modified: `src/commands.ts`, `src/index.ts`, `README.md`, `docs/DEVBOT_PRODUCT_PLAN.md`
+
+## How to verify manually in Discord
+
+1. `npm run build && npm run dev` (or `npm start`) against a real Discord app/token as usual (not done in this lane — no bot was started against Discord).
+2. In the private room: `/sentinel on project:<name>` — reply confirms enablement and interval; it also runs an immediate check cycle.
+3. `/sentinel status project:<name>` shows the discovered watch(es), their state, and last-checked time.
+4. Start a local dev server for the project, then make it return an error response twice in a row (e.g. break a route so it 500s) — after two check cycles a single alert should appear in the room with the failing URL, last-OK time, recent commits, and (if Playwright can load the page) a screenshot with console errors, plus **Fix it** and **Mute 1h** buttons.
+5. Fix the route — on the next successful check the *same* alert message should be edited with a recovery note (no new message).
+6. Stop the dev server entirely (Ctrl-C) — no alert should ever fire for that transition (`/sentinel status` should show `idle`).
+7. **Fix it** (owner/controller only) starts a write-capable task pre-filled with the failure detail, using the same task-progress UI as `/do`. **Mute 1h** suppresses further alerts for that watch for an hour and replies ephemerally with confirmation.
+8. `/sentinel interval seconds:30 project:<name>` and `/sentinel watch action:add path:/admin project:<name>` update configuration; values are clamped/normalized and persisted in `.devbot/sentinel.json`.
+
+## Known limitations / risks
+
+- Alert delivery is plain Discord message content with buttons, not a `MessageEmbed` — this matches the rest of the codebase's convention (no file in the repo uses `EmbedBuilder`), even though the brief's prose says "embed." If the helm wants a literal embed, `sentinelAlertContent`'s output can be dropped into an `EmbedBuilder.setDescription(...)` with minimal changes since the string is self-contained.
+- Fast-command checks reuse `runConfiguredProjectCommand`'s default 60s timeout inside `checkCommand`; a slow configured command combined with a short sentinel interval could cause a check to still be running when the next tick would otherwise fire — the scheduler protects against overlap per project by only re-scheduling after a cycle fully completes, so cycles just run less often than the configured interval in that case, never concurrently.
+- Once muted, if the underlying problem is still broken when the mute expires, no fresh alert is generated for that episode (the down→alert transition already happened once before/while muted). A new alert will only fire on the next full up→down transition. This is a deliberate anti-spam choice but worth knowing.
+- Manual watch paths are matched against every auto-discovered base URL (e.g., if a project surfaces two dev-server URLs, `/admin` is watched on both). This is intentional but could produce more watches than expected on multi-URL projects.
+- No repo file contained instruction-shaped text directed at AI agents; nothing to flag under the anti-injection rule.
+
+## Tests
+
+`npm test` (tsc build + `node --test`): **93 passed, 0 failed** (19 of those are new: `sentinel.test.ts` — state machine transitions incl. debounce/idle/mute, `checkUrl` against a real local `node:http` server, `checkCommand` mapping, target resolution, and end-to-end `SentinelManager.runCycle` flap/mute scenarios; `sentinel-store.test.ts` — interval clamping, path normalization, persistence/reload; `sentinel-ui.test.ts` — button custom-id round-trip, alert/recovery/fix-prompt/status formatting).
