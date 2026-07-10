@@ -2,6 +2,30 @@
 
 Branch: `claude/visual-diff-clips`
 
+## Rebased onto 85e2530 (2026-07-10)
+
+Rebased onto `origin/main` after bernard's "Add ambient Discord workrooms and security hardening" merge (`dd0af6b`, PR #15), which restructured `runProjectRequest` to execute every action-mode task inside an **isolated Git worktree** (`src/task-worktree.ts`) and hardened `src/project-screenshot.ts` (SSRF-safe `canReach`/`isAllowedScreenshotResource` with an `allowedOrigins` param, tighter URL normalization).
+
+Conflicts (3 files, all textual "both sides added adjacent lines" conflicts, no logic actually competing for the same lines):
+
+- **`src/task-store.ts`** — `formatTaskDetail`'s array literal: main added `changedFiles`/`diffStat`/`verification` lines, this lane added `captureChangedPercent`/`captureNote` lines, both after the same `includePatterns` line. Resolution: kept both blocks, worktree-evidence lines first, capture lines after (matches the chronological order they're populated in `runProjectRequest`).
+- **`src/commands.ts`** — the exported command array: main added a `Start Devbot workroom` context-menu command as the last array element ending the array; this lane added the `/ship` slash command the same way. Resolution: `/ship` slash command, then the context-menu command, then the closing `satisfies Array<...>` / `commandDefinitions` lines from main (main's version is stricter than this lane's plain `.map(...)`, so kept main's).
+- **`src/index.ts`** — two spots:
+  1. Import block: main added `task-access.js`/`task-worktree.js` imports where this lane's `visual-capture.js`/`ship-card.js` imports also landed. Trivial — kept both import groups (this lane's imports were on the other side of the hunk and merged in cleanly without a marker).
+  2. `runProjectRequest`, right after `runCodex(...)` resolves: main added `if (isolatedWorktree) { await recordTaskWorktreeEvidence(...) }`, this lane added the `finishVisualCapture`/`taskStore.recordCapture` block. Both needed — see the isolated-worktree semantic note below for how they were combined (not just concatenated).
+
+### Isolated-worktree capture semantics — decision and reasoning
+
+This lane's before/after screenshots hit the project's **detected local dev server** (`findProjectWebUrls`/`captureProjectScreenshot`), which watches and serves the **source checkout** (`options.project.root`). Bernard's isolation change means an action-mode task's file edits now land in a *separate* `git worktree add` checkout (`executionProject.root`, e.g. `~/.devbot/worktrees/<task>`) on a new review branch, and are explicitly **left uncommitted there for human review** — `recordTaskWorktreeEvidence` never merges or copies them back into the source checkout. I checked for a "promotion" step that might land the change in the source checkout before task completion (there's a `promote` task action, but it only re-runs a *different* task in action mode from a followup modal — it does not merge or fast-forward the isolated branch into the source checkout). So there is no in-flow hook to wait on before capturing "after".
+
+Net effect: the dev server the after-capture hits essentially never reflects this task's edits by the time `finishVisualCapture` runs, since they're not in that checkout at all. A 0%-changed (or noise-level) diff after an isolated action task is therefore not evidence the task had no visual effect — it just hasn't been merged yet. Silently showing "no diff" (or worse, attaching a "before/after, 0.2% changed" card) would misrepresent that as "verified no visual impact," which is false.
+
+Chose the second option offered in the lane brief: **keep the existing threshold gate** (`shouldAttachDiffCard`, still only attaches a card above ~0.5% changed pixels — still useful for catching real cases like static/public-asset changes, dev-server health regressions, or non-git-tracked state) **and always attach an explicit isolation caveat** as `captureNote` on the task record whenever `isolatedWorktree` was used for that task and an after-capture was actually attempted (see the comment + `recordCapture` call right after `finishVisualCapture` in `runProjectRequest`, `src/index.ts`). The note names the review branch and says the comparison won't reflect that branch until merged; it surfaces via `/task show id:<id>` (`formatTaskDetail`'s existing "Visual diff note:" line, unchanged from before the rebase). Did not also inject the caveat into the public completion message (`visualDiffNote`) — that helper only fires when a card is attached, and always adding a "may not reflect isolated changes" line to every action-task completion (most of which have no visual capture attempted at all) seemed like more noise than signal; task detail is the right place since that's already where isolation/branch state (`Branch: ... (isolated)`) is surfaced.
+
+Did not change `beginVisualCapture`/`finishVisualCapture` themselves (still called with `options.project`, the source checkout) — that's correct as-is: `findProjectWebUrls` → `detectLocalWebUrlsFromPs` matches running dev-server processes against `project.root`, so pointing at the isolated worktree path would find no running server at all, not a more-accurate one.
+
+`npm test`: 136/136 passing, two consecutive full runs (build + `node --test`), including the flaky-under-load `security.test.ts` "configured project commands receive an empty temporary home" case, which passed cleanly both times.
+
 ## What was built
 
 1. **`src/visual-diff.ts`** — pure, dependency-free pixel diffing on top of `sharp`:
