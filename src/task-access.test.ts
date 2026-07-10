@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canAccessTaskRecord, isTaskListVisible } from "./task-access.js";
+import { canAccessTaskRecord, isTaskListVisible, taskSyncRefusal } from "./task-access.js";
 import type { TaskRecord } from "./task-store.js";
 
 test("workroom tasks are limited to their requester and project-authorized controllers", () => {
@@ -21,6 +21,39 @@ test("ordinary project tasks retain project-level access", () => {
   const task = record({});
   assert.equal(canAccessTaskRecord(task, { userId: "viewer", projectAllowed: true, controller: false }), true);
   assert.equal(canAccessTaskRecord(task, { userId: "viewer", projectAllowed: false, controller: false }), false);
+});
+
+test("task branch sync is limited to the requester or a controller with project access", () => {
+  const task = record({
+    requesterId: "requester",
+    workspaceIsolated: true,
+    workspacePath: "/tmp/worktree",
+    branchName: "devbot/task/task-access",
+    baseBranch: "abc123"
+  });
+  assert.equal(taskSyncRefusal(task, { userId: "requester", projectAllowed: true, controller: false, safeMode: false }), undefined);
+  assert.equal(taskSyncRefusal(task, { userId: "controller", projectAllowed: true, controller: true, safeMode: false }), undefined);
+  assert.equal(taskSyncRefusal(task, { userId: "viewer", projectAllowed: true, controller: false, safeMode: false }), "requester-or-controller");
+  assert.equal(taskSyncRefusal(task, { userId: "requester", projectAllowed: false, controller: false, safeMode: false }), "access");
+});
+
+test("safe mode, missing branch evidence, and open tasks refuse branch sync", () => {
+  const context = { userId: "requester", projectAllowed: true, controller: false, safeMode: false };
+  const task = record({
+    requesterId: "requester",
+    workspaceIsolated: true,
+    workspacePath: "/tmp/worktree",
+    branchName: "devbot/task/task-access",
+    baseBranch: "abc123"
+  });
+  assert.equal(taskSyncRefusal(task, { ...context, safeMode: true }), "safe-mode");
+  assert.equal(taskSyncRefusal(record({ requesterId: "requester" }), context), "no-isolated-branch");
+  assert.equal(
+    taskSyncRefusal(record({ requesterId: "requester", workspaceIsolated: false, workspacePath: "/tmp/repo", baseBranch: "main" }), context),
+    "no-isolated-branch"
+  );
+  assert.equal(taskSyncRefusal({ ...task, status: "running" }, context), "task-active");
+  assert.equal(taskSyncRefusal({ ...task, status: "awaiting-approval" }, context), "task-active");
 });
 
 function record(overrides: Partial<TaskRecord>): TaskRecord {
