@@ -70,6 +70,12 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Opens the running app and navigates through visible links/buttons based on request language.
   - Handles requests like "browse page" or "watchlist view" without reading framework routes from disk.
   - Supports explicit URLs and paths such as `/cards/op01-016` when the user wants an exact target.
+- Managed task workspace previews:
+  - `/task preview` serves a task's verified isolated worktree with the project's configured `dev`/`preview`/`serve`/`start` preset or an allow-listed package.json script; free-text commands are never accepted, and missing dependencies fail closed without installing.
+  - The dev server binds a Devbot-chosen ephemeral port on `127.0.0.1` only. The exact observed origin is recorded and posted to the task's workroom or bound project room. The preview is reachable only from the machine running Devbot; it is not a tunnel and involves no public exposure.
+  - Lifecycle: capacity is reserved before spawning, pending starts are abortable, previews are TTL-limited with SIGTERM-then-SIGKILL cleanup and observed-exit confirmation, controls carry per-instance opaque IDs that expire when stale, a persisted owner-only pid ledger reconciles orphans after restarts (a recorded pid is signaled only when its command line still identifies it as the spawned preview), and shutdown stops everything.
+  - Access: only the task requester, owner, or an approved controller, with a project access recheck at start and on every control; safe mode blocks starting a preview but never stop or status.
+  - This is the managed preview of `task.workspacePath` that isolated-task evidence work was blocked on; future visual diff, video proof, or authenticated sharing features can consume the exported `TaskPreviewManager` API instead of capturing the unchanged source checkout.
 
 ## Current Constraints
 
@@ -83,6 +89,7 @@ The safety contract is explicit: only the requester or an approved controller ca
 - The audit trail spans Discord messages, local task/collaboration stores, and git history; it is not yet centralized or tamper-evident.
 - The v2 collaboration protocol supports allow-listed discovery and coordination, but transport is still Discord-specific and peer writes remain human-gated.
 - Ambient workroom activity aggregation and the deferred Activity idea 9 are not implemented.
+- Task previews assume an HTTP dev server that honors the provided `PORT`/`HOST` environment; readiness is any HTTP response on the chosen loopback port, one preview runs per task, and restart reconciliation of the pid ledger is POSIX-only.
 
 ## Improvement Themes
 
