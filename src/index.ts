@@ -85,8 +85,8 @@ import {
   inspectTaskWorktree,
   type TaskWorktree
 } from "./task-worktree.js";
-import { formatQueueDigest, formatQueueList, QueueStore, type QueueItem } from "./queue-store.js";
-import { formatScheduleList, ScheduleStore, type ScheduleEntry } from "./schedule-store.js";
+import { formatQueueDigest, formatQueueList, groupQueueItemsByProject, isQueueItemId, QueueStore, type QueueItem } from "./queue-store.js";
+import { formatScheduleList, isScheduleId, ScheduleStore, type ScheduleEntry } from "./schedule-store.js";
 import {
   parseTaskControl,
   taskActionMatchesState,
@@ -159,6 +159,7 @@ const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefin
 const queueStore = new QueueStore(process.env.DEVBOT_QUEUE_STORE?.trim() || undefined);
 const scheduleStore = new ScheduleStore(process.env.DEVBOT_SCHEDULE_STORE?.trim() || undefined);
 let queueAdvancing = false;
+let scheduleTicking = false;
 let scheduleTimer: ReturnType<typeof setInterval> | undefined;
 const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
@@ -196,6 +197,14 @@ client.once("clientReady", async () => {
     }
   } catch (error) {
     console.warn(`Unable to recover interrupted queue items: ${publicErrorMessage(error)}`);
+  }
+  try {
+    const recoveredScheduleEntries = await scheduleStore.recoverInterrupted("Interrupted when Devbot restarted.");
+    if (recoveredScheduleEntries.length > 0) {
+      console.log(`Recovered ${recoveredScheduleEntries.length} interrupted scheduled task${recoveredScheduleEntries.length === 1 ? "" : "s"} from the previous runtime.`);
+    }
+  } catch (error) {
+    console.warn(`Unable to recover interrupted scheduled tasks: ${publicErrorMessage(error)}`);
   }
   try {
     await scheduleStore.reconcileOnBoot();
@@ -246,7 +255,7 @@ client.once("clientReady", async () => {
     });
   }
   if (verifiedPrivateRoomId) {
-    await tryPostQueueDigest(config).catch((error) => {
+    await postQueueDigests(config).catch((error) => {
       console.warn(`Unable to post the recovered queue digest: ${publicErrorMessage(error)}`);
     });
     const runner = await queueStore.getRunner();
@@ -256,9 +265,17 @@ client.once("clientReady", async () => {
       });
     }
     scheduleTimer = setInterval(() => {
-      void tickSchedules(config).catch((error) => {
-        console.warn(`Scheduled task tick failed: ${publicErrorMessage(error)}`);
-      });
+      if (scheduleTicking) {
+        return;
+      }
+      scheduleTicking = true;
+      void tickSchedules(config)
+        .catch((error) => {
+          console.warn(`Scheduled task tick failed: ${publicErrorMessage(error)}`);
+        })
+        .finally(() => {
+          scheduleTicking = false;
+        });
     }, 30_000);
   }
 });
@@ -2379,11 +2396,17 @@ async function handleQueueCommand(interaction: ChatInputCommandInteraction, appC
       return;
     }
     const taskText = interaction.options.getString("task", true);
-    const item = await queueStore.add({ project: project.name, taskText, mode, addedBy: interaction.user.tag });
+    const item = await queueStore.add({
+      project: project.name,
+      taskText,
+      mode,
+      addedBy: interaction.user.tag,
+      addedById: interaction.user.id
+    });
     const items = await queueStore.list();
     const position = items.findIndex((entry) => entry.id === item.id) + 1;
     await interaction.reply({
-      content: `Queued at position ${position} (${mode === "answer" ? "ask" : "do"}) on \`${project.name}\`. Use \`/queue start\` to begin.`,
+      content: `Queued at position ${position} (${mode === "answer" ? "ask" : "do"}) on \`${project.name}\` (\`${item.id}\`). Use \`/queue start\` to begin.`,
       flags: MessageFlags.Ephemeral
     });
     return;
@@ -2405,10 +2428,24 @@ async function handleQueueCommand(interaction: ChatInputCommandInteraction, appC
 
   if (subcommand === "remove") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const position = interaction.options.getInteger("position", true);
+    const id = interaction.options.getString("id", true).trim();
+    if (!isQueueItemId(id)) {
+      await interaction.editReply(`Not a valid queue item id: \`${id}\`.`);
+      return;
+    }
+    const existing = await queueStore.get(id);
+    if (!existing) {
+      await interaction.editReply(`No queue item found for \`${id}\`.`);
+      return;
+    }
+    const project = findProject(appConfig.projects, existing.project);
+    if (!project || !isAllowedForProject(interaction, project)) {
+      await interaction.editReply(`You are not allowed to remove items on project \`${existing.project}\`.`);
+      return;
+    }
     try {
-      const removed = await queueStore.removeAtPosition(position);
-      await interaction.editReply(`Removed position ${position}: ${truncateSummary(removed?.taskText ?? "")}`);
+      const removed = await queueStore.removeById(id);
+      await interaction.editReply(`Removed \`${id}\`: ${truncateSummary(removed?.taskText ?? "")}`);
     } catch (error) {
       await interaction.editReply(publicErrorMessage(error));
     }
@@ -2417,8 +2454,11 @@ async function handleQueueCommand(interaction: ChatInputCommandInteraction, appC
 
   if (subcommand === "clear") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const cleared = await queueStore.clear();
-    await interaction.editReply(`Cleared ${cleared} pending item${cleared === 1 ? "" : "s"}.`);
+    const allowedProjectNames = new Set(
+      appConfig.projects.filter((project) => isAllowedForProject(interaction, project)).map((project) => project.name)
+    );
+    const cleared = await queueStore.clear(allowedProjectNames);
+    await interaction.editReply(`Cleared ${cleared} pending item${cleared === 1 ? "" : "s"} across your accessible projects.`);
     return;
   }
 
@@ -2451,7 +2491,10 @@ async function handleQueueCommand(interaction: ChatInputCommandInteraction, appC
 
   if (subcommand === "digest") {
     await interaction.deferReply();
-    const items = await queueStore.list();
+    const allowedProjectNames = new Set(
+      appConfig.projects.filter((project) => isAllowedForProject(interaction, project)).map((project) => project.name)
+    );
+    const items = (await queueStore.list()).filter((item) => allowedProjectNames.has(item.project));
     const roomId = effectivePrivateRoomId();
     const digest = formatQueueDigest(items, { guildId: appConfig.discordGuildId, channelId: roomId ?? interaction.channelId });
     const chunks = splitDiscordMessage(digest);
@@ -2471,13 +2514,18 @@ async function handleScheduleCommand(interaction: ChatInputCommandInteraction, a
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
-    const mode: CodexRequestMode = interaction.options.getString("mode") === "ask" ? "answer" : "action";
     const spec = interaction.options.getString("spec", true);
     const taskText = interaction.options.getString("task", true);
     try {
-      const entry = await scheduleStore.add({ spec, project: project.name, taskText, mode, addedBy: interaction.user.tag });
+      const entry = await scheduleStore.add({
+        spec,
+        project: project.name,
+        taskText,
+        addedBy: interaction.user.tag,
+        addedById: interaction.user.id
+      });
       await interaction.reply({
-        content: `Scheduled \`${entry.id}\`: ${entry.spec} on \`${project.name}\`. Next run ${new Date(entry.nextRun).toLocaleString()}.`,
+        content: `Scheduled \`${entry.id}\` (read-only): ${entry.spec} on \`${project.name}\`. Next run ${new Date(entry.nextRun).toLocaleString()}.`,
         flags: MessageFlags.Ephemeral
       });
     } catch (error) {
@@ -2494,7 +2542,11 @@ async function handleScheduleCommand(interaction: ChatInputCommandInteraction, a
 
   if (subcommand === "remove") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const id = interaction.options.getString("id", true);
+    const id = interaction.options.getString("id", true).trim();
+    if (!isScheduleId(id)) {
+      await interaction.editReply(`Not a valid schedule id: \`${id}\`.`);
+      return;
+    }
     const removed = await scheduleStore.remove(id);
     await interaction.editReply(removed ? `Removed schedule \`${id}\`.` : `No scheduled task found for \`${id}\`.`);
     return;
@@ -2502,7 +2554,11 @@ async function handleScheduleCommand(interaction: ChatInputCommandInteraction, a
 
   if (subcommand === "pause" || subcommand === "resume") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const id = interaction.options.getString("id", true);
+    const id = interaction.options.getString("id", true).trim();
+    if (!isScheduleId(id)) {
+      await interaction.editReply(`Not a valid schedule id: \`${id}\`.`);
+      return;
+    }
     const updated = await scheduleStore.setEnabled(id, subcommand === "resume");
     await interaction.editReply(
       updated ? `Schedule \`${id}\` is now ${updated.enabled ? "enabled" : "paused"}.` : `No scheduled task found for \`${id}\`.`
@@ -2522,14 +2578,16 @@ async function advanceQueue(appConfig: AppConfig): Promise<void> {
       if (!runner.running) {
         return;
       }
-      const item = await queueStore.nextQueued();
-      if (!item) {
-        await finishQueueDrain(appConfig);
+      const privateChannel = await privateRoomChannel();
+      if (!privateChannel) {
+        console.warn("Queue runner paused: the private room is not available.");
         return;
       }
-      const channel = await privateRoomChannel();
-      if (!channel) {
-        console.warn("Queue runner paused: the private room is not available.");
+      // Atomically claims the item (queued -> running) before any execution side effect, so a
+      // concurrent /queue remove sees it as running and correctly refuses to touch it.
+      const item = await queueStore.claimNext();
+      if (!item) {
+        await finishQueueDrain(appConfig);
         return;
       }
       const project = findProject(appConfig.projects, item.project);
@@ -2541,7 +2599,19 @@ async function advanceQueue(appConfig: AppConfig): Promise<void> {
         }
         continue;
       }
-      const outcome = await runQueueItem(appConfig, item, project, channel);
+      if (!(await requesterAllowedForProject(appConfig, project, item.addedById))) {
+        await queueStore.markFinished(item.id, {
+          state: "failed",
+          summary: "Skipped: the requester no longer has access to this project."
+        });
+        if (runner.stopOnFailure) {
+          await queueStore.stopRunner();
+          return;
+        }
+        continue;
+      }
+      const postChannel = await scopedRoomChannel(appConfig, project, privateChannel);
+      const outcome = await runQueueItem(appConfig, item, project, postChannel);
       if (!outcome.ok && runner.stopOnFailure) {
         await queueStore.stopRunner();
         return;
@@ -2556,10 +2626,10 @@ async function runQueueItem(
   appConfig: AppConfig,
   item: QueueItem,
   project: ProjectEntry,
-  channel: GuildTextBasedChannel
+  channel: GuildTextBasedChannel | undefined
 ): Promise<{ ok: boolean }> {
   let message: Message | undefined;
-  let claimedTaskId = false;
+  let taskIdAttached = false;
   try {
     const result = await runProjectRequest({
       appConfig,
@@ -2568,11 +2638,15 @@ async function runQueueItem(
       includePatterns: [],
       mode: item.mode,
       requester: item.addedBy,
+      requesterId: item.addedById,
       source: "queue",
       onProgress: async (progress) => {
-        if (!claimedTaskId) {
-          claimedTaskId = true;
-          await queueStore.markRunning(item.id, progress.taskId);
+        if (!taskIdAttached) {
+          taskIdAttached = true;
+          await queueStore.attachTaskId(item.id, progress.taskId);
+        }
+        if (!channel) {
+          return;
         }
         const content = `${formatTaskProgress(progress)}\n\nTrigger: queue item added by ${item.addedBy}.`;
         const components = [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })];
@@ -2584,8 +2658,9 @@ async function runQueueItem(
         }
       }
     });
-    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(project, result.route, item.mode)}`);
-    if (message) {
+    const suppressedNote = channel ? "" : " (output suppressed: no audience-safe room for this project)";
+    if (message && channel) {
+      const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(project, result.route, item.mode)}`);
       await message
         .edit({
           content: chunks.shift() ?? "Task completed without a response.",
@@ -2596,7 +2671,7 @@ async function runQueueItem(
         await channel.send(chunk).catch(() => undefined);
       }
     }
-    await queueStore.markFinished(item.id, { state: "done", summary: truncateSummary(result.answer) });
+    await queueStore.markFinished(item.id, { state: "done", summary: `${truncateSummary(result.answer)}${suppressedNote}` });
     return { ok: true };
   } catch (error) {
     await queueStore.markFinished(item.id, {
@@ -2609,25 +2684,38 @@ async function runQueueItem(
 
 async function finishQueueDrain(appConfig: AppConfig): Promise<void> {
   await queueStore.stopRunner();
-  await queueStore.setPendingDigest(true);
-  await tryPostQueueDigest(appConfig);
+  await postQueueDigests(appConfig);
 }
 
-async function tryPostQueueDigest(appConfig: AppConfig): Promise<void> {
-  const runner = await queueStore.getRunner();
-  if (!runner.pendingDigest) {
+/**
+ * Posts one digest per project group to that project's own audience-safe room (its bound
+ * ambient room, or the private room if the project has no audience restriction), so
+ * differently scoped projects are never combined into a single message. Groups whose
+ * project cannot be resolved to a safe room are left undigested and retried on the next
+ * call (drain finish or boot) rather than posted to the wrong audience or silently dropped.
+ */
+async function postQueueDigests(appConfig: AppConfig): Promise<void> {
+  const undigested = await queueStore.listUndigested();
+  if (undigested.length === 0) {
     return;
   }
-  const channel = await privateRoomChannel();
-  if (!channel) {
-    return;
+  for (const [projectName, items] of groupQueueItemsByProject(undigested)) {
+    const project = findProject(appConfig.projects, projectName);
+    if (!project) {
+      console.warn(`Queue digest skipped for unknown project \`${projectName}\`.`);
+      continue;
+    }
+    const channel = await scopedRoomChannel(appConfig, project);
+    if (!channel) {
+      console.warn(`Queue digest suppressed for \`${projectName}\`: no audience-safe room is available.`);
+      continue;
+    }
+    const digest = formatQueueDigest(items, { guildId: appConfig.discordGuildId, channelId: channel.id });
+    for (const chunk of splitDiscordMessage(digest)) {
+      await channel.send(chunk);
+    }
+    await queueStore.markDigested(items.map((entry) => entry.id));
   }
-  const items = await queueStore.list();
-  const digest = formatQueueDigest(items, { guildId: appConfig.discordGuildId, channelId: channel.id });
-  for (const chunk of splitDiscordMessage(digest)) {
-    await channel.send(chunk);
-  }
-  await queueStore.setPendingDigest(false);
 }
 
 async function privateRoomChannel(): Promise<GuildTextBasedChannel | undefined> {
@@ -2642,25 +2730,83 @@ async function privateRoomChannel(): Promise<GuildTextBasedChannel | undefined> 
   return channel as GuildTextBasedChannel;
 }
 
+/**
+ * Resolves the room background queue/schedule output for `project` may safely post to
+ * the project's bound ambient room when one is configured and its audience still checks
+ * out, otherwise the private room only if the project has no audience restriction of its
+ * own. Returns undefined (suppress posting) when a restricted project has no bound room,
+ * so scoped output never lands somewhere its audience cannot be guaranteed.
+ */
+async function scopedRoomChannel(
+  appConfig: AppConfig,
+  project: ProjectEntry,
+  fallbackPrivateChannel?: GuildTextBasedChannel
+): Promise<GuildTextBasedChannel | undefined> {
+  const roomId = setupStore.snapshot().projectRoomIds[project.name];
+  if (roomId && (await isConfiguredRoomId(roomId))) {
+    const channel = await client.channels.fetch(roomId).catch(() => null);
+    if (channel && (channel.type === ChannelType.GuildText || channel.type === ChannelType.PrivateThread)) {
+      return channel as GuildTextBasedChannel;
+    }
+  }
+  if (!hasProjectAudienceRestriction(project)) {
+    return fallbackPrivateChannel ?? (await privateRoomChannel());
+  }
+  return undefined;
+}
+
+/**
+ * Fail-closed re-authorization at execution time: even though the requester was allowed to
+ * enqueue/schedule against `project`, access may have been revoked (allowlist edited, role
+ * removed, user left the server) before this occurrence actually runs. Unresolvable
+ * requesters (unknown/legacy records, or a member who can no longer be fetched) are treated
+ * as not allowed rather than defaulting to trust.
+ */
+async function requesterAllowedForProject(appConfig: AppConfig, project: ProjectEntry, requesterId: string): Promise<boolean> {
+  const policy = project.metadata.policy;
+  const hasProjectAllowList = policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
+  if (!hasProjectAllowList) {
+    return true;
+  }
+  if (!requesterId || requesterId === "unknown") {
+    return false;
+  }
+  if (policy.allowedUsers.includes(requesterId)) {
+    return true;
+  }
+  const guild = await client.guilds.fetch(appConfig.discordGuildId).catch(() => null);
+  const member = guild ? await guild.members.fetch(requesterId).catch(() => null) : null;
+  if (!member) {
+    return false;
+  }
+  if (isApprovedDiscordUsername({ username: member.user.username, tag: member.user.tag, globalName: member.user.globalName }, policy.allowedUsernames)) {
+    return true;
+  }
+  return member.roles.cache.some((role) => policy.allowedRoles.includes(role.id));
+}
+
 async function tickSchedules(appConfig: AppConfig): Promise<void> {
-  const due = await scheduleStore.due();
-  for (const entry of due) {
+  // Atomically claims (marks running) every due entry before executing any of them, so an
+  // occurrence still in flight from a previous tick can never be claimed and started again.
+  const claimed = await scheduleStore.claimDue();
+  for (const entry of claimed) {
     await runScheduledEntry(appConfig, entry);
   }
 }
 
 async function runScheduledEntry(appConfig: AppConfig, entry: ScheduleEntry): Promise<void> {
   const project = findProject(appConfig.projects, entry.project);
-  const channel = await privateRoomChannel();
-  if (!project || !channel) {
+  const privateChannel = await privateRoomChannel();
+  if (!project || !privateChannel) {
     await scheduleStore.markRun(entry.id, `Skipped: ${!project ? "unknown project" : "private room unavailable"}.`);
     return;
   }
-  if (isWriteBlockedBySafeMode(appConfig, entry.mode)) {
-    await scheduleStore.markRun(entry.id, "Skipped: safe mode blocks write-capable scheduled tasks.");
+  if (!(await requesterAllowedForProject(appConfig, project, entry.addedById))) {
+    await scheduleStore.markRun(entry.id, "Skipped: the requester no longer has access to this project.");
     return;
   }
 
+  const channel = await scopedRoomChannel(appConfig, project, privateChannel);
   let message: Message | undefined;
   try {
     const result = await runProjectRequest({
@@ -2668,10 +2814,14 @@ async function runScheduledEntry(appConfig: AppConfig, entry: ScheduleEntry): Pr
       project,
       text: entry.taskText,
       includePatterns: [],
-      mode: entry.mode,
+      mode: "answer",
       requester: entry.addedBy,
+      requesterId: entry.addedById,
       source: `schedule:${entry.id}`,
       onProgress: async (progress) => {
+        if (!channel) {
+          return;
+        }
         const content = `${formatTaskProgress(progress)}\n\nTrigger: scheduled: ${entry.spec}.`;
         const components = [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })];
         if (!message) {
@@ -2681,19 +2831,20 @@ async function runScheduledEntry(appConfig: AppConfig, entry: ScheduleEntry): Pr
         }
       }
     });
-    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(project, result.route, entry.mode)}`);
-    if (message) {
+    const suppressedNote = channel ? "" : " (output suppressed: no audience-safe room for this project)";
+    if (message && channel) {
+      const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(project, result.route, "answer")}`);
       await message
         .edit({
           content: chunks.shift() ?? "Task completed without a response.",
-          components: [taskControlRow(result.taskId, { status: "succeeded", mode: entry.mode })]
+          components: [taskControlRow(result.taskId, { status: "succeeded", mode: "answer" })]
         })
         .catch(() => undefined);
       for (const chunk of chunks) {
         await channel.send(chunk).catch(() => undefined);
       }
     }
-    await scheduleStore.markRun(entry.id, truncateSummary(result.answer));
+    await scheduleStore.markRun(entry.id, `${truncateSummary(result.answer)}${suppressedNote}`);
   } catch (error) {
     await scheduleStore.markRun(entry.id, `Failed: ${publicErrorMessage(error)}`);
   }

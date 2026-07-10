@@ -530,8 +530,8 @@ const commandBuilders = [
     .addSubcommand((subcommand) =>
       subcommand
         .setName("remove")
-        .setDescription("Remove a queued item by its list position.")
-        .addIntegerOption((option) => option.setName("position").setDescription("Position shown by /queue list.").setRequired(true).setMinValue(1))
+        .setDescription("Remove a queued item by its stable id.")
+        .addStringOption((option) => option.setName("id").setDescription("Queue item id shown by /queue list.").setRequired(true))
     )
     .addSubcommand((subcommand) => subcommand.setName("clear").setDescription("Remove all pending queued items."))
     .addSubcommand((subcommand) =>
@@ -546,27 +546,20 @@ const commandBuilders = [
     .addSubcommand((subcommand) => subcommand.setName("digest").setDescription("Re-post the morning digest for the current queue.")),
   new SlashCommandBuilder()
     .setName("schedule")
-    .setDescription("Owner-only recurring devbot tasks.")
+    .setDescription("Owner-only recurring devbot tasks. Read-only: schedules can only ask, never write.")
     .addSubcommand((subcommand) =>
       subcommand
         .setName("add")
-        .setDescription("Create a recurring task.")
+        .setDescription("Create a recurring read-only (ask) task.")
         .addStringOption((option) =>
           option
             .setName("spec")
             .setDescription("daily HH:MM, weekdays HH:MM, or every <N>h, e.g. daily 07:00.")
             .setRequired(true)
         )
-        .addStringOption((option) => option.setName("task").setDescription("The task or question to run on schedule.").setRequired(true))
+        .addStringOption((option) => option.setName("task").setDescription("The read-only question to run on schedule.").setRequired(true))
         .addStringOption((option) =>
           option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
-        )
-        .addStringOption((option) =>
-          option
-            .setName("mode")
-            .setDescription("Ask (read-only) or do (write-capable). Defaults to do.")
-            .setRequired(false)
-            .addChoices({ name: "ask", value: "ask" }, { name: "do", value: "do" })
         )
     )
     .addSubcommand((subcommand) => subcommand.setName("list").setDescription("List scheduled tasks."))
