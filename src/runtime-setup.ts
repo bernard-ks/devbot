@@ -28,6 +28,7 @@ export function applySetupState(config: AppConfig, bootstrap: BootstrapRuntimeCo
   config.peerBotIds = new Set([...bootstrap.peerBotIds, ...setup.peerBotIds]);
   config.coordinationChannelId = setup.privateChannelId ?? bootstrap.coordinationChannelId;
   config.previewTunnelsEnabled = setup.previewTunnelsEnabled;
+  config.previewEnabledProjectNames = new Set(setup.previewEnabledProjects);
 
   const projects = new Map(bootstrap.projects.map((project) => [project.name, cloneProject(project)]));
   for (const [name, root] of Object.entries(setup.repositories)) {

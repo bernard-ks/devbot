@@ -25,6 +25,7 @@ export interface AppConfig {
   projects: ProjectEntry[];
   scanner: ScannerConfig;
   previewTunnelsEnabled: boolean;
+  previewEnabledProjectNames: Set<string>;
 }
 
 export interface BotIdentity {

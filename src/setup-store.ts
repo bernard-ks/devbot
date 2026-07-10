@@ -19,6 +19,7 @@ export interface SetupState {
   workspaceMessageId?: string;
   agentBackendId?: string;
   previewTunnelsEnabled: boolean;
+  previewEnabledProjects: string[];
 }
 
 const EMPTY_SETUP: SetupState = {
@@ -28,7 +29,8 @@ const EMPTY_SETUP: SetupState = {
   peerBotIds: [],
   repositories: {},
   projectRoomIds: {},
-  previewTunnelsEnabled: false
+  previewTunnelsEnabled: false,
+  previewEnabledProjects: []
 };
 
 export class SetupStore {
@@ -79,6 +81,7 @@ export class SetupStore {
       const normalized = normalizeProjectName(name);
       delete state.repositories[normalized];
       delete state.projectRoomIds[normalized];
+      state.previewEnabledProjects = state.previewEnabledProjects.filter((entry) => entry !== normalized);
       if (state.defaultProjectName === normalized) {
         delete state.defaultProjectName;
       }
@@ -150,6 +153,18 @@ export class SetupStore {
     });
   }
 
+  /**
+   * Per-project preview allow-list. Owner-controlled runtime state only —
+   * deliberately not read from checked-in `.devbot/project.json`, so a repo
+   * contributor cannot grant themselves public exposure by editing config.
+   */
+  setProjectPreviewEnabled(projectName: string, enabled: boolean): Promise<SetupState> {
+    return this.mutate((state) => {
+      state.previewEnabledProjects = updateIdList(state.previewEnabledProjects, normalizeProjectName(projectName), enabled);
+      return cloneSetup(state);
+    });
+  }
+
   private mutate<T>(change: (draft: SetupState) => T): Promise<T> {
     const run = this.mutationQueue.then(async () => {
       const draft = cloneSetup(this.state);
@@ -188,6 +203,7 @@ function loadSetupState(filePath: string): SetupState {
     repositories: stringRecord(raw.repositories),
     projectRoomIds: projectRoomIdRecord(raw.projectRoomIds),
     previewTunnelsEnabled: raw.previewTunnelsEnabled === true,
+    previewEnabledProjects: [...new Set(stringList(raw.previewEnabledProjects).map(normalizeProjectName))].sort(),
     ...(typeof raw.defaultProjectName === "string" && raw.defaultProjectName.trim()
       ? { defaultProjectName: normalizeProjectName(raw.defaultProjectName) }
       : {}),
@@ -258,6 +274,7 @@ function cloneSetup(state: SetupState): SetupState {
     repositories: { ...state.repositories },
     projectRoomIds: { ...state.projectRoomIds },
     previewTunnelsEnabled: state.previewTunnelsEnabled,
+    previewEnabledProjects: [...state.previewEnabledProjects],
     ...(state.defaultProjectName ? { defaultProjectName: state.defaultProjectName } : {}),
     ...(state.privateChannelId ? { privateChannelId: state.privateChannelId } : {}),
     ...(state.workspaceMessageId ? { workspaceMessageId: state.workspaceMessageId } : {}),

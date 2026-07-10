@@ -34,7 +34,8 @@ export function loadConfig(): AppConfig {
     coordinationChannelId: process.env.COORDINATION_CHANNEL_ID?.trim() || undefined,
     projects,
     scanner: DEFAULT_SCANNER,
-    previewTunnelsEnabled: false
+    previewTunnelsEnabled: false,
+    previewEnabledProjectNames: new Set()
   };
 }
 

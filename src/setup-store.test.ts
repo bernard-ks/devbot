@@ -36,6 +36,26 @@ test("setup store persists access peers repositories defaults and room", async (
   assert.equal(reloaded.workspaceMessageId, "message-1");
 });
 
+test("per-project preview allow-list persists, normalizes, and is cleared when the repository is removed", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-setup-preview-project-"));
+  const filePath = path.join(root, "setup.json");
+  const store = new SetupStore(filePath);
+
+  await store.setProjectPreviewEnabled("Web App", true);
+  assert.deepEqual(store.snapshot().previewEnabledProjects, ["web-app"]);
+
+  const reloaded = new SetupStore(filePath).snapshot();
+  assert.deepEqual(reloaded.previewEnabledProjects, ["web-app"]);
+
+  await store.setRepository("Web App", path.join(root, "web-app"));
+  await store.removeRepository("web app");
+  assert.deepEqual(store.snapshot().previewEnabledProjects, []);
+
+  await store.setProjectPreviewEnabled("api", true);
+  await store.setProjectPreviewEnabled("api", false);
+  assert.deepEqual(store.snapshot().previewEnabledProjects, []);
+});
+
 test("project room bindings are atomic, normalized, cloned, and removed with repositories", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-setup-project-rooms-"));
   const filePath = path.join(root, "setup.json");
@@ -110,7 +130,8 @@ test("runtime setup merges bootstrap and managed access while selecting a defaul
     projectRoomIds: {},
     defaultProjectName: "second",
     privateChannelId: "private-room",
-    previewTunnelsEnabled: true
+    previewTunnelsEnabled: true,
+    previewEnabledProjects: ["second"]
   };
 
   applySetupState(config, bootstrap, state);
@@ -118,6 +139,7 @@ test("runtime setup merges bootstrap and managed access while selecting a defaul
   assert.deepEqual([...config.peerBotIds].sort(), ["bootstrap-peer", "peer"]);
   assert.equal(config.coordinationChannelId, "private-room");
   assert.equal(config.previewTunnelsEnabled, true);
+  assert.deepEqual([...config.previewEnabledProjectNames], ["second"]);
   assert.equal(config.projects.find((item) => item.isDefault)?.name, "second");
   assert.equal(isSetupController(state, config.ownerUserId, "owner"), true);
   assert.equal(isSetupController(state, config.ownerUserId, "controller"), true);
@@ -167,7 +189,8 @@ test("setup wizard renders resumable readiness and native controls", () => {
     peerBotIds: [],
     repositories: {},
     projectRoomIds: {},
-    previewTunnelsEnabled: false
+    previewTunnelsEnabled: false,
+    previewEnabledProjects: []
   };
   const incomplete = setupWizardView(emptyState, config, undefined);
   const incompleteRows = incomplete.components.map((row) => row.toJSON());
@@ -223,7 +246,8 @@ function appConfig(projects: ProjectEntry[]): AppConfig {
     coordinationChannelId: "bootstrap-room",
     projects,
     scanner: { maxIndexedFileBytes: 1, maxSnippetCharsPerFile: 1, maxPackedContextChars: 1, maxRankedFiles: 1 },
-    previewTunnelsEnabled: false
+    previewTunnelsEnabled: false,
+    previewEnabledProjectNames: new Set()
   };
 }
 
