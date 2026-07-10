@@ -215,6 +215,12 @@ const commandBuilders = [
     )
     .addSubcommand((subcommand) =>
       subcommand
+        .setName("undo")
+        .setDescription("Revert a write-capable task's changes to the checkpoint taken before it ran.")
+        .addStringOption((option) => option.setName("id").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
         .setName("stale")
         .setDescription("List running tasks older than the selected threshold.")
         .addIntegerOption((option) =>

@@ -83,6 +83,14 @@ import {
   PeerStore
 } from "./peer.js";
 import { createReviewPacket, evaluateMergeGates, formatMergeGateResult, formatReviewPacket, formatValidationResults, validateReview } from "./review.js";
+import {
+  createCheckpoint,
+  diffSinceCheckpoint,
+  formatCheckpointChanges,
+  pruneCheckpoints,
+  restoreCheckpoint,
+  RollbackRefusedError
+} from "./checkpoint.js";
 import { contextLimitForRoute, routeRequest, type RequestRoute } from "./request-router.js";
 import { publicErrorMessage, redactSensitiveText } from "./security.js";
 import {
@@ -112,6 +120,8 @@ import {
   taskActionMatchesState,
   taskActionRows,
   taskControlRow,
+  taskHasRestorableCheckpoint,
+  undoConfirmRow,
   type TaskControlAction
 } from "./task-controls.js";
 import { isolatedVisualProofNote, resolveShipImage } from "./visual-capture.js";
@@ -1587,6 +1597,9 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       route,
       contextFileCount: context.files.length
     });
+    if (options.mode === "action") {
+      await ensureRollbackCheckpoint(options.project, task.id);
+    }
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree);
@@ -1703,6 +1716,39 @@ async function recordTaskWorktreeEvidence(
     diffStat: `${changedFiles.length} changed ${changedFiles.length === 1 ? "file" : "files"}`,
     verification
   });
+}
+
+async function ensureRollbackCheckpoint(project: ProjectEntry, taskId: string): Promise<void> {
+  try {
+    const checkpoint = await createCheckpoint(project.root, taskId);
+    await taskStore.attachCheckpoint(taskId, {
+      ref: checkpoint.ref,
+      headSha: checkpoint.headSha,
+      branch: checkpoint.branch,
+      createdAt: checkpoint.createdAt
+    });
+    await pruneCheckpoints(project.root, 20).catch(() => undefined);
+  } catch (error) {
+    throw new Error(
+      [
+        `Refusing to start write-capable work: could not create a rollback checkpoint for \`${project.name}\`.`,
+        "Devbot needs a git repository so any change can be undone. Initialize git in the project (or fix the git error) and try again.",
+        `Checkpoint error: ${error instanceof Error ? error.message : String(error)}`
+      ].join("\n")
+    );
+  }
+}
+
+function formatRollbackRefusal(error: RollbackRefusedError): string {
+  const lines = [`Undo refused: ${error.message}`];
+  if (error.reason === "newer-changes" && error.details.length > 0) {
+    lines.push("", "Files edited after the task finished:", codeBlock(error.details.join("\n")));
+  }
+  return lines.join("\n");
+}
+
+function codeBlock(value: string): string {
+  return `\`\`\`\n${value.replace(/```/g, "'''")}\n\`\`\``;
 }
 
 async function reportTaskProgress(options: ProjectRequestOptions, progress: TaskProgressEvent): Promise<void> {
@@ -2827,6 +2873,50 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     return;
   }
 
+  if (subcommand === "undo") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const id = interaction.options.getString("id", true);
+    const task = await taskStore.get(id);
+    if (!task || !allowedProjectNames.has(task.projectName)) {
+      await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
+      return;
+    }
+    if (!isControllerUser(interaction.user.id, appConfig)) {
+      await interaction.editReply("Only the owner or an approved controller can undo write-capable work.");
+      return;
+    }
+    if (!task.checkpointRef || !taskHasRestorableCheckpoint(task)) {
+      await interaction.editReply(
+        task.reverted
+          ? `Task \`${id}\` was already undone.`
+          : `Task \`${id}\` has no restorable rollback checkpoint (only completed or failed write-capable tasks can be undone).`
+      );
+      return;
+    }
+    const project = mustFindProject(appConfig.projects, task.projectName);
+    try {
+      const summary = await restoreCheckpoint(project.root, task.checkpointRef, {
+        expectedHeadSha: task.checkpointHeadSha ?? "",
+        expectedBranch: task.checkpointBranch ?? "HEAD",
+        ...(task.finishedAt ? { guardMs: Date.parse(task.finishedAt) } : {})
+      });
+      await taskStore.markReverted(task.id);
+      await interaction.editReply(
+        [
+          `Reverted \`${task.id}\` on \`${project.name}\` to the pre-task checkpoint.`,
+          `Restored ${summary.restored.length} file(s), removed ${summary.deleted.length} file(s) created during the task.`
+        ].join("\n")
+      );
+    } catch (error) {
+      if (error instanceof RollbackRefusedError) {
+        await interaction.editReply(formatRollbackRefusal(error));
+        return;
+      }
+      await interaction.editReply(`Undo failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return;
+  }
+
   if (subcommand === "stale") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const minutes = interaction.options.getInteger("minutes") ?? 30;
@@ -3097,6 +3187,76 @@ async function handleTaskControl(
       const reviewProject = await projectForTaskWorkspace(project, task);
       const results = await validateReview(reviewProject);
       await editButtonReplyWithChunks(interaction, formatValidationResults(project, results));
+    });
+    return;
+  }
+
+  if (action === "undo" || action === "undo-confirm") {
+    if (!canControl) {
+      await interaction.reply({ content: "Only the owner or an approved controller can undo write-capable work.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!task.checkpointRef) {
+      await interaction.reply({ content: "This task has no rollback checkpoint to restore.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (task.reverted) {
+      await interaction.reply({ content: "This task's changes were already undone.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (action === "undo") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      let changes;
+      try {
+        changes = await diffSinceCheckpoint(project.root, task.checkpointRef);
+      } catch (error) {
+        await interaction.editReply(`Unable to read the rollback checkpoint: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+      if (changes.length === 0) {
+        await interaction.editReply("Nothing changed since the checkpoint, so there is nothing to undo.");
+        return;
+      }
+      await interaction.editReply({
+        content: [
+          `**Undo \`${task.id}\` on \`${project.name}\`?**`,
+          "This reverts the working tree to the checkpoint taken before the task ran.",
+          "",
+          "Changes that will be reverted:",
+          codeBlock(formatCheckpointChanges(changes)),
+          "",
+          "Undo refuses automatically if the branch or HEAD moved, or if any of these files were edited after the task finished."
+        ].join("\n"),
+        components: [undoConfirmRow(task.id)]
+      });
+      return;
+    }
+
+    await runTaskActionOnce(interaction, `${task.id}:undo`, async () => {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      try {
+        const summary = await restoreCheckpoint(project.root, task.checkpointRef!, {
+          expectedHeadSha: task.checkpointHeadSha ?? "",
+          expectedBranch: task.checkpointBranch ?? "HEAD",
+          ...(task.finishedAt ? { guardMs: Date.parse(task.finishedAt) } : {})
+        });
+        await taskStore.markReverted(task.id);
+        await interaction.editReply(
+          [
+            `Reverted \`${task.id}\` on \`${project.name}\` to the pre-task checkpoint.`,
+            `Restored ${summary.restored.length} file(s), removed ${summary.deleted.length} file(s) created during the task.`,
+            "",
+            codeBlock(formatCheckpointChanges(summary.changes))
+          ].join("\n")
+        );
+      } catch (error) {
+        if (error instanceof RollbackRefusedError) {
+          await interaction.editReply(formatRollbackRefusal(error));
+          return;
+        }
+        await interaction.editReply(`Undo failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     });
     return;
   }
@@ -5683,7 +5843,7 @@ function commandRequiresController(interaction: ChatInputCommandInteraction): bo
     return subcommand === "validate" || subcommand === "gates";
   }
   if (interaction.commandName === "task") {
-    return subcommand === "cancel" || subcommand === "retry";
+    return subcommand === "cancel" || subcommand === "retry" || subcommand === "undo";
   }
   return interaction.commandName === "lab" && (subcommand === "approve" || subcommand === "bossfight");
 }
