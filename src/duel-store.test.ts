@@ -135,6 +135,120 @@ test("the store keeps a bounded number of duel records, dropping the oldest", as
   assert.equal((await store.get("collab-5"))?.status, "running");
 });
 
+const snapshot = { ref: "refs/devbot/duels/collab-1", commit: "a".repeat(40), tree: "b".repeat(40) };
+
+async function acceptableStore(): Promise<DuelStore> {
+  const store = await newStore();
+  await store.start({ id: "collab-1", taskId: "task-1", projectName: "webapp" });
+  await store.succeed("collab-1", {
+    authorTier: "standard",
+    reviewerTier: "deep",
+    reviewerIndependence: "independent",
+    evidence: { patchHash: "hash", fileCount: 1, includedFileCount: 1, truncated: false },
+    snapshot,
+    overall: "request-changes",
+    issues: [concededIssue]
+  });
+  return store;
+}
+
+test("succeed records the reviewed snapshot identity alongside the evidence", async () => {
+  const store = await acceptableStore();
+  const record = await store.get("collab-1");
+  assert.deepEqual(record?.snapshot, snapshot);
+});
+
+test("concurrent accept claims: exactly one submission wins the compare-and-set", async () => {
+  const store = await acceptableStore();
+  const [first, second] = await Promise.all([store.claimAccept("collab-1", "alice"), store.claimAccept("collab-1", "bob")]);
+  assert.equal([first.claimed, second.claimed].filter(Boolean).length, 1);
+  const record = await store.get("collab-1");
+  assert.equal(record?.fix?.status, "accepting");
+  assert.ok(record?.fix?.actor === "alice" || record?.fix?.actor === "bob");
+});
+
+test("accept claims are refused without a snapshot, while running, after dismissal, and after acceptance", async () => {
+  const noSnapshot = await succeededStore();
+  assert.equal((await noSnapshot.claimAccept("collab-1", "alice")).claimed, false);
+
+  const running = await newStore();
+  await running.start({ id: "collab-1", taskId: "task-1", projectName: "webapp" });
+  assert.equal((await running.claimAccept("collab-1", "alice")).claimed, false);
+
+  const dismissed = await acceptableStore();
+  await dismissed.dismiss("collab-1", "alice");
+  assert.equal((await dismissed.claimAccept("collab-1", "bob")).claimed, false);
+
+  const accepted = await acceptableStore();
+  await accepted.claimAccept("collab-1", "alice");
+  await accepted.completeAccept("collab-1", "task-fix-1");
+  assert.equal((await accepted.claimAccept("collab-1", "bob")).claimed, false);
+});
+
+test("a failed acceptance releases the claim as retryable without ever recording accepted", async () => {
+  const store = await acceptableStore();
+  await store.claimAccept("collab-1", "alice");
+  await store.failAccept("collab-1", "worktree creation failed");
+  const record = await store.get("collab-1");
+  assert.equal(record?.fix?.status, "failed-retryable");
+  assert.match(record?.fix?.error ?? "", /worktree creation failed/);
+  assert.equal(record?.fix?.taskId, undefined);
+  const retry = await store.claimAccept("collab-1", "bob");
+  assert.equal(retry.claimed, true, "a released claim must be re-claimable");
+});
+
+test("completeAccept records the durable fix task ID and only transitions an accepting claim", async () => {
+  const store = await acceptableStore();
+  assert.equal((await store.completeAccept("collab-1", "task-fix-1"))?.fix, undefined, "completing without a claim must be a no-op");
+  await store.claimAccept("collab-1", "alice");
+  await store.completeAccept("collab-1", "task-fix-1");
+  const record = await store.get("collab-1");
+  assert.equal(record?.fix?.status, "accepted");
+  assert.equal(record?.fix?.taskId, "task-fix-1");
+  await store.failAccept("collab-1", "late failure");
+  const afterLateFailure = await store.get("collab-1");
+  assert.equal(afterLateFailure?.fix?.status, "accepted", "an accepted duel cannot be failed afterwards");
+  assert.equal(afterLateFailure?.fix?.taskId, "task-fix-1");
+});
+
+test("dismiss is refused while an acceptance is in flight or after it was accepted", async () => {
+  const store = await acceptableStore();
+  await store.claimAccept("collab-1", "alice");
+  assert.equal((await store.dismiss("collab-1", "bob")).dismissed, false);
+  await store.completeAccept("collab-1", "task-fix-1");
+  assert.equal((await store.dismiss("collab-1", "bob")).dismissed, false);
+});
+
+test("restart recovery releases an interrupted accepting claim as retryable", async () => {
+  const store = await acceptableStore();
+  await store.claimAccept("collab-1", "alice");
+  const interrupted = await store.interruptRunning("Interrupted when Devbot restarted.");
+  assert.equal(interrupted, 1);
+  const record = await store.get("collab-1");
+  assert.equal(record?.status, "succeeded", "the duel result itself must survive the restart");
+  assert.equal(record?.fix?.status, "failed-retryable");
+  assert.equal((await store.claimAccept("collab-1", "bob")).claimed, true);
+});
+
+test("persisted records with malformed snapshot or fix state are dropped on load", async () => {
+  const file = await newStorePath();
+  const seedStore = new DuelStore(file);
+  await seedStore.start({ id: "collab-good", taskId: "task-1", projectName: "webapp" });
+
+  const raw = JSON.parse(await readFile(file, "utf8")) as { version: number; duels: Record<string, unknown>[] };
+  const template = raw.duels[0] as Record<string, unknown>;
+  raw.duels.push(
+    { ...template, id: "collab-bad-snapshot", snapshot: { ref: 42 } },
+    { ...template, id: "collab-bad-fix", fix: { status: "definitely-done" } }
+  );
+  await writeFile(file, JSON.stringify(raw));
+
+  const store = new DuelStore(file);
+  assert.equal((await store.get("collab-good"))?.status, "running");
+  assert.equal(await store.get("collab-bad-snapshot"), undefined);
+  assert.equal(await store.get("collab-bad-fix"), undefined);
+});
+
 test("malformed persisted records are dropped on load instead of being trusted", async () => {
   const file = await newStorePath();
   const seedStore = new DuelStore(file);
