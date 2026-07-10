@@ -17,13 +17,14 @@ import type {
   Message,
   MessageContextMenuCommandInteraction,
   ModalSubmitInteraction,
+  OmitPartialGroupDMChannel,
   StringSelectMenuInteraction,
   UserSelectMenuInteraction
 } from "discord.js";
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { isApprovedDiscordUsername } from "./access.js";
+import { isAccessSubjectAllowed, isApprovedDiscordUsername } from "./access.js";
 import {
   confirmToActProposalCard,
   needsMeInbox,
@@ -50,7 +51,14 @@ import { CollabStore, formatCollabRecent } from "./collab-store.js";
 import type { CollabContribution, CollabConversation } from "./collab-store.js";
 import { loadConfig, normalizeProjectName } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
-import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
+import {
+  answerWithProjectContext,
+  locateErrorInProject,
+  parseLocateResponse,
+  parseTranscription,
+  transcribeErrorImages,
+  type CodexRequestMode
+} from "./codex-client.js";
 import { parseMentionRequest, parseStatusRequest, statusDetailQuestion, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natural-intent.js";
@@ -109,6 +117,21 @@ import {
 } from "./task-ui.js";
 import { UserPreferenceStore } from "./user-preferences.js";
 import {
+  buildFixTaskPrompt,
+  canActOnScreenshotFix,
+  downloadImageAttachment,
+  filterImageAttachments,
+  formatNoErrorFoundReply,
+  formatScreenshotAnalysisReply,
+  parseScreenshotFixControl,
+  screenshotFixControlRow,
+  withTempImageDir,
+  type ImageAttachmentInput,
+  type ScreenshotFixAction,
+  type ScreenshotFixActionContext
+} from "./screenshot-fix.js";
+import { ScreenshotFixStore } from "./screenshot-fix-store.js";
+import {
   filterWorkForProjects,
   findExternalCodexWork,
   formatWorkStatus,
@@ -164,6 +187,7 @@ const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefin
 const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
+const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
 const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
 const activeWorkroomActions = new Set<string>();
@@ -294,6 +318,18 @@ client.on("interactionCreate", async (interaction) => {
           return;
         }
         await handleTaskControl(interaction, config, taskControl.action, taskControl.taskId);
+        return;
+      }
+      const screenshotFixControl = parseScreenshotFixControl(interaction.customId);
+      if (screenshotFixControl) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleScreenshotFixControl(interaction, config, screenshotFixControl.action, screenshotFixControl.id);
         return;
       }
       if (!parseWorkroomButton(interaction.customId)) {
@@ -505,6 +541,25 @@ client.on("messageCreate", async (message) => {
       return;
     }
     const visibleConfig = { ...config, projects: preferredProject ? [preferredProject] : visibleProjects };
+
+    const imageAttachments = filterImageAttachments(
+      [...message.attachments.values()].map((attachment) => ({
+        id: attachment.id,
+        name: attachment.name,
+        url: attachment.url,
+        contentType: attachment.contentType,
+        size: attachment.size
+      }))
+    );
+    if (imageAttachments.length > 0) {
+      if (!preferredProject) {
+        await message.reply("I can see the image, but no project is configured to analyze it against. Ask the owner to run `/setup repo`.");
+        return;
+      }
+      await handleScreenshotMention(message, config, preferredProject, imageAttachments);
+      return;
+    }
+
     const parsedStatusRequest = parseStatusRequest(statusProjectRequest.text);
     const statusRequest = parsedStatusRequest.isStatus
       ? parsedStatusRequest
@@ -1301,6 +1356,8 @@ interface ProjectRequestOptions {
   displayText?: string;
   signal?: AbortSignal;
   onProgress?: (progress: TaskProgressEvent) => Promise<void>;
+  /** Fires once the task record is durably created, before any work that can fail. Used to consume a caller-owned pending record only after there is something to retry against. */
+  onTaskStarted?: (taskId: string) => Promise<void>;
 }
 
 interface ProjectRequestResult {
@@ -1333,6 +1390,13 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
         ...(options.threadId ? { threadId: options.threadId } : {}),
         ...(options.agentRoles?.length ? { agentRoles: options.agentRoles } : {})
       });
+  if (options.onTaskStarted) {
+    try {
+      await options.onTaskStarted(task.id);
+    } catch (error) {
+      console.warn(`Unable to run the post-start hook for task ${task.id}: ${publicErrorMessage(error)}`);
+    }
+  }
   const controller = new AbortController();
   const abortFromParent = (): void => controller.abort(options.signal?.reason);
   if (options.signal?.aborted) abortFromParent();
@@ -1631,6 +1695,61 @@ async function executeMessageRequest(options: MessageRequestOptions): Promise<vo
   }
 }
 
+async function handleScreenshotMention(
+  message: OmitPartialGroupDMChannel<Message>,
+  appConfig: AppConfig,
+  project: ProjectEntry,
+  attachments: ImageAttachmentInput[]
+): Promise<void> {
+  await message.channel.sendTyping();
+  try {
+    await withTempImageDir(async (dir) => {
+      const imagePaths: string[] = [];
+      for (const [index, attachment] of attachments.entries()) {
+        imagePaths.push(await downloadImageAttachment(attachment, dir, index));
+      }
+
+      const transcriptionRaw = await transcribeErrorImages({
+        codex: appConfig.codex,
+        imagePaths,
+        cwd: project.root
+      });
+      const transcription = parseTranscription(transcriptionRaw);
+      if (!transcription.found) {
+        await message.reply(formatNoErrorFoundReply(redactSensitiveText(transcription.text), attachments.length));
+        return;
+      }
+
+      const context = await contextService.pack(project, transcription.text, [], appConfig.scanner.maxPackedContextChars);
+      const locateRaw = await locateErrorInProject({
+        codex: appConfig.codex,
+        context,
+        transcription: transcription.text
+      });
+      const located = parseLocateResponse(locateRaw);
+      const analysis = {
+        transcription: redactSensitiveText(transcription.text),
+        location: redactSensitiveText(located.location),
+        approach: redactSensitiveText(located.approach)
+      };
+
+      const record = await screenshotFixStore.create({
+        projectName: project.name,
+        requesterId: message.author.id,
+        ...analysis
+      });
+
+      await message.reply({
+        content: formatScreenshotAnalysisReply(analysis, attachments.length),
+        components: [screenshotFixControlRow(record.id)]
+      });
+    });
+  } catch (error) {
+    console.error(publicErrorMessage(error));
+    await message.reply(`Error analyzing the attached image: ${publicErrorMessage(error)}`);
+  }
+}
+
 function taskStatusForProgress(progress: TaskProgressEvent): TaskStatus {
   return progress.phase === "failed" ? "failed" : progress.phase === "canceled" ? "canceled" : "running";
 }
@@ -1812,17 +1931,19 @@ async function resolveAmbientThreadAudience(
 }
 
 function isAllowedGuildMember(member: GuildMember, appConfig: AppConfig): boolean {
-  if (isOwner(member.id, appConfig)) return true;
-  const hasAllowList = appConfig.allowedUserIds.size > 0 || appConfig.allowedUsernames.size > 0 || appConfig.allowedRoleIds.size > 0;
-  if (!hasAllowList) return true;
-  return appConfig.allowedUserIds.has(member.id)
-    || isApprovedDiscordUsername({
-      username: member.user.username,
-      globalName: member.user.globalName,
-      tag: member.user.tag,
-      displayName: member.displayName
-    }, appConfig.allowedUsernames)
-    || member.roles.cache.some((role) => appConfig.allowedRoleIds.has(role.id));
+  return isAccessSubjectAllowed(
+    {
+      userId: member.id,
+      nameSource: {
+        username: member.user.username,
+        globalName: member.user.globalName,
+        tag: member.user.tag,
+        displayName: member.displayName
+      },
+      roleIds: [...member.roles.cache.keys()]
+    },
+    appConfig
+  );
 }
 
 function isAllowedGuildMemberForProject(member: GuildMember, project: ProjectEntry): boolean {
@@ -2891,6 +3012,73 @@ async function handleTaskControl(
       ephemeral: true,
       parentTaskId: task.id,
       dedupeKey: `task-retry:${task.id}`
+    });
+  });
+}
+
+async function handleScreenshotFixControl(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: ScreenshotFixAction,
+  id: string
+): Promise<void> {
+  const record = await screenshotFixStore.get(id);
+  if (!record) {
+    await interaction.reply({ content: "That screenshot analysis is no longer available.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, record.projectName);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That analysis's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const actor: ScreenshotFixActionContext = {
+    userId: interaction.user.id,
+    controller: isControllerUser(interaction.user.id, appConfig)
+  };
+
+  if (action === "dismiss") {
+    if (!canActOnScreenshotFix("dismiss", record, actor)) {
+      await interaction.reply({
+        content: "Only the person who reported this screenshot, or an approved controller, can dismiss it.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    await screenshotFixStore.remove(id);
+    await interaction.update({ content: "Dismissed.", components: [] });
+    return;
+  }
+
+  if (!canActOnScreenshotFix("fix", record, actor)) {
+    await interaction.reply({
+      content: "You have view access, but only the owner or an approved controller can start write-capable work.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  if (isWriteBlockedBySafeMode(appConfig, "action")) {
+    await interaction.reply({ content: safeModeActionMessage("Fix it"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await runTaskActionOnce(interaction, `snap-fix:${id}`, async () => {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await executeInteractionRequest({
+      interaction,
+      appConfig,
+      project,
+      text: buildFixTaskPrompt(record),
+      includePatterns: [],
+      mode: "action",
+      requester: interaction.user.tag,
+      source: `button:snap-fix:${id}`,
+      ephemeral: true,
+      dedupeKey: `snap-fix:${id}`,
+      onTaskStarted: async () => {
+        await screenshotFixStore.remove(id);
+      }
     });
   });
 }
@@ -5197,37 +5385,30 @@ function isAllowed(
     | ModalSubmitInteraction,
   appConfig: AppConfig
 ): boolean {
-  if (!appConfig.ownerUserId) {
-    return false;
-  }
-  if (isOwner(interaction.user.id, appConfig)) {
-    return true;
-  }
-  const hasUserAllowList = appConfig.allowedUserIds.size > 0;
-  const hasUsernameAllowList = appConfig.allowedUsernames.size > 0;
-  const hasRoleAllowList = appConfig.allowedRoleIds.size > 0;
-  if (!hasUserAllowList && !hasUsernameAllowList && !hasRoleAllowList) {
-    return true;
-  }
+  return isAccessSubjectAllowed(
+    {
+      userId: interaction.user.id,
+      nameSource: interactionNameSource(interaction),
+      roleIds: interactionRoleIds(interaction)
+    },
+    appConfig
+  );
+}
 
-  if (appConfig.allowedUserIds.has(interaction.user.id)) {
-    return true;
-  }
-
-  if (isApprovedDiscordUsername(interactionNameSource(interaction), appConfig.allowedUsernames)) {
-    return true;
-  }
-
+function interactionRoleIds(
+  interaction:
+    | ChatInputCommandInteraction
+    | MessageContextMenuCommandInteraction
+    | ButtonInteraction
+    | AutocompleteInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction
+): string[] {
   if (interaction.member instanceof GuildMember) {
-    return interaction.member.roles.cache.some((role) => appConfig.allowedRoleIds.has(role.id));
+    return [...interaction.member.roles.cache.keys()];
   }
-
   const memberRoles = interaction.member?.roles;
-  if (Array.isArray(memberRoles)) {
-    return memberRoles.some((roleId) => appConfig.allowedRoleIds.has(roleId));
-  }
-
-  return false;
+  return Array.isArray(memberRoles) ? memberRoles : [];
 }
 
 function isAllowedForProject(
@@ -5291,28 +5472,14 @@ function canAccessTask(
 }
 
 function isAllowedMessage(message: Message, appConfig: AppConfig): boolean {
-  if (!appConfig.ownerUserId) {
-    return false;
-  }
-  if (isOwner(message.author.id, appConfig)) {
-    return true;
-  }
-  const hasUserAllowList = appConfig.allowedUserIds.size > 0;
-  const hasUsernameAllowList = appConfig.allowedUsernames.size > 0;
-  const hasRoleAllowList = appConfig.allowedRoleIds.size > 0;
-  if (!hasUserAllowList && !hasUsernameAllowList && !hasRoleAllowList) {
-    return true;
-  }
-
-  if (appConfig.allowedUserIds.has(message.author.id)) {
-    return true;
-  }
-
-  if (isApprovedDiscordUsername(messageNameSource(message), appConfig.allowedUsernames)) {
-    return true;
-  }
-
-  return message.member?.roles.cache.some((role) => appConfig.allowedRoleIds.has(role.id)) ?? false;
+  return isAccessSubjectAllowed(
+    {
+      userId: message.author.id,
+      nameSource: messageNameSource(message),
+      roleIds: message.member ? [...message.member.roles.cache.keys()] : []
+    },
+    appConfig
+  );
 }
 
 function isOwner(userId: string, appConfig: Pick<AppConfig, "ownerUserId">): boolean {

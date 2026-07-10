@@ -8,6 +8,7 @@ import {
   PRIVATE_FILE_MODE,
   redactSensitiveText
 } from "./security.js";
+import { neutralizeMentions } from "./messages.js";
 
 export type TaskStatus = "awaiting-approval" | "running" | "succeeded" | "failed" | "canceled";
 export type TaskAttention = "approval" | "blocked" | "review";
@@ -499,7 +500,7 @@ export function formatTaskList(tasks: TaskRecord[]): string {
       const finished = task.finishedAt ? `, finished ${formatTime(task.finishedAt)}` : "";
       const route = task.modelTier ? `, ${task.modelTier}/${task.contextMode ?? "unknown"}` : "";
       const merged = task.branchMerged ? " (branch merged)" : "";
-      return `- \`${task.id}\` ${task.status}${merged} ${task.mode}${route} via ${task.source} on \`${task.projectName}\` for ${task.requester}${finished}: ${truncate(task.text, 90)}`;
+      return `- \`${task.id}\` ${task.status}${merged} ${task.mode}${route} via ${task.source} on \`${task.projectName}\` for ${neutralizeMentions(task.requester)}${finished}: ${neutralizeMentions(truncate(task.text, 90))}`;
     })
     .join("\n");
 }
@@ -513,9 +514,9 @@ export function formatTaskLogs(task: TaskRecord): string {
     task.routeReason ? `Reason: ${task.routeReason}` : undefined,
     "",
     "Request:",
-    truncate(task.text, 1_500),
-    task.resultPreview ? ["", "Result:", truncate(task.resultPreview, 2_000)].join("\n") : undefined,
-    task.error ? ["", "Error:", truncate(task.error, 2_000)].join("\n") : undefined
+    neutralizeMentions(truncate(task.text, 1_500)),
+    task.resultPreview ? ["", "Result:", neutralizeMentions(truncate(task.resultPreview, 2_000))].join("\n") : undefined,
+    task.error ? ["", "Error:", neutralizeMentions(truncate(task.error, 2_000))].join("\n") : undefined
   ]
     .filter((line) => line !== undefined)
     .join("\n");
@@ -532,14 +533,14 @@ export function formatTaskDetail(task: TaskRecord): string {
     task.routeReason ? `Route reason: ${task.routeReason}` : undefined,
     task.parentTaskId ? `Continues task: \`${task.parentTaskId}\`` : undefined,
     task.attention ? `Needs attention: ${task.attention}` : undefined,
-    task.approvalStatus ? `Approval: ${task.approvalStatus}${task.approvalActor ? ` by ${task.approvalActor}` : ""}` : undefined,
+    task.approvalStatus ? `Approval: ${task.approvalStatus}${task.approvalActor ? ` by ${neutralizeMentions(task.approvalActor)}` : ""}` : undefined,
     task.proposalRevision ? `Proposal revision: ${task.proposalRevision}${task.approvedRevision ? ` (approved r${task.approvedRevision})` : ""}` : undefined,
     task.agentRoles?.length ? `Workroom roles: ${task.agentRoles.join(", ")}` : undefined,
     task.branchName ? `Branch: \`${task.branchName}\`${task.workspaceIsolated ? " (isolated)" : ""}${task.branchMerged ? ", merged into the default branch" : ""}` : undefined,
     task.branchMerged && task.workspaceIsolated ? "Worktree: eligible for pruning; the branch is fully merged." : undefined,
     task.baseBranch ? `Base revision: \`${task.baseBranch}\`` : undefined,
     task.commitSha ? `Commit: \`${task.commitSha}\`` : undefined,
-    `Requester: ${task.requester}`,
+    `Requester: ${neutralizeMentions(task.requester)}`,
     `Started: ${formatTime(task.startedAt)}`,
     task.finishedAt ? `Finished: ${formatTime(task.finishedAt)}` : undefined,
     task.contextFileCount !== undefined ? `Context files: ${task.contextFileCount}` : undefined,
@@ -549,9 +550,9 @@ export function formatTaskDetail(task: TaskRecord): string {
     task.verification?.length ? ["", "Verification:", ...task.verification.map((item) => `- ${item}`)].join("\n") : undefined,
     "",
     "Request:",
-    truncate(task.text, 800),
-    task.resultPreview ? ["", "Result preview:", truncate(task.resultPreview, 1_200)].join("\n") : undefined,
-    task.error ? ["", "Error:", truncate(task.error, 1_200)].join("\n") : undefined
+    neutralizeMentions(truncate(task.text, 800)),
+    task.resultPreview ? ["", "Result preview:", neutralizeMentions(truncate(task.resultPreview, 1_200))].join("\n") : undefined,
+    task.error ? ["", "Error:", neutralizeMentions(truncate(task.error, 1_200))].join("\n") : undefined
   ]
     .filter((line) => line !== undefined)
     .join("\n");

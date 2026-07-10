@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { formatTaskDetail, formatTaskList, TaskStore } from "./task-store.js";
+import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord } from "./task-store.js";
 
 test("branch merged state is durable and survives a reload", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-task-store-"));
@@ -65,4 +65,49 @@ test("loading rejects non-boolean branch merged values", async () => {
   assert.equal(marked?.branchMerged, true);
   const persisted = JSON.parse(await readFile(stateFile, "utf8")) as { tasks: Array<{ branchMerged?: unknown }> };
   assert.equal(persisted.tasks[0]?.branchMerged, true);
+});
+
+function hostileTask(): TaskRecord {
+  const now = new Date().toISOString();
+  return {
+    id: "task-hostile",
+    status: "failed",
+    source: "mention",
+    mode: "action",
+    projectName: "web",
+    requester: "@everyone <@111>",
+    text: "ping @everyone plus <@222> and <@&333> immediately",
+    includePatterns: [],
+    approvalStatus: "approved",
+    approvalActor: "@here <@444>",
+    resultPreview: "posted to @everyone via <@555>",
+    error: "failed while notifying <@&666> and @everyone",
+    startedAt: now,
+    updatedAt: now,
+    finishedAt: now
+  };
+}
+
+function assertMentionSafe(output: string): void {
+  assert.doesNotMatch(output, /@everyone/);
+  assert.doesNotMatch(output, /@here/);
+  assert.doesNotMatch(output, /<@\d/);
+  assert.doesNotMatch(output, /<@&\d/);
+  assert.match(output, /@\u200beveryone/);
+}
+
+test("task list output neutralizes stored mentions", () => {
+  assertMentionSafe(formatTaskList([hostileTask()]));
+});
+
+test("task detail output neutralizes stored mentions including approval actor, result, and error", () => {
+  const output = formatTaskDetail(hostileTask());
+  assertMentionSafe(output);
+  assert.match(output, /Approval: approved by @\u200bhere/);
+  assert.match(output, /Result preview:/);
+  assert.match(output, /Error:/);
+});
+
+test("task log output neutralizes stored mentions in request, result, and error", () => {
+  assertMentionSafe(formatTaskLogs(hostileTask()));
 });

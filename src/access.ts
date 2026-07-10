@@ -31,3 +31,32 @@ export function isApprovedDiscordUsername(source: DiscordNameSource, approvedUse
 
   return discordUsernamesFor(source).some((name) => approved.has(name));
 }
+
+export interface AccessSubject {
+  userId: string;
+  nameSource: DiscordNameSource;
+  roleIds?: readonly string[];
+}
+
+export interface AccessAllowLists {
+  ownerUserId: string | undefined;
+  allowedUserIds: ReadonlySet<string>;
+  allowedUsernames: ReadonlySet<string>;
+  allowedRoleIds: ReadonlySet<string>;
+}
+
+export function isAccessSubjectAllowed(subject: AccessSubject, config: AccessAllowLists): boolean {
+  if (!config.ownerUserId) {
+    return false;
+  }
+  if (subject.userId === config.ownerUserId) {
+    return true;
+  }
+  if (config.allowedUserIds.has(subject.userId)) {
+    return true;
+  }
+  if (isApprovedDiscordUsername(subject.nameSource, config.allowedUsernames)) {
+    return true;
+  }
+  return (subject.roleIds ?? []).some((roleId) => config.allowedRoleIds.has(roleId));
+}
