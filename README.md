@@ -87,6 +87,7 @@ npm start
 - **Workspace:** open the shared Devbot launcher or run `/dashboard`; choose a project and use its native controls.
 - **Ask:** `@devbot <question>` or `/ask question:<text>` keeps the request read-only.
 - **Do:** `/do task:<text>` is the intentional write-capable path for the owner and controllers.
+- **Undo:** every write-capable task snapshots the working tree to a git checkpoint before it runs; use the controller-gated **Undo** action or `/task undo` to revert the changes exactly.
 - **Check:** `/status` reports current work, blockers, repository evidence, and the next action.
 - **Snap-to-fix:** mention `@devbot` with a screenshot of a stack trace, console error, or broken UI attached; Devbot transcribes the visible error, locates the likely spot in the project, and offers a one-tap **Fix it** button that starts a `/do` task pre-filled with the finding.
 - **Set up:** `/setup wizard` is owner-only and resumable; `/setup doctor` diagnoses the full path.
@@ -135,6 +136,7 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/task retry id:<task-id>`: Retry a saved task with the same project, mode, text, and include patterns.
 - `/task freshness project:<name> limit:<optional>`: Show merged state and behind/ahead counts for saved task branches against the project's local default branch. Branches that are fully merged are marked durably on the task record and flagged as prune-eligible worktrees.
 - `/task sync task:<task-id>`: Rebase one task branch onto the current local default branch inside its isolated worktree. Available to the task requester, the owner, or an approved controller; blocked by safe mode and while the task is still open. The pre-sync tip is preserved under `refs/devbot/backup/<task-id>` first, conflicts abort with the branch restored and the conflicted files reported, and configured validation runs afterwards for controllers with results reported as-is.
+- `/task undo id:<task-id>`: Revert a write-capable task's changes to the git checkpoint captured before it ran (controller-gated).
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
 - `/dashboard project:<optional>`: Open the personal interactive workspace with project selection, current status, recent work, and native Ask / Change controls.
 - `/inbox project:<optional> limit:<optional>`: Open the ephemeral **Needs Me** inbox for pending proposals and decisions, with review controls and refresh.

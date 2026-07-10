@@ -74,6 +74,7 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Updates one Discord task message through routing, context preparation, work, failure, cancellation, and completion.
   - Uses restart-stable task controls for follow-up, review, validation, adjustment, retry, and cancellation.
   - Tracks task branch freshness and merged state against the local default branch (`/task freshness`, `/task show`) and rebases stale task branches inside their isolated worktrees on request (`/task sync`) with a backup ref, conflict-abort safety, and honest reporting.
+  - One-tap rollback: snapshots the entire working tree (tracked, untracked, deletions) to a git checkpoint before every write-capable run, then offers a controller-gated Undo action and `/task undo` that restores the tree exactly. Undo refuses when HEAD or the branch moved, or when covered files were edited after the task finished, so newer work is never clobbered.
 - External local Codex awareness:
   - Detects local Codex app/CLI sessions whose working directory belongs to a configured project.
   - Separates confirmed external runs from open app sessions whose activity cannot be known.
