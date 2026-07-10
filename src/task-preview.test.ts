@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { createServer as createHttpServer } from "node:http";
 import { mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -348,6 +349,60 @@ test("restart reconciliation kills identifiable orphans and never signals other 
   assert.ok(notes.some((note) => note.includes(`no longer belongs to preview ${foreignId}`)));
   await waitFor(() => processGone(orphan.pid!));
   assert.equal((await readLedger(fixture)).previews.length, 0);
+});
+
+test("never accepts a foreign server that races for the selected port", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX listener ownership");
+    return;
+  }
+  const fixture = await createFixture();
+  // A foreign server owns the selected port before and after the preview runs.
+  const foreign = createHttpServer((_request, response) => {
+    response.statusCode = 200;
+    response.end("foreign-service");
+  });
+  const foreignPort = await new Promise<number>((resolve, reject) => {
+    foreign.once("error", reject);
+    foreign.listen(0, "127.0.0.1", () => {
+      const address = foreign.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("no foreign port"));
+        return;
+      }
+      resolve(address.port);
+    });
+  });
+
+  // The managed child never binds the port within the window, so the only
+  // responder on it is the foreign server that already owns it.
+  const script = await writeFakeServer(fixture, { listenDelayMs: 60_000 });
+  const manager = makeManager(fixture, {
+    readyTimeoutMs: 4_000,
+    reservePort: async () => foreignPort
+  });
+  try {
+    // Sanity: the foreign server is genuinely responsive on the raced port.
+    assert.equal(await (await fetch(`http://127.0.0.1:${foreignPort}/`)).text(), "foreign-service");
+
+    const result = await manager.start(startInput(fixture, nodeCommand(script), "task-foreign-race"));
+
+    // The foreign listener must never be presented as the task preview.
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.instance?.state, "failed");
+    assert.match(result.message, /different process already owns/i);
+    assert.equal(manager.status(result.instance!.id)?.state, "failed");
+    assert.equal((await readLedger(fixture)).previews.length, 0);
+    assert.ok(result.instance?.pid);
+    await waitFor(() => processGone(result.instance!.pid!));
+
+    // The manager only stops its own child; the foreign listener is untouched.
+    assert.equal(await (await fetch(`http://127.0.0.1:${foreignPort}/`)).text(), "foreign-service");
+  } finally {
+    await manager.stopAll("requested");
+    await new Promise<void>((resolve) => foreign.close(() => resolve()));
+  }
 });
 
 test("resolves only configured presets or allow-listed package scripts", async () => {

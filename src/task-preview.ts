@@ -93,7 +93,17 @@ export interface TaskPreviewManagerOptions {
   sigkillDelayMs?: number;
   exitWaitMs?: number;
   shell?: string;
+  /**
+   * Test seam for selecting the ephemeral loopback port. Production always uses
+   * {@link reserveLoopbackPort}; tests inject a fixed port to drive the foreign
+   * listener race deterministically. The selected port is only a hint: readiness
+   * is gated on proven listener ownership, so a foreign process claiming this
+   * port is refused rather than accepted.
+   */
+  reservePort?: () => Promise<number>;
 }
+
+type PortOwnership = "owned" | "foreign" | "unknown";
 
 interface ManagedPreview {
   snapshot: PreviewInstance;
@@ -105,6 +115,13 @@ interface ManagedPreview {
   exitPromise?: Promise<void>;
   ttlTimer?: NodeJS.Timeout;
   killTimer?: NodeJS.Timeout;
+  /**
+   * POSIX process-group id of the spawned child (equal to its pid because the
+   * child is spawned detached as a group leader). Every descendant the dev
+   * command forks inherits this group, so a loopback listener owned by this
+   * group is provably the managed child. Undefined on Windows.
+   */
+  groupId?: number;
 }
 
 interface PreviewLedgerEntry {
@@ -219,6 +236,15 @@ export async function resolvePreviewCommand(
  * read the exact observed origin from the returned instance, and release it
  * with `stop()`. Origins are always `http://127.0.0.1:<ephemeral port>`; the
  * manager never binds or forwards anything non-loopback.
+ *
+ * Readiness is bound to the exact managed child, not merely a responsive port.
+ * The ephemeral port is chosen with a brief bind-then-close, which leaves a
+ * window in which a foreign process could claim it (a TOCTOU). Rather than
+ * trust any HTTP responder on that port, `start()` proves the loopback listener
+ * belongs to the managed child's process group before reporting the preview
+ * active, and `stop()` proves the child's owned listener is gone before
+ * reporting success. A foreign server that races for the port is refused and is
+ * never presented as the task preview.
  */
 export class TaskPreviewManager {
   private readonly instances = new Map<string, ManagedPreview>();
@@ -230,6 +256,7 @@ export class TaskPreviewManager {
   private readonly sigkillDelayMs: number;
   private readonly exitWaitMs: number;
   private readonly shell: string;
+  private readonly reservePort: () => Promise<number>;
   private ledger: PreviewLedgerFile | undefined;
   private ledgerTail: Promise<void> = Promise.resolve();
   private shuttingDown = false;
@@ -243,6 +270,7 @@ export class TaskPreviewManager {
     this.sigkillDelayMs = Math.max(50, Math.floor(options.sigkillDelayMs ?? DEFAULT_SIGKILL_DELAY_MS));
     this.exitWaitMs = Math.max(this.sigkillDelayMs + 1_000, Math.floor(options.exitWaitMs ?? DEFAULT_EXIT_WAIT_MS));
     this.shell = options.shell ?? (process.platform === "win32" ? process.env.COMSPEC ?? "cmd.exe" : "/bin/sh");
+    this.reservePort = options.reservePort ?? reserveLoopbackPort;
   }
 
   async start(input: StartPreviewInput): Promise<StartPreviewResult> {
@@ -296,7 +324,7 @@ export class TaskPreviewManager {
     this.instances.set(id, managed);
 
     try {
-      const port = await reserveLoopbackPort();
+      const port = await this.reservePort();
       const origin = `http://127.0.0.1:${port}`;
       managed.snapshot.port = port;
       managed.snapshot.origin = origin;
@@ -359,6 +387,32 @@ export class TaskPreviewManager {
     this.terminate(managed);
     await this.awaitExit(managed);
     return this.reportStopOutcome(managed);
+  }
+
+  /**
+   * Confirms the loopback listener owned by the managed child's process group is
+   * gone. After the group is signaled and its leader's exit is observed, no
+   * descendant should still hold the port. A foreign listener that happens to
+   * occupy the port is not ours and does not block a successful stop.
+   */
+  private async confirmOwnedListenerGone(managed: ManagedPreview): Promise<boolean> {
+    if (process.platform === "win32" || managed.groupId === undefined || !managed.snapshot.port) {
+      return true;
+    }
+    const deadline = Date.now() + Math.min(this.exitWaitMs, 3_000);
+    while (Date.now() < deadline) {
+      // Cheap proof first: if the child's whole process group is gone, no member
+      // of it can still hold the port, so the owned listener is provably gone
+      // without paying for an `lsof` scan on the common stop path.
+      if (!processGroupExists(managed.groupId)) {
+        return true;
+      }
+      if ((await classifyPortListener(managed.snapshot.port, managed.groupId)) !== "owned") {
+        return true;
+      }
+      await sleep(this.pollIntervalMs);
+    }
+    return !processGroupExists(managed.groupId) || (await classifyPortListener(managed.snapshot.port, managed.groupId)) !== "owned";
   }
 
   status(id: string): PreviewInstance | undefined {
@@ -458,6 +512,9 @@ export class TaskPreviewManager {
     });
     managed.child = child;
     managed.snapshot.pid = child.pid;
+    if (process.platform !== "win32" && child.pid !== undefined) {
+      managed.groupId = child.pid;
+    }
 
     const appendOutput = (chunk: Buffer) => {
       managed.outputTail = `${managed.outputTail}${chunk.toString("utf8")}`.slice(-MAX_OUTPUT_TAIL_CHARS);
@@ -480,6 +537,7 @@ export class TaskPreviewManager {
 
   private async waitForReady(managed: ManagedPreview): Promise<void> {
     const deadline = Date.now() + this.readyTimeoutMs;
+    const verifyOwnership = process.platform !== "win32" && managed.groupId !== undefined;
     while (Date.now() < deadline) {
       if (managed.aborted || managed.snapshot.state !== "pending") {
         await this.awaitExit(managed);
@@ -491,6 +549,31 @@ export class TaskPreviewManager {
       if (await respondsOnLoopback(managed.snapshot.port)) {
         if (managed.aborted || managed.exitObserved || managed.snapshot.state !== "pending") {
           return;
+        }
+        if (verifyOwnership) {
+          const ownership = await classifyPortListener(managed.snapshot.port, managed.groupId);
+          if (managed.aborted || managed.exitObserved || managed.snapshot.state !== "pending") {
+            return;
+          }
+          if (ownership === "foreign") {
+            managed.aborted = true;
+            managed.snapshot.state = "stopping";
+            this.terminate(managed);
+            await this.awaitExit(managed);
+            managed.snapshot.state = "failed";
+            managed.snapshot.message = withOutputTail(
+              "A different process already owns this preview's loopback port, so Devbot refused to attach to it and started no preview.",
+              managed.outputTail
+            );
+            return;
+          }
+          if (ownership !== "owned") {
+            // Indeterminate: the managed child may not have bound the port yet
+            // (a transient responder or an in-flight listener). Keep waiting
+            // until ownership is proven or the deadline passes; never accept.
+            await sleep(this.pollIntervalMs);
+            continue;
+          }
         }
         managed.snapshot.state = "active";
         managed.snapshot.expiresAt = new Date(Date.now() + this.ttlMs).toISOString();
@@ -509,7 +592,7 @@ export class TaskPreviewManager {
     await this.awaitExit(managed);
     managed.snapshot.state = "failed";
     managed.snapshot.message = withOutputTail(
-      `The preview did not respond on its loopback origin within ${Math.round(this.readyTimeoutMs / 1000)}s and was stopped.`,
+      `The preview did not respond on its loopback origin within ${Math.round(this.readyTimeoutMs / 1000)}s under Devbot's ownership, and was stopped.`,
       managed.outputTail
     );
   }
@@ -593,11 +676,20 @@ export class TaskPreviewManager {
     this.pruneFinished();
   }
 
-  private reportStopOutcome(managed: ManagedPreview): StopPreviewResult {
+  private async reportStopOutcome(managed: ManagedPreview): Promise<StopPreviewResult> {
     if (!managed.exitObserved && managed.snapshot.pid !== undefined) {
       return {
         ok: false,
         message: managed.snapshot.message ?? "The preview process has not confirmed its exit yet.",
+        instance: cloneInstance(managed.snapshot)
+      };
+    }
+    if (!(await this.confirmOwnedListenerGone(managed))) {
+      return {
+        ok: false,
+        message:
+          managed.snapshot.message ??
+          "The preview process exited but a loopback listener it owned is still bound; the stop is not yet confirmed.",
         instance: cloneInstance(managed.snapshot)
       };
     }
@@ -815,6 +907,91 @@ function processExists(pid: number): boolean {
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function processGroupExists(groupId: number): boolean {
+  try {
+    process.kill(-groupId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Classifies who owns the loopback listener on `port` relative to the managed
+ * child's process group. Returns "owned" when a listening pid shares the child's
+ * process group (the managed child or a descendant), "foreign" when every
+ * listening pid belongs to a different group, and "unknown" when ownership
+ * cannot be determined yet (no listener bound, or the tooling is unavailable).
+ * "unknown" never proves ownership, so callers keep waiting or fail closed.
+ */
+async function classifyPortListener(port: number, groupId: number | undefined): Promise<PortOwnership> {
+  if (process.platform === "win32" || groupId === undefined) {
+    return "unknown";
+  }
+  const pids = await listeningPidsOnPort(port);
+  if (pids === undefined || pids.length === 0) {
+    return "unknown";
+  }
+  let sawForeign = false;
+  for (const pid of pids) {
+    const pgid = await processGroupId(pid);
+    if (pgid === groupId) {
+      return "owned";
+    }
+    if (pgid !== undefined) {
+      sawForeign = true;
+    }
+  }
+  return sawForeign ? "foreign" : "unknown";
+}
+
+async function listeningPidsOnPort(port: number): Promise<number[] | undefined> {
+  if (process.platform === "win32") {
+    return undefined;
+  }
+  try {
+    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN", "-t"], {
+      env: minimalChildEnvironment(),
+      maxBuffer: 1_000_000,
+      timeout: 5_000
+    });
+    return parsePids(stdout);
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException & { stdout?: string };
+    if (failure.code === "ENOENT") {
+      // lsof is unavailable; ownership cannot be determined.
+      return undefined;
+    }
+    // lsof exits non-zero with empty output when nothing matches the filter.
+    return parsePids(failure.stdout ?? "");
+  }
+}
+
+function parsePids(text: string): number[] {
+  return [
+    ...new Set(
+      text
+        .split(/\s+/)
+        .map((value) => Number.parseInt(value, 10))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )
+  ];
+}
+
+async function processGroupId(pid: number): Promise<number | undefined> {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-o", "pgid=", "-p", String(pid)], {
+      env: minimalChildEnvironment(),
+      maxBuffer: 100_000,
+      timeout: 5_000
+    });
+    const pgid = Number.parseInt(stdout.trim(), 10);
+    return Number.isInteger(pgid) && pgid > 0 ? pgid : undefined;
+  } catch {
+    return undefined;
   }
 }
 
