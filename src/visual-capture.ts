@@ -28,6 +28,11 @@ export function isSafeCaptureFileName(fileName: string): boolean {
   );
 }
 
+/** The honest completion note for isolated tasks; review round 2 requires it in the user-facing completion message, not only in task metadata. */
+export function isolatedVisualProofNote(taskId: string, branch: string): string {
+  return `Visual proof unavailable: this task ran on isolated branch \`${branch}\`, which the project's dev server does not serve. Run \`/ship task:${taskId}\` for details, or review the branch directly.`;
+}
+
 export interface ShipCaptureLive {
   isolated: false;
   image: Buffer;

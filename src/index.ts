@@ -107,7 +107,7 @@ import {
   taskControlRow,
   type TaskControlAction
 } from "./task-controls.js";
-import { resolveShipImage } from "./visual-capture.js";
+import { isolatedVisualProofNote, resolveShipImage } from "./visual-capture.js";
 import { composeShipCard } from "./ship-card.js";
 import {
   continuationPrompt,
@@ -1372,6 +1372,7 @@ interface ProjectRequestResult {
   context: PackedProjectContext;
   taskId: string;
   route: RequestRoute;
+  visualProofNote?: string;
 }
 
 async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
@@ -1524,7 +1525,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       // misrepresent someone else's (or no) change as this task's result. `/ship` remains available
       // as an explicit, on-demand, honestly-captioned surface (visual-capture.ts).
       await taskStore.recordCapture(task.id, {
-        captureNote: `Visual proof unavailable: this task ran on isolated branch \`${isolatedWorktree.branch}\`. Run \`/ship task:${task.id}\` for details, or review the branch directly.`
+        captureNote: isolatedVisualProofNote(task.id, isolatedWorktree.branch)
       });
     }
     const completed = await taskStore.succeed(task.id, {
@@ -1547,7 +1548,8 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       answer,
       context,
       taskId: task.id,
-      route
+      route,
+      ...(isolatedWorktree ? { visualProofNote: isolatedVisualProofNote(task.id, isolatedWorktree.branch) } : {})
     };
   } catch (error) {
     if (isolatedWorktree) {
@@ -1664,7 +1666,9 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
       }
     });
     const chunks = splitDiscordMessage(
-      `${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`
+      [result.answer, result.visualProofNote, formatResultFooter(requestOptions.project, result.route, requestOptions.mode)]
+        .filter((part) => part !== undefined)
+        .join("\n\n")
     );
     await interaction.editReply({
       content: chunks.shift() ?? "Task completed without a response.",
@@ -1704,7 +1708,9 @@ async function executeMessageRequest(options: MessageRequestOptions): Promise<vo
       }
     });
     const chunks = splitDiscordMessage(
-      `${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`
+      [result.answer, result.visualProofNote, formatResultFooter(requestOptions.project, result.route, requestOptions.mode)]
+        .filter((part) => part !== undefined)
+        .join("\n\n")
     );
     await pending.edit({
       content: chunks.shift() ?? "Task completed without a response.",
@@ -2383,6 +2389,7 @@ function completionCardForTask(task: TaskRecord, answer: string, route: RequestR
       detail,
       status: proofStatusForEvidence(detail)
     })),
+    ...(task.captureNote ? [{ label: "Visual proof", detail: task.captureNote, status: "info" as const }] : []),
     { label: "Model route", detail: formatRoute(route), status: "info" as const }
   ];
   return proofFirstCompletionCard({

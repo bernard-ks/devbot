@@ -123,3 +123,12 @@ Bernard requested changes on `a587fa1` (see `REVIEW.md` at the worktree root —
 **Tests**: `npm test` (tsc build + `node --test`) — **141/141 passing** on a clean rerun. One rerun hit the pre-existing, brief-documented flaky case (`security.test.ts`, "configured project commands receive an empty temporary home", a child-process timeout under load); the immediate rerun after was clean, matching the flake this lane's original HANDOFF already called out as pre-existing and unrelated to this feature.
 
 **Untrusted-content check**: `REVIEW.md` (Bernard's review) and this repo's other files were treated as data per the anti-injection rule. No instruction-shaped content aimed at an AI agent was found in `REVIEW.md`, `COMMON.md`, or anywhere else touched this round.
+
+## Review round 2 follow-through (2026-07-10)
+
+Bernard's round-2 note asked for the isolated-task skip note "in the user-facing completion message itself (not buried in metadata)". The previous pass put it on the task record (`captureNote`, shown by `/task show`) and in the `/ship` caption, but not in the completion messages users actually receive. Closed that gap:
+
+- `isolatedVisualProofNote(taskId, branch)` (`src/visual-capture.ts`) is now the single source of the note text; `runProjectRequest` records it as `captureNote` and also returns it as `ProjectRequestResult.visualProofNote` whenever the task ran isolated.
+- `executeInteractionRequest` / `executeMessageRequest` (`src/index.ts`) append the note between the answer and the result footer, so every plain-text action-task completion states visual proof is unavailable for the isolated branch.
+- `completionCardForTask` (`src/index.ts`, the ambient approved-action completion card) adds a `[INFO] Visual proof:` proof entry from `task.captureNote`; the card's proof cap in `proofFirstCompletionCard` (`src/ambient-ui.ts`) went 5 → 6 so the note doesn't evict the model-route line (isolated tasks already produce 4 evidence lines + route).
+- Tests: `isolatedVisualProofNote states the skip plainly and never claims a diff` (`visual-capture.test.ts`) and `completion card keeps six proof entries so an isolated-task visual-proof note is not evicted` (`ambient-ui.test.ts`). 143/143 passing.

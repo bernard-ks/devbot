@@ -5,7 +5,14 @@ import path from "node:path";
 import test from "node:test";
 import type { TaskRecord } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
-import { canAutoCaptureProject, captureFileName, isSafeCaptureFileName, pruneCaptures, resolveShipImage } from "./visual-capture.js";
+import {
+  canAutoCaptureProject,
+  captureFileName,
+  isolatedVisualProofNote,
+  isSafeCaptureFileName,
+  pruneCaptures,
+  resolveShipImage
+} from "./visual-capture.js";
 
 function project(overrides: Partial<ProjectEntry["metadata"]["policy"]> = {}): ProjectEntry {
   return {
@@ -84,6 +91,14 @@ test("resolveShipImage reports isolated tasks as unavailable without attempting 
     isolatedProject
   );
   assert.deepEqual(result, { isolated: true, branch: "devbot/task/task-abc" });
+});
+
+test("isolatedVisualProofNote states the skip plainly and never claims a diff", () => {
+  const note = isolatedVisualProofNote("task-abc", "devbot/task/task-abc");
+  assert.match(note, /^Visual proof unavailable/);
+  assert.match(note, /isolated branch `devbot\/task\/task-abc`/);
+  assert.match(note, /\/ship task:task-abc/);
+  assert.equal(/% of the page changed/.test(note), false);
 });
 
 test("resolveShipImage returns undefined without a screenshot when auto-capture is blocked", async () => {

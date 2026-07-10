@@ -145,6 +145,29 @@ test("completion card with task-derived text cannot expand mentions at the trans
   assert.deepEqual(payload.allowedMentions, { parse: [] });
 });
 
+test("completion card keeps six proof entries so an isolated-task visual-proof note is not evicted", () => {
+  const payload = proofFirstCompletionCard({
+    taskId: "task-3",
+    project: "devbot",
+    title: "Isolated action complete",
+    proof: [
+      { label: "Recorded evidence", detail: "Work isolated on branch devbot/task/task-3.", status: "passed" },
+      { label: "Recorded evidence", detail: "Inspected staged and unstaged Git diff without storing patch contents.", status: "passed" },
+      { label: "Recorded evidence", detail: "No configured validation command was run automatically.", status: "info" },
+      { label: "Recorded evidence", detail: "Changes were left uncommitted on the isolated branch for human review.", status: "passed" },
+      { label: "Visual proof", detail: "Visual proof unavailable: this task ran on isolated branch `devbot/task/task-3`.", status: "info" },
+      { label: "Model route", detail: "standard / focused", status: "info" }
+    ],
+    summary: "Made the header sticky on the isolated branch."
+  });
+  const json = serialize(payload);
+  const content = textContent(json);
+  assert.match(content, /\[INFO\] Visual proof:/);
+  assert.match(content, /Visual proof unavailable/);
+  assert.match(content, /\[INFO\] Model route/);
+  assertDiscordBounds(json);
+});
+
 test("Needs Me inbox caps visible decisions and keeps every control routable", () => {
   const payload = needsMeInbox({
     inboxId: "inbox-main",
