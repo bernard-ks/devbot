@@ -501,8 +501,8 @@ function taskVouchesForProject(
 
 /** Case- and whitespace-insensitive equality of two project identities; an empty identity never matches, failing closed. */
 function sameProjectIdentity(a: string, b: string): boolean {
-  const left = a.trim().toLowerCase().slice(0, MAX_ID_FIELD_LENGTH);
-  const right = b.trim().toLowerCase().slice(0, MAX_ID_FIELD_LENGTH);
+  const left = a.trim().toLowerCase();
+  const right = b.trim().toLowerCase();
   return left.length > 0 && left === right;
 }
 
@@ -511,7 +511,9 @@ function normalizeProjectIdentity(value: string): string {
   if (!normalized) {
     throw new Error("Project memory requires a non-empty project name.");
   }
-  return normalized.slice(0, MAX_ID_FIELD_LENGTH);
+  // Project identity is an authorization and storage namespace. Never truncate
+  // it: two valid setup names may share an arbitrarily long prefix.
+  return normalized;
 }
 
 function pruneEntries(entries: MemoryEntry[], maxOutcomes: number, maxTotalEntries: number): MemoryEntry[] {

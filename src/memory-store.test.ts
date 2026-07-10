@@ -47,8 +47,9 @@ test("memory store persists entries under a central Devbot-owned store, not the 
 
 test("same-root project aliases have isolated files and reject entries bound to another project identity", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-memory-shared-root-"));
-  const privateProject = { root, name: "private-a" };
-  const publicAlias = { root, name: "public-alias" };
+  const sharedPrefix = "a".repeat(80);
+  const privateProject = { root, name: `${sharedPrefix}-private` };
+  const publicAlias = { root, name: `${sharedPrefix}-public` };
   const store = new MemoryStore(await tempStoreRoot());
 
   const privateEntry = await store.add(privateProject, {
@@ -57,7 +58,7 @@ test("same-root project aliases have isolated files and reject entries bound to 
     source: "manual",
     author: "owner"
   });
-  assert.equal(privateEntry.projectName, "private-a");
+  assert.equal(privateEntry.projectName, privateProject.name);
 
   const privateFile = await store.fileFor(privateProject);
   const publicFile = await store.fileFor(publicAlias);
