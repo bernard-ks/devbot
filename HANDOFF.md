@@ -2,6 +2,69 @@
 
 Branch: `claude/task-queue-schedule`
 
+## Rebased onto 85e2530
+
+Rebased onto `origin/main` at `85e2530` (merge of bernard's `dd0af6b` "Add ambient
+Discord workrooms and security hardening", +1500 lines in `src/index.ts` plus
+changes to `src/commands.ts`, `src/config.ts`, `.env.example`, etc.). This lane's
+single commit replayed as `1c75658`.
+
+Conflicted files and how they were resolved:
+
+- **`src/commands.ts`** — both sides appended to the same `commandBuilders` array
+  literal at the same spot: bernard added the "Start Devbot workroom" context-menu
+  command, this lane added the `/queue` and `/schedule` slash command builders.
+  Kept both entries (context-menu command, then `/queue`, then `/schedule`) inside
+  the same `commandBuilders` array, preserving bernard's `satisfies Array<Pick<...,
+  "toJSON">>` typing and the `commandDefinitions = commandBuilders.map(...)` export
+  bernard introduced (this lane's pre-rebase version exported a plain inline
+  `.map(...)` off the array literal directly).
+- **`src/index.ts`** — three conflict regions, all caused by both branches
+  inserting new code at the same anchor points (not overlapping logic edits):
+  - Import block: merged bernard's `task-access.ts`/`task-worktree.ts` imports
+    with this lane's `queue-store.ts`/`schedule-store.ts` imports — both kept.
+  - A ~1000-line region after `taskStatusForProgress()`: bernard inserted the
+    entire ambient-workroom proposal system (`AmbientProposalRequest` through
+    `agentRole()`) and this lane inserted `handleQueueCommand` through
+    `truncateSummary()` at the same point, so diff3 interleaved unrelated `if`
+    blocks from each side into one unreadable conflict. Resolved by reconstructing
+    both blocks from their source commits verbatim and placing bernard's ambient
+    block first, then this lane's queue/schedule block, immediately before
+    `getWorkStatusMessage()` (order doesn't matter functionally — both are
+    independent top-level function groups).
+  - `ProjectRequestOptions` / `runProjectRequest`: bernard extended the options
+    interface (`existingTaskId`, `requesterId`, `accessScope`, `internal`,
+    `channelId`, `threadId`, `agentRoles`, `displayText`, `signal`) and rewired
+    the function body to run write-capable (`mode: "action"`) requests inside an
+    **isolated task git worktree** (`createTaskWorktree`) instead of directly
+    against the project root. All new fields are optional, so `runQueueItem`'s
+    and `runScheduledEntry`'s existing `runProjectRequest({...})` calls needed no
+    changes — they pass straight through the same function name and now
+    automatically get isolated-worktree execution for `/queue`/`/schedule` `do`
+    items, exactly like `/do` does. No new/renamed execution engine to re-route
+    to; verified by reading the merged `runProjectRequest` body and confirming
+    the required fields this lane supplies (`project`, `text`, `includePatterns`,
+    `mode`, `requester`, `source`, `onProgress`) are still accepted unchanged.
+
+Beyond the textual conflicts, integrated this lane with bernard's security
+hardening: the queue/schedule code (written before that hardening commit
+existed) was surfacing raw `error.message`/`String(error)` to Discord replies,
+stored queue/schedule summaries, and console logs. Bernard's commit established
+`publicErrorMessage(error)` (from `src/security.ts`, redacts tokens/secrets/keys)
+as the sitewide convention for anything error-derived that reaches a user or a
+log line. Swapped all of the following to use it: `/queue remove`'s error reply,
+`/schedule add`'s error reply, `runQueueItem`'s failure summary, `runScheduledEntry`'s
+failure summary, and the six queue/schedule-related `console.warn`/`console.error`
+calls added in `clientReady` and `/queue start`.
+
+`.env.example`, `README.md`, `docs/DEVBOT_PRODUCT_PLAN.md` auto-merged cleanly
+(bernard's additions and this lane's additions were in different, non-adjacent
+spots) — no manual resolution needed there.
+
+Verified post-rebase: `npx tsc -p tsconfig.json --noEmit` clean, `npm test` green
+twice in a row (147 passed / 0 failed both runs — 74 pre-existing +29 from this
+lane +44 from bernard's security/ambient/worktree test files).
+
 ## What was built
 
 ### `/queue` — stack tasks, run them one at a time, wake up to a digest
@@ -55,4 +118,4 @@ Branch: `claude/task-queue-schedule`
 - Not run against live Discord (per lane rules — verified via `npm test`, a full `tsc` build, and manual code-path tracing against the existing `/do`/`/ask` execution path only).
 
 ## Test results
-`npm test` (tsc build + `node --test` on dist): **103 passed, 0 failed** — 74 pre-existing plus 29 new (14 in `queue-store.test.ts`, 15 in `schedule-store.test.ts`).
+`npm test` (tsc build + `node --test` on dist): **103 passed, 0 failed** at the time this lane was authored — 74 pre-existing plus 29 new (14 in `queue-store.test.ts`, 15 in `schedule-store.test.ts`). After rebasing onto `85e2530` (see "Rebased onto 85e2530" above), the suite is **147 passed, 0 failed**, run twice to rule out the known CPU-load flake.
