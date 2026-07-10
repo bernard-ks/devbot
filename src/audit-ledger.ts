@@ -205,9 +205,27 @@ export class AuditLedger implements AuditRecorder {
       };
     }
     if (anchor.seq < firstSeq) {
+      // The anchor predates the first retained record, so it cannot be checked
+      // against a record still on disk. The retained chain nonetheless carries
+      // an authenticated retention checkpoint: records[0].prevHash is the hash
+      // of the record that used to sit at firstSeq - 1, cryptographically bound
+      // into the verified chain. An anchor pinned exactly at that pruned
+      // boundary with the matching hash is a genuine interrupted anchor update
+      // that retention has since passed, so it is authenticated and behind.
+      // Anything deeper, or a hash that does not match the checkpoint, cannot be
+      // authenticated against the retained records: fail closed rather than
+      // trusting it (and, in loadTail, rather than rewriting head.json over it).
+      const boundarySeq = firstSeq - 1;
+      const boundaryHash = records[0]!.prevHash;
+      if (anchor.seq === boundarySeq && anchor.hash === boundaryHash) {
+        return {
+          status: "behind",
+          detail: `The head anchor at seq ${anchor.seq} is the pruned retention boundary and is authenticated by the retained chain (an interrupted anchor update).`
+        };
+      }
       return {
-        status: "behind",
-        detail: `The head anchor at seq ${anchor.seq} predates the retained records; it cannot be cross-checked.`
+        status: "divergent",
+        detail: `The head anchor at seq ${anchor.seq} predates the retained records and cannot be authenticated against them (retention boundary at seq ${boundarySeq}).`
       };
     }
     const anchored = records.find((record) => record.seq === anchor.seq);

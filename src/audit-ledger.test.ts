@@ -202,6 +202,45 @@ test("a wrong-hash behind anchor refuses appends and is not silently rewritten",
   assert.equal((await new AuditLedger(directory).verify()).anchor, "divergent");
 });
 
+test("a retention-pruned anchor predating the retained records fails closed and is not rewritten", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "devbot-audit-behind-retention-"));
+  const ledger = new AuditLedger(directory, { maxFileBytes: 10, maxFiles: 3 });
+  for (let index = 1; index <= 6; index += 1) {
+    await ledger.record(sampleEvent(index));
+  }
+
+  // Retention keeps only seq 4-6; seq 1-3 (and their hashes) are pruned.
+  assert.deepEqual(await ledgerFileNames(directory), ["ledger-000004.jsonl", "ledger-000005.jsonl", "ledger-000006.jsonl"]);
+
+  // Forge the anchor to a sequence that predates the first retained record with
+  // an arbitrary 64-hex hash. It cannot be authenticated against the retained
+  // chain (its seq is below the pruned boundary at seq 3), so every operation
+  // must reject it rather than treating it as a benign "behind" anchor and
+  // silently overwriting the forged head on the next append.
+  const anchorPath = path.join(directory, "head.json");
+  const forgedAnchor = { version: 1, seq: 1, hash: "c".repeat(64), updatedAt: new Date().toISOString() };
+  await writeFile(anchorPath, `${JSON.stringify(forgedAnchor, null, 2)}\n`, "utf8");
+
+  const verification = await new AuditLedger(directory).verify();
+  assert.equal(verification.ok, false);
+  assert.equal(verification.anchor, "divergent");
+  assert.match(formatAuditVerification(verification), /cannot be authenticated/i);
+
+  const reader = new AuditLedger(directory);
+  await assert.rejects(reader.records(), /anchor diverges/);
+  await assert.rejects(reader.recent({ limit: 5 }), /anchor diverges/);
+  await assert.rejects(reader.show(5), /anchor diverges/);
+
+  await assert.rejects(new AuditLedger(directory).record(sampleEvent(7)), /diverges from its anchor/);
+
+  // The forged anchor is preserved as evidence: the refused append never
+  // rewrote head.json, and verification still reports the divergence.
+  const persisted = JSON.parse(await readFile(anchorPath, "utf8")) as { seq: number; hash: string };
+  assert.equal(persisted.seq, 1);
+  assert.equal(persisted.hash, "c".repeat(64));
+  assert.equal((await new AuditLedger(directory).verify()).anchor, "divergent");
+});
+
 test("a malformed head anchor refuses appends without rewriting it", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "devbot-audit-malformed-anchor-"));
   const ledger = new AuditLedger(directory);
