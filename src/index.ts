@@ -72,8 +72,10 @@ import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natur
 import { captureProjectScreenshot, findProjectWebUrls, type ProjectScreenshot } from "./project-screenshot.js";
 import {
   buildTimelapseGif,
+  isolatedProofNote,
   isUiRelatedTask,
   listChangedFiles,
+  pushBoundedFrame,
   recordProjectFlow,
   type ProjectVideoOutcome,
   type ProjectVideoResult
@@ -865,7 +867,7 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
       requester: interaction.user.tag,
       source: "slash:do",
       ephemeral: hasProjectAudienceRestriction(project),
-      watch: interaction.options.getBoolean("watch") ?? true
+      watch: interaction.options.getBoolean("watch") ?? false
     });
     return;
   }
@@ -1477,6 +1479,8 @@ interface ProjectRequestResult {
   taskId: string;
   route: RequestRoute;
   visualProofNote?: string;
+  isolated: boolean;
+  workspaceBranch?: string;
 }
 
 async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
@@ -1653,7 +1657,9 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       context,
       taskId: task.id,
       route,
-      ...(isolatedWorktree ? { visualProofNote: isolatedVisualProofNote(task.id, isolatedWorktree.branch) } : {})
+      ...(isolatedWorktree ? { visualProofNote: isolatedVisualProofNote(task.id, isolatedWorktree.branch) } : {}),
+      isolated: Boolean(isolatedWorktree),
+      ...(isolatedWorktree ? { workspaceBranch: isolatedWorktree.branch } : {})
     };
   } catch (error) {
     if (isolatedWorktree) {
@@ -1808,19 +1814,23 @@ interface WatchSession {
 function startWatchSession(project: ProjectEntry, requestText: string, onFrame: (image: Buffer) => void): WatchSession {
   const frames: Buffer[] = [];
   let stopped = false;
+  let capturing = false;
   const timer = setInterval(() => {
-    if (stopped) {
+    if (stopped || capturing) {
       return;
     }
+    capturing = true;
     void (async () => {
       try {
         const shot = await captureProjectScreenshot(project, { requestText });
         if (shot && !stopped) {
-          frames.push(shot.image);
+          pushBoundedFrame(frames, shot.image);
           onFrame(shot.image);
         }
       } catch (error) {
         console.warn(`Watch mode capture failed for ${project.name}: ${(error as Error).message}`);
+      } finally {
+        capturing = false;
       }
     })();
   }, WATCH_INTERVAL_MS);
@@ -1842,14 +1852,28 @@ interface CompletionProof {
   attachment?: AttachmentBuilder;
 }
 
-async function captureCompletionProof(project: ProjectEntry, taskText: string, policyBlock: string | undefined): Promise<CompletionProof | undefined> {
+interface CompletionProofOptions {
+  policyBlock?: string | undefined;
+  isolated: boolean;
+  branch?: string | undefined;
+}
+
+async function captureCompletionProof(
+  project: ProjectEntry,
+  taskText: string,
+  options: CompletionProofOptions
+): Promise<CompletionProof | undefined> {
   try {
     const changedFiles = await listChangedFiles(project);
     if (!isUiRelatedTask(taskText, changedFiles)) {
       return undefined;
     }
 
-    if (policyBlock) {
+    if (options.isolated) {
+      return { note: isolatedProofNote(options.branch) };
+    }
+
+    if (options.policyBlock) {
       return { note: "Proof capture unavailable: project policy blocks UI capture for this project." };
     }
 
@@ -1920,7 +1944,11 @@ async function executeDoInteraction(options: DoInteractionOptions): Promise<void
     });
     watchSession?.stop();
 
-    const proof = await captureCompletionProof(requestOptions.project, requestOptions.text, policyBlock);
+    const proof = await captureCompletionProof(requestOptions.project, requestOptions.text, {
+      policyBlock,
+      isolated: result.isolated,
+      branch: result.workspaceBranch
+    });
     const timelapse = watchSession && watchSession.frames.length > 0 ? await buildTimelapseGif(watchSession.frames) : undefined;
 
     const footer = formatResultFooter(requestOptions.project, result.route, requestOptions.mode);

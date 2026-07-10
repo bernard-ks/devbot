@@ -556,7 +556,7 @@ const commandBuilders = [
     .addBooleanOption((option) =>
       option
         .setName("watch")
-        .setDescription("Live screenshots while working; default on when a dev server is detected.")
+        .setDescription("Opt in to live screenshots of the running dev server while working (default off).")
         .setRequired(false)
     ),
   new SlashCommandBuilder()
