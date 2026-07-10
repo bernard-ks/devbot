@@ -92,8 +92,9 @@ The safety contract is explicit: only the requester or an approved controller ca
 - Video proof-of-work and live watch mode:
   - `/clip` records a short scored multi-step local UI flow (up to ~4 interactions, 30s/1280x720 caps) and attaches it, shrinking viewport/duration once and falling back to a screenshot if it is still over Discord's attachment size limit.
   - Transcodes the recording to MP4 with `ffmpeg` when it is present on PATH; otherwise attaches the WebM directly.
-  - Completed UI-related `/do` tasks automatically get a recorded flow attached, or an explicit "proof capture unavailable" note so proof is never silently missing.
-  - `/do` watch mode live-updates the task message with a screenshot roughly every 20s while a dev server is detected (default on, `watch:false` to opt out) and stitches up to the last 12 captured frames into an animated GIF timelapse with `sharp` on completion.
+  - `/clip` and completion recording confine the browser to approved project origins for the whole session (Playwright request routing plus post-navigation URL checks), not just the initial reachability probe.
+  - `/do` action tasks run in an isolated worktree the dev server does not serve, so automatic completion recording is skipped with an honest "proof capture skipped: isolated worktree" note pointing to `/clip` after merge rather than presenting the unchanged source app as proof.
+  - `/do` watch mode is opt-in (`watch:true`, default off): while a dev server is detected it live-updates the task message with a screenshot roughly every 20s, never overlaps captures, keeps at most the last 12 frames in memory, and stitches them into an animated GIF timelapse with `sharp` on completion.
 
 ## Current Constraints
 
