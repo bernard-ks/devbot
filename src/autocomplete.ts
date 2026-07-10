@@ -58,7 +58,7 @@ export function memoryChoices(entries: MemoryEntry[], focused: string): Autocomp
     .filter((entry) => searchableMemoryText(entry).includes(query))
     .slice(0, 25)
     .map((entry) => ({
-      name: `${entry.id} | ${entry.kind} ${truncateChoiceLabel(entry.text)}`,
+      name: truncateChoiceLabel(`${entry.id} | ${entry.kind} ${entry.text}`, MAX_CHOICE_NAME_LENGTH),
       value: entry.id
     }));
 }
@@ -71,10 +71,12 @@ function searchableMemoryText(entry: MemoryEntry): string {
   return `${entry.id} ${entry.kind} ${entry.source} ${entry.text} ${entry.tags.join(" ")}`.toLowerCase();
 }
 
-function truncateChoiceLabel(value: string): string {
+/** Discord rejects autocomplete choice names longer than 100 characters. */
+const MAX_CHOICE_NAME_LENGTH = 100;
+
+function truncateChoiceLabel(value: string, maxLength: number): string {
   const normalized = value.replace(/\s+/g, " ").trim();
-  const maxLength = 60;
-  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 1)}...`;
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 3)}...`;
 }
 
 function normalize(value: string): string {

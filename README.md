@@ -171,6 +171,7 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/memory search query:<text> project:<optional>`: Search memory entries by relevance to a query.
 - `/memory promote id:<memory-id> project:<optional>`: Owner/controller-only; approve an automatically captured outcome so it becomes eligible for automatic recall.
 - `/memory forget id:<memory-id> project:<optional>`: Owner-only; permanently delete a memory entry. This removes it from Devbot's memory only, not from git, Discord, task, or backup history.
+- `/memory purge confirm:<project-name> project:<optional>`: Owner-only; permanently delete every memory entry for a project. Requires retyping the project name to confirm, and likewise leaves git, Discord, task, and backup history untouched.
 
 You can also mention the bot in a channel:
 

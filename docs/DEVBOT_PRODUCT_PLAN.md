@@ -40,7 +40,7 @@ The safety contract is explicit: only the requester or an approved controller ca
   - `/refresh` rebuilds the in-memory project file index.
   - `/ask` answers read-only project questions with local context.
   - `/do` asks local Codex to perform focused project work.
-  - `/remember`, `/memory list`, `/memory search`, and `/memory forget` record and recall per-project decisions, notes, and task outcomes.
+  - `/remember`, `/memory list`, `/memory search`, `/memory promote`, `/memory forget`, and `/memory purge` record, recall, approve, and delete per-project decisions, notes, and task outcomes.
   - Guild command definitions synchronize automatically at startup.
 - Mention support:
   - Direct bot mentions can invoke the bot without requesting the privileged Message Content intent.
@@ -96,7 +96,8 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Automatically records a terse outcome (result, changed files, detail) when an action task succeeds or fails; automatic outcomes start `proposed`/`untrusted` and are excluded from automatic recall until a controller runs `/memory promote` to mark them `active`/`trusted`. Manual `/remember` decisions and notes are `active`/`trusted` immediately.
   - Redacts secrets from entry text, tags, and author at write time and again defensively on read/output/recall; validates and normalizes every entry against a versioned schema, quarantining (never silently destroying) corrupt or invalid lines.
   - Only the intentional `/ask`, `/do`, and direct-mention answer routes recall memory into a prompt (status, labs, council, and peer routes do not); recall is access-filtered, restricted to active/trusted entries, uses exact-token relevance with a generic-term stoplist, and its rendered size is reserved out of the route's context budget. Entries are HTML-escaped before insertion so they cannot forge or close the prompt's delimiter tags, and the influencing memory IDs are recorded on the task.
-  - `/status` and `/setup doctor` surface memory entry counts and store health without ever touching the managed project's checkout; `/setup repo remove` purges that project's memory file.
+  - `/status` and `/setup doctor` surface memory entry counts and store health without ever touching the managed project's checkout; `/setup repo remove` purges that project's memory file, and the owner can purge a project's memory on demand with `/memory purge` (confirmed by retyping the project name).
+  - Migrates any `.devbot/memory.jsonl` a pre-release build wrote inside a managed checkout into the central store on first access (entries stay untrusted until promoted, invalid lines are quarantined) and retires the stray file; symlinked or oversized legacy files are left untouched.
 
 ## Current Constraints
 

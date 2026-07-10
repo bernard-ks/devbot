@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { discordUsernamesFor, isApprovedDiscordUsername, normalizeDiscordUsernames } from "./access.js";
-import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
+import { commandChoices, memoryChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
 import {
   collabDeliveryKey,
   createCollabEnvelope,
@@ -697,6 +697,25 @@ test("autocomplete helpers suggest projects commands tasks and peers", () => {
     ),
     [{ name: "alex-devbot (alex)", value: "123" }]
   );
+
+  const longId = `mem-${"a".repeat(60)}`;
+  const memoryEntry = {
+    schemaVersion: 1 as const,
+    id: longId,
+    kind: "decision" as const,
+    text: `Adopt the new renderer. ${"context ".repeat(30)}`,
+    source: "manual" as const,
+    author: "tom",
+    createdAt: "2026-06-23T20:00:00.000Z",
+    tags: ["render"],
+    accessScope: "project" as const,
+    status: "active" as const,
+    trust: "trusted" as const
+  };
+  const memoryChoice = memoryChoices([memoryEntry], "renderer");
+  assert.equal(memoryChoice.length, 1);
+  assert.equal(memoryChoice[0]?.value, longId);
+  assert.ok(memoryChoice[0]!.name.length <= 100, "autocomplete choice names must stay within Discord's 100-character limit");
 });
 
 test("command schema exposes help and autocomplete for high-friction options", () => {
@@ -755,6 +774,10 @@ test("command schema exposes help and autocomplete for high-friction options", (
   const promote = memory?.options?.find((option) => option.name === "promote");
   const promoteId = promote?.options?.find((option) => option.name === "id");
   assert.equal(promoteId?.autocomplete, true);
+  const purge = memory?.options?.find((option) => option.name === "purge");
+  const purgeConfirm = purge?.options?.find((option) => option.name === "confirm");
+  assert.equal(purgeConfirm?.required, true);
+  assert.equal(purgeConfirm?.max_length, 100);
 });
 
 test("workroom controls encode IDs and follow lifecycle state", () => {
@@ -875,6 +898,7 @@ test("ship control is offered to controllers on completed action tasks but never
 interface CommandJson {
   name: string;
   autocomplete?: boolean;
+  required?: boolean;
   max_length?: number;
   min_value?: number;
   max_value?: number;

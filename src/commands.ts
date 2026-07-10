@@ -609,6 +609,17 @@ const commandBuilders = [
           option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
         )
     )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("purge")
+        .setDescription("Owner-only: permanently delete every memory entry for a project.")
+        .addStringOption((option) =>
+          option.setName("confirm").setDescription("Type the project name to confirm the purge.").setRequired(true).setMaxLength(100)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+        )
+    )
 ] satisfies Array<Pick<SlashCommandBuilder, "toJSON"> | Pick<ContextMenuCommandBuilder, "toJSON">>;
 
 export const commandDefinitions = commandBuilders.map((command) => command.toJSON());

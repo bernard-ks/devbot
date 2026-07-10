@@ -66,8 +66,9 @@ import {
   setActiveBackendId,
   type BackendAvailability
 } from "./agent-backend.js";
+import { executeMemoryCommand, type MemoryCommandRequest } from "./memory-commands.js";
 import { formatMemoryRecallBlock } from "./memory-recall.js";
-import { checkMemoryStoreHealth, formatMemoryList, MemoryStore, type MemoryAccessContext, type MemoryKind } from "./memory-store.js";
+import { checkMemoryStoreHealth, MemoryStore, type MemoryAccessContext, type MemoryKind } from "./memory-store.js";
 import { parseMentionRequest, parseStatusRequest, statusDetailQuestion, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natural-intent.js";
@@ -2778,8 +2779,6 @@ async function getDetailedStatusResponse(options: StatusResponseOptions): Promis
   return { content: [`Repository assessment for \`${project.name}\`:`, answer].join("\n") };
 }
 
-const MAX_MEMORY_QUERY_LENGTH = 200;
-
 function memoryAccessContextFor(interaction: ChatInputCommandInteraction, project: ProjectEntry, appConfig: AppConfig): MemoryAccessContext {
   return {
     userId: interaction.user.id,
@@ -2803,57 +2802,35 @@ async function handleMemoryCommand(interaction: ChatInputCommandInteraction, app
   if (!(await ensureProjectAccess(interaction, project))) {
     return;
   }
-  const access = memoryAccessContextFor(interaction, project, appConfig);
+  const request = memoryCommandRequestFrom(interaction, subcommand);
+  if (!request) {
+    await interaction.editReply(`Unknown memory subcommand \`${subcommand}\`.`);
+    return;
+  }
+  const actor = {
+    access: memoryAccessContextFor(interaction, project, appConfig),
+    owner: isOwner(interaction.user.id, appConfig)
+  };
+  await replyChunked(interaction, await executeMemoryCommand(memoryStore, project, actor, request));
+}
 
+function memoryCommandRequestFrom(interaction: ChatInputCommandInteraction, subcommand: string): MemoryCommandRequest | undefined {
   if (subcommand === "list") {
     const kind = (interaction.options.getString("kind") as MemoryKind | null) ?? undefined;
-    const limit = interaction.options.getInteger("limit") ?? 10;
-    const entries = await memoryStore.list(project, { access, ...(kind ? { kind } : {}), limit });
-    await replyChunked(interaction, formatMemoryList(entries, project.name));
-    return;
+    const limit = interaction.options.getInteger("limit") ?? undefined;
+    return { subcommand, ...(kind ? { kind } : {}), ...(limit ? { limit } : {}) };
   }
-
   if (subcommand === "search") {
-    const query = interaction.options.getString("query", true).slice(0, MAX_MEMORY_QUERY_LENGTH);
-    const entries = await memoryStore.search(project, query, access);
-    await replyChunked(interaction, formatMemoryList(entries, project.name, query));
-    return;
+    return { subcommand, query: interaction.options.getString("query", true) };
   }
-
-  if (subcommand === "promote") {
-    if (!isControllerUser(interaction.user.id, appConfig)) {
-      await interaction.editReply("Only the owner or an approved controller can promote memory entries.");
-      return;
-    }
-    const id = interaction.options.getString("id", true);
-    const existing = await memoryStore.get(project, id, access);
-    if (!existing) {
-      await interaction.editReply(`No memory entry \`${id}\` found for \`${project.name}\`.`);
-      return;
-    }
-    const promoted = await memoryStore.promote(project, id);
-    await interaction.editReply(
-      promoted
-        ? `Promoted \`${id}\` to active/trusted for \`${project.name}\`. It is now eligible for automatic recall.`
-        : `No memory entry \`${id}\` found for \`${project.name}\`.`
-    );
-    return;
+  if (subcommand === "promote" || subcommand === "forget") {
+    return { subcommand, id: interaction.options.getString("id", true) };
   }
-
-  if (subcommand === "forget") {
-    if (!isOwner(interaction.user.id, appConfig)) {
-      await interaction.editReply("Only the configured Devbot owner can forget memory entries.");
-      return;
-    }
-    const id = interaction.options.getString("id", true);
-    const removed = await memoryStore.forget(project, id);
-    await interaction.editReply(
-      removed
-        ? `Forgot memory entry \`${id}\` for \`${project.name}\`. This removes it from Devbot's project memory only; it does not alter git history, Discord messages, task records, or backups.`
-        : `No memory entry \`${id}\` found for \`${project.name}\`.`
-    );
-    return;
+  if (subcommand === "purge") {
+    const confirm = interaction.options.getString("confirm") ?? undefined;
+    return { subcommand, ...(confirm ? { confirm } : {}) };
   }
+  return undefined;
 }
 
 async function handleTaskCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
