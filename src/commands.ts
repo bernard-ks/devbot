@@ -546,21 +546,72 @@ const commandBuilders = [
     .addSubcommand((subcommand) => subcommand.setName("digest").setDescription("Re-post the morning digest for the current queue.")),
   new SlashCommandBuilder()
     .setName("schedule")
-    .setDescription("Owner-only recurring devbot tasks. Read-only: schedules can only ask, never write.")
+    .setDescription("Owner-only recurring devbot tasks. Read-only by default; action occurrences are approval-gated.")
     .addSubcommand((subcommand) =>
       subcommand
         .setName("add")
-        .setDescription("Create a recurring read-only (ask) task.")
+        .setDescription("Create a recurring task. Read-only (ask) unless mode:action is chosen explicitly.")
         .addStringOption((option) =>
           option
             .setName("spec")
             .setDescription("daily HH:MM, weekdays HH:MM, or every <N>h, e.g. daily 07:00.")
             .setRequired(true)
         )
-        .addStringOption((option) => option.setName("task").setDescription("The read-only question to run on schedule.").setRequired(true))
+        .addStringOption((option) => option.setName("task").setDescription("The question or task to run on schedule.").setRequired(true))
+        .addStringOption((option) =>
+          option
+            .setName("mode")
+            .setDescription("ask (default): read-only. action: each occurrence posts an approval card before any write.")
+            .setRequired(false)
+            .addChoices({ name: "ask", value: "ask" }, { name: "action", value: "action" })
+        )
         .addStringOption((option) =>
           option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
         )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("approve")
+        .setDescription("Grant a standing approval so an action schedule can run without a fresh card, within limits.")
+        .addStringOption((option) => option.setName("id").setDescription("Schedule ID from /schedule list.").setRequired(true))
+        .addIntegerOption((option) =>
+          option
+            .setName("expires-in-hours")
+            .setDescription("Mandatory expiry: hours until this standing approval lapses (max 720).")
+            .setRequired(true)
+            .setMinValue(1)
+            .setMaxValue(720)
+        )
+        .addIntegerOption((option) =>
+          option
+            .setName("max-runs")
+            .setDescription("Mandatory budget: maximum occurrences this approval covers (max 500).")
+            .setRequired(true)
+            .setMinValue(1)
+            .setMaxValue(500)
+        )
+        .addIntegerOption((option) =>
+          option
+            .setName("review-after-runs")
+            .setDescription("Review checkpoint: after this many runs the next occurrence needs fresh approval.")
+            .setRequired(false)
+            .setMinValue(1)
+            .setMaxValue(500)
+        )
+        .addIntegerOption((option) =>
+          option
+            .setName("review-after-hours")
+            .setDescription("Review checkpoint: after this many hours the next occurrence needs fresh approval.")
+            .setRequired(false)
+            .setMinValue(1)
+            .setMaxValue(720)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("revoke")
+        .setDescription("Revoke a schedule's standing approval; occurrences fall back to approval cards.")
+        .addStringOption((option) => option.setName("id").setDescription("Schedule ID from /schedule list.").setRequired(true))
     )
     .addSubcommand((subcommand) => subcommand.setName("list").setDescription("List scheduled tasks."))
     .addSubcommand((subcommand) =>

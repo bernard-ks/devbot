@@ -33,6 +33,7 @@ export type AmbientAction =
   | "progress-cancel"
   | "completion-proof"
   | "completion-reviewed"
+  | "schedule-revoke"
   | "inbox-open"
   | "inbox-refresh"
   | "team-select";
@@ -96,6 +97,7 @@ export interface ProofFirstCompletionInput {
   changedFiles?: readonly string[];
   roles?: readonly AmbientRole[];
   showProofButton?: boolean;
+  standingApprovalScheduleId?: string;
 }
 
 export type NeedsMeUrgency = "normal" | "high";
@@ -302,19 +304,29 @@ export function proofFirstCompletionCard(input: ProofFirstCompletionInput): Ambi
     .addSeparatorComponents(new SeparatorBuilder().setDivider(true))
     .addTextDisplayComponents(text(result));
 
+  const buttons: ButtonBuilder[] = [];
   if (input.showProofButton !== false) {
-    container.addActionRowComponents(
-      new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setCustomId(ambientCustomId("completion-proof", input.taskId))
-          .setLabel("Open proof")
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId(ambientCustomId("completion-reviewed", input.taskId))
-          .setLabel("Mark reviewed")
-          .setStyle(ButtonStyle.Success)
-      )
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(ambientCustomId("completion-proof", input.taskId))
+        .setLabel("Open proof")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(ambientCustomId("completion-reviewed", input.taskId))
+        .setLabel("Mark reviewed")
+        .setStyle(ButtonStyle.Success)
     );
+  }
+  if (input.standingApprovalScheduleId) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(ambientCustomId("schedule-revoke", input.standingApprovalScheduleId))
+        .setLabel("Revoke standing approval")
+        .setStyle(ButtonStyle.Danger)
+    );
+  }
+  if (buttons.length > 0) {
+    container.addActionRowComponents(new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons));
   }
   return componentsV2Payload(container);
 }
@@ -409,6 +421,7 @@ function isAmbientAction(value: string | undefined): value is AmbientAction {
     || value === "progress-cancel"
     || value === "completion-proof"
     || value === "completion-reviewed"
+    || value === "schedule-revoke"
     || value === "inbox-open"
     || value === "inbox-refresh"
     || value === "team-select";

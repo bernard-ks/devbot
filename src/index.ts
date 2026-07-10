@@ -87,7 +87,15 @@ import {
   type TaskWorktree
 } from "./task-worktree.js";
 import { formatQueueDigest, formatQueueList, groupQueueItemsByProject, isQueueItemId, QueueStore, type QueueItem } from "./queue-store.js";
-import { formatScheduleList, isScheduleId, ScheduleStore, type ScheduleEntry } from "./schedule-store.js";
+import {
+  describeStandingApproval,
+  formatScheduleList,
+  isScheduleId,
+  ScheduleStore,
+  type ScheduleEntry,
+  type StandingApproval
+} from "./schedule-store.js";
+import { runActionOccurrence } from "./schedule-actions.js";
 import {
   parseTaskControl,
   taskActionMatchesState,
@@ -1711,6 +1719,7 @@ interface AmbientProposalRequest {
   channel: unknown;
   source: string;
   parentTaskId?: string;
+  updateSelectedProject?: boolean;
 }
 
 async function createAmbientProposalFromMessage(
@@ -1732,7 +1741,11 @@ async function createAmbientProposalFromMessage(
 }
 
 async function createAmbientProposal(input: AmbientProposalRequest): Promise<TaskRecord> {
-  await userPreferences.setSelectedProject(input.requesterId, input.project.name);
+  // Unattended sources (scheduled occurrences) must not silently rewrite the
+  // requester's selected project.
+  if (input.updateSelectedProject !== false) {
+    await userPreferences.setSelectedProject(input.requesterId, input.project.name);
+  }
   const task = await taskStore.propose({
     source: input.source,
     mode: "action",
@@ -1969,6 +1982,24 @@ async function handleAmbientButton(
   if (action === "inbox-refresh") {
     await interaction.deferUpdate();
     await interaction.editReply(await needsMePayload(interaction, appConfig));
+    return;
+  }
+  if (action === "schedule-revoke") {
+    if (!isControllerUser(interaction.user.id, appConfig)) {
+      await interaction.reply({ content: "Only the owner or an approved controller can revoke a standing approval.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!isScheduleId(entityId)) {
+      await interaction.reply({ content: "That schedule is no longer available.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const revoked = await scheduleStore.revokeStandingApproval(entityId, interaction.user.tag, interaction.user.id);
+    await interaction.reply({
+      content: revoked
+        ? `Standing approval for \`${entityId}\` was revoked. Future occurrences will post approval cards instead.`
+        : `No standing approval is active for \`${entityId}\`.`,
+      flags: MessageFlags.Ephemeral
+    });
     return;
   }
   const proposalReference = parseProposalEntityId(entityId);
@@ -2530,21 +2561,84 @@ async function handleScheduleCommand(interaction: ChatInputCommandInteraction, a
     }
     const spec = interaction.options.getString("spec", true);
     const taskText = interaction.options.getString("task", true);
+    // Only the explicit `action` choice yields a write-capable schedule; omitting the
+    // option always creates a read-only one.
+    const mode = interaction.options.getString("mode") === "action" ? "action" as const : "answer" as const;
     try {
       const entry = await scheduleStore.add({
         spec,
         project: project.name,
         taskText,
+        mode,
         addedBy: interaction.user.tag,
         addedById: interaction.user.id
       });
+      const modeNote = entry.mode === "action"
+        ? "action: each occurrence posts an approval card unless a standing approval from `/schedule approve` covers it"
+        : "read-only";
       await interaction.reply({
-        content: `Scheduled \`${entry.id}\` (read-only): ${entry.spec} on \`${project.name}\`. Next run ${new Date(entry.nextRun).toLocaleString()}.`,
+        content: `Scheduled \`${entry.id}\` (${modeNote}): ${entry.spec} on \`${project.name}\`. Next run ${new Date(entry.nextRun).toLocaleString()}.`,
         flags: MessageFlags.Ephemeral
       });
     } catch (error) {
       await interaction.reply({ content: publicErrorMessage(error), flags: MessageFlags.Ephemeral });
     }
+    return;
+  }
+
+  if (subcommand === "approve") {
+    // Granting a standing approval authorizes unattended write-capable runs, so it is
+    // gated exactly like creating or resuming schedules while safe mode is active.
+    if (appConfig.safeMode) {
+      await interaction.reply({ content: safeModeScheduleMessage("/schedule approve"), flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const id = interaction.options.getString("id", true).trim();
+    if (!isScheduleId(id)) {
+      await interaction.editReply(`Not a valid schedule id: \`${id}\`.`);
+      return;
+    }
+    const expiresInHours = interaction.options.getInteger("expires-in-hours", true);
+    const maxRuns = interaction.options.getInteger("max-runs", true);
+    const reviewAfterRuns = interaction.options.getInteger("review-after-runs");
+    const reviewAfterHours = interaction.options.getInteger("review-after-hours");
+    try {
+      const grantedAt = Date.now();
+      const entry = await scheduleStore.grantStandingApproval(id, {
+        grantedBy: interaction.user.tag,
+        grantedById: interaction.user.id,
+        expiresAt: new Date(grantedAt + expiresInHours * 3_600_000),
+        maxRuns,
+        ...(reviewAfterRuns !== null ? { reviewAfterRuns } : {}),
+        ...(reviewAfterHours !== null ? { reviewAt: new Date(grantedAt + reviewAfterHours * 3_600_000) } : {})
+      });
+      await interaction.editReply(
+        [
+          `Standing approval granted for \`${entry.id}\` (${describeStandingApproval(entry)}).`,
+          "Occurrences it covers execute without a fresh card and post proof to the project's room; once it expires, runs out, or reaches a review checkpoint, occurrences fall back to approval cards.",
+          "Revoke it anytime with `/schedule revoke` or the button on a standing-run result."
+        ].join("\n")
+      );
+    } catch (error) {
+      await interaction.editReply(publicErrorMessage(error));
+    }
+    return;
+  }
+
+  if (subcommand === "revoke") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const id = interaction.options.getString("id", true).trim();
+    if (!isScheduleId(id)) {
+      await interaction.editReply(`Not a valid schedule id: \`${id}\`.`);
+      return;
+    }
+    const revoked = await scheduleStore.revokeStandingApproval(id, interaction.user.tag, interaction.user.id);
+    await interaction.editReply(
+      revoked
+        ? `Standing approval for \`${id}\` was revoked. Future occurrences will post approval cards instead.`
+        : `No standing approval is active for \`${id}\`.`
+    );
     return;
   }
 
@@ -2813,11 +2907,12 @@ async function tickSchedules(appConfig: AppConfig): Promise<void> {
 }
 
 async function runScheduledEntry(appConfig: AppConfig, entry: ScheduleEntry): Promise<void> {
-  // Schedules are read-only-only. The store already rejects write-capable records at
-  // creation and on load, but an occurrence is the last gate before unattended execution,
-  // so fail closed here too if a legacy/corrupted record ever slips through.
-  if (String(entry.mode) !== "answer") {
-    await scheduleStore.markRun(entry.id, "Skipped: schedules are read-only; write-capable schedule records are not supported.");
+  // The store already rejects unknown-mode records at creation and on load, but an
+  // occurrence is the last gate before unattended execution, so fail closed here too if
+  // a corrupted record ever slips through. Only `answer` executes unattended; `action`
+  // occurrences go through the approval-gated path below.
+  if (String(entry.mode) !== "answer" && String(entry.mode) !== "action") {
+    await scheduleStore.markRun(entry.id, "Skipped: unsupported schedule mode; nothing was executed.");
     return;
   }
   const project = findProject(appConfig.projects, entry.project);
@@ -2832,6 +2927,17 @@ async function runScheduledEntry(appConfig: AppConfig, entry: ScheduleEntry): Pr
   }
 
   const channel = await scopedRoomChannel(appConfig, project, privateChannel);
+  if (entry.mode === "action") {
+    // Approval cards and standing-run proof must land with the project's scoped
+    // audience; without an audience-safe room the occurrence is skipped, never
+    // silently executed or posted elsewhere.
+    if (!channel) {
+      await scheduleStore.markRun(entry.id, "Skipped: no audience-safe room is available for this project's approval card.");
+      return;
+    }
+    await runScheduledActionEntry(appConfig, entry, project, channel);
+    return;
+  }
   let message: Message | undefined;
   try {
     const result = await runProjectRequest({
@@ -2873,6 +2979,102 @@ async function runScheduledEntry(appConfig: AppConfig, entry: ScheduleEntry): Pr
   } catch (error) {
     await scheduleStore.markRun(entry.id, `Failed: ${publicErrorMessage(error)}`);
   }
+}
+
+/**
+ * Resolves one claimed `action` occurrence. The decision logic (standing approval vs
+ * approval card vs skip) lives in `runActionOccurrence`; this wires it to the ambient
+ * proposal flow and the task engine, always against the project's scoped audience.
+ */
+async function runScheduledActionEntry(
+  appConfig: AppConfig,
+  entry: ScheduleEntry,
+  project: ProjectEntry,
+  channel: GuildTextBasedChannel
+): Promise<void> {
+  await runActionOccurrence(entry, {
+    scheduleStore,
+    taskStore,
+    safeMode: appConfig.safeMode,
+    createProposal: async (occurrence) =>
+      createAmbientProposal({
+        appConfig,
+        project,
+        text: occurrence.taskText,
+        includePatterns: [],
+        requester: occurrence.addedBy,
+        requesterId: occurrence.addedById,
+        channelId: channel.id,
+        channel,
+        source: `schedule:${occurrence.id}`,
+        updateSelectedProject: false
+      }),
+    executeStandingRun: (occurrence, approval) =>
+      executeStandingScheduleRun(appConfig, occurrence, approval, project, channel)
+  });
+}
+
+async function executeStandingScheduleRun(
+  appConfig: AppConfig,
+  entry: ScheduleEntry,
+  approval: StandingApproval,
+  project: ProjectEntry,
+  channel: GuildTextBasedChannel
+): Promise<string> {
+  let message: Message | undefined;
+  const trigger = `Trigger: scheduled: ${entry.spec} (standing-approval run ${approval.runsUsed}/${approval.maxRuns}, granted by ${approval.grantedBy}).`;
+  const result = await runProjectRequest({
+    appConfig,
+    project,
+    text: entry.taskText,
+    includePatterns: [],
+    mode: "action",
+    requester: entry.addedBy,
+    requesterId: entry.addedById,
+    source: `schedule:${entry.id}`,
+    onProgress: async (progress) => {
+      const content = `${formatTaskProgress(progress)}\n\n${trigger}`;
+      const components = [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })];
+      if (!message) {
+        message = await channel.send({ content, components });
+      } else {
+        await message.edit({ content, components }).catch(() => undefined);
+      }
+    }
+  });
+  const completed = await taskStore.get(result.taskId);
+  const proof = [
+    ...(completed?.verification ?? []).map((detail) => ({
+      label: proofStatusForEvidence(detail) === "failed" ? "Attention" : "Recorded evidence",
+      detail,
+      status: proofStatusForEvidence(detail)
+    })),
+    {
+      label: "Standing approval",
+      detail: `Run ${approval.runsUsed} of ${approval.maxRuns}, granted by ${approval.grantedBy}, expires ${new Date(approval.expiresAt).toLocaleString()}.`,
+      status: "info" as const
+    },
+    { label: "Model route", detail: formatRoute(result.route), status: "info" as const }
+  ];
+  if (message) {
+    await message
+      .edit({
+        content: `Standing-approval occurrence complete. ${trigger}`,
+        components: [taskControlRow(result.taskId, { status: "succeeded", mode: "action" })]
+      })
+      .catch(() => undefined);
+  }
+  await sendToTextChannel(channel, proofFirstCompletionCard({
+    taskId: result.taskId,
+    project: project.name,
+    title: entry.taskText,
+    summary: result.answer,
+    proof,
+    ...(completed?.changedFiles ? { changedFiles: completed.changedFiles } : {}),
+    showProofButton: true,
+    standingApprovalScheduleId: entry.id
+  }));
+  return truncateSummary(result.answer);
 }
 
 function truncateSummary(value: string): string {
