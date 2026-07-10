@@ -166,6 +166,10 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/ask question:<text> project:<optional> include:<optional patterns>`: Ask the model a question with local project context.
 - `/do task:<text> project:<optional> include:<optional patterns>`: Ask local Codex to perform a focused project task. Requires owner or controller access.
 - `/ship task:<task-id>`: Compose a 1200x675 shareable card for a completed `/do` task with the project name and task summary. Action tasks run in an isolated Git worktree with no managed preview, so their card is text-only with an explicit "visual proof unavailable" note; a live screenshot is only attempted for non-isolated tasks. Requires owner or controller access; also available as a "Ship it" button on completed action tasks.
+- `/remember text:<text> project:<optional> kind:<decision|note>`: Record a project decision or note for Devbot to recall later. Requires owner or controller access.
+- `/memory list project:<optional> kind:<optional> limit:<optional>`: List recent memory entries for a project.
+- `/memory search query:<text> project:<optional>`: Search memory entries by relevance to a query.
+- `/memory forget id:<memory-id> project:<optional>`: Owner-only; permanently delete a memory entry.
 
 You can also mention the bot in a channel:
 

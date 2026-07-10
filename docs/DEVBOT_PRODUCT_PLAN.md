@@ -40,6 +40,7 @@ The safety contract is explicit: only the requester or an approved controller ca
   - `/refresh` rebuilds the in-memory project file index.
   - `/ask` answers read-only project questions with local context.
   - `/do` asks local Codex to perform focused project work.
+  - `/remember`, `/memory list`, `/memory search`, and `/memory forget` record and recall per-project decisions, notes, and task outcomes.
   - Guild command definitions synchronize automatically at startup.
 - Mention support:
   - Direct bot mentions can invoke the bot without requesting the privileged Message Content intent.
@@ -89,6 +90,11 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Screenshots wait for two consecutive identical frames (animations/transitions disabled, `prefers-reduced-motion` emulated) before being used, so loading spinners and blinking carets don't get misread as content.
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
+- Project memory:
+  - Persists decisions, manual notes, and completed action-task outcomes per project in `.devbot/memory.jsonl`.
+  - Automatically records a terse outcome (result, changed files, detail) when an action task succeeds or fails.
+  - Ranks memory entries against each `/ask`/`/do` request using the same relevance scoring as file context, then folds the top matches into the prompt as a clearly delimited, explicitly untrusted "project history" block that the model is instructed never to treat as instructions.
+  - `/status` and `/setup doctor` surface memory entry counts and store health.
 
 ## Current Constraints
 
