@@ -20,6 +20,7 @@ The small-team foundation now exists: owner-managed private setup, durable local
   - `/projects` lists configured local projects.
   - `/status` reports a decision-ready brief: confirmed bot work and phases, external runs, activity-unknown app sessions, repository evidence, risks, and a recommended next step.
   - `/status image:true` can attach a live local UI screenshot when a web dev server is detected.
+  - `/dashboard` opens a personal Discord-native workspace with authorized project selection and modal Ask / Change flows.
   - `/refresh` rebuilds the in-memory project file index.
   - `/ask` answers read-only project questions with local context.
   - `/do` asks local Codex to perform focused project work.
@@ -27,7 +28,7 @@ The small-team foundation now exists: owner-managed private setup, durable local
 - Mention support:
   - Direct bot mentions can invoke the bot without requesting the privileged Message Content intent.
   - Status-style mentions avoid unnecessary Codex runs.
-  - Normal mentions stay read-only; `/do` is the explicit write-capable surface.
+  - Normal mentions stay read-only; workspace Make change and `/do` are the explicit write-capable surfaces.
 - Local project context:
   - Scans static or owner-registered project roots and supports a selected default on multi-project hosts.
   - Ignores dependency/build folders and common secret files.
@@ -38,6 +39,8 @@ The small-team foundation now exists: owner-managed private setup, durable local
   - Supports read-only answer mode and workspace-write action mode.
   - Routes requests through Luna, Terra, or Sol and chooses none, focused, or full prepacked project context before execution.
   - Tracks active work in memory and persists task history locally.
+  - Updates one Discord task message through routing, context preparation, work, failure, cancellation, and completion.
+  - Uses restart-stable task controls for follow-up, review, validation, adjustment, retry, and cancellation.
 - External local Codex awareness:
   - Detects local Codex app/CLI sessions whose working directory belongs to a configured project.
   - Separates confirmed external runs from open app sessions whose activity cannot be known.
@@ -71,9 +74,8 @@ The small-team foundation now exists: owner-managed private setup, durable local
   - project aliases
   - review links or branch references and merge state
   - screenshot URLs and capture metadata
-- Add durable task IDs to every `/do` request while keeping them out of normal conversation UI.
-- Add `/task status <id>`, `/task cancel <id>`, `/task logs <id>`, and `/task retry <id>`.
-- Persist work status across bot restarts.
+- Migrate durable local task state to SQLite while keeping task IDs out of normal conversation UI.
+- Persist recoverable active execution across bot restarts instead of closing interrupted tasks as canceled.
 - Add structured logs with request IDs.
 
 ### 2. Better Project Awareness
@@ -237,7 +239,7 @@ MVP multi-bot flow:
 - Add reviewer assignment.
 - Add verification/check summarization.
 - Add cross-bot handoff threads. MVP implemented as `/lab handoff` cards and peer review-packet requests; lab sessions now create Discord audit threads where the channel supports them.
-- Add project dashboards in Discord. MVP implemented as `/dashboard`.
+- Add project dashboards in Discord. Implemented as a personal interactive `/dashboard` workspace plus a shared setup launcher.
 - Add automatic stale task reminders. MVP implemented as `/task stale`; automatic timed reminders remain deferred to avoid surprise channel noise.
 - Add private devbot collaboration lab. MVP implemented with `/lab council`, `/lab roundtable`, `/lab see`, `/lab handoff`, `/lab bossfight`, `/lab jam`, `/lab argue`, `/lab fix-from-snip`, `/lab campfire`, `/lab roster`, `/lab ritual`, `/lab recent`, `/lab events`, `/lab approve`, and `/lab safety`.
 

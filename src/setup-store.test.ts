@@ -22,6 +22,7 @@ test("setup store persists access peers repositories defaults and room", async (
   await store.setRepository("Web App", repoRoot);
   await store.setDefaultProject("web-app");
   await store.setPrivateChannel("channel-1");
+  await store.setWorkspaceMessage("message-1");
 
   const reloaded = new SetupStore(filePath).snapshot();
   assert.deepEqual(reloaded.viewerUserIds, ["controller-1", "viewer-1"]);
@@ -30,6 +31,7 @@ test("setup store persists access peers repositories defaults and room", async (
   assert.equal(reloaded.repositories["web-app"], repoRoot);
   assert.equal(reloaded.defaultProjectName, "web-app");
   assert.equal(reloaded.privateChannelId, "channel-1");
+  assert.equal(reloaded.workspaceMessageId, "message-1");
 });
 
 test("setup access changes preserve controller-viewer invariants under concurrency", async () => {
@@ -113,7 +115,7 @@ test("setup wizard renders resumable readiness and native controls", () => {
 
   const ready = setupWizardView(emptyState, config, "room-1", true);
   assert.match(ready.content, /Devbot is ready/);
-  assert.match(ready.content, /Ask: mention/);
+  assert.match(ready.content, /workspace launcher is ready/);
   assert.equal(ready.components[0]?.toJSON().components.find((component) => "custom_id" in component && component.custom_id.endsWith(":finish"))?.disabled, false);
 });
 

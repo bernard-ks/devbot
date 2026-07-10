@@ -173,7 +173,7 @@ export const commandDefinitions = [
     ),
   new SlashCommandBuilder()
     .setName("dashboard")
-    .setDescription("Show a compact project dashboard with active work, recent tasks, and configured commands.")
+    .setDescription("Open your interactive project workspace.")
     .addStringOption((option) =>
       option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
     ),

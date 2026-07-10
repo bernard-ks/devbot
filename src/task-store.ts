@@ -4,6 +4,8 @@ import { randomBytes } from "node:crypto";
 
 export type TaskStatus = "running" | "succeeded" | "failed" | "canceled";
 
+const TASK_ID_PATTERN = /^task-[a-z0-9-]{1,64}$/i;
+
 export interface TaskRecord {
   id: string;
   status: TaskStatus;
@@ -13,6 +15,8 @@ export interface TaskRecord {
   requester: string;
   text: string;
   includePatterns: string[];
+  parentTaskId?: string;
+  dedupeKey?: string;
   contextFileCount?: number;
   model?: string;
   modelTier?: string;
@@ -33,6 +37,8 @@ export interface StartTaskInput {
   requester: string;
   text: string;
   includePatterns?: string[];
+  parentTaskId?: string;
+  dedupeKey?: string;
 }
 
 interface TaskStateFile {
@@ -51,6 +57,9 @@ export class TaskStore {
 
   async start(input: StartTaskInput): Promise<TaskRecord> {
     return this.mutate((state) => {
+      if (input.dedupeKey && state.tasks.some((task) => task.dedupeKey === input.dedupeKey)) {
+        throw new Error("That task action has already started. Open its child task for the latest state.");
+      }
       const now = new Date().toISOString();
       const task: TaskRecord = {
         id: newTaskId(),
@@ -61,6 +70,8 @@ export class TaskStore {
         requester: input.requester,
         text: input.text,
         includePatterns: input.includePatterns ?? [],
+        ...(input.parentTaskId ? { parentTaskId: input.parentTaskId } : {}),
+        ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
         startedAt: now,
         updatedAt: now
       };
@@ -79,8 +90,13 @@ export class TaskStore {
     contextMode?: string;
     routeReason?: string;
     routeSource?: string;
-  }): Promise<void> {
+  }): Promise<boolean> {
+    let transitioned = false;
     await this.update(id, (task, now) => {
+      if (task.status !== "running") {
+        return;
+      }
+      transitioned = true;
       task.status = "succeeded";
       if (result.contextFileCount !== undefined) {
         task.contextFileCount = result.contextFileCount;
@@ -95,14 +111,21 @@ export class TaskStore {
       if (result.routeSource !== undefined) task.routeSource = result.routeSource;
       task.finishedAt = now;
     });
+    return transitioned;
   }
 
-  async fail(id: string, error: unknown): Promise<void> {
+  async fail(id: string, error: unknown): Promise<boolean> {
+    let transitioned = false;
     await this.update(id, (task, now) => {
+      if (task.status !== "running") {
+        return;
+      }
+      transitioned = true;
       task.status = "failed";
       task.error = error instanceof Error ? error.message : String(error);
       task.finishedAt = now;
     });
+    return transitioned;
   }
 
   async cancel(id: string, reason = "Canceled by user request."): Promise<TaskRecord | undefined> {
@@ -119,6 +142,24 @@ export class TaskStore {
       canceled = task;
     });
     return canceled;
+  }
+
+  async interruptRunning(reason = "Interrupted when Devbot restarted."): Promise<number> {
+    return this.mutate((state) => {
+      const now = new Date().toISOString();
+      let interrupted = 0;
+      for (const task of state.tasks) {
+        if (task.status !== "running") {
+          continue;
+        }
+        task.status = "canceled";
+        task.error = reason;
+        task.finishedAt = now;
+        task.updatedAt = now;
+        interrupted += 1;
+      }
+      return interrupted;
+    });
   }
 
   async get(id: string): Promise<TaskRecord | undefined> {
@@ -258,6 +299,7 @@ export function formatTaskDetail(task: TaskRecord): string {
     task.modelTier ? `Route: ${task.modelTier} / ${task.contextMode ?? "unknown"} via ${task.routeSource ?? "unknown"}` : undefined,
     task.model ? `Model: ${task.model}` : undefined,
     task.routeReason ? `Route reason: ${task.routeReason}` : undefined,
+    task.parentTaskId ? `Continues task: \`${task.parentTaskId}\`` : undefined,
     `Requester: ${task.requester}`,
     `Started: ${formatTime(task.startedAt)}`,
     task.finishedAt ? `Finished: ${formatTime(task.finishedAt)}` : undefined,
@@ -275,6 +317,10 @@ export function formatTaskDetail(task: TaskRecord): string {
 
 function newTaskId(): string {
   return `task-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+}
+
+export function isTaskId(value: string): boolean {
+  return TASK_ID_PATTERN.test(value);
 }
 
 function formatTime(value: string): string {
