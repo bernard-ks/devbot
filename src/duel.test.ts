@@ -99,10 +99,39 @@ test("verdict parsing treats an empty response as indeterminate, never approve",
   assert.ok(verdict.warnings.some((warning) => warning.includes("empty")));
 });
 
-test("verdict parsing tolerates an approve verdict with stray issue-shaped text ignored", () => {
+test("verdict parsing treats an approve verdict with stray prose as indeterminate, never approve", () => {
   const verdict = parseDuelVerdict("VERDICT: approve\nNo substantive issues found in this change.");
+  assert.equal(verdict.overall, "indeterminate");
+  assert.equal(verdict.issues.length, 0);
+  assert.ok(verdict.warnings.some((warning) => warning.includes("Unexpected output line")));
+});
+
+test("verdict parsing accepts an approve verdict when the only other output is blank lines", () => {
+  const verdict = parseDuelVerdict("VERDICT: approve\n\n   \n");
   assert.equal(verdict.overall, "approve");
   assert.equal(verdict.issues.length, 0);
+  assert.equal(verdict.warnings.length, 0);
+});
+
+test("verdict parsing treats an unanchored 'VERDICT approve OR request-changes' as indeterminate, never approve", () => {
+  const verdict = parseDuelVerdict("VERDICT approve OR request-changes");
+  assert.equal(verdict.overall, "indeterminate");
+  assert.equal(verdict.issues.length, 0);
+  assert.ok(verdict.warnings.some((warning) => warning.includes("Could not parse verdict line")));
+});
+
+test("verdict parsing treats 'VERDICT approve but I found a serious bug' as indeterminate, never approve", () => {
+  const verdict = parseDuelVerdict("VERDICT approve but I found a serious bug");
+  assert.equal(verdict.overall, "indeterminate");
+  assert.equal(verdict.issues.length, 0);
+  assert.ok(verdict.warnings.some((warning) => warning.includes("Could not parse verdict line")));
+});
+
+test("verdict parsing treats 'VERDICT approve' followed by a bullet-prefixed ISSUE line as indeterminate, never approve", () => {
+  const verdict = parseDuelVerdict("VERDICT approve\n- ISSUE severity=high file=src/x.ts line=1 claim=This actually breaks things.");
+  assert.equal(verdict.overall, "indeterminate");
+  assert.equal(verdict.issues.length, 0);
+  assert.ok(verdict.warnings.some((warning) => warning.includes("Unexpected output line")));
 });
 
 test("verdict parsing treats a contradictory approve-with-issues as indeterminate, not approve", () => {

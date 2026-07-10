@@ -164,7 +164,7 @@ function capChunkBytes(chunk: string, maxBytes: number): string {
   return `${buffer.subarray(0, keepBytes).toString("utf8")}${suffix}`;
 }
 
-const VERDICT_LINE = /^\s*verdict\s*[:=]?\s*(approve|request[-_ ]changes)\b/i;
+const VERDICT_LINE = /^\s*verdict\s*[:=]?\s*(approve|request[-_ ]changes)\s*$/i;
 const VERDICT_PREFIX = /^\s*verdict\b/i;
 const ISSUE_LINE = /^\s*issue\b[:\s]*(.*)$/i;
 
@@ -192,6 +192,9 @@ export function parseDuelVerdict(response: string): DuelVerdict {
   const issues: DuelIssue[] = [];
 
   for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
     const verdictMatch = line.match(VERDICT_LINE);
     if (verdictMatch?.[1]) {
       declaredVerdicts.push(normalizeOverall(verdictMatch[1]));
@@ -209,7 +212,9 @@ export function parseDuelVerdict(response: string): DuelVerdict {
       } else {
         warnings.push(`Could not parse issue line: ${line.trim().slice(0, 200)}`);
       }
+      continue;
     }
+    warnings.push(`Unexpected output line makes the verdict indeterminate: ${line.trim().slice(0, 200)}`);
   }
 
   if (declaredVerdicts.length === 0) {

@@ -96,6 +96,7 @@ import {
   type DuelResult
 } from "./duel.js";
 import { DuelStore } from "./duel-store.js";
+import { reconcileInterruptedDuels } from "./duel-recovery.js";
 import { duelDecisionRow, isBoundDuelControl, parseDuelControl, type ParsedDuelControl } from "./duel-ui.js";
 import {
   commandRequiresApproval,
@@ -238,9 +239,13 @@ client.once("clientReady", async () => {
     console.warn(`Unable to recover interrupted tasks: ${publicErrorMessage(error)}`);
   }
   try {
-    const interruptedDuels = await duelStore.interruptRunning();
-    if (interruptedDuels > 0) {
-      console.log(`Recovered ${interruptedDuels} interrupted duel review${interruptedDuels === 1 ? "" : "s"} from the previous runtime.`);
+    const { interruptedIds } = await reconcileInterruptedDuels(duelStore, collabStore, (id, error) => {
+      console.warn(`Unable to close collaboration conversation for interrupted duel ${id}: ${publicErrorMessage(error)}`);
+    });
+    if (interruptedIds.length > 0) {
+      console.log(
+        `Recovered ${interruptedIds.length} interrupted duel review${interruptedIds.length === 1 ? "" : "s"} from the previous runtime.`
+      );
     }
   } catch (error) {
     console.warn(`Unable to recover interrupted duel reviews: ${publicErrorMessage(error)}`);

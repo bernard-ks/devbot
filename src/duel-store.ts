@@ -134,16 +134,20 @@ export class DuelStore {
     return { dismissed, record };
   }
 
-  async interruptRunning(reason = "Interrupted when Devbot restarted."): Promise<number> {
+  /** Marks every still-"running" duel as failed and returns their ids so the startup path can
+   *  reconcile each one's side effects (a duel's id is its collaboration conversation id). A
+   *  crash-interrupted duel otherwise leaves its collaboration conversation open forever, which
+   *  keeps consuming the collaboration limit. */
+  async interruptRunning(reason = "Interrupted when Devbot restarted."): Promise<string[]> {
     return this.mutate((state) => {
       const now = new Date().toISOString();
-      let interrupted = 0;
+      const interrupted: string[] = [];
       for (const record of state.duels) {
         if (record.status !== "running") continue;
         record.status = "failed";
         record.error = reason;
         record.updatedAt = now;
-        interrupted += 1;
+        interrupted.push(record.id);
       }
       return interrupted;
     });

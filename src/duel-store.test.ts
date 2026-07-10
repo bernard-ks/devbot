@@ -91,13 +91,31 @@ test("dismiss is refused for running or failed duels", async () => {
   assert.equal(afterFailure.dismissed, false);
 });
 
-test("interruptRunning marks running duels as failed for restart-safe recovery", async () => {
+test("interruptRunning marks running duels as failed and returns their ids for reconciliation", async () => {
   const store = await newStore();
   await store.start({ id: "collab-1", taskId: "task-1", projectName: "webapp" });
+  await store.start({ id: "collab-2", taskId: "task-2", projectName: "webapp" });
+  await store.succeed("collab-2", {
+    authorTier: "standard",
+    reviewerTier: "deep",
+    reviewerIndependence: "independent",
+    evidence: { patchHash: "hash", fileCount: 0, includedFileCount: 0, truncated: false },
+    overall: "approve",
+    issues: []
+  });
+  await store.start({ id: "collab-3", taskId: "task-3", projectName: "webapp" });
+
   const interrupted = await store.interruptRunning("Interrupted when Devbot restarted.");
-  assert.equal(interrupted, 1);
-  const record = await store.get("collab-1");
-  assert.equal(record?.status, "failed");
+  assert.deepEqual(interrupted.sort(), ["collab-1", "collab-3"]);
+  assert.equal((await store.get("collab-1"))?.status, "failed");
+  assert.equal((await store.get("collab-2"))?.status, "succeeded");
+  assert.equal((await store.get("collab-3"))?.status, "failed");
+});
+
+test("interruptRunning returns an empty id list when nothing was running", async () => {
+  const store = await newStore();
+  const interrupted = await store.interruptRunning();
+  assert.deepEqual(interrupted, []);
 });
 
 test("stored issues are bounded in count and per-field length, not stored verbatim", async () => {
