@@ -1,34 +1,41 @@
 # Lane J — Agent-vs-agent duel review
 
-## What this adds
+## What this adds (current scope: stage 1, read-only)
 
 A second, independent Codex session adversarially reviews a completed write-capable task's
-actual diff, the original author gets one rebuttal round, and the resolved outcome (conceded /
-disputed / withdrawn) surfaces to the owner in a dedicated Discord thread.
+change evidence, an author-side session gets one rebuttal round, and the resolved outcome
+(conceded / disputed) surfaces to the owner in a dedicated Discord thread. The duel is
+deliberately read-only in this stage: it never creates write tasks. Automated "Accept & fix"
+returns as stage 2, once the reviewed snapshot is reproducible for a fix task and the
+decision-to-task transition is atomic (see "Review round 2 — stage-1 rescope" below).
 
 - `/review duel task:<task-id>` — owner/controller-only slash command.
 - A **Duel review** button on completed action-mode task cards (owner/controller-gated), next to
   Follow up / Review changes / Run checks.
 - Reviewer round: a fresh read-only Codex session, always on a *different* Luna/Terra/Sol tier than
-  the author used (fast/standard → reviewer runs deep; deep → reviewer runs standard), given the
-  task's actual `git diff HEAD` (budgeted/truncated per file and in total) and asked to return a
-  structured `VERDICT:` + `ISSUE severity=... file=... line=... claim=...` block, or approve plainly
-  when the diff is clean.
-- Rebuttal round: only runs if the reviewer raised at least one issue. The original author's tier
-  gets the same diff plus the reviewer's issues and must respond with one `RESPONSE id=... stance=
-  concede|rebut|withdraw reasoning=...` line per issue. No third round.
-- Each issue resolves to a final status: `concede` → conceded (real), `rebut` → disputed,
-  `withdraw` → withdrawn, no rebuttal recorded → disputed (left open, not silently dropped).
-- The duel is recorded as a `CollabStore` conversation (new `"duel"` intent alongside the existing
-  lab intents) with a dedicated audit thread — reusing the same `startLabConversation` /
-  `createLabThread` machinery every other `/lab` command uses, so `/lab recent`-style history and
-  the thread pattern both work for duels without new infrastructure.
-- Thread message: summary (verdict, tiers, N issues: X conceded / Y disputed / Z withdrawn) +
-  the issue list with severities, file:line, reviewer claim, and author response.
-- If any issue was conceded, an **Accept & fix** button (owner/controller only) opens a modal
-  pre-filled with a `/do`-style fix task built from the conceded issues (editable before submit,
-  respects safe mode); **Dismiss** records a `deny` decision. Both are one-shot — decisions can't
-  be re-recorded once made (guarded by `CollabStore.decide`'s existing single-decision rule).
+  the author used (fast/standard → reviewer runs deep; deep → reviewer runs standard), given
+  evidence built against the task's recorded base revision — committed, staged, unstaged, and
+  bounded untracked changes, sensitive paths excluded, redacted, byte-budgeted, and pinned by a
+  SHA-256 patch hash — and asked to return a structured `VERDICT:` + `ISSUE severity=... file=...
+  line=... claim=...` block, or approve plainly when the diff is clean.
+- Rebuttal round: only runs if the reviewer raised at least one issue. An author-side session (a
+  fresh session on the author's tier, no continuity with the original run) gets the same evidence
+  plus the reviewer's issues and must respond with one `RESPONSE id=... stance=concede|rebut
+  reasoning=...` line per issue. No unilateral withdraw, no third round.
+- Verdict parsing fails closed: approve requires zero issues, request-changes requires at least
+  one valid issue, and anything empty, malformed, or contradictory is `indeterminate` — surfaced
+  as UNRESOLVED with its parser warnings, never as a clean pass.
+- The duel is recorded as a `CollabStore` conversation (new `"duel"` intent) with a dedicated
+  audit thread, plus a durable, versioned `DuelStore` record created *before* model work runs
+  (running/succeeded/failed, restart-safe). Clean, failed, and dismissed duels close their
+  conversation terminally so they never pile up against the open-collaboration limit.
+- Thread message: summary (verdict, tiers, reviewer-independence status, snapshot identity,
+  evidence coverage, warnings, N issues: X conceded / Y disputed) + the issue list with
+  severities, file:line, reviewer claim, and author response.
+- If any issue was conceded, a **Copy fix prompt** button (owner/controller only, bound to the
+  duel's own control message) replies ephemerally with a copyable `/do`-style follow-up prompt and
+  a truthful explanation that this stage never starts the task itself; **Dismiss** records a
+  `deny` decision one-shot and closes the duel.
 
 ## Files touched
 
@@ -42,19 +49,19 @@ disputed / withdrawn) surfaces to the owner in a dedicated Discord thread.
   rebuttal parsing (well-formed/empty/unknown-id), the issue-status resolution matrix, tier
   selection, tier labels, fix-task prompt construction, and two engine-level tests (clean diff
   skips rebuttal; issue found runs both rounds) using an injected fake `complete`.
-- `src/duel-ui.ts` (new) — Discord button/modal customId encoding and tolerant parsing:
-  `devbot:duel-control:review:<taskId>`, `devbot:duel-control:accept|dismiss:<conversationId>`,
-  `devbot:duel-fix-modal:<conversationId>`.
+- `src/duel-ui.ts` (new) — Discord button customId encoding and tolerant parsing plus the
+  control-message binding predicate: `devbot:duel-control:review:<taskId>`,
+  `devbot:duel-control:prompt|dismiss:<conversationId>`.
 - `src/task-controls.ts` — imports `duelReviewButton`; adds it to `taskActionRows` for
   succeeded action-mode tasks when the viewer can control.
 - `src/collab-protocol.ts` — added `"duel"` to `CollabIntent` (type + runtime array); no other
   protocol changes.
 - `src/commands.ts` — added `/review duel task:<task-id>` subcommand (autocomplete reuses the
   existing generic `task`-named-option autocomplete handler, no new autocomplete wiring needed).
-- `src/index.ts` — `handleReviewDuelCommand`, `handleDuelControl`, `handleDuelFixModal`,
-  `runDuelForTask` (shared by the slash command and the button), `recordDuelResult`,
-  `duelResolvedIssuesFromConversation`; new customId dispatch branches for buttons and modal
-  submits; widened `startLabConversation`/`createLabThread` parameter types to also accept
+- `src/index.ts` — `handleReviewDuelCommand`, `handleDuelControl`,
+  `runDuelForTask` (shared by the slash command and the button), `recordDuelAudit`;
+  a new customId dispatch branch for the duel buttons;
+  widened `startLabConversation`/`createLabThread` parameter types to also accept
   `ButtonInteraction` (both already only used `.channel`/`.user`/`.channelId`, which both
   interaction kinds have) so the button-triggered duel can reuse the exact same thread-creation
   path as `/lab` commands.
@@ -68,34 +75,31 @@ disputed / withdrawn) surfaces to the owner in a dedicated Discord thread.
 3. Confirm a new thread appears (named like `duel Duel review: task-... <suffix>`) with the
    posting bot's header, then the verdict/issue summary.
 4. If issues were raised, confirm the author's response lines appear per issue and the
-   conceded/disputed/withdrawn counts in the summary match.
-5. If ≥1 issue was conceded, click **Accept & fix**, confirm a modal opens pre-filled with the
-   conceded issues, edit if desired, submit, and confirm a new write-capable task starts.
-6. Click **Dismiss** on a different duel and confirm it records without starting a task, and that
-   clicking either decision button again says the duel was already decided.
+   conceded/disputed counts in the summary match, along with the snapshot identity, evidence
+   coverage, and any parser warnings.
+5. If ≥1 issue was conceded, click **Copy fix prompt**, confirm you get an ephemeral copyable
+   `/do`-style prompt plus an explanation that this stage never starts the task itself, and
+   confirm no task starts.
+6. Click **Dismiss** and confirm it records the decision and closes the duel, and that clicking
+   either decision button again says the duel was already decided.
 7. Confirm a non-owner/non-controller account cannot trigger `/review duel`, the button, or the
-   decision buttons.
+   decision buttons, and that the decision buttons refuse clicks relayed from any message other
+   than the duel's own control message.
+8. Run a duel against a clean change (reviewer approves, nothing conceded) and confirm its
+   workroom conversation is closed automatically rather than left open.
 
 ## Known limitations / risks
 
-- Diff evidence is `git diff HEAD` against the working tree at duel time, not a snapshot pinned to
-  when the task actually ran; if further changes land on the project between the task finishing
-  and the duel running, the reviewer sees the current working tree, not strictly "that task's"
-  diff. This matches the only diff source `review.ts` already offers elsewhere in devbot (task
-  records don't track a changed-file list), so it's consistent with existing behavior, not a new
-  gap — but worth knowing if multiple tasks land back-to-back before a duel is requested.
+- Diff evidence is captured at duel time against the task's recorded base revision and pinned by a
+  patch hash, but it still reads the task workspace as it exists when the duel runs; if the
+  workspace changed since the task finished, the review honestly covers the current state (and
+  records that identity), not a time-of-completion archive. Task records don't retain a
+  time-of-completion snapshot today; that archival snapshot is a stage-2 prerequisite.
 - The reviewer/rebuttal prompts ask the model to follow an exact line format; the parsers are
   tolerant (regex-based, warn-and-degrade on drift) but a badly-misbehaving model could still
-  produce zero parsed issues on a genuinely dirty diff. This fails toward "approve" rather than
-  toward inventing false positives, which matches the acceptance criterion but means a false
-  "clean" review is possible if the reviewer ignores the format entirely. Nothing in this codebase
-  today validates model output against ground truth beyond structural parsing (the same trust
-  boundary `request-router.ts`'s router-response parsing already accepts elsewhere in devbot).
-- `duelResolvedIssuesFromConversation` reconstructs conceded issues for **Accept & fix** by reading
-  back a JSON-stringified contribution from `CollabStore` rather than a dedicated typed store. This
-  keeps the durable-state footprint small and reuses existing infrastructure per the lane brief's
-  instruction to follow `collab-store.ts` patterns, but it means duel history isn't independently
-  queryable outside that one conversation's contributions today.
+  produce output with no parseable verdict on a genuinely dirty diff. That now resolves to an
+  `indeterminate` result surfaced as UNRESOLVED with warnings — never a silent approve — but it
+  does mean a duel can end without a usable verdict when the reviewer ignores the format entirely.
 - No repo file contained instruction-shaped text directed at AI agents; nothing to flag there.
 - Two full Codex read-only invocations per duel (reviewer + optional rebuttal) can take a while
   back-to-back for a `deep`/Sol-tier reviewer; the slash command and button both defer the reply
@@ -144,11 +148,16 @@ top-level `interactionCreate` `try/catch` → `replyWithError`, which already ca
 `security.test.ts` case "configured project commands receive an empty temporary home" — passed
 clean on the first run, no rerun needed).
 
-## Review round 1
+## Review round 1 (historical)
 
-bernard requested changes on the initial PR (`REVIEW.md`, `CHANGES_REQUESTED`). Every numbered
-blocking issue is addressed below with its fix and the test(s) that cover it. New commits only;
+bernard requested changes on the initial PR (`CHANGES_REQUESTED`). Every numbered blocking issue
+was addressed as described below with its fix and the test(s) that cover it. New commits only;
 nothing in the reviewed history was rewritten.
+
+> Note: the round-1 responses to issues 3 and 4 built a reproducibility-gated, atomically-claimed
+> **Accept & fix** path. That entire write path was subsequently REMOVED in the stage-1 rescope
+> (see "Review round 2 — stage-1 rescope" at the end of this document), which resolves those two
+> issues by construction instead. The text below is kept as an accurate record of round 1 only.
 
 **1. The "actual diff" is not the task's complete change.** `gatherDuelChangeEvidence()` (`src/duel.ts`)
 was rewritten: it now takes the task's isolation info and builds evidence relative to
@@ -312,3 +321,37 @@ consecutive full runs.
 4. Confirm dismiss/accept both refuse if clicked from a different message than the one the duel
    posted its own decision row on (e.g. by manually re-sending the same customIds in another
    message during testing).
+
+## Review round 2 — stage-1 rescope (read-only duel, no write controls)
+
+Following the recommended two-stage product shape from review round 1, this branch now lands
+**stage 1 only**: a read-only, immutable, fail-closed duel result with explicit evidence coverage
+and no write controls.
+
+What changed relative to the round-1 state:
+
+- **"Accept & fix" is removed entirely** — the modal, the `devbot:duel-fix-modal:*` dispatch,
+  `handleDuelFixModal`, `resolveDuelFixWorkspace`/`verifyDuelFixReproducible`, and the
+  `DuelStore` acceptance-claim machinery are gone. The write-path race (round-1 issue 4) and the
+  wrong-codebase-state seed (issue 3) are resolved by construction: there is no write path.
+  Conceded issues instead get a **Copy fix prompt** button that replies ephemerally with a
+  copyable `/do`-style follow-up prompt and a truthful explanation that this stage never starts
+  the task itself. Stage 2 re-adds automated fixes only once the reviewed snapshot is reproducible
+  and the decision-to-task transition is atomic and auditable.
+- **Parser and rebuttal warnings now surface in Discord** — `DuelResult.warnings` aggregates
+  reviewer-verdict and rebuttal parser warnings and `formatDuelSummary` renders them, so an
+  indeterminate or partially parsed run shows *why*.
+- **Terminal conversation closure** — clean (nothing conceded), failed, and dismissed duels close
+  their `CollabStore` conversation instead of counting against the 200-open-conversation limit
+  forever. Only duels with conceded issues stay open, until dismissed.
+- **Decision controls fail closed on project policy** — a duel whose project is no longer
+  registered (or not allowed to the clicker) refuses prompt/dismiss, instead of skipping the
+  project check when lookup fails. Binding to the duel's own control message/channel moved to
+  `duel-ui.ts` (`isBoundDuelControl`) with direct tests for wrong-message/wrong-channel/unbound
+  cases; the store-level dismiss race (duplicate submissions) is tested with concurrent calls.
+- **Persisted duel state is validated on load** — records that don't match the typed schema are
+  dropped rather than trusted, an unsupported state-file version is refused, and new tests cover
+  issue-count/field-length bounding and the record-cap eviction.
+- README / product plan / this handoff now describe the stage-1 read-only scope explicitly.
+
+`npm test`: 163/163 green (`npm run build` + `node --test` over `dist`), `git diff --check` clean.
