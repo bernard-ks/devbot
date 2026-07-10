@@ -22,7 +22,7 @@
     "allowedUsernames": [],
     "allowedRoles": [],
     "allowedPeers": [],
-    "screenshotPolicy": "allow",
+    "screenshotPolicy": "approval",
     "maxContextChars": 120000,
     "readOnlyCommands": ["test", "lint"],
     "approvalRequiredCommands": ["verify", "web-build"]

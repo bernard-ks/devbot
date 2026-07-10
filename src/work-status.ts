@@ -3,6 +3,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { CodexRequestMode } from "./codex-client.js";
 import type { ModelTier, RequestContextMode } from "./request-router.js";
+import { minimalChildEnvironment } from "./security.js";
 import type { ProjectEntry } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -362,6 +363,7 @@ function inlineCode(value: string): string {
 export async function findExternalCodexWork(projects: ProjectEntry[], now = new Date()): Promise<ActiveWork[]> {
   try {
     const { stdout } = await execFileAsync("ps", ["-axo", "pid=,etime=,command="], {
+      env: minimalChildEnvironment(),
       maxBuffer: 2_000_000
     });
     return parseExternalCodexWork(stdout, projects, now);

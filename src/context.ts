@@ -1,5 +1,7 @@
-import { lstat, readdir, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
+import { redactSensitiveText } from "./security.js";
 import type { IndexedFile, PackedProjectContext, ProjectEntry, ScannerConfig } from "./types.js";
 
 const IGNORED_PATH_PARTS = new Set([
@@ -28,6 +30,16 @@ const IGNORED_FILENAMES = new Set([
   ".env.local",
   ".env.production",
   ".envrc",
+  ".git-credentials",
+  ".gitconfig",
+  ".gitcookies",
+  ".netrc",
+  ".npmrc",
+  ".pypirc",
+  ".yarnrc",
+  "credentials.json",
+  "id_ed25519",
+  "id_rsa",
   "package-lock.json",
   "pnpm-lock.yaml",
   "yarn.lock"
@@ -78,9 +90,6 @@ const TEXT_EXTENSIONS = new Set([
   ".yml"
 ]);
 
-const SECRET_LINE = /\b(api[_-]?key|secret|token|password|private[_-]?key|client[_-]?secret)\b/i;
-const SECRET_VALUE = /(=|:)\s*["']?[A-Za-z0-9_\-./+=]{16,}/g;
-
 export class ProjectContextService {
   private readonly cache = new Map<string, IndexedFile[]>();
 
@@ -88,12 +97,15 @@ export class ProjectContextService {
 
   async refresh(project: ProjectEntry): Promise<number> {
     const files = await this.indexProject(project);
-    this.cache.set(project.name, files);
+    this.cache.set(cacheKey(project), files);
     return files.length;
   }
 
   invalidate(projectName: string): void {
-    this.cache.delete(projectName);
+    const prefix = `${projectName}\0`;
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(prefix)) this.cache.delete(key);
+    }
   }
 
   async pack(
@@ -102,7 +114,7 @@ export class ProjectContextService {
     includePatterns: string[] = [],
     maxPackedContextChars = this.scanner.maxPackedContextChars
   ): Promise<PackedProjectContext> {
-    const indexed = this.cache.get(project.name) ?? (await this.indexAndCache(project));
+    const indexed = this.cache.get(cacheKey(project)) ?? (await this.indexAndCache(project));
     const filtered = includePatterns.length > 0 ? indexed.filter((file) => matchesAny(file.relativePath, includePatterns)) : indexed;
     const ranked = rankFiles(filtered, question).slice(0, this.scanner.maxRankedFiles);
     const files: IndexedFile[] = [];
@@ -130,18 +142,25 @@ export class ProjectContextService {
 
   private async indexAndCache(project: ProjectEntry): Promise<IndexedFile[]> {
     const files = await this.indexProject(project);
-    this.cache.set(project.name, files);
+    this.cache.set(cacheKey(project), files);
     return files;
   }
 
   private async indexProject(project: ProjectEntry): Promise<IndexedFile[]> {
     const files: IndexedFile[] = [];
-    await walk(project.root, project.root, this.scanner, files);
+    const canonicalRoot = await realpath(project.root).catch(() => path.resolve(project.root));
+    await walk(project.root, project.root, canonicalRoot, this.scanner, files);
     return files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
   }
 }
 
-async function walk(root: string, current: string, scanner: ScannerConfig, output: IndexedFile[]): Promise<void> {
+async function walk(
+  root: string,
+  current: string,
+  canonicalRoot: string,
+  scanner: ScannerConfig,
+  output: IndexedFile[]
+): Promise<void> {
   let entries;
   try {
     entries = await readdir(current, { withFileTypes: true });
@@ -158,7 +177,7 @@ async function walk(root: string, current: string, scanner: ScannerConfig, outpu
     }
 
     if (entry.isDirectory()) {
-      await walk(root, absolutePath, scanner, output);
+      await walk(root, absolutePath, canonicalRoot, scanner, output);
       continue;
     }
 
@@ -167,22 +186,31 @@ async function walk(root: string, current: string, scanner: ScannerConfig, outpu
     }
 
     try {
-      const stats = await lstat(absolutePath);
-      if (stats.size > scanner.maxIndexedFileBytes) {
-        continue;
+      const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+      const handle = await open(absolutePath, constants.O_RDONLY | noFollow);
+      try {
+        const stats = await handle.stat();
+        if (!stats.isFile() || stats.size > scanner.maxIndexedFileBytes) continue;
+        const [resolvedPath, currentStats] = await Promise.all([realpath(absolutePath), lstat(absolutePath)]);
+        if (
+          !isWithinRoot(resolvedPath, canonicalRoot)
+          || !currentStats.isFile()
+          || currentStats.dev !== stats.dev
+          || currentStats.ino !== stats.ino
+        ) {
+          continue;
+        }
+        const text = redactSecrets(await handle.readFile("utf8"));
+        if (looksBinary(text)) continue;
+        output.push({
+          relativePath,
+          absolutePath,
+          sizeBytes: stats.size,
+          text
+        });
+      } finally {
+        await handle.close();
       }
-
-      const text = redactSecrets(await readFile(absolutePath, "utf8"));
-      if (looksBinary(text)) {
-        continue;
-      }
-
-      output.push({
-        relativePath,
-        absolutePath,
-        sizeBytes: stats.size,
-        text
-      });
     } catch {
       continue;
     }
@@ -199,7 +227,8 @@ function shouldIgnore(relativePath: string, filename: string): boolean {
 }
 
 function isLikelyTextFile(filename: string): boolean {
-  if (filename.includes(".pem") || filename.includes(".key") || filename.includes(".p12")) {
+  const normalized = filename.toLowerCase();
+  if (/\.(?:key|kdbx|p12|pem|pfx)$/.test(normalized)) {
     return false;
   }
 
@@ -211,10 +240,16 @@ function looksBinary(text: string): boolean {
 }
 
 function redactSecrets(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => (SECRET_LINE.test(line) ? line.replace(SECRET_VALUE, "$1 [REDACTED]") : line))
-    .join("\n");
+  return redactSensitiveText(text);
+}
+
+function cacheKey(project: ProjectEntry): string {
+  return `${project.name}\0${path.resolve(project.root)}`;
+}
+
+function isWithinRoot(candidate: string, root: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
 function rankFiles(files: IndexedFile[], question: string): IndexedFile[] {

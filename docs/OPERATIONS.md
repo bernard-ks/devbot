@@ -56,6 +56,41 @@ The Discord workspace stores a selected project per approved user. Mentions, `/a
 
 Open the shared launcher or run `/dashboard` to get a personal ephemeral workspace. Its project selector only includes roots the user can access. Ask and Make change open Discord modals; task messages update in place and expose safe public controls plus a role-aware private Actions panel.
 
+## Ambient Workrooms
+
+The ambient flow is the default for natural action-shaped mentions in a configured private room:
+
+```text
+@devbot add a regression test for the webhook retry bug
+```
+
+Devbot classifies the request, stores it as `awaiting-approval`, and posts a Components V2 proposal card. The card supports **Approve and start**, **Edit**, **Answer only**, and **Decline**. The requester or a controller can edit, answer-only, or decline; only the owner or an approved controller can approve write-capable work. Use `/inbox` to find pending decisions, or open the dashboard and choose **Needs Me**.
+
+When the proposal is created, Devbot opens a private task thread when the parent room supports private threads and membership management. Unrestricted projects inherit the configured Devbot audience; scoped projects use the requester and explicit project audience IDs. Devbot then stores the thread ID with the task. Approval starts the task inside that workroom. The task runs with Builder, Reviewer, and Verifier preflight seats by default; the proposal selector can reduce or change that team. The seats are read-only planning and review work, and do not authorize mutations.
+
+Task-thread messages can always invoke Devbot with `@devbot`. To allow unmentioned natural-language follow-ups in those private threads, enable **Message Content Intent** for the bot in Discord's developer portal and set `DEVBOT_MESSAGE_CONTENT_INTENT=true`; leave it off when mention-only operation is preferred.
+
+Write execution creates a Git worktree outside the source checkout, normally under `~/.devbot/worktrees`, with a branch named `devbot/task/<task-name>`. Devbot runs Codex against that worktree and records changed-file plus bounded diff-status evidence. Changes remain uncommitted for human review; Devbot does not merge or push. The source checkout is not staged or checked out by the isolation helper.
+
+Completion is proof-first: the workroom card lists recorded evidence before the result, then exposes **Open proof** for the saved task detail. Evidence can include the isolated branch, changed-file count, bounded diff status, model route, and any limitation. Workroom tasks are visible through task APIs only to their requester and project-authorized controllers; internal preflight seats are excluded from task lists. No configured validation command is run automatically by this ambient action path; use the project command policy and `/review validate` or `/review gates` when those checks are appropriate.
+
+Safety and fallback rules:
+
+- `DEVBOT_SAFE_MODE=true` blocks proposal approval and other write execution.
+- A private task thread is preferred. If Discord cannot create it, an unrestricted proposal can remain in the configured private room; a scoped proposal is closed before it is published. If a project room is not private, `/setup project-room` refuses the binding.
+- If the target is not a Git repository, the worktree path would be unsafe, the branch/path already exists, or Git worktree support fails, Devbot stops before granting write access and records the isolation blocker.
+- Scoped project audiences do not receive channel-mention results; use the ephemeral dashboard or `/ask` path instead.
+- Completed, declined, failed, canceled, and interrupted tasks retain their state in `.devbot/tasks.json`; task controls become unavailable when the saved state no longer permits the requested action.
+
+Bind a project room as the owner:
+
+```text
+/setup project-room action:bind project:webapp channel:#webapp-room
+/setup project-room action:remove project:webapp
+```
+
+The channel must be a private server text channel or private thread, and every visible member must satisfy both the Devbot and project allowlists. Devbot rechecks bound-room privacy and periodically revalidates its effective audience. In a bound room, the bound project is selected automatically and a mention naming another project is rejected with a pointer to that project's room.
+
 When Devbot restarts, saved tasks that were still marked running are recovered as canceled with an interruption reason. This keeps the workspace from presenting orphaned work as active after a process restart.
 
 Configure project roots with `config/projects.json`:
@@ -100,7 +135,9 @@ Project metadata can also include a `policy` block:
 }
 ```
 
-Empty `allowedUsers`, `allowedUsernames`, and `allowedRoles` preserve the global bot allow-list for project-specific commands. Empty `allowedPeers` means any globally allow-listed peer can ask about the project. `screenshotPolicy` can be `allow`, `approval`, or `deny`.
+Empty `allowedUsers`, `allowedUsernames`, and `allowedRoles` preserve the global bot allow-list for project-specific commands. Empty `allowedPeers` means any globally allow-listed peer can ask about the project. `screenshotPolicy` can be `allow`, `approval`, or `deny`; omission defaults to `approval`. Commands must be listed in `readOnlyCommands` to avoid an approval gate, while unclassified commands fail closed.
+
+Discord-triggered Codex and configured-command child processes receive a minimal environment that excludes the Discord token and application credentials. Codex prompts travel over stdin, answer mode is fixed to `read-only`, action mode cannot exceed `workspace-write`, and child output is bounded and redacted before it reaches task state or Discord. On supported systems, private state files are mode `0600` and active task/collaboration directories are mode `0700`.
 
 If any project user or role allowlist is populated, Devbot sends workspace, `/ask`, `/do`, `/status`, `/snip`, `/task`, `/run`, `/review`, continuation, and retry output ephemerally. It declines channel-mention results for that project because Discord cannot make one ordinary channel reply visible to only a subset of room members.
 
@@ -208,7 +245,7 @@ Safe mode still allows read-only mentions, status, ask, screenshots, task reads,
 
 Devbot chooses screenshot targets in this order:
 
-1. Explicit local URL in the request.
+1. Explicit local URL in the request, only when its origin exactly matches a configured or detected project URL.
 2. Explicit route path in the request.
 3. Project metadata `frontendUrl`.
 4. `PROJECT_SCREENSHOT_URL`.
@@ -225,6 +262,8 @@ Screenshot replies include:
 - bad HTTP responses
 
 If screenshots always hit the wrong app, set `frontendUrl` in the target project's `.devbot/project.json`.
+
+Screenshot navigation is loopback-only. Devbot blocks redirects and browser requests to unapproved origins, arbitrary local ports, remote hosts, link-local metadata services, and URLs containing credentials. Cross-origin CDN assets are intentionally blocked, so a secure capture can look less styled than the normal app.
 
 ## Peer Bot Setup
 

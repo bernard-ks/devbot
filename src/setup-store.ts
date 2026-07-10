@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { normalizeProjectName } from "./config.js";
+import { hardenPrivateDirectoryPermissions, PRIVATE_DIRECTORY_MODE } from "./security.js";
 
 export type SetupUserPermission = "view" | "control";
 
@@ -12,6 +13,7 @@ export interface SetupState {
   controllerUserIds: string[];
   peerBotIds: string[];
   repositories: Record<string, string>;
+  projectRoomIds: Record<string, string>;
   defaultProjectName?: string;
   privateChannelId?: string;
   workspaceMessageId?: string;
@@ -22,7 +24,8 @@ const EMPTY_SETUP: SetupState = {
   viewerUserIds: [],
   controllerUserIds: [],
   peerBotIds: [],
-  repositories: {}
+  repositories: {},
+  projectRoomIds: {}
 };
 
 export class SetupStore {
@@ -72,9 +75,34 @@ export class SetupStore {
     return this.mutate((state) => {
       const normalized = normalizeProjectName(name);
       delete state.repositories[normalized];
+      delete state.projectRoomIds[normalized];
       if (state.defaultProjectName === normalized) {
         delete state.defaultProjectName;
       }
+      return cloneSetup(state);
+    });
+  }
+
+  bindProjectRoom(projectName: string, roomId: string): Promise<SetupState> {
+    return this.mutate((state) => {
+      const normalizedProjectName = normalizeProjectName(projectName);
+      const normalizedRoomId = roomId.trim();
+      if (!normalizedProjectName || !normalizedRoomId) {
+        throw new Error("Project name and room ID are required.");
+      }
+      for (const [existingProject, existingRoomId] of Object.entries(state.projectRoomIds)) {
+        if (existingProject !== normalizedProjectName && existingRoomId === normalizedRoomId) {
+          delete state.projectRoomIds[existingProject];
+        }
+      }
+      state.projectRoomIds[normalizedProjectName] = normalizedRoomId;
+      return cloneSetup(state);
+    });
+  }
+
+  unbindProjectRoom(projectName: string): Promise<SetupState> {
+    return this.mutate((state) => {
+      delete state.projectRoomIds[normalizeProjectName(projectName)];
       return cloneSetup(state);
     });
   }
@@ -117,6 +145,7 @@ function loadSetupState(filePath: string): SetupState {
   if (!existsSync(filePath)) {
     return cloneSetup(EMPTY_SETUP);
   }
+  if (process.platform !== "win32") chmodSync(filePath, 0o600);
 
   let parsed: unknown;
   try {
@@ -135,6 +164,7 @@ function loadSetupState(filePath: string): SetupState {
     controllerUserIds: stringList(raw.controllerUserIds),
     peerBotIds: stringList(raw.peerBotIds),
     repositories: stringRecord(raw.repositories),
+    projectRoomIds: projectRoomIdRecord(raw.projectRoomIds),
     ...(typeof raw.defaultProjectName === "string" && raw.defaultProjectName.trim()
       ? { defaultProjectName: normalizeProjectName(raw.defaultProjectName) }
       : {}),
@@ -148,7 +178,9 @@ function loadSetupState(filePath: string): SetupState {
 }
 
 async function persistSetup(filePath: string, state: SetupState): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
+  const directory = path.dirname(filePath);
+  await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+  await hardenPrivateDirectoryPermissions(directory);
   const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   await rename(tempPath, filePath);
@@ -179,6 +211,18 @@ function stringRecord(value: unknown): Record<string, string> {
   );
 }
 
+function projectRoomIdRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter((entry): entry is [string, string] => typeof entry[1] === "string" && Boolean(entry[0].trim()) && Boolean(entry[1].trim()))
+      .map(([projectName, roomId]) => [normalizeProjectName(projectName), roomId.trim()])
+      .filter(([projectName]) => Boolean(projectName))
+  );
+}
+
 function cloneSetup(state: SetupState): SetupState {
   return {
     version: 1,
@@ -186,6 +230,7 @@ function cloneSetup(state: SetupState): SetupState {
     controllerUserIds: [...state.controllerUserIds],
     peerBotIds: [...state.peerBotIds],
     repositories: { ...state.repositories },
+    projectRoomIds: { ...state.projectRoomIds },
     ...(state.defaultProjectName ? { defaultProjectName: state.defaultProjectName } : {}),
     ...(state.privateChannelId ? { privateChannelId: state.privateChannelId } : {}),
     ...(state.workspaceMessageId ? { workspaceMessageId: state.workspaceMessageId } : {})

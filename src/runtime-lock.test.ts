@@ -12,6 +12,7 @@ test("runtime lock detects the live bot process and clears only its own PID", as
 
   markRuntimeRunning(lockFile);
   assert.equal(isRuntimeRunning(lockFile), true);
+  assert.throws(() => markRuntimeRunning(lockFile), /Another Devbot runtime already owns/);
   clearRuntimeLock(lockFile);
   assert.equal(existsSync(lockFile), false);
 

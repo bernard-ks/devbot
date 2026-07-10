@@ -52,7 +52,8 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
     canControl: false,
     safeMode: false,
     status,
-    recentTasks: [task]
+    recentTasks: [task],
+    needsAttentionCount: 2
   });
   const rows = viewer.components.map((row) => row.toJSON());
   const makeChange = rows[0]?.components.find((component) => "custom_id" in component && component.custom_id.includes(":act:"));
@@ -61,7 +62,8 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
   assert.match(viewer.content, /Done \| Answer/);
   assert.doesNotMatch(viewer.content, /task-abc/);
   assert.equal(makeChange && "disabled" in makeChange ? makeChange.disabled : undefined, true);
-  assert.equal(rows[1]?.components[0]?.type, 3);
+  assert.equal(rows[2]?.components[0]?.type, 3);
+  assert.match(JSON.stringify(rows[0]), /Needs Me \(2\)/);
 
   const controller = workspacePanelView({
     projects: [pullprice],
@@ -86,10 +88,11 @@ test("workspace status compaction preserves now risk and next", () => {
   assert.match(compact, /Run the focused suite/);
 });
 
-test("workspace recent work hides internal council seats", () => {
+test("workspace recent work hides internal council and agent seats", () => {
   const visible = recentTask();
   const internal = { ...recentTask(), id: "task-council", source: "lab:council:systems", text: "sealed seat prompt" };
-  assert.deepEqual(workspaceRecentTasks([internal, visible]).map((task) => task.id), [visible.id]);
+  const agent = { ...recentTask(), id: "task-agent", source: "workroom:agent:reviewer", text: "review seat prompt" };
+  assert.deepEqual(workspaceRecentTasks([internal, agent, visible]).map((task) => task.id), [visible.id]);
 });
 
 function project(name: string, isDefault: boolean): ProjectEntry {

@@ -8,6 +8,21 @@ Devbot is a local Discord interface for Codex-backed development work. It answer
 
 The small-team foundation now exists: owner-managed private setup, durable local tasks, peer discovery, sealed councils, approval records, and review handoffs. The next product step is to make those capabilities feel as natural as ordinary Discord conversation while deepening evidence-backed multi-agent work.
 
+## Ambient Workrooms: Ideas 1-8
+
+The ambient workroom slice is now implemented:
+
+1. Natural `@devbot` requests are classified as answer requests or proposed actions. Action-shaped mentions receive a confirmation preview with **Approve and start**, **Edit**, **Answer only**, and **Decline**; no write begins from the mention alone.
+2. Each proposal is persisted as an approval-gated task and gets a private Discord task thread when the room supports private thread creation and membership management.
+3. Approved write tasks run in a separate `devbot/task/<task-name>` Git branch and worktree outside the source checkout. Completion records the branch, changed files, and bounded diff-status evidence while leaving changes uncommitted for human review. Devbot does not merge or push.
+4. `/inbox` and dashboard **Needs Me** show pending decisions for the current user, with private task detail and refresh controls.
+5. Completion cards put recorded proof before the result and provide an **Open proof** action for the saved task record.
+6. Owner-only `/setup project-room action:bind project:<name> channel:<channel>` binds a private channel or private thread to one project; `action:remove` removes the binding.
+7. Workroom roles are Builder, Reviewer, and Verifier. They provide read-only implementation, review, and evidence perspectives before approved work executes, and can be selected on the proposal card.
+8. Proposal, progress, proof, and inbox surfaces use bounded Discord Components V2 payloads, strict custom-ID parsing, sanitized text, and state-aware controls.
+
+The safety contract is explicit: only the requester or an approved controller can edit or decline; only the owner or approved controller can approve write work; safe mode blocks write execution; scoped-audience projects decline channel-mention output; scoped proposals close if a private task thread cannot be created; and unavailable Git isolation stops the action before write access. Activity idea 9 is deferred and is not represented as an implemented feature.
+
 ## Current Features
 
 - Initial setup:
@@ -28,7 +43,12 @@ The small-team foundation now exists: owner-managed private setup, durable local
 - Mention support:
   - Direct bot mentions can invoke the bot without requesting the privileged Message Content intent.
   - Status-style mentions avoid unnecessary Codex runs.
-  - Normal mentions stay read-only; workspace Make change and `/do` are the explicit write-capable surfaces.
+  - Read-only mentions answer directly; action-shaped mentions open the implemented approval preview and private task workroom flow.
+- Ambient workrooms:
+  - Natural intent previews with approve, edit, answer-only, and decline controls.
+  - Private task threads, isolated task branches/worktrees, proof-first completion, and `/inbox` / dashboard Needs Me.
+  - Owner-bound project rooms through `/setup project-room`.
+  - Builder, Reviewer, and Verifier roles with bounded Components V2 cards.
 - Local project context:
   - Scans static or owner-registered project roots and supports a selected default on multi-project hosts.
   - Ignores dependency/build folders and common secret files.
@@ -62,6 +82,7 @@ The small-team foundation now exists: owner-managed private setup, durable local
 - A setup-managed private room controls new message visibility, but it cannot retroactively hide messages previously posted in other channels.
 - The audit trail spans Discord messages, local task/collaboration stores, and git history; it is not yet centralized or tamper-evident.
 - The v2 collaboration protocol supports allow-listed discovery and coordination, but transport is still Discord-specific and peer writes remain human-gated.
+- Ambient workroom activity aggregation and the deferred Activity idea 9 are not implemented.
 
 ## Improvement Themes
 

@@ -4,8 +4,8 @@ Devbot is a private, local-first Discord workspace for building software with Co
 
 The everyday model is intentionally small:
 
-- **Ask:** mention `@devbot` for a read-only answer.
-- **Do:** use `/do` for an intentional project change.
+- **Ask:** mention `@devbot` for an answer, or let an action-shaped mention open a proposal first.
+- **Do:** approve a proposal, use the private task workroom, or use `/do` for an intentional project change.
 - **Check:** use `/status` to see what is happening.
 
 Devbot uses your signed-in local Codex CLI or app session and does not need a separate OpenAI API key or hosted Devbot backend. Selected project context is handled through that Codex session; Discord messages still travel through Discord.
@@ -80,12 +80,36 @@ npm start
 
 The workspace remembers each approved user's selected project locally. Mentions, `/ask`, `/do`, `/status`, and `/dashboard` use that project when no explicit project is supplied. Every interaction rechecks current project access, controller authority, safe mode, and task state.
 
+## Ambient Workrooms
+
+Ideas 1-8 are implemented as the ambient workroom flow:
+
+1. **Natural intent preview:** `@devbot fix the failing auth test` is classified as a proposed action and shown as a confirmation card. `@devbot why is auth failing?` remains an immediate read-only answer. The proposal offers **Approve and start**, **Edit**, **Answer only**, and **Decline**. Editing opens a modal; answer-only runs without write access.
+2. **Private task threads:** an approved-room mention creates a private task thread and posts the proposal there. Unrestricted projects inherit the configured Devbot audience; scoped projects admit the requester and explicit project audience IDs. Eligible peers and the bot are added when project policy permits.
+3. **Isolated work:** an approved write action runs from a separate `devbot/task/<task-name>` branch and worktree under `~/.devbot/worktrees` by default. The source checkout is left untouched. Changed-file and bounded diff-status evidence are saved, while the changes remain uncommitted for human review; Devbot does not merge or push them.
+4. **Needs Me:** `/inbox` and the dashboard **Needs Me** control surface proposals and other decisions waiting for the current user. Open an item to see its private task detail, workroom, approval state, branch, changed files, and verification evidence.
+5. **Proof-first completion:** completion cards show recorded proof before the result, including isolation evidence, changed files, and the route used. **Open proof** reveals the saved task detail; **Mark reviewed** clears the item from Needs Me for the requester and controllers.
+6. **Project rooms:** the owner can bind a private channel or private thread to one project with `/setup project-room action:bind project:webapp channel:#webapp-room`. Mentions in that room are restricted to the bound project; remove the binding with `action:remove`.
+7. **Workroom roles:** proposals default to **Builder**, **Reviewer**, and **Verifier**. The selector can change the team before approval: Builder proposes the smallest implementation, Reviewer checks scope and regressions, and Verifier defines completion evidence. These seats produce a read-only preflight brief before an approved action runs.
+8. **Components V2:** proposal, progress, proof, and Needs Me surfaces use bounded Discord Components V2 containers with stable, allow-listed custom IDs and disabled controls when state changes. Content is sanitized and mentions are not expanded by these cards.
+
+Example:
+
+```text
+@devbot update the billing retry copy in webapp
+```
+
+Review the private proposal, choose the roles, then select **Approve and start**. During execution, the workroom reports progress. On completion, inspect proof and the isolated branch before taking any repository action. For a read-only path, choose **Answer only** or write `/ask question:... project:webapp`.
+
+Safety and fallback behavior are intentional. Only the requester or an approved controller can edit or decline a proposal; only the owner or an approved controller can approve write work or cancel it. `DEVBOT_SAFE_MODE=true` blocks approval and write execution. A project with a scoped audience declines channel-mention results and directs the user to the private workspace or `/ask`. If Discord cannot create a private task thread, an unrestricted proposal may remain in the configured private room; a scoped proposal is closed without publishing. If the target is not a Git repository, the worktree path is unsafe, or Git isolation is unavailable, the action stops before Codex receives write access and records the blocker in task evidence.
+
 ## Advanced Command Reference
 
 - `/setup show`: Show owner-managed viewers, controllers, peer bots, private room, and project roots. Every `/setup` command is restricted to `DEVBOT_OWNER_USER_ID`.
 - `/setup user action:<add|remove> user:<user> permission:<view|control>`: Manage private-room viewers. Controllers can also invoke write-capable commands; granting control automatically grants view access.
 - `/setup devbot action:<add|remove> bot:<bot>`: Manage peer Devbots and their private-room access.
 - `/setup repo action:<add|remove|default> name:<name> path:<required for add>`: Register a local project root or select the default used when a command omits `project`.
+- `/setup project-room action:<bind|remove> project:<name> channel:<optional>`: Bind or remove a private ambient room for one project. The selected channel must be private, and every visible member must satisfy both the Devbot and project allowlists.
 - `/setup room name:<optional>`: Create or resync the private Devbot room. It uses a deny-by-default text channel when Devbot can manage channels, otherwise it adopts or creates an invite-only private thread.
 - `/projects`: List configured projects.
 - `/status project:<optional> question:<optional> image:<optional>`: Show a decision-ready brief with confirmed Devbot tasks, task phase, external Codex runs, activity-unknown app sessions, repository evidence, visible blockers or risks, and the best next step. Add a question for a deeper read-only inspection, and set `image:true` to attach a live project UI screenshot when a local web app is detected.
@@ -98,6 +122,7 @@ The workspace remembers each approved user's selected project locally. Mentions,
 - `/task retry id:<task-id>`: Retry a saved task with the same project, mode, text, and include patterns.
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
 - `/dashboard project:<optional>`: Open the personal interactive workspace with project selection, current status, recent work, and native Ask / Change controls.
+- `/inbox project:<optional> limit:<optional>`: Open the ephemeral **Needs Me** inbox for pending proposals and decisions, with review controls and refresh.
 - `/run command:<name> project:<optional>`: Run a configured command from `<project>/.devbot/project.json`, using the selected default project when omitted.
 - `/review packet project:<name> task:<optional>`: Create a provider-neutral review handoff packet from git status, diff stat, last commit, and optional task context.
 - `/review validate project:<name> commands:<optional>`: Run configured validation commands.
@@ -135,7 +160,7 @@ You can also mention the bot in a channel:
 @devbot what's the status on the web build, send me a snip of the browse page
 ```
 
-Mentions are read-only by default and use the invoking user's workspace project, then the setup-selected default as a fallback. This keeps ordinary conversation safe; write-capable work remains a deliberate workspace **Make change** action or `/do`. Use `project:<name>` to override the selection for one mention.
+Read-only mentions use the invoking user's workspace project, then the setup-selected default as a fallback. An action-shaped mention opens a proposal instead of changing files; write-capable work starts only after an explicit approval. Use `project:<name>` to override the selection for one mention. Inside a project room, the room binding wins and a mention for another project is declined.
 
 Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@devbot give me a breakdown of what you are working on` return the decision-ready brief without invoking Codex. Devbot distinguishes confirmed work from an open Codex app session, because an open session can be working, waiting, or idle. It never exposes process IDs or private external prompts. Generic requests for blockers and next steps stay deterministic; diagnostic questions about failures, diffs, remaining work, or merge readiness trigger the deeper read-only Codex inspection. If the message asks for a snip, screenshot, image, or picture, the bot tries to attach a live project UI screenshot. Page hints such as `browse page` or `watchlist` are handled by opening the running app and navigating through visible UI controls instead of reading framework routes from disk. Explicit paths like `/cards/op01-016` are still supported when you want an exact target.
 
@@ -173,7 +198,7 @@ Each target project can define optional metadata at `<project>/.devbot/project.j
     "allowedUsernames": [],
     "allowedRoles": [],
     "allowedPeers": [],
-    "screenshotPolicy": "allow",
+    "screenshotPolicy": "approval",
     "readOnlyCommands": ["test"],
     "approvalRequiredCommands": ["verify"]
   }
@@ -184,7 +209,7 @@ Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true
 
 Global access can be limited with `ALLOWED_USER_IDS`, `ALLOWED_USERNAMES`, and `ALLOWED_ROLE_IDS`. User IDs are the most stable option. Account usernames are matched case-insensitively; mutable global display names and guild nicknames are intentionally ignored.
 
-Project policy lets each repo narrow collaboration behavior. `allowedUsers`, `allowedUsernames`, and `allowedRoles` scope project-specific slash command access, `allowedPeers` limits peer bot access per project, `screenshotPolicy` can be `allow`, `approval`, or `deny`, and command policy marks presets that are safe to run versus approval-gated.
+Project policy lets each repo narrow collaboration behavior. `allowedUsers`, `allowedUsernames`, and `allowedRoles` scope project-specific slash command access, `allowedPeers` limits peer bot access per project, and `screenshotPolicy` can be `allow`, `approval`, or `deny`. Omitted screenshot policy defaults to approval. Commands must be named in `readOnlyCommands` to avoid an approval gate; unclassified commands fail closed.
 
 When a project has any user or role allowlist, Devbot keeps workspace, `/ask`, `/do`, `/status`, `/snip`, `/task`, `/run`, `/review`, continuation, and retry results ephemeral so other members of the shared room cannot read them. Because channel mentions cannot be selectively hidden, Devbot declines mention-based results for those projects and points the user to the private workspace or `/ask`.
 
@@ -197,6 +222,15 @@ Use `/devbot announce` to publish capabilities. Basic peer requests are sent as 
 `/lab council` is the first persistent multiplayer workflow. It runs independent Product Steward, Systems Builder, and Evidence Verifier seats in parallel by default; `seats:4` adds an Operations Guardian. It opens a private Discord thread when the channel and bot permissions support one, stores stable participant IDs and correlated peer invitations, hides proposals from normal workroom views during collection, and exposes native decision buttons. Peer fan-out requires a dedicated private text channel or private thread in `COORDINATION_CHANNEL_ID`; without both a private workroom and coordination room the council runs local-only in an ephemeral response. Devbot automatically unarchives a configured coordination thread and adds allow-listed peer bots before sending. Sealing prevents agents from anchoring on earlier responses; it is an application-level visibility rule, not encryption of the Discord transport or local state file. See [Collaboration Protocol](docs/COLLABORATION_PROTOCOL.md).
 
 The safety boundary is deliberate: peer bots can ask, observe, plan, review, and hand off inside allow-listed projects. Peer-triggered edits, command execution, validation with side effects, pushes, merges, deploys, dependency installs, and secret/config changes require explicit human approval.
+
+## Security Boundaries
+
+- Discord-launched Codex processes receive a minimal environment without the bot token or application credentials. Prompts are sent over standard input instead of command-line arguments, user config and rules are ignored, optional tools are disabled, and `danger-full-access` is rejected.
+- Git inspection and isolated-worktree operations run without inherited credentials, hooks, signing, filesystem monitors, pagers, or external diff helpers. Repositories with locally configured checkout filters are refused before a worktree is created.
+- Retained isolated worktrees are capped at 100 by default so abandoned task branches cannot grow without bound; remove reviewed worktrees before starting more.
+- Screenshots are limited to configured or detected loopback origins. Redirects and browser subresources are restricted to those approved origins; arbitrary localhost ports, remote hosts, credentials in URLs, and link-local metadata addresses are rejected.
+- Local task, setup, preference, peer, and collaboration state is written owner-only inside owner-only directories. Responses, stored results, errors, command output, and indexed context pass through credential redaction.
+- These controls reduce exposure but do not make untrusted repositories harmless. Keep credentials out of project roots, review isolated changes before applying them, use ID-based Discord allowlists, and leave screenshot policy at `approval` unless a project UI is safe to post.
 
 ## Project Context Behavior
 
@@ -216,6 +250,8 @@ By default:
 
 - `/ask` uses `CODEX_SANDBOX=read-only`.
 - `/do` uses `CODEX_ACTION_SANDBOX=workspace-write`.
+- Discord-triggered Codex runs reject `danger-full-access`, receive a minimal credential-free child environment, and take prompts over stdin rather than process arguments.
+- Local task, setup, peer, collaboration, preference, and runtime state use owner-only files; active task and collaboration directories are hardened to owner-only access on supported systems.
 
 Defaults are conservative:
 

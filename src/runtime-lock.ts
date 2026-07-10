@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 export function runtimeLockPath(configured?: string): string {
@@ -6,8 +6,18 @@ export function runtimeLockPath(configured?: string): string {
 }
 
 export function markRuntimeRunning(filePath = runtimeLockPath()): void {
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(filePath, `${process.pid}\n`, { encoding: "utf8", mode: 0o600 });
+  const directory = path.dirname(filePath);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") chmodSync(directory, 0o700);
+  try {
+    writeFileSync(filePath, `${process.pid}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (isRuntimeRunning(filePath)) {
+      throw new Error(`Another Devbot runtime already owns ${filePath}.`);
+    }
+    writeFileSync(filePath, `${process.pid}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  }
 }
 
 export function isRuntimeRunning(filePath = runtimeLockPath()): boolean {

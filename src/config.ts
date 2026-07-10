@@ -54,23 +54,23 @@ function loadRoutingConfig(defaultModel: string | undefined) {
   };
 }
 
-function loadCodexConfig() {
-  const sandbox = process.env.CODEX_SANDBOX?.trim() || "read-only";
-  if (!isCodexSandbox(sandbox)) {
-    throw new Error(`Invalid CODEX_SANDBOX: ${sandbox}`);
+export function loadCodexConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig["codex"] {
+  const sandbox = environment.CODEX_SANDBOX?.trim() || "read-only";
+  if (sandbox !== "read-only") {
+    throw new Error("CODEX_SANDBOX must be read-only for Discord-initiated answer requests.");
   }
 
-  const actionSandbox = process.env.CODEX_ACTION_SANDBOX?.trim() || "workspace-write";
-  if (!isCodexSandbox(actionSandbox)) {
+  const actionSandbox = environment.CODEX_ACTION_SANDBOX?.trim() || "workspace-write";
+  if (actionSandbox !== "read-only" && actionSandbox !== "workspace-write") {
     throw new Error(`Invalid CODEX_ACTION_SANDBOX: ${actionSandbox}`);
   }
 
   return {
-    bin: resolveCodexBin(process.env.CODEX_BIN),
-    model: process.env.CODEX_MODEL?.trim() || undefined,
+    bin: resolveCodexBin(environment.CODEX_BIN),
+    model: environment.CODEX_MODEL?.trim() || undefined,
     sandbox,
     actionSandbox,
-    timeoutMs: Number(process.env.CODEX_TIMEOUT_MS || 180_000)
+    timeoutMs: Number(environment.CODEX_TIMEOUT_MS || 180_000)
   };
 }
 
@@ -98,10 +98,6 @@ export function loadDiscordConfig(): Pick<AppConfig, "discordToken" | "discordCl
     discordClientId: requiredEnv("DISCORD_CLIENT_ID"),
     discordGuildId: requiredEnv("DISCORD_GUILD_ID")
   };
-}
-
-function isCodexSandbox(value: string): value is "read-only" | "workspace-write" | "danger-full-access" {
-  return value === "read-only" || value === "workspace-write" || value === "danger-full-access";
 }
 
 function loadProjects(): ProjectEntry[] {
@@ -212,17 +208,30 @@ function loadProjectMetadata(root: string, projectName: string): ProjectMetadata
 }
 
 function readProjectPolicy(value: unknown): ProjectMetadata["policy"] {
-  const raw = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value))) {
+    throw new Error("Project policy must be a JSON object.");
+  }
+  const raw = (value ?? {}) as Record<string, unknown>;
   const visibility = stringValue(raw.visibility);
   const screenshotPolicy = stringValue(raw.screenshotPolicy);
+  if (visibility && visibility !== "private" && visibility !== "team" && visibility !== "public") {
+    throw new Error(`Unsupported project policy visibility: ${visibility}.`);
+  }
+  if (screenshotPolicy && screenshotPolicy !== "allow" && screenshotPolicy !== "approval" && screenshotPolicy !== "deny") {
+    throw new Error(`Unsupported project screenshot policy: ${screenshotPolicy}.`);
+  }
+  const maxContextChars = numberValue(raw.maxContextChars);
+  if (raw.maxContextChars !== undefined && maxContextChars === undefined) {
+    throw new Error("Project policy maxContextChars must be a positive number.");
+  }
   return {
     visibility: visibility === "team" || visibility === "public" ? visibility : "private",
     allowedUsers: stringArray(raw.allowedUsers),
     allowedUsernames: normalizeDiscordUsernames(stringArray(raw.allowedUsernames)),
     allowedRoles: stringArray(raw.allowedRoles),
     allowedPeers: stringArray(raw.allowedPeers),
-    screenshotPolicy: screenshotPolicy === "approval" || screenshotPolicy === "deny" ? screenshotPolicy : "allow",
-    maxContextChars: numberValue(raw.maxContextChars),
+    screenshotPolicy: screenshotPolicy === "allow" || screenshotPolicy === "deny" ? screenshotPolicy : "approval",
+    maxContextChars,
     readOnlyCommands: stringArray(raw.readOnlyCommands).map(normalizeProjectName),
     approvalRequiredCommands: stringArray(raw.approvalRequiredCommands).map(normalizeProjectName)
   };
@@ -231,9 +240,12 @@ function readProjectPolicy(value: unknown): ProjectMetadata["policy"] {
 function readJsonObject(filePath: string): Record<string, unknown> {
   try {
     const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    return {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("the root value must be a JSON object");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(`Unable to load project metadata at ${filePath}: ${(error as Error).message}`, { cause: error });
   }
 }
 
