@@ -1598,7 +1598,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       contextFileCount: context.files.length
     });
     if (options.mode === "action") {
-      await ensureRollbackCheckpoint(options.project, task.id);
+      await ensureRollbackCheckpoint(executionProject, task.id);
     }
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
     if (isolatedWorktree) {
@@ -2895,7 +2895,8 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     }
     const project = mustFindProject(appConfig.projects, task.projectName);
     try {
-      const summary = await restoreCheckpoint(project.root, task.checkpointRef, {
+      const workspaceProject = await projectForTaskWorkspace(project, task);
+      const summary = await restoreCheckpoint(workspaceProject.root, task.checkpointRef, {
         expectedHeadSha: task.checkpointHeadSha ?? "",
         expectedBranch: task.checkpointBranch ?? "HEAD",
         ...(task.finishedAt ? { guardMs: Date.parse(task.finishedAt) } : {})
@@ -3209,7 +3210,8 @@ async function handleTaskControl(
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       let changes;
       try {
-        changes = await diffSinceCheckpoint(project.root, task.checkpointRef);
+        const workspaceProject = await projectForTaskWorkspace(project, task);
+        changes = await diffSinceCheckpoint(workspaceProject.root, task.checkpointRef);
       } catch (error) {
         await interaction.editReply(`Unable to read the rollback checkpoint: ${error instanceof Error ? error.message : String(error)}`);
         return;
@@ -3236,7 +3238,8 @@ async function handleTaskControl(
     await runTaskActionOnce(interaction, `${task.id}:undo`, async () => {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       try {
-        const summary = await restoreCheckpoint(project.root, task.checkpointRef!, {
+        const workspaceProject = await projectForTaskWorkspace(project, task);
+        const summary = await restoreCheckpoint(workspaceProject.root, task.checkpointRef!, {
           expectedHeadSha: task.checkpointHeadSha ?? "",
           expectedBranch: task.checkpointBranch ?? "HEAD",
           ...(task.finishedAt ? { guardMs: Date.parse(task.finishedAt) } : {})

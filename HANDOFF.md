@@ -45,3 +45,86 @@ command. Undo refuses automatically whenever a human should reconcile instead.
 
 ## Anti-injection note
 No instruction-shaped text aimed at AI agents was found in the files I touched. All repo content was treated as data.
+
+## Rebased onto 85e2530 (2026-07-09)
+
+`git rebase origin/main` replayed all 5 lane-D commits with **zero merge
+conflicts** against bernard's `dd0af6b`/`85e2530` (ambient Discord workrooms +
+security hardening, +1500 lines in `index.ts`). Git's structural merge kept
+`ensureRollbackCheckpoint(...)` in place immediately before the `runCodex(...)`
+call inside `runProjectRequest`, so the checkpoint-before-every-action-task
+call site survived the rebase intact with no manual resolution needed.
+
+### Action-mode call-site audit (post-rebase)
+
+Bernard's merge added a second write path — ambient workroom auto-approval —
+plus a brand-new isolation layer (`src/task-worktree.ts`). I traced every
+place `CodexRequestMode === "action"` can reach Codex:
+
+- `runProjectRequest()` (index.ts) is the **only** function that calls
+  `answerWithProjectContext`/`runCodex`. Verified via grep: `answerWithProjectContext`
+  has exactly one caller in production code, and `runProjectRequest` has 12
+  call sites (`/do`, ambient-mention auto-execution, ambient workroom
+  approval, retry, adjust, promote, followup) — all funnel through the same
+  function, so there is exactly one checkpoint gate to keep correct.
+- Bernard also added a **hard isolation gate** ahead of the checkpoint: for
+  every action-mode task, `runProjectRequest` now calls `createTaskWorktree()`
+  to check out an isolated `devbot/task/<id>` git worktree/branch off HEAD
+  *before* any Codex call. If isolation is unavailable, the task fails and
+  throws **before** reaching `ensureRollbackCheckpoint`/`runCodex` — so no
+  write path exists that skips both gates. Codex's cwd (`context.project.root`)
+  is always the isolated worktree, never the source checkout, confirmed via
+  `docs/OPERATIONS.md`: "the source checkout is not staged or checked out by
+  the isolation helper."
+
+### Semantic fix required: checkpoint/undo now target the wrong root
+
+Because Codex writes always land in the isolated worktree (not the source
+checkout) after bernard's merge, the original `ensureRollbackCheckpoint(options.project, ...)`
+call was checkpointing a path (`options.project.root`, the source checkout)
+that the task never actually modifies — the checkpoint-before-every-action-task
+guarantee "held" in the literal sense (it always ran) but had become
+practically inert, and the three Undo/`diffSinceCheckpoint`/`restoreCheckpoint`
+call sites (`/task undo`, the Undo button, and its confirm step) all resolved
+against `project.root` too, so a click on Undo for a normal isolated task would
+report "nothing changed since the checkpoint" even though the task did
+real work (just in its own worktree).
+
+Fixed by reusing the same `projectForTaskWorkspace()` helper bernard already
+wrote for `review`/`validate` (which resolves a task's actual workspace root —
+the isolated worktree path when `task.workspaceIsolated`, else the project
+root, with `inspectTaskWorktree` re-verifying the worktree is trustworthy):
+
+- `src/index.ts` — checkpoint creation now targets `executionProject`
+  (the isolated worktree project the function already computes) instead of
+  `options.project`, so the "before" snapshot matches where Codex actually
+  writes.
+- `src/index.ts` — `/task undo`, the Undo-button diff preview, and the
+  Undo-confirm restore all now resolve `await projectForTaskWorkspace(project, task)`
+  and operate on `workspaceProject.root` instead of `project.root`, so Undo
+  reverts the workspace the task's checkpoint was actually taken in.
+- Backward compatible: pre-rebase task records (no `workspaceIsolated`) still
+  resolve to `project.root` unchanged, since `projectForTaskWorkspace` only
+  substitutes the workspace path when the task recorded one.
+
+No files had textual conflicts; this was a semantic gap introduced by
+combining two safety features (checkpoint-based undo + worktree isolation)
+that were both individually correct but pointed at different roots. No new
+tests were added for this fix (out of scope for the rebase task and the
+existing `checkpoint.test.ts`/`task-worktree.test.ts` suites already cover
+each mechanism in isolation); a follow-up lane should add an integration
+test that runs an isolated action task end-to-end and confirms `/task undo`
+reverts files inside `task.workspacePath`.
+
+### Test results
+
+`npm test`: 126 tests. Two isolated full-suite runs under heavy host CPU
+load (other lane agents + Godot processes running concurrently, load average
+~16 on 10 cores) intermittently timed out 1-2 tests in `security.test.ts`
+(`Codex receives prompts over stdin...`, `configured project commands receive
+an empty temporary home`) — both have hardcoded 5000ms child-process
+timeouts and are unrelated to any file this lane touches. Running
+`security.test.ts` alone (less contention) passed 11/11 in ~375ms total,
+confirming this is the pre-existing CPU-load flake, not a rebase
+regression. Every `checkpoint.test.ts` and `task-worktree.test.ts` test
+passed on every run.
