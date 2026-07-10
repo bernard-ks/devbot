@@ -181,6 +181,23 @@ const commandBuilders = [
     )
     .addSubcommand((subcommand) =>
       subcommand
+        .setName("freshness")
+        .setDescription("Show merged state and behind/ahead counts for saved task branches.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addIntegerOption((option) =>
+          option.setName("limit").setDescription("Number of task branches to check, 1-25.").setRequired(false).setMinValue(1).setMaxValue(25)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("sync")
+        .setDescription("Rebase a task branch onto the current project default branch in its isolated worktree.")
+        .addStringOption((option) => option.setName("task").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
         .setName("stale")
         .setDescription("List running tasks older than the selected threshold.")
         .addIntegerOption((option) =>

@@ -79,7 +79,14 @@ import {
   screenshotRequiresApproval
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord, type TaskStatus } from "./task-store.js";
-import { canAccessTaskRecord } from "./task-access.js";
+import { canAccessTaskRecord, taskSyncRefusal, type TaskSyncRefusal } from "./task-access.js";
+import {
+  describeBranchFreshness,
+  inspectBranchFreshness,
+  syncTaskBranch,
+  type BranchFreshnessResult,
+  type SyncTaskBranchResult
+} from "./branch-freshness.js";
 import {
   createTaskWorktree,
   inspectTaskWorktree,
@@ -2438,12 +2445,91 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
   if (subcommand === "show" || subcommand === "status") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const id = interaction.options.getString("id", true);
-    const task = await taskStore.get(id);
+    const saved = await taskStore.get(id);
+    if (!saved || !allowedProjectNames.has(saved.projectName) || !canAccessTask(interaction, saved, appConfig)) {
+      await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
+      return;
+    }
+    const { task, freshness } = await refreshTaskBranchState(saved, findProject(appConfig.projects, saved.projectName));
     await interaction.editReply(
-      task && allowedProjectNames.has(task.projectName) && canAccessTask(interaction, task, appConfig)
-        ? formatTaskDetail(task)
-        : `No accessible saved task found for \`${id}\`.`
+      freshness
+        ? [formatTaskDetail(task), "", `Branch freshness: ${freshness.available ? describeBranchFreshness(freshness) : freshness.message}`].join("\n")
+        : formatTaskDetail(task)
     );
+    return;
+  }
+
+  if (subcommand === "freshness") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!allowedProjectNames.has(project.name)) {
+      await interaction.editReply(`You are not allowed to use project \`${project.name}\`.`);
+      return;
+    }
+    const limit = interaction.options.getInteger("limit") ?? 10;
+    const candidates = (await taskStore.listRecent({ projectName: project.name, limit: 25 }))
+      .filter((task) => !task.internal && canAccessTask(interaction, task, appConfig))
+      .filter((task) => task.workspaceIsolated && task.branchName)
+      .slice(0, limit);
+    if (candidates.length === 0) {
+      await interaction.editReply(`No saved tasks with isolated branches found for \`${project.name}\`.`);
+      return;
+    }
+    const defaultBranch = project.metadata.defaultBranch ?? "main";
+    const lines: string[] = [];
+    for (const candidate of candidates) {
+      const { freshness } = await refreshTaskBranchState(candidate, project);
+      const summary = !freshness ? "no branch evidence" : freshness.available ? describeBranchFreshness(freshness) : freshness.message;
+      lines.push(`- \`${candidate.id}\` \`${candidate.branchName}\`: ${summary}`);
+    }
+    await editInteractionWithChunks(
+      interaction,
+      { content: [`Branch freshness for \`${project.name}\` against \`${defaultBranch}\`:`, ...lines].join("\n") },
+      true
+    );
+    return;
+  }
+
+  if (subcommand === "sync") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const id = interaction.options.getString("task", true);
+    const task = await taskStore.get(id);
+    if (!task || !allowedProjectNames.has(task.projectName) || !canAccessTask(interaction, task, appConfig)) {
+      await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
+      return;
+    }
+    const project = mustFindProject(appConfig.projects, task.projectName);
+    const refusal = taskSyncRefusal(task, {
+      userId: interaction.user.id,
+      projectAllowed: allowedProjectNames.has(task.projectName),
+      controller: isControllerUser(interaction.user.id, appConfig),
+      safeMode: appConfig.safeMode
+    });
+    if (refusal) {
+      await interaction.editReply(taskSyncRefusalMessage(refusal));
+      return;
+    }
+    const { workspacePath, branchName, baseBranch } = task;
+    if (!workspacePath || !branchName || !baseBranch) {
+      await interaction.editReply(taskSyncRefusalMessage("no-isolated-branch"));
+      return;
+    }
+    const actionKey = `${task.id}:sync`;
+    if (activeTaskActions.has(actionKey)) {
+      await interaction.editReply("That task action is already running.");
+      return;
+    }
+    activeTaskActions.add(actionKey);
+    try {
+      const result = await syncTaskBranch({
+        worktree: { sourcePath: project.root, path: workspacePath, branch: branchName, baseRevision: baseBranch },
+        defaultBranch: project.metadata.defaultBranch ?? "main",
+        taskId: task.id
+      });
+      await concludeTaskSync(interaction, appConfig, project, task, workspacePath, result);
+    } finally {
+      activeTaskActions.delete(actionKey);
+    }
     return;
   }
 
@@ -2534,6 +2620,123 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     );
     await interaction.editReply(stale.length ? formatTaskList(stale) : `No running tasks older than ${minutes}m.`);
   }
+}
+
+async function refreshTaskBranchState(
+  task: TaskRecord,
+  project: ProjectEntry | undefined
+): Promise<{ task: TaskRecord; freshness: BranchFreshnessResult | undefined }> {
+  if (!project || !task.workspaceIsolated || !task.branchName) {
+    return { task, freshness: undefined };
+  }
+  const freshness = await inspectBranchFreshness({
+    repositoryPath: project.root,
+    branch: task.branchName,
+    defaultBranch: project.metadata.defaultBranch ?? "main"
+  });
+  if (freshness.available && freshness.merged !== Boolean(task.branchMerged)) {
+    const updated = await taskStore.setBranchSync(task.id, { merged: freshness.merged });
+    return { task: updated ?? task, freshness };
+  }
+  return { task, freshness };
+}
+
+function taskSyncRefusalMessage(refusal: TaskSyncRefusal): string {
+  if (refusal === "safe-mode") return safeModeActionMessage("/task sync");
+  if (refusal === "task-active") return "This task is still open; wait for it to finish or cancel it before syncing its branch.";
+  if (refusal === "requester-or-controller") return "Only the task requester, the owner, or an approved controller can sync a task branch.";
+  if (refusal === "no-isolated-branch") return "This task has no isolated branch and worktree to sync.";
+  return "No accessible saved task found.";
+}
+
+async function concludeTaskSync(
+  interaction: ChatInputCommandInteraction,
+  appConfig: AppConfig,
+  project: ProjectEntry,
+  task: TaskRecord,
+  workspacePath: string,
+  result: SyncTaskBranchResult
+): Promise<void> {
+  if (result.outcome === "blocked") {
+    await interaction.editReply(`Sync for \`${task.id}\` did not run: ${result.message}`);
+    return;
+  }
+
+  if (result.outcome === "already-merged") {
+    await taskStore.setBranchSync(task.id, { merged: true });
+    await interaction.editReply(
+      `Branch \`${result.freshness.branch}\` is already fully merged into \`${result.freshness.defaultBranch}\`; nothing to sync. The isolated worktree is eligible for pruning.`
+    );
+    return;
+  }
+
+  if (result.outcome === "up-to-date") {
+    await interaction.editReply(
+      `Branch \`${result.freshness.branch}\` is already up to date with \`${result.freshness.defaultBranch}\`${result.freshness.ahead > 0 ? ` and ahead by ${result.freshness.ahead}` : ""}; nothing to sync.`
+    );
+    return;
+  }
+
+  if (result.outcome === "conflict") {
+    const more = result.conflictedFileCount - result.conflictedFiles.length;
+    await appendTaskSyncEvidence(task.id, [
+      `Sync onto ${result.defaultBranch} aborted on ${result.conflictedFileCount} conflicted ${result.conflictedFileCount === 1 ? "file" : "files"}; branch ${result.restored ? "restored to" : "preserved at"} ${shortSha(result.previousTip)} via ${result.backupRef}.`
+    ]);
+    await editInteractionWithChunks(
+      interaction,
+      {
+        content: [
+          `Sync for \`${task.id}\` stopped: ${result.message}`,
+          "",
+          "Conflicted files:",
+          ...result.conflictedFiles.map((file) => `- \`${file}\``),
+          ...(more > 0 ? [`- and ${more} more`] : [])
+        ].join("\n")
+      },
+      true
+    );
+    return;
+  }
+
+  await taskStore.setBranchSync(task.id, { baseBranch: result.defaultTip });
+  await appendTaskSyncEvidence(task.id, [
+    `Branch ${result.branch} rebased onto ${result.defaultBranch} at ${shortSha(result.defaultTip)}; ${result.replayedCommits} ${result.replayedCommits === 1 ? "commit" : "commits"} replayed.`,
+    `Pre-sync tip ${shortSha(result.previousTip)} preserved at ${result.backupRef}.`
+  ]);
+  const lines = [
+    `Synced \`${result.branch}\` onto \`${result.defaultBranch}\` at \`${shortSha(result.defaultTip)}\` in the isolated worktree.`,
+    `Replayed ${result.replayedCommits} ${result.replayedCommits === 1 ? "commit" : "commits"}; new tip \`${shortSha(result.newTip)}\`.`,
+    `The pre-sync tip \`${shortSha(result.previousTip)}\` is preserved at \`${result.backupRef}\`.`
+  ];
+
+  if (configuredCommandNames(project).length === 0) {
+    await interaction.editReply(lines.join("\n"));
+    return;
+  }
+  if (!isControllerUser(interaction.user.id, appConfig)) {
+    lines.push("Configured validation was not run automatically; ask the owner or a controller to run `/review validate` for this task.");
+    await interaction.editReply(lines.join("\n"));
+    return;
+  }
+  try {
+    const results = await validateReview({ ...project, root: workspacePath });
+    await appendTaskSyncEvidence(task.id, [
+      `Post-sync validation ${results.every((item) => item.ok) ? "passed" : "failed"}: ${results.map((item) => item.kind).join(", ")}.`
+    ]);
+    await editInteractionWithChunks(interaction, { content: [...lines, "", formatValidationResults(project, results)].join("\n") }, true);
+  } catch (error) {
+    await appendTaskSyncEvidence(task.id, [`Post-sync validation could not run: ${publicErrorMessage(error)}`]);
+    await editInteractionWithChunks(interaction, { content: [...lines, "", `Post-sync validation could not run: ${publicErrorMessage(error)}`].join("\n") }, true);
+  }
+}
+
+async function appendTaskSyncEvidence(taskId: string, lines: string[]): Promise<void> {
+  const current = await taskStore.get(taskId);
+  await taskStore.setEvidence(taskId, { verification: [...(current?.verification ?? []), ...lines].slice(-12) });
+}
+
+function shortSha(value: string): string {
+  return value.slice(0, 10);
 }
 
 async function handleTaskControl(
