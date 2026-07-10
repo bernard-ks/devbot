@@ -38,7 +38,23 @@ export interface QueueRunnerState {
   running: boolean;
   stopOnFailure: boolean;
   startedBy?: string;
+  startedById?: string;
   startedAt?: string;
+  /**
+   * Project names the runner is authorized to process, captured from the controller who
+   * started it. When present, only items on these projects are ever claimed, so starting or
+   * stopping the queue can never trigger or halt work on a project the actor cannot control.
+   * Undefined means an unscoped legacy runner (all projects) — only reachable for state written
+   * before this field existed.
+   */
+  scopeProjects?: string[];
+}
+
+export interface ClaimNextOptions {
+  /** Restrict claiming to items on these projects (the runner's control scope). */
+  projects?: ReadonlySet<string>;
+  /** When false, action-mode items are left queued (fail-closed while safe mode is on). */
+  allowActionMode?: boolean;
 }
 
 export interface AddQueueItemInput {
@@ -99,10 +115,16 @@ export class QueueStore {
     return item ? { ...item } : undefined;
   }
 
-  /** Atomically claims the next queued item by transitioning it to `running` before any execution side effect starts. */
-  async claimNext(): Promise<QueueItem | undefined> {
+  /**
+   * Atomically claims the next runnable queued item by transitioning it to `running` before any
+   * execution side effect starts. `options` narrows what counts as runnable: `projects` scopes
+   * to the runner's authorized projects, and `allowActionMode: false` leaves action-mode items
+   * queued (used to fail closed while safe mode is on). Items excluded by these filters stay
+   * `queued` so they resume once the scope widens or safe mode is lifted.
+   */
+  async claimNext(options?: ClaimNextOptions): Promise<QueueItem | undefined> {
     return this.mutate((state) => {
-      const item = nextQueuedItem(state.items);
+      const item = nextRunnableItem(state.items, options);
       if (!item) {
         return undefined;
       }
@@ -179,12 +201,26 @@ export class QueueStore {
     return { ...state.runner };
   }
 
-  async startRunner(startedBy: string, stopOnFailure: boolean): Promise<QueueRunnerState> {
+  async startRunner(
+    startedBy: string,
+    stopOnFailure: boolean,
+    options?: { startedById?: string; scopeProjects?: readonly string[] }
+  ): Promise<QueueRunnerState> {
     return this.mutate((state) => {
       state.runner.running = true;
       state.runner.stopOnFailure = stopOnFailure;
       state.runner.startedBy = startedBy;
       state.runner.startedAt = new Date().toISOString();
+      if (options?.startedById) {
+        state.runner.startedById = options.startedById;
+      } else {
+        delete state.runner.startedById;
+      }
+      if (options?.scopeProjects) {
+        state.runner.scopeProjects = [...new Set(options.scopeProjects)];
+      } else {
+        delete state.runner.scopeProjects;
+      }
       return { ...state.runner };
     });
   }
@@ -321,6 +357,21 @@ function sanitizeText(value: string): string {
 
 export function nextQueuedItem(items: QueueItem[]): QueueItem | undefined {
   return items.find((item) => item.state === "queued");
+}
+
+export function nextRunnableItem(items: QueueItem[], options?: ClaimNextOptions): QueueItem | undefined {
+  return items.find((item) => {
+    if (item.state !== "queued") {
+      return false;
+    }
+    if (options?.projects && !options.projects.has(item.project)) {
+      return false;
+    }
+    if (options?.allowActionMode === false && item.mode === "action") {
+      return false;
+    }
+    return true;
+  });
 }
 
 export function pendingQueueCount(items: QueueItem[]): number {
@@ -467,11 +518,16 @@ function normalizeLoadedRunner(value: unknown): QueueRunnerState {
     return { ...DEFAULT_RUNNER_STATE };
   }
   const runner = value as Partial<QueueRunnerState>;
+  const scopeProjects = Array.isArray(runner.scopeProjects)
+    ? [...new Set(runner.scopeProjects.filter((name): name is string => typeof name === "string" && name.length > 0))]
+    : undefined;
   return {
     running: runner.running === true,
     stopOnFailure: runner.stopOnFailure === true,
     ...(stringValue(runner.startedBy) ? { startedBy: stringValue(runner.startedBy)! } : {}),
-    ...(validTimestamp(runner.startedAt) ? { startedAt: validTimestamp(runner.startedAt)! } : {})
+    ...(stringValue(runner.startedById) ? { startedById: stringValue(runner.startedById)! } : {}),
+    ...(validTimestamp(runner.startedAt) ? { startedAt: validTimestamp(runner.startedAt)! } : {}),
+    ...(scopeProjects ? { scopeProjects } : {})
   };
 }
 

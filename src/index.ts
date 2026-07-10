@@ -24,7 +24,13 @@ import type {
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { isAccessSubjectAllowed, isApprovedDiscordUsername } from "./access.js";
+import {
+  isAccessSubjectAllowed,
+  isApprovedDiscordUsername,
+  requesterHasGlobalAccess,
+  requesterHasProjectAccess,
+  type RequesterIdentity
+} from "./access.js";
 import {
   confirmToActProposalCard,
   needsMeInbox,
@@ -2703,10 +2709,32 @@ async function handleQueueCommand(interaction: ChatInputCommandInteraction, appC
       await interaction.reply({ content: "The queue is already running.", flags: MessageFlags.Ephemeral });
       return;
     }
+    // Scope the runner to exactly the projects this actor may control, so starting the queue can
+    // never trigger work on a project they cannot see. Refuse to start when they have no
+    // controllable pending work rather than spinning up an empty, wrongly scoped runner.
+    const controllableNames = new Set(
+      appConfig.projects.filter((project) => isAllowedForProject(interaction, project)).map((project) => project.name)
+    );
+    const pendingInScope = (await queueStore.list()).filter(
+      (item) => item.state === "queued" && controllableNames.has(item.project)
+    );
+    if (pendingInScope.length === 0) {
+      await interaction.reply({
+        content: "There is no queued work on a project you can control. Nothing to start.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
     const stopOnFailure = interaction.options.getBoolean("stop-on-failure") ?? false;
-    await queueStore.startRunner(interaction.user.tag, stopOnFailure);
+    await queueStore.startRunner(interaction.user.tag, stopOnFailure, {
+      startedById: interaction.user.id,
+      scopeProjects: [...controllableNames]
+    });
+    const safeModeNote = appConfig.safeMode
+      ? " Safe mode is on, so any write-capable (do) items stay queued until it is lifted; read-only (ask) items still run."
+      : "";
     await interaction.reply({
-      content: `Queue started${stopOnFailure ? " (will stop on the first failure)" : ""}.`,
+      content: `Queue started${stopOnFailure ? " (will stop on the first failure)" : ""}.${safeModeNote}`,
       flags: MessageFlags.Ephemeral
     });
     void advanceQueue(appConfig).catch((error) => {
@@ -2716,6 +2744,29 @@ async function handleQueueCommand(interaction: ChatInputCommandInteraction, appC
   }
 
   if (subcommand === "stop") {
+    const current = await queueStore.getRunner();
+    if (!current.running) {
+      await interaction.reply({ content: "The queue is not running.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    // Only stop when the actor could control everything the runner is currently scoped to (or is
+    // its starter / the owner), so a controller cannot halt work on a hidden project.
+    const scope = current.scopeProjects ?? [];
+    const controlsEntireScope = scope.every((name) => {
+      const project = findProject(appConfig.projects, name);
+      return project ? isAllowedForProject(interaction, project) : false;
+    });
+    const mayStop =
+      isOwner(interaction.user.id, appConfig) ||
+      interaction.user.id === current.startedById ||
+      (scope.length > 0 && controlsEntireScope);
+    if (!mayStop) {
+      await interaction.reply({
+        content: "You can only stop the queue if you control every project it is currently running.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
     const runner = await queueStore.stopRunner();
     await interaction.reply({
       content: runner.running ? "Unable to stop the queue." : "The queue will stop after the current item finishes.",
@@ -2836,8 +2887,13 @@ async function advanceQueue(appConfig: AppConfig): Promise<void> {
         return;
       }
       // Atomically claims the item (queued -> running) before any execution side effect, so a
-      // concurrent /queue remove sees it as running and correctly refuses to touch it.
-      const item = await queueStore.claimNext();
+      // concurrent /queue remove sees it as running and correctly refuses to touch it. Claiming
+      // is bounded to the runner's control scope and, while safe mode is on, to read-only items,
+      // so write-capable work and out-of-scope projects are left queued instead of executed.
+      const item = await queueStore.claimNext({
+        ...(runner.scopeProjects ? { projects: new Set(runner.scopeProjects) } : {}),
+        allowActionMode: !appConfig.safeMode
+      });
       if (!item) {
         await finishQueueDrain(appConfig);
         return;
@@ -2851,10 +2907,34 @@ async function advanceQueue(appConfig: AppConfig): Promise<void> {
         }
         continue;
       }
+      // Fail-closed execution-time gate: a write-capable item may only run if safe mode is off.
+      // claimNext already skips action items under safe mode, but re-check here so a state file
+      // mutated between claim and execution can never slip write work through.
+      if (item.mode === "action" && isWriteBlockedBySafeMode(appConfig, "action")) {
+        await queueStore.markFinished(item.id, {
+          state: "failed",
+          summary: "Skipped: safe mode is on; write-capable queue work is paused."
+        });
+        continue;
+      }
+      // Re-authorize the requester's current global/setup-managed AND project access at the
+      // moment of execution; additionally require write-capable items to still be run by a
+      // current controller, matching what enqueueing them required.
       if (!(await requesterAllowedForProject(appConfig, project, item.addedById))) {
         await queueStore.markFinished(item.id, {
           state: "failed",
           summary: "Skipped: the requester no longer has access to this project."
+        });
+        if (runner.stopOnFailure) {
+          await queueStore.stopRunner();
+          return;
+        }
+        continue;
+      }
+      if (item.mode === "action" && !isControllerUser(item.addedById, appConfig)) {
+        await queueStore.markFinished(item.id, {
+          state: "failed",
+          summary: "Skipped: the requester is no longer a controller and cannot run write-capable work."
         });
         if (runner.stopOnFailure) {
           await queueStore.stopRunner();
@@ -3007,37 +3087,57 @@ async function scopedRoomChannel(
   return undefined;
 }
 
+function memberAccessIdentity(member: GuildMember): RequesterIdentity {
+  return {
+    id: member.id,
+    username: member.user.username,
+    globalName: member.user.globalName,
+    tag: member.user.tag,
+    displayName: member.displayName,
+    roleIds: [...member.roles.cache.keys()]
+  };
+}
+
 /**
  * Fail-closed re-authorization at execution time: even though the requester was allowed to
- * enqueue/schedule against `project`, access may have been revoked (allowlist edited, role
- * removed, user left the server) before this occurrence actually runs. Unresolvable
- * requesters (unknown/legacy records, or a member who can no longer be fetched) are treated
- * as not allowed rather than defaulting to trust.
+ * enqueue/schedule against `project`, access may have been revoked (global allowlist or
+ * setup-managed viewer/controller lists edited, project policy changed, role removed, user
+ * left the server) before this occurrence actually runs. Both the current global/setup-managed
+ * access AND the project policy are rechecked here — a requester who no longer passes the
+ * global allowlist can no longer drive queued/scheduled work even on an unrestricted project.
+ * Unresolvable requesters (unknown/legacy records, or a member who can no longer be fetched)
+ * are treated as not allowed rather than defaulting to trust.
  */
 async function requesterAllowedForProject(appConfig: AppConfig, project: ProjectEntry, requesterId: string): Promise<boolean> {
-  const policy = project.metadata.policy;
-  const hasProjectAllowList = policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
-  if (!hasProjectAllowList) {
-    return true;
-  }
   if (!requesterId || requesterId === "unknown") {
     return false;
   }
-  if (policy.allowedUsers.includes(requesterId)) {
-    return true;
-  }
   const guild = await client.guilds.fetch(appConfig.discordGuildId).catch(() => null);
   const member = guild ? await guild.members.fetch(requesterId).catch(() => null) : null;
-  if (!member) {
+  const identity = member ? memberAccessIdentity(member) : undefined;
+  const globallyAllowed = requesterHasGlobalAccess(
+    {
+      ownerUserId: appConfig.ownerUserId,
+      allowedUserIds: appConfig.allowedUserIds,
+      allowedUsernames: appConfig.allowedUsernames,
+      allowedRoleIds: appConfig.allowedRoleIds
+    },
+    requesterId,
+    identity
+  );
+  if (!globallyAllowed) {
     return false;
   }
-  if (isApprovedDiscordUsername({ username: member.user.username, tag: member.user.tag, globalName: member.user.globalName }, policy.allowedUsernames)) {
-    return true;
-  }
-  return member.roles.cache.some((role) => policy.allowedRoles.includes(role.id));
+  return requesterHasProjectAccess(project.metadata.policy, requesterId, identity);
 }
 
 async function tickSchedules(appConfig: AppConfig): Promise<void> {
+  // Fail closed under safe mode: schedules stay off entirely (even read-only ones) until safe
+  // mode is lifted, matching the copy shown by `/schedule add|resume`. Entries keep their state
+  // and are neither claimed nor advanced, so nothing runs unattended while safe mode is on.
+  if (appConfig.safeMode) {
+    return;
+  }
   // Atomically claims (marks running) every due entry before executing any of them, so an
   // occurrence still in flight from a previous tick can never be claimed and started again.
   const claimed = await scheduleStore.claimDue();

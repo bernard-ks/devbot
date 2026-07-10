@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isAccessSubjectAllowed, type AccessAllowLists, type AccessSubject } from "./access.js";
+import {
+  isAccessSubjectAllowed,
+  requesterHasGlobalAccess,
+  requesterHasProjectAccess,
+  type AccessAllowLists,
+  type AccessSubject,
+  type GlobalAccessPolicy,
+  type ProjectAccessPolicy,
+  type RequesterIdentity
+} from "./access.js";
 import { applySetupState, captureBootstrapConfig } from "./runtime-setup.js";
 import type { SetupState } from "./setup-store.js";
 import type { AppConfig } from "./types.js";
@@ -96,4 +105,69 @@ test("guild members outside the allowlists are excluded from workroom audiences"
   assert.equal(isAccessSubjectAllowed(subject("member-1", { roleIds: [] }), config), true);
   assert.equal(isAccessSubjectAllowed(subject("member-2", { roleIds: ["role-1"] }), config), true);
   assert.equal(isAccessSubjectAllowed(subject("member-3", { roleIds: ["role-2"] }), config), false);
+});
+
+function globalPolicy(overrides: Partial<GlobalAccessPolicy> = {}): GlobalAccessPolicy {
+  return {
+    ownerUserId: "owner",
+    allowedUserIds: new Set<string>(),
+    allowedUsernames: new Set<string>(),
+    allowedRoleIds: new Set<string>(),
+    ...overrides
+  };
+}
+
+function identity(id: string, overrides: Partial<RequesterIdentity> = {}): RequesterIdentity {
+  return {
+    id,
+    username: id,
+    tag: `${id}#0`,
+    roleIds: [],
+    ...overrides
+  };
+}
+
+test("global re-auth allows all when no global allowlist is configured", () => {
+  const policy = globalPolicy();
+  assert.equal(requesterHasGlobalAccess(policy, "anyone", identity("anyone")), true);
+});
+
+test("global re-auth denies a user revoked from the allowlist even on the unrestricted path", () => {
+  // The exact blocker: a global allowlist exists but the requester is no longer on it. Previously
+  // an unrestricted project short-circuited to allow; now global access is rechecked first.
+  const policy = globalPolicy({ allowedUserIds: new Set(["still-allowed"]) });
+  assert.equal(requesterHasGlobalAccess(policy, "still-allowed", identity("still-allowed")), true);
+  assert.equal(requesterHasGlobalAccess(policy, "revoked", identity("revoked")), false);
+});
+
+test("global re-auth honors username and role membership, and always allows the owner", () => {
+  assert.equal(requesterHasGlobalAccess(globalPolicy({ allowedUsernames: new Set(["tester"]) }), "u1", identity("u1", { username: "Tester", tag: "Tester#1" })), true);
+  assert.equal(requesterHasGlobalAccess(globalPolicy({ allowedRoleIds: new Set(["role-1"]) }), "u2", identity("u2", { roleIds: ["role-0", "role-1"] })), true);
+  assert.equal(requesterHasGlobalAccess(globalPolicy({ allowedUserIds: new Set(["someone"]) }), "owner", identity("owner")), true);
+});
+
+test("global re-auth fails closed for unknown/unresolved requesters", () => {
+  const policy = globalPolicy({ allowedUsernames: new Set(["ghost"]) });
+  assert.equal(requesterHasGlobalAccess(policy, "unknown", undefined), false);
+  assert.equal(requesterHasGlobalAccess(policy, "", identity("")), false);
+  // Member left the server (identity undefined): a username/role-only match can no longer be
+  // proven, so access is denied even though the name would have matched.
+  assert.equal(requesterHasGlobalAccess(policy, "ghost", undefined), false);
+});
+
+function projectPolicy(overrides: Partial<ProjectAccessPolicy> = {}): ProjectAccessPolicy {
+  return { allowedUsers: [], allowedUsernames: [], allowedRoles: [], ...overrides };
+}
+
+test("project re-auth allows all on an unrestricted project but re-checks a restricted one", () => {
+  assert.equal(requesterHasProjectAccess(projectPolicy(), "anyone", identity("anyone")), true);
+  const restricted = projectPolicy({ allowedUsers: ["member-1"] });
+  assert.equal(requesterHasProjectAccess(restricted, "member-1", identity("member-1")), true);
+  assert.equal(requesterHasProjectAccess(restricted, "member-2", identity("member-2")), false);
+});
+
+test("project re-auth fails closed when a role-scoped member can no longer be resolved", () => {
+  const restricted = projectPolicy({ allowedRoles: ["role-1"] });
+  assert.equal(requesterHasProjectAccess(restricted, "member-1", identity("member-1", { roleIds: ["role-1"] })), true);
+  assert.equal(requesterHasProjectAccess(restricted, "member-1", undefined), false);
 });

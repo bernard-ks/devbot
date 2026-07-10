@@ -9,6 +9,7 @@ import {
   groupQueueItemsByProject,
   isQueueItemId,
   nextQueuedItem,
+  nextRunnableItem,
   pendingQueueCount,
   QueueStore,
   retainQueueItems,
@@ -202,6 +203,58 @@ test("runner state start/stop persist", async () => {
 
   runner = await store.stopRunner();
   assert.equal(runner.running, false);
+});
+
+test("startRunner records the controller and control scope and survives a restart", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-queue-scope-"));
+  const filePath = path.join(root, "queue.json");
+  const store = new QueueStore(filePath);
+  const runner = await store.startRunner("tom", false, { startedById: "user-1", scopeProjects: ["web", "web", "docs"] });
+  assert.equal(runner.startedById, "user-1");
+  assert.deepEqual([...(runner.scopeProjects ?? [])].sort(), ["docs", "web"]);
+
+  // Reload from disk (a restart): the scope and starter must persist so the resumed runner
+  // stays bounded to the same projects.
+  const reloaded = new QueueStore(filePath);
+  const persisted = await reloaded.getRunner();
+  assert.equal(persisted.running, true);
+  assert.equal(persisted.startedById, "user-1");
+  assert.deepEqual([...(persisted.scopeProjects ?? [])].sort(), ["docs", "web"]);
+});
+
+test("claimNext only claims items on projects within the runner scope", async () => {
+  const store = await tempStore();
+  await store.add(addInput({ project: "secret", taskText: "hidden" }));
+  await store.add(addInput({ project: "web", taskText: "visible" }));
+  const claimed = await store.claimNext({ projects: new Set(["web"]) });
+  assert.equal(claimed?.taskText, "visible");
+  // The out-of-scope item stays queued rather than being started by a controller who cannot see it.
+  const items = await store.list();
+  assert.equal(items.find((entry) => entry.project === "secret")?.state, "queued");
+});
+
+test("claimNext leaves action-mode items queued when action mode is disallowed (safe mode)", async () => {
+  const store = await tempStore();
+  await store.add(addInput({ mode: "action", taskText: "write" }));
+  await store.add(addInput({ mode: "answer", taskText: "read" }));
+  const claimed = await store.claimNext({ allowActionMode: false });
+  assert.equal(claimed?.taskText, "read");
+  assert.equal(claimed?.mode, "answer");
+  const items = await store.list();
+  assert.equal(items.find((entry) => entry.taskText === "write")?.state, "queued");
+  // With only the action item left and action mode still disallowed, nothing more is claimable.
+  assert.equal(await store.claimNext({ allowActionMode: false }), undefined);
+});
+
+test("nextRunnableItem honors project scope and action-mode filters", () => {
+  const items: QueueItem[] = [
+    { ...item("a", "queued", "secret"), mode: "action" },
+    { ...item("b", "queued", "web"), mode: "action" },
+    { ...item("c", "queued", "web"), mode: "answer" }
+  ];
+  assert.equal(nextRunnableItem(items, { projects: new Set(["web"]) })?.id, "b");
+  assert.equal(nextRunnableItem(items, { projects: new Set(["web"]), allowActionMode: false })?.id, "c");
+  assert.equal(nextRunnableItem(items, { projects: new Set(["missing"]) }), undefined);
 });
 
 test("recoverInterrupted fails running items and returns them", async () => {
