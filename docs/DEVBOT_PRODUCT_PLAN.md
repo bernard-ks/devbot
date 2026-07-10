@@ -80,7 +80,7 @@ The safety contract is explicit: only the requester or an approved controller ca
 - Local Codex process detection is heuristic and depends on command-line shape.
 - Discord setup state is a local atomic JSON store rather than a shared database; run one Devbot process per setup file.
 - A setup-managed private room controls new message visibility, but it cannot retroactively hide messages previously posted in other channels.
-- The audit trail spans Discord messages, local task/collaboration stores, and git history; it is not yet centralized or tamper-evident.
+- Task lifecycle, approvals, command executions, setup changes, and workroom decisions are now centralized in a local hash-chained audit ledger with `/audit recent|show|verify`. The chain plus its head anchor make partial edits, truncation, and accidents evident, but the ledger is not tamper-proof: a local attacker with write access to `.devbot/audit/` can rewrite the whole chain and anchor consistently. Discord messages and git history remain independent corroborating trails.
 - The v2 collaboration protocol supports allow-listed discovery and coordination, but transport is still Discord-specific and peer writes remain human-gated.
 - Ambient workroom activity aggregation and the deferred Activity idea 9 are not implemented.
 
