@@ -42,6 +42,7 @@ import {
 } from "./lab.js";
 import { renderStatusImage } from "./status-image.js";
 import { TaskStore } from "./task-store.js";
+import { parseTaskControl, taskControlRow } from "./task-controls.js";
 import type { ProjectEntry } from "./types.js";
 import { formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
@@ -196,7 +197,7 @@ test("mention status questions route to read-only answer mode", () => {
   assert.equal(request.mode, "answer");
 });
 
-test("mention action verbs route to action mode", () => {
+test("mentions remain read-only even when phrased as actions", () => {
   const request = parseMentionRequest("<@!123> project:webapp include:src/* fix the failing tests", "123", [
     project("webapp", "/tmp/webapp")
   ]);
@@ -204,10 +205,16 @@ test("mention action verbs route to action mode", () => {
   assert.equal(request.project.name, "webapp");
   assert.deepEqual(request.includePatterns, ["src/*"]);
   assert.equal(request.text, "fix the failing tests");
-  assert.equal(request.mode, "action");
+  assert.equal(request.mode, "answer");
 });
 
-test("mention mode override wins over inferred mode", () => {
+test("bare test mention is a read-only ping rather than a project action", () => {
+  const request = parseMentionRequest("<@123> test", "123", [project("webapp", "/tmp/webapp")]);
+  assert.equal(request.mode, "answer");
+  assert.equal(request.text, "test");
+});
+
+test("explicit mention mode can request an action", () => {
   const request = parseMentionRequest("<@123> mode:action whats the current state", "123", [
     project("webapp", "/tmp/webapp")
   ]);
@@ -289,7 +296,15 @@ test("task store persists task lifecycle to disk", async () => {
     includePatterns: ["src/*"]
   });
 
-  await store.succeed(task.id, { contextFileCount: 2, resultPreview: "done" });
+  await store.succeed(task.id, {
+    contextFileCount: 2,
+    resultPreview: "done",
+    model: "gpt-5.6-terra",
+    modelTier: "standard",
+    contextMode: "focused",
+    routeReason: "Targeted project question.",
+    routeSource: "model"
+  });
 
   const reloaded = new TaskStore(stateFile);
   const saved = await reloaded.get(task.id);
@@ -299,6 +314,10 @@ test("task store persists task lifecycle to disk", async () => {
   assert.equal(saved?.contextFileCount, 2);
   assert.equal(saved?.resultPreview, "done");
   assert.equal(saved?.includePatterns[0], "src/*");
+  assert.equal(saved?.model, "gpt-5.6-terra");
+  assert.equal(saved?.modelTier, "standard");
+  assert.equal(saved?.contextMode, "focused");
+  assert.equal(saved?.routeSource, "model");
   assert.equal(recent[0]?.id, task.id);
 });
 
@@ -482,6 +501,13 @@ test("workroom controls encode IDs and follow lifecycle state", () => {
   assert.equal(synthesized.find((button) => "custom_id" in button && button.custom_id.includes(":approve:"))?.disabled, false);
 });
 
+test("task controls keep task IDs behind native details and retry buttons", () => {
+  const row = taskControlRow("task-abc").toJSON();
+  assert.deepEqual(row.components.map((component) => "label" in component ? component.label : undefined), ["Details", "Retry"]);
+  assert.deepEqual(parseTaskControl("devbot:task-control:details:task-abc"), { action: "details", taskId: "task-abc" });
+  assert.equal(parseTaskControl("devbot:setup:refresh"), undefined);
+});
+
 interface CommandJson {
   name: string;
   autocomplete?: boolean;
@@ -495,15 +521,15 @@ test("safe mode blocks only write-capable Codex requests", () => {
   assert.equal(isWriteBlockedBySafeMode({ safeMode: true }, "action"), true);
   assert.equal(isWriteBlockedBySafeMode({ safeMode: true }, "answer"), false);
   assert.equal(isWriteBlockedBySafeMode({ safeMode: false }, "action"), false);
-  assert.match(safeModeActionMessage("/act"), /cannot start write-capable Codex work/);
-  assert.match(safeModeActionMessage("/act"), /Read-only commands still work/);
+  assert.match(safeModeActionMessage("/do"), /cannot start write-capable Codex work/);
+  assert.match(safeModeActionMessage("/do"), /Read-only commands still work/);
 });
 
 test("approved Discord usernames normalize without trusting mutable display names", () => {
-  const approved = new Set(normalizeDiscordUsernames(["@Bernard-KS", "Team Lead"]));
+  const approved = new Set(normalizeDiscordUsernames(["@Alex-Dev", "Team Lead"]));
 
-  assert.deepEqual(discordUsernamesFor({ username: "Bernard-KS", tag: "Bernard-KS#0001" }), ["bernard-ks", "bernard-ks#0001"]);
-  assert.equal(isApprovedDiscordUsername({ username: "bernard-ks" }, approved), true);
+  assert.deepEqual(discordUsernamesFor({ username: "Alex-Dev", tag: "Alex-Dev#0001" }), ["alex-dev", "alex-dev#0001"]);
+  assert.equal(isApprovedDiscordUsername({ username: "alex-dev" }, approved), true);
   assert.equal(isApprovedDiscordUsername({ globalName: "team lead" }, approved), false);
   assert.equal(isApprovedDiscordUsername({ displayName: "Someone Else" }, approved), false);
 });
@@ -844,7 +870,7 @@ test("project policy gates peers screenshots and commands", () => {
     policy: {
       visibility: "team",
       allowedUsers: [],
-      allowedUsernames: ["bernard-ks"],
+      allowedUsernames: ["alex-dev"],
       allowedRoles: [],
       allowedPeers: ["222"],
       screenshotPolicy: "approval",

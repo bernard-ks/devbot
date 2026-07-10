@@ -14,10 +14,14 @@ const DEFAULT_SCANNER = {
 
 export function loadConfig(): AppConfig {
   const projects = loadProjects();
+  const codex = loadCodexConfig();
 
   return {
     ...loadDiscordConfig(),
-    codex: loadCodexConfig(),
+    ownerUserId: process.env.DEVBOT_OWNER_USER_ID?.trim() || undefined,
+    autoDeployCommands: parseBoolean(process.env.DEVBOT_AUTO_DEPLOY_COMMANDS, true),
+    codex,
+    routing: loadRoutingConfig(codex.model),
     allowedUserIds: csvSet(process.env.ALLOWED_USER_IDS),
     allowedUsernames: normalizedUsernameSet(process.env.ALLOWED_USERNAMES),
     allowedRoleIds: csvSet(process.env.ALLOWED_ROLE_IDS),
@@ -30,6 +34,23 @@ export function loadConfig(): AppConfig {
     coordinationChannelId: process.env.COORDINATION_CHANNEL_ID?.trim() || undefined,
     projects,
     scanner: DEFAULT_SCANNER
+  };
+}
+
+function loadRoutingConfig(defaultModel: string | undefined) {
+  const routerModel = process.env.CODEX_ROUTER_MODEL?.trim() || undefined;
+  return {
+    enabled: parseBoolean(process.env.CODEX_ROUTING_ENABLED, Boolean(routerModel)),
+    routerModel,
+    routerReasoningEffort: process.env.CODEX_ROUTER_REASONING_EFFORT?.trim() || "low",
+    routerTimeoutMs: Number(process.env.CODEX_ROUTER_TIMEOUT_MS || 30_000),
+    fastModel: process.env.CODEX_FAST_MODEL?.trim() || defaultModel,
+    fastReasoningEffort: process.env.CODEX_FAST_REASONING_EFFORT?.trim() || undefined,
+    standardModel: process.env.CODEX_STANDARD_MODEL?.trim() || defaultModel,
+    standardReasoningEffort: process.env.CODEX_STANDARD_REASONING_EFFORT?.trim() || undefined,
+    deepModel: process.env.CODEX_DEEP_MODEL?.trim() || defaultModel,
+    deepReasoningEffort: process.env.CODEX_DEEP_REASONING_EFFORT?.trim() || undefined,
+    focusedContextChars: Number(process.env.CODEX_FOCUSED_CONTEXT_CHARS || 24_000)
   };
 }
 
@@ -86,7 +107,7 @@ function isCodexSandbox(value: string): value is "read-only" | "workspace-write"
 function loadProjects(): ProjectEntry[] {
   const raw = process.env.PROJECTS_JSON?.trim() || readProjectsFile();
   if (!raw) {
-    throw new Error("No projects configured. Set PROJECTS_JSON or create config/projects.json.");
+    return [];
   }
 
   let parsed: ProjectMap;
@@ -98,18 +119,18 @@ function loadProjects(): ProjectEntry[] {
 
   const entries = Object.entries(parsed)
     .filter(([name, projectPath]) => name.trim() && projectPath.trim())
-    .map(([name, projectPath]) => {
-      const root = path.resolve(expandEnvPlaceholders(projectPath, `project ${name}`));
-      const projectName = normalizeProjectName(name);
-      return {
-        name: projectName,
-        root,
-        metadata: loadProjectMetadata(root, projectName)
-      };
-    });
+    .map(([name, projectPath]) => loadProjectEntry(name, expandEnvPlaceholders(projectPath, `project ${name}`)));
 
-  if (entries.length === 0) {
-    throw new Error("Project configuration did not contain any usable project entries.");
+  const configuredDefault = process.env.DEFAULT_PROJECT?.trim();
+  if (configuredDefault) {
+    const normalizedDefault = normalizeProjectName(configuredDefault);
+    const selected = entries.find((entry) => entry.name === normalizedDefault);
+    if (!selected) {
+      throw new Error(`DEFAULT_PROJECT does not match a configured project: ${configuredDefault}`);
+    }
+    selected.isDefault = true;
+  } else if (entries.length === 1 && entries[0]) {
+    entries[0].isDefault = true;
   }
 
   return entries;
@@ -146,8 +167,18 @@ function normalizedUsernameSet(value: string | undefined): Set<string> {
   return new Set(normalizeDiscordUsernames((value ?? "").split(",")));
 }
 
-function normalizeProjectName(name: string): string {
+export function normalizeProjectName(name: string): string {
   return name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+}
+
+export function loadProjectEntry(name: string, projectPath: string): ProjectEntry {
+  const root = path.resolve(projectPath);
+  const projectName = normalizeProjectName(name);
+  return {
+    name: projectName,
+    root,
+    metadata: loadProjectMetadata(root, projectName)
+  };
 }
 
 export function expandEnvPlaceholders(value: string, label = "value"): string {

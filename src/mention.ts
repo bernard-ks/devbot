@@ -40,7 +40,7 @@ export function parseMentionRequest(
     text = text.replace(modeMatch[0], "").trim();
   }
 
-  const mode = modeMatch ? parseMentionMode(modeMatch[1] ?? "") : inferMentionMode(text);
+  const mode = modeMatch ? parseMentionMode(modeMatch[1] ?? "") : "answer";
   return { project, text, includePatterns, mode };
 }
 
@@ -110,30 +110,20 @@ function mustFindProject(projects: ProjectEntry[], name: string): ProjectEntry {
 }
 
 function defaultProject(projects: ProjectEntry[]): ProjectEntry {
+  const selected = projects.find((project) => project.isDefault);
+  if (selected) {
+    return selected;
+  }
   if (projects.length === 1 && projects[0]) {
     return projects[0];
   }
 
-  throw new Error("Multiple projects are configured. Add `project:<name>` to the message.");
+  if (projects.length === 0) {
+    throw new Error("No projects are configured. Ask the owner to run `/setup repo`.");
+  }
+  throw new Error("Multiple projects are configured. Add `project:<name>` or ask the owner to select a default with `/setup repo`.");
 }
 
 function parseMentionMode(value: string): CodexRequestMode {
   return value.toLowerCase() === "act" || value.toLowerCase() === "action" ? "action" : "answer";
-}
-
-function inferMentionMode(text: string): CodexRequestMode {
-  const normalized = text.trim().toLowerCase();
-  if (/^(what|whats|what's|why|how|where|when|who|which|summarize|explain|describe|show|tell me|status|state)\b/.test(normalized)) {
-    return "answer";
-  }
-
-  if (/\b(current state|state of|status of|summary of|overview of)\b/.test(normalized)) {
-    return "answer";
-  }
-
-  if (/^(fix|add|update|change|create|delete|remove|rename|refactor|implement|run|test|build|install|commit|push)\b/.test(normalized)) {
-    return "action";
-  }
-
-  return "answer";
 }

@@ -1,35 +1,43 @@
 # Devbot Product Plan
 
-Date: 2026-06-24
+Updated: 2026-07-09
 
 ## Purpose
 
-Devbot is a local Discord interface for Codex-backed development work. Its current strength is that it can answer project questions, run focused local Codex tasks, report active Codex work, and attach live UI screenshots without requiring an OpenAI API key.
+Devbot is a local Discord interface for Codex-backed development work. It answers project questions, runs focused local Codex tasks, reports active work, and attaches live UI screenshots without requiring an OpenAI API key.
 
-The next product step is to make devbot useful for a small team, not just one developer. The most interesting direction is a Discord server with multiple developer-owned devbots that can discover each other, exchange status, request help, hand off work, and coordinate review and merge flows.
+The small-team foundation now exists: owner-managed private setup, durable local tasks, peer discovery, sealed councils, approval records, and review handoffs. The next product step is to make those capabilities feel as natural as ordinary Discord conversation while deepening evidence-backed multi-agent work.
 
 ## Current Features
 
+- Initial setup:
+  - `npm run setup` opens a loopback-only browser wizard.
+  - The wizard validates the Discord bot, opens installation, discovers servers, chooses the server owner, registers a local repository, creates the private room, deploys commands, and starts Devbot.
+  - Discord application creation and bot-token retrieval remain the only required Developer Portal step.
 - Discord slash commands:
+  - `/setup wizard` provides resumable owner setup for viewers, controllers, peer bots, a private room, and runtime project roots.
+  - `/setup doctor` diagnoses the complete local and Discord setup path.
   - `/projects` lists configured local projects.
   - `/status` reports active bot work and detected local Codex sessions for configured projects.
   - `/status image:true` can attach a live local UI screenshot when a web dev server is detected.
   - `/refresh` rebuilds the in-memory project file index.
   - `/ask` answers read-only project questions with local context.
-  - `/act` asks local Codex to perform focused project work and return a fixed summary.
+  - `/do` asks local Codex to perform focused project work.
+  - Guild command definitions synchronize automatically at startup.
 - Mention support:
-  - Direct bot mentions and matching role mentions can invoke the bot.
+  - Direct bot mentions can invoke the bot without requesting the privileged Message Content intent.
   - Status-style mentions avoid unnecessary Codex runs.
-  - Action-style mentions route to local Codex with workspace-write sandboxing.
+  - Normal mentions stay read-only; `/do` is the explicit write-capable surface.
 - Local project context:
-  - Scans configured project roots.
+  - Scans static or owner-registered project roots and supports a selected default on multi-project hosts.
   - Ignores dependency/build folders and common secret files.
   - Redacts secret-looking values from indexed text.
   - Ranks local files against the user request before building the Codex prompt.
 - Local Codex execution:
   - Uses the installed Codex CLI/app session instead of OpenAI API keys.
   - Supports read-only answer mode and workspace-write action mode.
-  - Tracks bot-owned active work in memory.
+  - Routes requests through Luna, Terra, or Sol and chooses none, focused, or full prepacked project context before execution.
+  - Tracks active work in memory and persists task history locally.
 - External local Codex awareness:
   - Detects local Codex app/CLI sessions whose working directory belongs to a configured project.
   - Reports sanitized process status without leaking command prompts.
@@ -41,14 +49,15 @@ The next product step is to make devbot useful for a small team, not just one de
 
 ## Current Constraints
 
-- Runtime state is in memory. Bot restarts lose active task history.
-- The bot has no durable concept of task ownership, handoff, review state, or merge state.
+- Active process tracking is in memory, while task, setup, peer, and collaboration history use local JSON stores rather than a shared database.
+- Review packets and approval records are durable, but branch and provider merge state are not synchronized automatically.
 - The context scanner is text-only and does not understand repository structure beyond path/content ranking.
 - Screenshot targeting can click one visible matching UI control, but it does not yet plan multi-step flows, log in, seed test data, or navigate complex dynamic states.
 - Local Codex process detection is heuristic and depends on command-line shape.
-- Permissions are coarse: allow-listed users or roles can use broad bot capabilities.
-- There is no durable audit trail beyond Discord messages and local git history.
-- There is no formal multi-bot protocol. Two devbots in one Discord server currently cannot reliably discover each other or coordinate.
+- Discord setup state is a local atomic JSON store rather than a shared database; run one Devbot process per setup file.
+- A setup-managed private room controls new message visibility, but it cannot retroactively hide messages previously posted in other channels.
+- The audit trail spans Discord messages, local task/collaboration stores, and git history; it is not yet centralized or tamper-evident.
+- The v2 collaboration protocol supports allow-listed discovery and coordination, but transport is still Discord-specific and peer writes remain human-gated.
 
 ## Improvement Themes
 
@@ -61,7 +70,7 @@ The next product step is to make devbot useful for a small team, not just one de
   - project aliases
   - review links or branch references and merge state
   - screenshot URLs and capture metadata
-- Add task IDs to every `/act` and mention-triggered action.
+- Add durable task IDs to every `/do` request while keeping them out of normal conversation UI.
 - Add `/task status <id>`, `/task cancel <id>`, `/task logs <id>`, and `/task retry <id>`.
 - Persist work status across bot restarts.
 - Add structured logs with request IDs.
@@ -99,7 +108,7 @@ The next product step is to make devbot useful for a small team, not just one de
 ### 4. Review And Merge Workflows
 
 - Keep review/merge support provider-neutral instead of coupling devbot to one hosting provider or CLI.
-- Make `/act` optionally produce a branch and review packet instead of editing main directly.
+- Make `/do` optionally produce a branch and review packet instead of editing main directly.
 - Add merge gates:
   - clean working tree
   - tests pass
@@ -204,7 +213,7 @@ MVP multi-bot flow:
 
 ### Phase 2: Review-Centered Workflow
 
-- Add branch/review packet creation mode for `/act`. MVP implemented as `/review packet`, which can include a saved task ID and local git state.
+- Add branch/review packet creation mode for `/do`. MVP implemented as `/review packet`, which can include a saved task ID and local git state.
 - Add review status and verification commands. MVP implemented with `/review validate`.
 - Add review validation command that runs configured tests. Done through project metadata commands.
 - Add merge gate logic. MVP implemented as `/review gates`; it checks clean working tree plus configured validation without merging.

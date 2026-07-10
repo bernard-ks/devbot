@@ -13,7 +13,7 @@ export function projectChoices(projects: ProjectEntry[], focused: string): Autoc
   return projects
     .filter((project) => project.name.includes(query) || project.metadata.aliases.some((alias) => alias.includes(query)))
     .slice(0, 25)
-    .map((project) => ({ name: project.name, value: project.name }));
+    .map((project) => ({ name: `${project.name}${project.isDefault ? " (default)" : ""}`, value: project.name }));
 }
 
 export function commandChoices(project: ProjectEntry | undefined, focused: string): AutocompleteChoice[] {

@@ -3,6 +3,73 @@ import { SlashCommandBuilder } from "discord.js";
 export const commandDefinitions = [
   new SlashCommandBuilder().setName("projects").setDescription("List configured local projects."),
   new SlashCommandBuilder()
+    .setName("setup")
+    .setDescription("Owner-only Devbot access, peer, room, and repository setup.")
+    .addSubcommand((subcommand) => subcommand.setName("wizard").setDescription("Open the guided, resumable Devbot setup."))
+    .addSubcommand((subcommand) => subcommand.setName("doctor").setDescription("Check owner, room, repo, Codex, routing, and command readiness."))
+    .addSubcommand((subcommand) => subcommand.setName("show").setDescription("Show the current private Devbot configuration."))
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("user")
+        .setDescription("Add or remove a viewer or controller.")
+        .addStringOption((option) =>
+          option
+            .setName("action")
+            .setDescription("Whether to add or remove access.")
+            .setRequired(true)
+            .addChoices({ name: "add", value: "add" }, { name: "remove", value: "remove" })
+        )
+        .addUserOption((option) => option.setName("user").setDescription("Discord user to configure.").setRequired(true))
+        .addStringOption((option) =>
+          option
+            .setName("permission")
+            .setDescription("View can use Devbot; control can also run privileged actions.")
+            .setRequired(true)
+            .addChoices({ name: "view", value: "view" }, { name: "control", value: "control" })
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("devbot")
+        .setDescription("Add or remove a peer bot from private collaboration.")
+        .addStringOption((option) =>
+          option
+            .setName("action")
+            .setDescription("Whether to add or remove the peer.")
+            .setRequired(true)
+            .addChoices({ name: "add", value: "add" }, { name: "remove", value: "remove" })
+        )
+        .addUserOption((option) => option.setName("bot").setDescription("Discord bot account to configure.").setRequired(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("repo")
+        .setDescription("Add, remove, or select a local project root.")
+        .addStringOption((option) =>
+          option
+            .setName("action")
+            .setDescription("Repository action.")
+            .setRequired(true)
+            .addChoices(
+              { name: "add or update", value: "add" },
+              { name: "remove", value: "remove" },
+              { name: "make default", value: "default" }
+            )
+        )
+        .addStringOption((option) => option.setName("name").setDescription("Short project name, such as devbot.").setRequired(true))
+        .addStringOption((option) =>
+          option.setName("path").setDescription("Local absolute path; required when adding a repo.").setRequired(false)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("room")
+        .setDescription("Create or resync the private Devbot room.")
+        .addStringOption((option) =>
+          option.setName("name").setDescription("Channel name used when creating the room.").setRequired(false).setMaxLength(80)
+        )
+    ),
+  new SlashCommandBuilder()
     .setName("status")
     .setDescription("Show Codex dev work currently in progress.")
     .addStringOption((option) =>
@@ -114,14 +181,14 @@ export const commandDefinitions = [
     .setName("run")
     .setDescription("Run a configured project command preset.")
     .addStringOption((option) =>
-      option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
-    )
-    .addStringOption((option) =>
       option
         .setName("command")
         .setDescription("Configured command name such as test, build, lint, verify, or a project preset.")
         .setRequired(true)
         .setAutocomplete(true)
+    )
+    .addStringOption((option) =>
+      option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
     ),
   new SlashCommandBuilder()
     .setName("review")
@@ -206,14 +273,14 @@ export const commandDefinitions = [
         .setName("council")
         .setDescription("Collect independent sealed agent proposals, then reveal and synthesize them.")
         .addStringOption((option) =>
-          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
-        )
-        .addStringOption((option) =>
           option
             .setName("prompt")
             .setDescription("Question or decision for the council, up to 500 characters.")
             .setRequired(true)
             .setMaxLength(500)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
         )
         .addIntegerOption((option) =>
           option
@@ -383,10 +450,10 @@ export const commandDefinitions = [
     .setName("ask")
     .setDescription("Ask a development question with local project context.")
     .addStringOption((option) =>
-      option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+      option.setName("question").setDescription("What you want to know or inspect.").setRequired(true)
     )
     .addStringOption((option) =>
-      option.setName("question").setDescription("What you want to know or inspect.").setRequired(true)
+      option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
     )
     .addStringOption((option) =>
       option
@@ -395,13 +462,13 @@ export const commandDefinitions = [
         .setRequired(false)
     ),
   new SlashCommandBuilder()
-    .setName("act")
-    .setDescription("Ask local Codex to perform a focused project task.")
-    .addStringOption((option) =>
-      option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
-    )
+    .setName("do")
+    .setDescription("Intentionally ask Devbot to make a focused project change.")
     .addStringOption((option) =>
       option.setName("task").setDescription("The concrete change or command workflow to run.").setRequired(true)
+    )
+    .addStringOption((option) =>
+      option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
     )
     .addStringOption((option) =>
       option

@@ -8,7 +8,7 @@ export function isWriteBlockedBySafeMode(appConfig: Pick<AppConfig, "safeMode">,
 export function safeModeActionMessage(surface: string): string {
   return [
     `Safe mode is on, so ${surface} cannot start write-capable Codex work.`,
-    "Read-only commands still work: `/ask`, `/status`, `/snip`, `/task show`, `/task logs`, `/dashboard`, and peer read-only requests.",
+    "Read-only commands still work: mentions, `/ask`, `/status`, `/snip`, `/task show`, `/task logs`, `/dashboard`, and peer read-only requests.",
     "Set `DEVBOT_SAFE_MODE=false` and restart devbot to allow write-capable actions."
   ].join("\n");
 }
