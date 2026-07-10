@@ -1329,21 +1329,19 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
   const activeBackendId = getActiveBackendId();
   const activeBackend = backends.find((backend) => backend.id === activeBackendId);
   const backendReady = Boolean(activeBackend?.installed);
-  const codexReady = path.isAbsolute(appConfig.codex.bin)
-    ? Boolean((await stat(appConfig.codex.bin).catch(() => undefined))?.isFile())
-    : Boolean(appConfig.codex.bin);
+  const answerReadOnly = activeBackend ? activeBackend.capabilities.enforcesAnswerReadOnly : true;
   const checks = [
     [Boolean(appConfig.ownerUserId), "Owner identity", "Set DEVBOT_OWNER_USER_ID locally and restart."],
     [Boolean(effectivePrivateRoomId()), "Private room", "Run /setup wizard and choose Use private room."],
     [repoReady, "Default repository", "Add or repair a repository in /setup wizard."],
     [backendReady, `Agent backend (${activeBackendId})`, "Install the selected agent CLI or pick another with /setup backend."],
-    [codexReady, "Codex executable", "Set CODEX_BIN to an installed Codex CLI."],
+    [answerReadOnly, `Read-only answers (${activeBackendId})`, "This backend cannot guarantee read-only /ask runs; switch to codex or claude with /setup backend."],
     [appConfig.routing.enabled && Boolean(appConfig.routing.fastModel && appConfig.routing.standardModel && appConfig.routing.deepModel), "Luna / Terra / Sol routing", "Check CODEX_ROUTER_MODEL and tier model settings."],
     [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."]
   ] as const;
   const passed = checks.filter(([ready]) => ready).length;
   const backendSummary = backends.length
-    ? backends.map((backend) => `${backend.id === activeBackendId ? "*" : "-"} ${backend.id}: ${backend.installed ? backend.version ?? "installed" : "not installed"}${backend.experimental ? " (experimental)" : ""}`)
+    ? backends.map((backend) => `${backend.id === activeBackendId ? "*" : "-"} ${backend.id}: ${backend.installed ? backend.version ?? "installed" : "not installed"}${backend.experimental ? " (experimental)" : ""}${backend.capabilities.enforcesAnswerReadOnly ? "" : " (no read-only /ask)"}`)
     : ["- backend detection unavailable"];
   return [
     "Devbot doctor",
@@ -1361,7 +1359,11 @@ async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
 function formatBackendLine(backend: BackendAvailability, activeId: string): string {
   const marker = backend.id === activeId ? "ACTIVE " : "       ";
   const status = backend.installed ? backend.version ?? "installed" : "not installed";
-  const tags = [backend.experimental ? "experimental" : "", backend.error && !backend.installed ? backend.error : ""].filter(Boolean);
+  const tags = [
+    backend.experimental ? "experimental" : "",
+    backend.capabilities.enforcesAnswerReadOnly ? "" : "no read-only /ask",
+    backend.error && !backend.installed ? backend.error : ""
+  ].filter(Boolean);
   return `${marker}${backend.id} (${backend.displayName}): ${status}${tags.length ? ` [${tags.join("; ")}]` : ""}`;
 }
 
