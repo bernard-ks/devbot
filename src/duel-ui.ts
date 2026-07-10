@@ -4,7 +4,7 @@ import { isTaskId } from "./task-store.js";
 const CONTROL_PREFIX = "devbot:duel-control:";
 const COLLAB_ID_PATTERN = /^collab-[a-z0-9]+-[a-z0-9]+$/i;
 
-export type DuelControlAction = "review" | "prompt" | "dismiss";
+export type DuelControlAction = "review" | "accept" | "prompt" | "dismiss";
 
 export interface ParsedDuelControl {
   action: DuelControlAction;
@@ -22,13 +22,18 @@ export function duelReviewButton(taskId: string): ButtonBuilder {
   return new ButtonBuilder().setCustomId(`${CONTROL_PREFIX}review:${taskId}`).setLabel("Duel review").setStyle(ButtonStyle.Secondary);
 }
 
-/** Read-only decision row: this stage of the duel feature never creates write tasks, so the only
- *  controls are copying a follow-up prompt and dismissing the findings. */
-export function duelDecisionRow(conversationId: string): ActionRowBuilder<ButtonBuilder> {
+/** Decision row: "Accept & fix" is only offered when the caller verified that the reviewed
+ *  snapshot ref still resolves to the recorded state; otherwise the row stays read-only with a
+ *  copyable follow-up prompt and dismissal. */
+export function duelDecisionRow(conversationId: string, options: { acceptAndFix?: boolean } = {}): ActionRowBuilder<ButtonBuilder> {
   if (!isDuelConversationId(conversationId)) {
     throw new Error("Duel conversation ID cannot be encoded in a Discord control.");
   }
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const row = new ActionRowBuilder<ButtonBuilder>();
+  if (options.acceptAndFix) {
+    row.addComponents(new ButtonBuilder().setCustomId(`${CONTROL_PREFIX}accept:${conversationId}`).setLabel("Accept & fix").setStyle(ButtonStyle.Success));
+  }
+  return row.addComponents(
     new ButtonBuilder().setCustomId(`${CONTROL_PREFIX}prompt:${conversationId}`).setLabel("Copy fix prompt").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`${CONTROL_PREFIX}dismiss:${conversationId}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary)
   );
@@ -45,7 +50,7 @@ export function parseDuelControl(customId: string): ParsedDuelControl | undefine
   if (action === "review" && isTaskId(targetId)) {
     return { action, targetId };
   }
-  if ((action === "prompt" || action === "dismiss") && isDuelConversationId(targetId)) {
+  if ((action === "accept" || action === "prompt" || action === "dismiss") && isDuelConversationId(targetId)) {
     return { action, targetId };
   }
   return undefined;
