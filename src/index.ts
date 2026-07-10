@@ -5843,14 +5843,21 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
   // the report under the victim's identity, and a reply cannot resume a prompt opened while
   // the channel pointed at a different project (an `/intake set` rebind) — which would pack,
   // screenshot, and deliver this project's context onto the old project's record and room.
+  //
+  // The lookup atomically CLAIMS the record (capturing the binding generation) rather than
+  // just reading it: the long screenshot/pack/assess work below runs outside the store lock,
+  // so a `setChannel` rebind can dismiss the record in between. Completion is committed through
+  // finalizeClaimedFollowup, whose compare-and-set re-checks the claim and the binding before
+  // delivering — a rebind mid-flight drops the result instead of resurrecting a dismissed report.
   const referencedMessageId = message.reference?.messageId;
-  const followupOf = referencedMessageId
-    ? await intakeStore.findByFollowupPrompt(referencedMessageId, {
+  const followupClaim = referencedMessageId
+    ? await intakeStore.claimFollowup(referencedMessageId, {
         authorId: message.author.id,
         channelId: message.channelId,
         projectName: project.name
       })
     : undefined;
+  const followupOf = followupClaim?.record;
 
   // Ordinary chatter never reaches the pipeline: a new report needs the explicit trigger
   // prefix, and only the trigger (or a correlated follow-up reply) spends any quota.
@@ -5878,8 +5885,12 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
 
   if (!classification.complete) {
     const reply = await message.reply(`${missingInfoReply(classification.missing)}${attachmentNote}`).catch(() => undefined);
-    if (followupOf) {
-      await intakeStore.updateRecord(followupOf.id, {
+    if (followupOf && followupClaim) {
+      // Re-open the claimed record with a fresh prompt through the same compare-and-set:
+      // if a rebind dismissed it while we were replying, the claim no longer holds and the
+      // re-open is dropped rather than resurrecting the report.
+      await intakeStore.finalizeClaimedFollowup(followupOf.id, followupClaim, {
+        status: "incomplete",
         text: reportText,
         ...(reply ? { followupPromptMessageId: reply.id } : { clearFollowupPrompt: true })
       });
@@ -5942,29 +5953,41 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
   // The Codex-synthesized assessment sentence goes first so it always survives the cap even
   // when the automated screenshot diagnostics alone would fill it.
   const combinedEvidence = boundEvidence([assessment.evidence, ...evidence]);
-  const record = followupOf
-    ? await intakeStore.updateRecord(followupOf.id, {
-        text: reportText,
-        signature,
-        status: assessment.status,
-        evidence: combinedEvidence,
-        ...(screenshot ? { screenshotUrl: screenshot.url } : {}),
-        ...(duplicate ? { duplicateOfId: duplicate.id } : {}),
-        clearFollowupPrompt: true
-      })
-    : await intakeStore.addRecord({
-        channelId: message.channelId,
-        messageId: message.id,
-        authorId: message.author.id,
-        authorTag: message.author.tag,
-        projectName: project.name,
-        text: reportText,
-        signature,
-        status: assessment.status,
-        evidence: combinedEvidence,
-        ...(screenshot ? { screenshotUrl: screenshot.url } : {}),
-        ...(duplicate ? { duplicateOfId: duplicate.id } : {})
-      });
+  let record: IntakeRecord | undefined;
+  if (followupOf && followupClaim) {
+    // Finalize the claimed follow-up: only commits if the record is still claimed by this
+    // attempt and the binding generation/channel/project are unchanged. A rebind between the
+    // claim and here retires the record; finalization then reports !ok and we drop the result
+    // without delivering to any room or resurrecting the dismissed report.
+    const finalized = await intakeStore.finalizeClaimedFollowup(followupOf.id, followupClaim, {
+      text: reportText,
+      signature,
+      status: assessment.status,
+      evidence: combinedEvidence,
+      ...(screenshot ? { screenshotUrl: screenshot.url } : {}),
+      ...(duplicate ? { duplicateOfId: duplicate.id } : {}),
+      clearFollowupPrompt: true
+    });
+    if (!finalized?.ok) {
+      console.warn(`Intake follow-up from ${message.author.tag} was retired by a channel rebind before completion; dropping.`);
+      return;
+    }
+    record = finalized.record;
+  } else {
+    record = await intakeStore.addRecord({
+      channelId: message.channelId,
+      messageId: message.id,
+      authorId: message.author.id,
+      authorTag: message.author.tag,
+      projectName: project.name,
+      text: reportText,
+      signature,
+      status: assessment.status,
+      evidence: combinedEvidence,
+      ...(screenshot ? { screenshotUrl: screenshot.url } : {}),
+      ...(duplicate ? { duplicateOfId: duplicate.id } : {})
+    });
+  }
   if (!record) {
     console.warn(`Intake report from ${message.author.tag} disappeared before it could be completed.`);
     return;

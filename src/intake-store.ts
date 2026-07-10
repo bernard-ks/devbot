@@ -18,6 +18,7 @@ const MAX_EVIDENCE_LENGTH = 400;
 
 export type IntakeStatus =
   | "incomplete"
+  | "claimed"
   | "pending"
   | "confirmed"
   | "unconfirmed"
@@ -29,6 +30,7 @@ export type IntakeStatus =
 
 const INTAKE_STATUSES: readonly IntakeStatus[] = [
   "incomplete",
+  "claimed",
   "pending",
   "confirmed",
   "unconfirmed",
@@ -42,6 +44,13 @@ const INTAKE_STATUSES: readonly IntakeStatus[] = [
 export interface IntakeChannelConfig {
   channelId: string;
   projectName: string;
+  /**
+   * Monotonic per-binding counter, bumped on every `setChannel`. A follow-up
+   * completion captures this at claim time and refuses to deliver if it no
+   * longer matches, so a rebind between lookup and finalization cannot resurrect
+   * or misroute an in-flight report.
+   */
+  generation: number;
 }
 
 export interface IntakeRecord {
@@ -61,8 +70,18 @@ export interface IntakeRecord {
   triageChannelId?: string;
   followupPromptMessageId?: string;
   acceptedTaskId?: string;
+  /** Set while a follow-up completion holds the record; identifies the owning attempt. */
+  claimToken?: string;
+  /** Binding generation captured at claim time; rechecked before delivery. */
+  claimGeneration?: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface IntakeFollowupClaim {
+  record: IntakeRecord;
+  claimToken: string;
+  generation: number;
 }
 
 export interface AddIntakeRecordInput {
@@ -124,27 +143,30 @@ export class IntakeStore {
   ) {}
 
   /**
-   * Binds `channelId` to `projectName` as the intake channel. Reassigning a
-   * channel to a different project also closes every still-open follow-up in
-   * that channel that belongs to another project: those prompts were issued
-   * for the old project, so a later reply to one of them must not be able to
-   * resume against the newly-bound project. They are dismissed and their
-   * follow-up prompt is cleared inside the same serialized mutation as the
-   * rebind, so no reply can race the reassignment and slip through.
+   * Binds `channelId` to `projectName` as the intake channel and bumps the
+   * binding generation. Rebinding also closes every still-open follow-up that
+   * no longer matches the new binding — both `incomplete` reports still holding
+   * a "need more detail" prompt and `claimed` reports whose completion is
+   * mid-flight — so a later reply cannot resume against the newly-bound project,
+   * and an in-flight completion that already captured the old generation cannot
+   * resurrect a report the rebind just retired. They are dismissed and their
+   * follow-up prompt / claim are cleared inside the same serialized mutation as
+   * the rebind, so no reply or finalization can race the reassignment.
    */
   async setChannel(channelId: string, projectName: string): Promise<IntakeStateFile> {
     return this.mutate((state) => {
-      state.channel = { channelId, projectName };
+      const generation = (state.channel?.generation ?? 0) + 1;
+      state.channel = { channelId, projectName, generation };
       const now = new Date().toISOString();
       for (const record of state.records) {
-        if (
-          record.status === "incomplete" &&
-          record.channelId === channelId &&
-          record.projectName !== projectName &&
-          record.followupPromptMessageId !== undefined
-        ) {
+        const boundToNew = record.channelId === channelId && record.projectName === projectName;
+        const openIncomplete = record.status === "incomplete" && record.followupPromptMessageId !== undefined;
+        const claimedInFlight = record.status === "claimed";
+        if (!boundToNew && (openIncomplete || claimedInFlight)) {
           record.status = "dismissed";
           delete record.followupPromptMessageId;
+          delete record.claimToken;
+          delete record.claimGeneration;
           record.updatedAt = now;
         }
       }
@@ -267,6 +289,77 @@ export class IntakeStore {
     return match ? cloneRecord(match) : undefined;
   }
 
+  /**
+   * Atomically claims the open `incomplete` follow-up record for `promptMessageId`
+   * (same reporter/channel/project binding as {@link findByFollowupPrompt}) so its
+   * long, unserialized completion work can run outside the store lock without a
+   * concurrent `setChannel` silently stealing it. The claim moves the record to
+   * `claimed`, drops its prompt so no second reply can double-claim it, mints a
+   * per-attempt `claimToken`, and captures the current binding `generation`.
+   * {@link finalizeClaimedFollowup} later re-checks that token + generation before
+   * committing any result. Returns `undefined` if no matching open record exists.
+   */
+  async claimFollowup(
+    promptMessageId: string,
+    binding: { authorId: string; channelId: string; projectName: string }
+  ): Promise<IntakeFollowupClaim | undefined> {
+    return this.mutate((state) => {
+      const record = state.records.find(
+        (item) =>
+          item.status === "incomplete" &&
+          item.followupPromptMessageId === promptMessageId &&
+          item.authorId === binding.authorId &&
+          item.channelId === binding.channelId &&
+          item.projectName === binding.projectName
+      );
+      if (!record) {
+        return undefined;
+      }
+      const claimToken = randomBytes(16).toString("hex");
+      const generation = state.channel?.generation ?? 0;
+      record.status = "claimed";
+      record.claimToken = claimToken;
+      record.claimGeneration = generation;
+      delete record.followupPromptMessageId;
+      record.updatedAt = new Date().toISOString();
+      return { record: cloneRecord(record), claimToken, generation };
+    });
+  }
+
+  /**
+   * Compare-and-set finalization for a claimed follow-up: the result is committed
+   * only if — inside the same serialized mutation — the record is still `claimed`
+   * by this exact `claimToken`, and the live binding still matches the generation,
+   * channel, and project captured at claim time. Otherwise a rebind (or a dismiss)
+   * won the race, so the patch is dropped and the record is left as the rebind
+   * retired it — never resurrected. Returns `undefined` if the record has vanished.
+   */
+  async finalizeClaimedFollowup(
+    id: string,
+    claim: { claimToken: string; generation: number },
+    patch: IntakeUpdate
+  ): Promise<IntakeTransitionResult | undefined> {
+    return this.mutate((state) => {
+      const record = state.records.find((item) => item.id === id);
+      if (!record) {
+        return undefined;
+      }
+      const stillClaimed = record.status === "claimed" && record.claimToken === claim.claimToken;
+      const bindingUnchanged =
+        state.channel !== undefined &&
+        state.channel.generation === claim.generation &&
+        state.channel.channelId === record.channelId &&
+        state.channel.projectName === record.projectName;
+      if (!stillClaimed || !bindingUnchanged) {
+        return { ok: false, record: cloneRecord(record) };
+      }
+      applyIntakeUpdate(record, patch);
+      delete record.claimToken;
+      delete record.claimGeneration;
+      return { ok: true, record: cloneRecord(record) };
+    });
+  }
+
   /** Records in one of `statuses` whose triage card never reached a delivery room, newest first, for safe redelivery. */
   async listUndelivered(statuses: readonly IntakeStatus[], limit = 10): Promise<IntakeRecord[]> {
     const state = await this.readState();
@@ -360,7 +453,7 @@ export class IntakeStore {
       }
       this.state = {
         version: 1,
-        ...(isValidChannelConfig(candidate.channel) ? { channel: candidate.channel } : {}),
+        ...(isValidChannelConfig(candidate.channel) ? { channel: normalizeChannelConfig(candidate.channel) } : {}),
         records: Array.isArray(candidate.records)
           ? candidate.records.map(normalizeLoadedIntakeRecord).filter((record): record is IntakeRecord => record !== undefined)
           : [],
@@ -440,10 +533,18 @@ export function isIntakeRecordId(value: string): boolean {
   return INTAKE_RECORD_ID_PATTERN.test(value);
 }
 
-function isValidChannelConfig(value: unknown): value is IntakeChannelConfig {
+function isValidChannelConfig(value: unknown): value is Partial<IntakeChannelConfig> {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<IntakeChannelConfig>;
   return typeof candidate.channelId === "string" && Boolean(candidate.channelId) && typeof candidate.projectName === "string" && Boolean(candidate.projectName);
+}
+
+function normalizeChannelConfig(candidate: Partial<IntakeChannelConfig>): IntakeChannelConfig {
+  const generation =
+    typeof candidate.generation === "number" && Number.isInteger(candidate.generation) && candidate.generation >= 0
+      ? candidate.generation
+      : 0;
+  return { channelId: candidate.channelId!, projectName: candidate.projectName!, generation };
 }
 
 function normalizeLoadedIntakeRecord(value: unknown): IntakeRecord | undefined {
@@ -484,6 +585,10 @@ function normalizeLoadedIntakeRecord(value: unknown): IntakeRecord | undefined {
     ...(stringValue(record.triageChannelId) ? { triageChannelId: stringValue(record.triageChannelId)! } : {}),
     ...(stringValue(record.followupPromptMessageId) ? { followupPromptMessageId: stringValue(record.followupPromptMessageId)! } : {}),
     ...(stringValue(record.acceptedTaskId) ? { acceptedTaskId: stringValue(record.acceptedTaskId)! } : {}),
+    ...(status === "claimed" && stringValue(record.claimToken) ? { claimToken: stringValue(record.claimToken)! } : {}),
+    ...(status === "claimed" && typeof record.claimGeneration === "number" && Number.isInteger(record.claimGeneration)
+      ? { claimGeneration: record.claimGeneration }
+      : {}),
     createdAt,
     updatedAt
   };

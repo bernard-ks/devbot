@@ -313,7 +313,7 @@ test("intake store persists channel config, records, and signature-based duplica
 
   await store.setChannel("channel-1", "web-app");
   const snapshot = await store.snapshot();
-  assert.deepEqual(snapshot.channel, { channelId: "channel-1", projectName: "web-app" });
+  assert.deepEqual(snapshot.channel, { channelId: "channel-1", projectName: "web-app", generation: 1 });
 
   const first = await store.addRecord({
     channelId: "channel-1",
@@ -521,6 +521,116 @@ test("rebinding an intake channel from project A to project B closes A's open pr
     projectName: "private-b"
   });
   assert.equal(bFollowup?.id, bRecord.id);
+});
+
+test("a claimed follow-up with no intervening rebind finalizes and commits its result", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-intake-claim-ok-"));
+  const store = new IntakeStore(path.join(root, "intake.json"));
+
+  await store.setChannel("channel-1", "private-a");
+  const record = await store.addRecord({
+    channelId: "channel-1",
+    messageId: "msg-a",
+    authorId: "reporter-1",
+    authorTag: "reporter#0001",
+    projectName: "private-a",
+    text: "the dashboard 500s",
+    signature: "text:the dashboard 500s",
+    status: "incomplete",
+    followupPromptMessageId: "prompt-a"
+  });
+
+  // The follow-up reply claims the record before the long evidence work.
+  const claim = await store.claimFollowup("prompt-a", {
+    authorId: "reporter-1",
+    channelId: "channel-1",
+    projectName: "private-a"
+  });
+  assert.ok(claim, "the open follow-up should be claimable");
+  assert.equal(claim?.record.status, "claimed");
+
+  // Claiming drops the prompt, so a racing second reply cannot double-claim the record.
+  const doubleClaim = await store.claimFollowup("prompt-a", {
+    authorId: "reporter-1",
+    channelId: "channel-1",
+    projectName: "private-a"
+  });
+  assert.equal(doubleClaim, undefined);
+
+  // No rebind happened, so finalization commits the confirmed verdict.
+  const finalized = await store.finalizeClaimedFollowup(record.id, claim!, {
+    status: "confirmed",
+    evidence: ["Console error: TypeError"],
+    clearFollowupPrompt: true
+  });
+  assert.equal(finalized?.ok, true);
+  const committed = await store.get(record.id);
+  assert.equal(committed?.status, "confirmed");
+  assert.equal(committed?.claimToken, undefined);
+});
+
+test("a rebind during a follow-up completion drops the result: the dismissed old-channel intake is neither confirmed nor delivered", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-intake-rebind-race-"));
+  const store = new IntakeStore(path.join(root, "intake.json"));
+
+  // Channel-1 is bound to project A with an open incomplete report awaiting more detail.
+  await store.setChannel("channel-1", "private-a");
+  const record = await store.addRecord({
+    channelId: "channel-1",
+    messageId: "msg-a",
+    authorId: "reporter-1",
+    authorTag: "reporter#0001",
+    projectName: "private-a",
+    text: "the dashboard is broken",
+    signature: "text:the dashboard is broken",
+    status: "incomplete",
+    followupPromptMessageId: "prompt-a"
+  });
+
+  // The reporter replies: the completion path claims the record (capturing the binding
+  // generation) and then begins its long, unserialized screenshot/pack/assess work.
+  const claim = await store.claimFollowup("prompt-a", {
+    authorId: "reporter-1",
+    channelId: "channel-1",
+    projectName: "private-a"
+  });
+  assert.ok(claim, "the open follow-up should be claimable");
+  assert.equal(claim?.record.status, "claimed");
+
+  // Mid-flight, the owner rebinds intake to a different channel and project. This bumps the
+  // binding generation and dismisses the now-orphaned old-channel claim in the same mutation.
+  await store.setChannel("channel-2", "private-b");
+  const afterRebind = await store.get(record.id);
+  assert.equal(afterRebind?.status, "dismissed");
+
+  // The evidence work finishes and tries to confirm+deliver against the stale claim. The
+  // compare-and-set rejects it: the generation and channel no longer match and the record is
+  // no longer claimed, so the confirmed verdict is dropped rather than resurrecting the report.
+  const finalized = await store.finalizeClaimedFollowup(record.id, claim!, {
+    status: "confirmed",
+    evidence: ["Console error: TypeError"],
+    triageMessageId: "delivered-to-a-room",
+    clearFollowupPrompt: true
+  });
+  assert.equal(finalized?.ok, false);
+
+  // Final state stays dismissed: not confirmed, and no triage card was ever recorded as
+  // delivered — to the old project's room or the newly-bound project's room.
+  const finalState = await store.get(record.id);
+  assert.equal(finalState?.status, "dismissed");
+  assert.equal(finalState?.triageMessageId, undefined);
+
+  // Even re-attempting finalization under the *new* binding generation cannot revive it: the
+  // record is dismissed, not claimed, so it can never be confirmed or delivered.
+  const retryUnderNewBinding = await store.finalizeClaimedFollowup(
+    record.id,
+    { claimToken: claim!.claimToken, generation: claim!.generation + 1 },
+    { status: "confirmed", triageMessageId: "delivered-to-b-room" }
+  );
+  assert.equal(retryUnderNewBinding?.ok, false);
+  const stillDismissed = await store.get(record.id);
+  assert.equal(stillDismissed?.status, "dismissed");
+  assert.equal(stillDismissed?.triageMessageId, undefined);
 });
 
 test("intake reserveRateLimitSlot is atomic: concurrent reports each consume a distinct slot", async () => {
