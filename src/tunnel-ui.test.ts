@@ -23,6 +23,7 @@ test("tunnelConfirmMessage discloses the exact origin, project, branch/revision,
   assert.match(message.content, /abc1234/);
   assert.match(message.content, /15 minute/);
   assert.match(message.content, /anonymous public Internet URL/i);
+  assert.match(message.content, /every path, API route, websocket, and debug endpoint/i);
   assert.match(message.content, /Cloudflare/);
   assert.equal(message.components.length, 1);
   const [confirmButton, cancelButton] = message.components[0]?.components.map((component) => component.toJSON()) as Array<{
@@ -38,10 +39,10 @@ test("tunnelConfirmExpiredMessage distinguishes cancellation from a confirmation
   assert.match(tunnelConfirmExpiredMessage(pending, "confirm-timeout"), /timed out/i);
 });
 
-test("tunnelShareMessage surfaces the URL, forwarding origin, expiry, exposure warning, and an id-bound stop button", () => {
+test("tunnelShareMessage surfaces the URL embed-suppressed, forwarding origin, expiry, exposure warning, and an id-bound stop button", () => {
   const tunnel = fakeTunnel();
   const message = tunnelShareMessage(tunnel);
-  assert.match(message.content, /https:\/\/random-words\.trycloudflare\.com/);
+  assert.match(message.content, /<https:\/\/random-words\.trycloudflare\.com>/);
   assert.match(message.content, /http:\/\/127\.0\.0\.1:3000/);
   assert.match(message.content, /<t:\d+:R>/);
   assert.match(message.content, /Anyone with this link/i);
@@ -52,7 +53,7 @@ test("tunnelShareMessage surfaces the URL, forwarding origin, expiry, exposure w
 
 test("tunnelExpiredMessage dead-links the URL and reports every expiry reason", () => {
   const tunnel = fakeTunnel();
-  assert.match(tunnelExpiredMessage(tunnel, "ttl"), /~~https:\/\/random-words\.trycloudflare\.com~~/);
+  assert.match(tunnelExpiredMessage(tunnel, "ttl"), /~~<https:\/\/random-words\.trycloudflare\.com>~~/);
   assert.match(tunnelExpiredMessage(tunnel, "ttl"), /TTL reached/);
   assert.match(tunnelExpiredMessage(tunnel, "stop"), /stopped by the owner/);
   assert.match(tunnelExpiredMessage(tunnel, "shutdown"), /Devbot shut down/);
@@ -82,7 +83,7 @@ test("formatTunnelStatusList lists the tunnel URL and forwarding origin, or repo
   assert.equal(formatTunnelStatusList([]), "No active preview tunnels.");
   const list = formatTunnelStatusList([fakeTunnel()]);
   assert.match(list, /web/);
-  assert.match(list, /random-words\.trycloudflare\.com/);
+  assert.match(list, /<https:\/\/random-words\.trycloudflare\.com>/);
   assert.match(list, /127\.0\.0\.1:3000/);
 });
 

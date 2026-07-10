@@ -4,7 +4,8 @@ import type { ActiveTunnel, PendingExpireReason, PendingTunnel, ProjectRevisionI
 const TUNNEL_ID_PATTERN = /^[a-z0-9-]{1,64}$/i;
 const DISCLOSURE = [
   "This is an **anonymous public Internet URL** (a Cloudflare Quick Tunnel), for testing only.",
-  "Anyone with the link can reach the exact local origin below for as long as it is live — Devbot's owner/allowlist checks do not apply once it is shared."
+  "Anyone with the link can reach the exact local origin below — every path, API route, websocket, and debug endpoint it serves — for as long as it is live.",
+  "Devbot's owner/allowlist checks do not apply once it is shared."
 ].join(" ");
 
 export function tunnelControlRow(id: string): ActionRowBuilder<ButtonBuilder> {
@@ -72,7 +73,7 @@ export function tunnelConfirmExpiredMessage(pending: PendingTunnel, reason: Pend
 export function tunnelShareMessage(tunnel: ActiveTunnel): { content: string; components: ActionRowBuilder<ButtonBuilder>[] } {
   const expiresUnix = Math.floor(new Date(tunnel.expiresAt).getTime() / 1000);
   const content = [
-    `Public preview tunnel for \`${tunnel.projectName}\`: ${tunnel.url}`,
+    `Public preview tunnel for \`${tunnel.projectName}\`: <${tunnel.url}>`,
     `Forwarding to local origin \`${tunnel.origin}\`. Expires <t:${expiresUnix}:R>.`,
     "**Anyone with this link can reach your local dev server** until it expires or is stopped.",
     `Started by <@${tunnel.startedBy}>.`
@@ -82,7 +83,7 @@ export function tunnelShareMessage(tunnel: ActiveTunnel): { content: string; com
 
 export function tunnelExpiredMessage(tunnel: ActiveTunnel, reason: TunnelExpireReason): string {
   return [
-    `Preview tunnel for \`${tunnel.projectName}\` has expired (~~${tunnel.url}~~).`,
+    `Preview tunnel for \`${tunnel.projectName}\` has expired (~~<${tunnel.url}>~~).`,
     `Reason: ${expireReasonText(reason)}.`
   ].join("\n");
 }
@@ -140,7 +141,7 @@ export function formatTunnelStatusList(tunnels: ActiveTunnel[]): string {
   return tunnels
     .map((tunnel) => {
       const expiresUnix = Math.floor(new Date(tunnel.expiresAt).getTime() / 1000);
-      return `- \`${tunnel.projectName}\`: ${tunnel.url} -> ${tunnel.origin} (expires <t:${expiresUnix}:R>, started by <@${tunnel.startedBy}>)`;
+      return `- \`${tunnel.projectName}\`: <${tunnel.url}> -> \`${tunnel.origin}\` (expires <t:${expiresUnix}:R>, started by <@${tunnel.startedBy}>)`;
     })
     .join("\n");
 }
