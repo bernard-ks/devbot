@@ -90,11 +90,14 @@ import {
   formatDuelIssues,
   formatDuelSummary,
   gatherDuelChangeEvidence,
+  resolveDuelFixWorkspace,
   runDuelReview,
   tierLabel,
-  type DuelResult,
-  type ResolvedDuelIssue
+  verifyDuelFixReproducible,
+  type DuelChangeEvidence,
+  type DuelResult
 } from "./duel.js";
+import { DuelStore, type DuelRecord } from "./duel-store.js";
 import { duelDecisionRow, duelFixModal, parseDuelControl, parseDuelFixModal, type ParsedDuelControl } from "./duel-ui.js";
 import {
   commandRequiresApproval,
@@ -209,6 +212,7 @@ const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_S
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
+const duelStore = new DuelStore(process.env.DEVBOT_DUEL_STORE?.trim() || undefined);
 const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
 const activeWorkroomActions = new Set<string>();
@@ -234,6 +238,14 @@ client.once("clientReady", async () => {
     }
   } catch (error) {
     console.warn(`Unable to recover interrupted tasks: ${publicErrorMessage(error)}`);
+  }
+  try {
+    const interruptedDuels = await duelStore.interruptRunning();
+    if (interruptedDuels > 0) {
+      console.log(`Recovered ${interruptedDuels} interrupted duel review${interruptedDuels === 1 ? "" : "s"} from the previous runtime.`);
+    }
+  } catch (error) {
+    console.warn(`Unable to recover interrupted duel reviews: ${publicErrorMessage(error)}`);
   }
   if (config.autoDeployCommands && client.application) {
     try {
@@ -1756,16 +1768,18 @@ interface InteractionRequestOptions extends Omit<ProjectRequestOptions, "onProgr
   ephemeral?: boolean;
 }
 
-async function executeInteractionRequest(options: InteractionRequestOptions): Promise<void> {
+async function executeInteractionRequest(options: InteractionRequestOptions): Promise<string | undefined> {
   const { interaction, ephemeral, ...requestOptions } = options;
   if (!interaction.deferred && !interaction.replied) {
     await interaction.deferReply(ephemeral ? { flags: MessageFlags.Ephemeral } : undefined);
   }
   let progressRendered = false;
+  let createdTaskId: string | undefined;
   try {
     const result = await runProjectRequest({
       ...requestOptions,
       onProgress: async (progress) => {
+        createdTaskId = progress.taskId;
         await interaction.editReply({
           content: formatTaskProgress(progress),
           components: [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })]
@@ -1773,6 +1787,7 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
         progressRendered = true;
       }
     });
+    createdTaskId = result.taskId;
     const chunks = splitDiscordMessage(
       [result.answer, result.visualProofNote, formatResultFooter(requestOptions.project, result.route, requestOptions.mode)]
         .filter((part) => part !== undefined)
@@ -1788,11 +1803,13 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
         ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {})
       });
     }
+    return result.taskId;
   } catch (error) {
     if (!progressRendered) {
       throw error;
     }
     console.error(publicErrorMessage(error));
+    return createdTaskId;
   }
 }
 
@@ -3664,22 +3681,41 @@ async function handleDuelControl(interaction: ButtonInteraction, appConfig: AppC
     await interaction.reply({ content: "Only the owner or an approved controller can record a duel decision.", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (conversation.decision) {
+  const duelProject = conversation.projectName ? findProject(appConfig.projects, conversation.projectName) : undefined;
+  if (duelProject && !isAllowedForProject(interaction, duelProject)) {
+    await interaction.reply({ content: `You are not allowed to use project \`${duelProject.name}\`.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!isBoundDuelControl(conversation, interaction.message.id, interaction.channelId)) {
+    await interaction.reply({ content: "This is not the active control panel for this duel.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const duel = await duelStore.get(conversation.id);
+  if (!duel || duel.status !== "succeeded") {
+    await interaction.reply({ content: "This duel review has no recorded result to act on.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (duel.dismissed || duel.acceptance.state === "claimed" || duel.acceptance.state === "completed") {
     await interaction.reply({
-      content: `This duel was already ${conversation.decision.outcome === "approve" ? "accepted" : "dismissed"}.`,
+      content: duel.dismissed ? "This duel was already dismissed." : "This duel's findings were already accepted.",
       flags: MessageFlags.Ephemeral
     });
     return;
   }
 
   if (parsed.action === "dismiss") {
+    const { dismissed } = await duelStore.dismiss(conversation.id, interaction.user.tag);
+    if (!dismissed) {
+      await interaction.reply({ content: "This duel was already decided.", flags: MessageFlags.Ephemeral });
+      return;
+    }
     await collabStore.decide({ conversationId: conversation.id, outcome: "deny", actor: interaction.user.tag, note: "Dismissed the duel findings." });
     await interaction.reply({ content: "Dismissed the duel findings.", flags: MessageFlags.Ephemeral });
     return;
   }
 
-  const issues = await duelResolvedIssuesFromConversation(conversation.id);
-  const conceded = issues.filter((issue) => issue.status === "conceded");
+  const conceded = duel.issues.filter((issue) => issue.status === "conceded");
   if (conceded.length === 0) {
     await interaction.reply({ content: "No conceded issues are recorded for this duel.", flags: MessageFlags.Ephemeral });
     return;
@@ -3689,7 +3725,52 @@ async function handleDuelControl(interaction: ButtonInteraction, appConfig: AppC
     return;
   }
 
+  const reproducibility = await duelFixReproducibility(duelProject, duel);
+  if (!reproducibility.available) {
+    await interaction.reply({
+      content: [
+        `Accept & fix is unavailable: ${reproducibility.reason}`,
+        "Here is the fix prompt to copy manually instead:",
+        "```",
+        buildFixTaskPrompt(conversation.brief ?? "", conceded).slice(0, 1_800),
+        "```"
+      ].join("\n"),
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
   await interaction.showModal(duelFixModal(conversation.id, buildFixTaskPrompt(conversation.brief ?? "", conceded)));
+}
+
+/** Requires the accept/dismiss buttons (and the modal they open) to be operated from the exact
+ *  message and channel the duel posted them in, mirroring the workroom control-panel binding
+ *  pattern used elsewhere. */
+function isBoundDuelControl(conversation: CollabConversation, messageId: string | undefined, channelId: string | null): boolean {
+  const expectedChannelId = conversation.controlChannelId ?? conversation.threadId ?? conversation.channelId;
+  return Boolean(
+    conversation.controlMessageId
+      && messageId === conversation.controlMessageId
+      && (!expectedChannelId || channelId === expectedChannelId)
+  );
+}
+
+async function duelFixReproducibility(
+  project: ProjectEntry | undefined,
+  duel: DuelRecord
+): Promise<{ available: true } | { available: false; reason: string }> {
+  if (!project) {
+    return { available: false, reason: "that duel's project is no longer registered." };
+  }
+  if (!duel.evidence) {
+    return { available: false, reason: "no evidence snapshot was recorded for this duel." };
+  }
+  const sourceTask = await taskStore.get(duel.taskId);
+  if (!sourceTask) {
+    return { available: false, reason: "the reviewed task is no longer available." };
+  }
+  const resolved = await verifyDuelFixReproducible({ project, task: sourceTask, expectedPatchHash: duel.evidence.patchHash });
+  return resolved.available ? { available: true } : { available: false, reason: resolved.reason };
 }
 
 async function handleDuelFixModal(interaction: ModalSubmitInteraction, appConfig: AppConfig, conversationId: string): Promise<void> {
@@ -3702,16 +3783,13 @@ async function handleDuelFixModal(interaction: ModalSubmitInteraction, appConfig
     await interaction.reply({ content: "Only the owner or an approved controller can start write-capable work.", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (conversation.decision) {
-    await interaction.reply({
-      content: `This duel was already ${conversation.decision.outcome === "approve" ? "accepted" : "dismissed"}.`,
-      flags: MessageFlags.Ephemeral
-    });
-    return;
-  }
   const project = conversation.projectName ? findProject(appConfig.projects, conversation.projectName) : undefined;
   if (!project || !isAllowedForProject(interaction, project)) {
     await interaction.reply({ content: "That duel's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (interaction.message && !isBoundDuelControl(conversation, interaction.message.id, interaction.channelId)) {
+    await interaction.reply({ content: "This is not the active control panel for this duel.", flags: MessageFlags.Ephemeral });
     return;
   }
   if (isWriteBlockedBySafeMode(appConfig, "action")) {
@@ -3719,25 +3797,62 @@ async function handleDuelFixModal(interaction: ModalSubmitInteraction, appConfig
     return;
   }
 
-  const text = interaction.fields.getTextInputValue("task").trim();
+  const duel = await duelStore.get(conversation.id);
+  if (!duel || duel.status !== "succeeded" || !duel.evidence) {
+    await interaction.reply({ content: "This duel review has no recorded result to act on.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const sourceTask = await taskStore.get(duel.taskId);
+  if (!sourceTask) {
+    await interaction.reply({ content: "The reviewed task is no longer available, so Accept & fix was refused.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // Claim acceptance atomically BEFORE any mutating workspace resolution (which commits pending
+  // changes into the reviewed worktree): otherwise two concurrent modal submissions could both
+  // race into `git commit` on the same isolated worktree before either lost the claim.
+  const { claimed } = await duelStore.claimAcceptance(conversation.id, interaction.user.tag);
+  if (!claimed) {
+    await interaction.reply({ content: "This duel's findings were already accepted or dismissed.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const workspace = await resolveDuelFixWorkspace({ project, task: sourceTask, expectedPatchHash: duel.evidence.patchHash });
+  if (!workspace.available) {
+    await duelStore.failAcceptance(conversation.id, workspace.reason);
+    await interaction.reply({ content: `Accept & fix is unavailable: ${workspace.reason}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
   await collabStore.decide({
     conversationId: conversation.id,
     outcome: "approve",
     actor: interaction.user.tag,
     note: "Accepted conceded duel issues into a fix task."
   });
+  const text = interaction.fields.getTextInputValue("task").trim();
   await userPreferences.setSelectedProject(interaction.user.id, project.name);
-  await executeInteractionRequest({
-    interaction,
-    appConfig,
-    project,
-    text,
-    includePatterns: [],
-    mode: "action",
-    requester: interaction.user.tag,
-    source: `duel:accept:${conversation.id}`,
-    ephemeral: hasProjectAudienceRestriction(project)
-  });
+  try {
+    const createdTaskId = await executeInteractionRequest({
+      interaction,
+      appConfig,
+      project: { ...project, root: workspace.root },
+      text,
+      includePatterns: [],
+      mode: "action",
+      requester: interaction.user.tag,
+      source: `duel:accept:${conversation.id}`,
+      ephemeral: hasProjectAudienceRestriction(project)
+    });
+    if (createdTaskId) {
+      await duelStore.completeAcceptance(conversation.id, createdTaskId);
+    } else {
+      await duelStore.failAcceptance(conversation.id, "Accept & fix did not produce a task id.");
+    }
+  } catch (error) {
+    await duelStore.failAcceptance(conversation.id, publicErrorMessage(error));
+    throw error;
+  }
 }
 
 async function runDuelForTask(
@@ -3746,25 +3861,51 @@ async function runDuelForTask(
   project: ProjectEntry,
   task: TaskRecord
 ): Promise<void> {
-  const diffProject = await projectForTaskWorkspace(project, task);
-  const diff = await gatherDuelChangeEvidence(diffProject);
-  const result = await runDuelReview({
-    routing: appConfig.routing,
-    task,
-    projectName: project.name,
-    projectRoot: diffProject.root,
-    diff,
-    codex: appConfig.codex
-  });
-
   const conversation = await startLabConversation(interaction, "duel", project, `Duel review: ${task.id}`, task.text);
-  await recordDuelResult(conversation.id, task, project, result);
+  await duelStore.start({ id: conversation.id, taskId: task.id, projectName: project.name });
+
+  let diff: DuelChangeEvidence;
+  let result: DuelResult;
+  try {
+    const diffProject = await projectForTaskWorkspace(project, task);
+    diff = await gatherDuelChangeEvidence(diffProject, task);
+    result = await runDuelReview({
+      routing: appConfig.routing,
+      task,
+      projectName: project.name,
+      projectRoot: diffProject.root,
+      diff,
+      codex: appConfig.codex
+    });
+  } catch (error) {
+    await duelStore.fail(conversation.id, error);
+    throw error;
+  }
+
+  await duelStore.succeed(conversation.id, {
+    authorTier: result.authorTier,
+    reviewerTier: result.reviewerTier,
+    reviewerIndependence: result.reviewerIndependence,
+    evidence: {
+      ...(diff.baseRevision ? { baseRevision: diff.baseRevision } : {}),
+      ...(diff.headRevision ? { headRevision: diff.headRevision } : {}),
+      patchHash: diff.patchHash,
+      fileCount: diff.fileCount,
+      includedFileCount: diff.includedFileCount,
+      truncated: diff.truncated
+    },
+    overall: result.reviewerVerdict.overall,
+    issues: result.issues
+  });
+  await recordDuelAudit(conversation.id, result);
 
   const summary = formatDuelSummary({
     taskId: task.id,
     projectName: project.name,
     authorTier: result.authorTier,
     reviewerTier: result.reviewerTier,
+    reviewerIndependence: result.reviewerIndependence,
+    evidence: diff,
     overall: result.reviewerVerdict.overall,
     issues: result.issues,
     skippedRebuttal: result.skippedRebuttal
@@ -3776,11 +3917,14 @@ async function runDuelForTask(
   const thread = conversation.threadId ? await client.channels.fetch(conversation.threadId).catch(() => undefined) : undefined;
   if (thread?.isTextBased()) {
     const chunks = splitDiscordMessage(fullContent);
-    await sendToTextChannel(thread, {
+    const sent = (await sendToTextChannel(thread, {
       content: chunks.shift() ?? "Duel review completed.",
       components: decisionRow,
       allowedMentions: { parse: [] }
-    });
+    })) as { id?: string } | undefined;
+    if (decisionRow.length > 0 && sent?.id) {
+      await collabStore.setControlMessage(conversation.id, sent.id, thread.id);
+    }
     for (const chunk of chunks) {
       await sendToTextChannel(thread, { content: chunk, allowedMentions: { parse: [] } });
     }
@@ -3791,13 +3935,19 @@ async function runDuelForTask(
   }
 
   const chunks = splitDiscordMessage(fullContent);
-  await interaction.editReply({ content: chunks.shift() ?? "Duel review completed.", components: decisionRow });
+  const sentReply = await interaction.editReply({ content: chunks.shift() ?? "Duel review completed.", components: decisionRow });
+  if (decisionRow.length > 0 && sentReply?.id) {
+    await collabStore.setControlMessage(conversation.id, sentReply.id, interaction.channelId);
+  }
   for (const chunk of chunks) {
     await interaction.followUp({ content: chunk });
   }
 }
 
-async function recordDuelResult(conversationId: string, task: TaskRecord, project: ProjectEntry, result: DuelResult): Promise<void> {
+/** Human-readable audit trail in the thread's collaboration history. The machine-critical,
+ *  validated result (used to gate Accept & fix) lives in the durable, typed duel store instead of
+ *  a generic contribution string, which used to get silently truncated at 12,000 characters. */
+async function recordDuelAudit(conversationId: string, result: DuelResult): Promise<void> {
   await collabStore.addContribution({
     conversationId,
     actorId: `reviewer:${result.reviewerTier}`,
@@ -3809,42 +3959,20 @@ async function recordDuelResult(conversationId: string, task: TaskRecord, projec
   if (!result.skippedRebuttal && result.rebuttalRaw) {
     await collabStore.addContribution({
       conversationId,
-      actorId: `author:${result.authorTier}`,
-      actorName: `${tierLabel(result.authorTier)} author`,
+      actorId: `author-side:${result.authorTier}`,
+      actorName: `${tierLabel(result.authorTier)} author-side rebuttal`,
       kind: "synthesis",
       content: result.rebuttalRaw.slice(0, 8_000),
       sealed: false
     });
   }
-  await collabStore.addContribution({
-    conversationId,
-    actorId: "devbot",
-    actorName: "Duel resolution",
-    kind: "synthesis",
-    content: JSON.stringify({ taskId: task.id, projectName: project.name, issues: result.issues }),
-    sealed: false
-  });
   await collabStore.addEvent({
     conversationId,
     type: "decision",
     actor: "devbot",
-    summary: `${result.reviewerVerdict.overall} - ${result.issues.length} issue(s)`,
+    summary: `${result.reviewerVerdict.overall} - ${result.issues.length} issue(s); structured result recorded in the duel store`,
     mode: "think"
   });
-}
-
-async function duelResolvedIssuesFromConversation(conversationId: string): Promise<ResolvedDuelIssue[]> {
-  const contributions = await collabStore.contributions(conversationId, { includeSealed: true });
-  const record = [...contributions].reverse().find((contribution) => contribution.actorId === "devbot" && contribution.kind === "synthesis");
-  if (!record) {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(record.content) as { issues?: ResolvedDuelIssue[] };
-    return Array.isArray(parsed.issues) ? parsed.issues : [];
-  } catch {
-    return [];
-  }
 }
 
 async function handleDevbotCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
