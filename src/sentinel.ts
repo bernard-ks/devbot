@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
+import { isLoopbackHost, projectScreenshotOrigins } from "./project-screenshot.js";
+import { redactSensitiveText } from "./security.js";
 import { runConfiguredProjectCommand } from "./command-runner.js";
 import {
   DEBOUNCE_THRESHOLD,
+  defaultExpectedStatus,
+  expectedStatusPredicate,
   SentinelStore,
   type SentinelProjectConfig,
   type WatchKind,
@@ -12,6 +16,7 @@ import {
 import type { ProjectEntry } from "./types.js";
 
 const execAsync = promisify(exec);
+const MAX_REDIRECTS = 5;
 
 export interface WatchCheckResult {
   reachable: boolean;
@@ -45,23 +50,6 @@ export function applyWatchCheck(
 ): WatchTransitionResult {
   const code = result.statusCode ?? result.exitCode;
 
-  if (!result.reachable) {
-    // A network refusal or command launch failure is ambiguous: it could mean the
-    // process crashed, or the developer intentionally stopped it. Only ever move
-    // to "idle" here so an intentional shutdown never triggers an alert.
-    const wasKnown = previous.status === "up" || previous.status === "down";
-    return {
-      state: {
-        ...previous,
-        status: wasKnown || previous.status === "unknown" ? "idle" : previous.status,
-        consecutiveFailures: 0,
-        lastCheckAt: now,
-        ...(result.error !== undefined ? { lastError: result.error } : {})
-      },
-      event: undefined
-    };
-  }
-
   if (result.ok) {
     const wasDown = previous.status === "down";
     const { lastError: _droppedLastError, ...rest } = previous;
@@ -75,6 +63,28 @@ export function applyWatchCheck(
         ...(code !== undefined ? { lastCode: code } : {})
       },
       event: wasDown ? "recovery" : undefined
+    };
+  }
+
+  // Both a reachable-but-erroring response (e.g. HTTP 5xx, a failing command)
+  // and a network refusal (the process is gone) are failures, and a target
+  // that crashed after being healthy is exactly the regression this feature
+  // exists to catch. A target that has never been observed healthy (unknown,
+  // or already idle) has nothing to regress from yet: it stays idle without
+  // accumulating failures or alerting. That is also how an intentional stop
+  // avoids spurious alerts — the user disables the watch (`/sentinel off`)
+  // rather than relying on the sentinel to guess intent from a refusal.
+  if (previous.status === "unknown" || previous.status === "idle") {
+    return {
+      state: {
+        ...previous,
+        status: "idle",
+        consecutiveFailures: 0,
+        lastCheckAt: now,
+        ...(code !== undefined ? { lastCode: code } : {}),
+        ...(result.error !== undefined ? { lastError: result.error } : {})
+      },
+      event: undefined
     };
   }
 
@@ -93,22 +103,64 @@ export function applyWatchCheck(
   };
 }
 
+export interface CheckUrlOptions {
+  timeoutMs?: number;
+  isExpectedStatus?: (statusCode: number) => boolean;
+  fetchImpl?: typeof fetch;
+  maxRedirects?: number;
+}
+
+/**
+ * Fetches a watch URL with the same SSRF posture as the screenshot subsystem:
+ * every hop (the initial request and any redirect target) must resolve to a
+ * loopback host inside the project's approved origin set, credentials in the
+ * URL are never sent, and redirects are followed manually so a hop to an
+ * unapproved origin is rejected rather than silently followed by `fetch`.
+ */
 export async function checkUrl(
   url: string,
-  timeoutMs = 5_000,
-  fetchImpl: typeof fetch = fetch
+  allowedOrigins: ReadonlySet<string>,
+  options: CheckUrlOptions = {}
 ): Promise<WatchCheckResult> {
+  const {
+    timeoutMs = 5_000,
+    isExpectedStatus = defaultExpectedStatus,
+    fetchImpl = fetch,
+    maxRedirects = MAX_REDIRECTS
+  } = options;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const startedAt = Date.now();
   try {
-    const response = await fetchImpl(url, { method: "GET", signal: controller.signal });
-    return {
-      reachable: true,
-      ok: response.status < 500,
-      statusCode: response.status,
-      responseTimeMs: Date.now() - startedAt
-    };
+    let currentUrl = url;
+    for (let hop = 0; hop <= maxRedirects; hop += 1) {
+      if (!isApprovedWatchOrigin(currentUrl, allowedOrigins)) {
+        return {
+          reachable: true,
+          ok: false,
+          error: `Blocked request to a non-approved origin: ${safeOrigin(currentUrl)}`
+        };
+      }
+
+      const response = await fetchImpl(currentUrl, { method: "GET", redirect: "manual", signal: controller.signal });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location) {
+          return { reachable: true, ok: false, statusCode: response.status, error: "Redirect response had no location header." };
+        }
+        currentUrl = new URL(location, currentUrl).toString();
+        continue;
+      }
+
+      return {
+        reachable: true,
+        ok: isExpectedStatus(response.status),
+        statusCode: response.status,
+        responseTimeMs: Date.now() - startedAt
+      };
+    }
+    return { reachable: true, ok: false, error: "Too many redirects." };
   } catch (error) {
     return {
       reachable: false,
@@ -117,6 +169,32 @@ export async function checkUrl(
     };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+function isApprovedWatchOrigin(value: string, allowedOrigins: ReadonlySet<string>): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return false;
+    }
+    if (url.username || url.password) {
+      return false;
+    }
+    if (!isLoopbackHost(url.hostname)) {
+      return false;
+    }
+    return allowedOrigins.has(url.origin);
+  } catch {
+    return false;
+  }
+}
+
+function safeOrigin(value: string): string {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return "(unparseable url)";
   }
 }
 
@@ -132,13 +210,13 @@ export async function checkCommand(
       reachable: true,
       ok: result.ok,
       ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
-      ...(result.ok ? {} : { error: truncateError(result.output) })
+      ...(result.ok ? {} : { error: truncateError(redactSensitiveText(result.output)) })
     };
   } catch (error) {
     return {
       reachable: false,
       ok: false,
-      error: error instanceof Error ? error.message : String(error)
+      error: redactSensitiveText(error instanceof Error ? error.message : String(error))
     };
   }
 }
@@ -173,19 +251,25 @@ export function watchIdForCommand(commandName: string): string {
   return `cmd-${slug || "command"}`;
 }
 
-export async function resolveWatchTargets(
-  project: ProjectEntry,
-  config: SentinelProjectConfig,
-  discoverUrls: (project: ProjectEntry) => Promise<string[]>
-): Promise<WatchTarget[]> {
-  const bases = await discoverUrls(project);
+/**
+ * Resolves the concrete watch targets for a cycle. `bases` are the project's
+ * currently approved origins (auto-discovered plus statically configured dev
+ * server URLs, see `findProjectWebUrls`); manual paths are joined onto them,
+ * and a manual absolute URL is only kept if it shares an origin with one of
+ * those bases — matching the screenshot subsystem's approved-origin rule
+ * rather than trusting "any loopback port."
+ */
+export function resolveWatchTargets(project: ProjectEntry, config: SentinelProjectConfig, bases: string[]): WatchTarget[] {
+  const allowedOrigins = projectScreenshotOrigins(project, bases);
   const urls = new Set<string>();
   for (const base of bases) {
     urls.add(normalizeWatchUrl(base));
   }
   for (const manualPath of config.manualPaths) {
     if (/^https?:\/\//i.test(manualPath)) {
-      urls.add(normalizeWatchUrl(manualPath));
+      if (isApprovedWatchOrigin(manualPath, allowedOrigins)) {
+        urls.add(normalizeWatchUrl(manualPath));
+      }
       continue;
     }
     for (const base of bases) {
@@ -228,7 +312,7 @@ export interface SentinelEvent {
 
 export interface SentinelDeps {
   discoverUrls: (project: ProjectEntry) => Promise<string[]>;
-  checkUrlFn: (url: string) => Promise<WatchCheckResult>;
+  checkUrlFn: (url: string, allowedOrigins: ReadonlySet<string>, isExpectedStatus: (statusCode: number) => boolean) => Promise<WatchCheckResult>;
   checkCommandFn: (project: ProjectEntry, commandName: string) => Promise<WatchCheckResult>;
   now: () => Date;
 }
@@ -299,14 +383,17 @@ export class SentinelManager {
       }
 
       const nowIso = this.deps.now().toISOString();
-      const targets = await resolveWatchTargets(project, config, this.deps.discoverUrls);
+      const bases = await this.deps.discoverUrls(project);
+      const allowedOrigins = projectScreenshotOrigins(project, bases);
+      const isExpectedStatus = expectedStatusPredicate(config.expectedStatus);
+      const targets = resolveWatchTargets(project, config, bases);
       const events: SentinelEvent[] = [];
 
       for (const target of targets) {
         const previous = (await this.store.getWatchState(projectName, target.id)) ?? initialWatchState(target);
         const result =
           target.kind === "url"
-            ? await this.deps.checkUrlFn(target.target)
+            ? await this.deps.checkUrlFn(target.target, allowedOrigins, isExpectedStatus)
             : await this.deps.checkCommandFn(project, target.target);
         const { state: next, event } = applyWatchCheck(previous, result, nowIso);
         await this.store.saveWatchState(projectName, target.id, next);

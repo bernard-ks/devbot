@@ -557,6 +557,32 @@ const commandBuilders = [
         .addStringOption((option) =>
           option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
         )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("fast-command")
+        .setDescription("Set or clear the read-only command Sentinel runs each cycle. Leave command empty to clear.")
+        .addStringOption((option) =>
+          option
+            .setName("command")
+            .setDescription("A project-declared read-only command name (see .devbot/project.json policy.readOnlyCommands).")
+            .setRequired(false)
+            .setAutocomplete(true)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("expected-status")
+        .setDescription("Set healthy HTTP status codes, e.g. 200-299. Leave empty to reset to the 200-399 default.")
+        .addStringOption((option) =>
+          option.setName("status").setDescription("Status code, range, or comma-separated list.").setRequired(false)
+        )
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+        )
     ),
   new SlashCommandBuilder()
     .setName("refresh")

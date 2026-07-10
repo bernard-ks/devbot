@@ -38,7 +38,7 @@ import {
   type AmbientAction,
   type AmbientRole
 } from "./ambient-ui.js";
-import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
+import { commandChoices, peerChoices, projectChoices, readOnlyCommandChoices, taskChoices } from "./autocomplete.js";
 import {
   collabDeliveryKey,
   createCollabEnvelope,
@@ -150,11 +150,12 @@ import {
 } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
 import { checkCommand, checkUrl, recentCommits, SentinelManager, type SentinelEvent } from "./sentinel.js";
-import { SentinelStore } from "./sentinel-store.js";
+import { isValidExpectedStatusSpec, SentinelStore } from "./sentinel-store.js";
 import {
   formatSentinelStatus,
   parseSentinelControl,
   sentinelAlertContent,
+  sentinelAlertRoomId,
   sentinelAlertRow,
   sentinelFixTaskPrompt,
   sentinelRecoveryNote,
@@ -215,7 +216,7 @@ const sentinelManager = new SentinelManager(
   sentinelStore,
   {
     discoverUrls: findProjectWebUrls,
-    checkUrlFn: (url) => checkUrl(url),
+    checkUrlFn: (url, allowedOrigins, isExpectedStatus) => checkUrl(url, allowedOrigins, { isExpectedStatus }),
     checkCommandFn: (project, commandName) => checkCommand(project, commandName),
     now: () => new Date()
   },
@@ -3522,6 +3523,55 @@ async function handleSentinelCommand(interaction: ChatInputCommandInteraction, a
     return;
   }
 
+  if (subcommand === "fast-command") {
+    const requested = interaction.options.getString("command")?.trim();
+    if (!requested) {
+      await sentinelStore.setFastCommand(project.name, undefined);
+      await interaction.reply({ content: `Sentinel fast command for \`${project.name}\` cleared.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const normalized = requested.toLowerCase();
+    const eligible = configuredCommandNames(project).includes(normalized) && !commandRequiresApproval(project, normalized);
+    if (!eligible) {
+      await interaction.reply({
+        content: `\`${requested}\` is not eligible as a sentinel fast command for \`${project.name}\`. Only commands listed in that project's \`.devbot/project.json\` \`policy.readOnlyCommands\` can run unattended.`,
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    const watchConfig = await sentinelStore.setFastCommand(project.name, normalized);
+    await interaction.reply({
+      content: `Sentinel fast command for \`${project.name}\` set to \`${watchConfig.fastCommand}\`.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (subcommand === "expected-status") {
+    const requested = interaction.options.getString("status")?.trim();
+    if (!requested) {
+      await sentinelStore.setExpectedStatus(project.name, undefined);
+      await interaction.reply({
+        content: `Sentinel expected status for \`${project.name}\` reset to the default (200-399).`,
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    if (!isValidExpectedStatusSpec(requested)) {
+      await interaction.reply({
+        content: `\`${requested}\` is not a valid expected-status spec. Use a status code (\`404\`), a range (\`200-299\`), or a comma-separated list (\`200,301,304\`).`,
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    const watchConfig = await sentinelStore.setExpectedStatus(project.name, requested);
+    await interaction.reply({
+      content: `Sentinel expected status for \`${project.name}\` set to \`${watchConfig.expectedStatus}\`.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
   const watchConfig = await sentinelStore.getProjectConfig(project.name);
   const watches = await sentinelStore.listProjectWatches(project.name);
   await interaction.reply({ content: formatSentinelStatus(project.name, watchConfig, watches), flags: MessageFlags.Ephemeral });
@@ -3581,14 +3631,28 @@ async function handleSentinelButton(
   });
 }
 
+async function resolveSentinelAlertRoomId(project: ProjectEntry): Promise<string | undefined> {
+  const boundRoomId = setupStore.snapshot().projectRoomIds[project.name];
+  const generalRoomId = effectivePrivateRoomId();
+  return sentinelAlertRoomId({
+    ...(boundRoomId ? { boundRoomId, boundRoomAudienceVerified: await isConfiguredRoomId(boundRoomId) } : {}),
+    hasProjectAudienceRestriction: hasProjectAudienceRestriction(project),
+    ...(generalRoomId ? { generalRoomId } : {})
+  });
+}
+
 async function handleSentinelEvent(event: SentinelEvent): Promise<void> {
   const project = config.projects.find((item) => item.name === event.projectName);
-  const roomId = effectivePrivateRoomId();
-  if (!project || !roomId) {
+  if (!project) {
     return;
   }
 
   if (event.event === "alert") {
+    const roomId = await resolveSentinelAlertRoomId(project);
+    if (!roomId) {
+      console.warn(`Sentinel alert for ${project.name} suppressed: no room can guarantee this project's audience.`);
+      return;
+    }
     const commits = await recentCommits(project);
     const screenshot =
       event.target.kind === "url"
@@ -5580,6 +5644,12 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, appConfi
 
   if (focused.name === "project") {
     await interaction.respond(projectChoices(allowedProjects, value));
+    return;
+  }
+
+  if (interaction.commandName === "sentinel" && focused.name === "command") {
+    const project = findProjectFromAutocomplete(interaction, allowedProjects);
+    await interaction.respond(readOnlyCommandChoices(project, value));
     return;
   }
 

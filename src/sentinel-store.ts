@@ -1,8 +1,19 @@
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  hardenPrivateDirectoryPermissions,
+  hardenPrivateFilePermissions,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+  redactSensitiveText
+} from "./security.js";
 
 export type WatchKind = "url" | "command";
 export type WatchStatus = "unknown" | "up" | "down" | "idle";
+
+const WATCH_KINDS: readonly WatchKind[] = ["url", "command"];
+const WATCH_STATUSES: readonly WatchStatus[] = ["unknown", "up", "down", "idle"];
 
 export interface WatchState {
   id: string;
@@ -24,6 +35,7 @@ export interface SentinelProjectConfig {
   intervalSeconds: number;
   manualPaths: string[];
   fastCommand?: string;
+  expectedStatus?: string;
 }
 
 interface SentinelProjectRecord {
@@ -56,7 +68,7 @@ export function clampIntervalSeconds(seconds: number): number {
 export function normalizeManualPath(value: string): string {
   const trimmed = value.trim();
   if (/^https?:\/\//i.test(trimmed)) {
-    return isLoopbackWatchUrl(trimmed) ? trimmed.replace(/\/+$/, "") : "";
+    return isAcceptableWatchUrl(trimmed) ? trimmed.replace(/\/+$/, "") : "";
   }
   const cleaned = trimmed.replace(/^\/+|\/+$/g, "");
   return `/${cleaned}`;
@@ -64,13 +76,20 @@ export function normalizeManualPath(value: string): string {
 
 /**
  * Sentinel only ever polls a project's own dev server. A manually added watch
- * path that names a full URL must stay on loopback, matching the same
- * SSRF-hardening convention project-screenshot.ts applies to captured pages.
+ * path that names a full URL must stay on loopback and carry no embedded
+ * credentials, matching the SSRF-hardening convention project-screenshot.ts
+ * applies to captured pages. This is a format-level floor: `resolveWatchTargets`
+ * additionally restricts manual URLs to the project's currently approved
+ * origins at check time, since "some loopback port" is not the same guarantee
+ * as "this project's own dev server."
  */
-function isLoopbackWatchUrl(value: string): boolean {
+function isAcceptableWatchUrl(value: string): boolean {
   try {
     const url = new URL(value);
     if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return false;
+    }
+    if (url.username || url.password) {
       return false;
     }
     const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
@@ -78,6 +97,54 @@ function isLoopbackWatchUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+const EXPECTED_STATUS_TOKEN = /^(\d{3})(?:-(\d{3}))?$/;
+
+/**
+ * Parses an expected-status spec such as "200-299", "200", or "200,301,304"
+ * into a predicate. Returns undefined for an empty or malformed spec.
+ */
+export function parseExpectedStatusSpec(spec: string): ((statusCode: number) => boolean) | undefined {
+  const tokens = spec
+    .split(",")
+    .map((token) => token.trim())
+    .filter(Boolean);
+  if (tokens.length === 0) {
+    return undefined;
+  }
+
+  const ranges: Array<[number, number]> = [];
+  for (const token of tokens) {
+    const match = EXPECTED_STATUS_TOKEN.exec(token);
+    if (!match) {
+      return undefined;
+    }
+    const min = Number(match[1]);
+    const max = match[2] !== undefined ? Number(match[2]) : min;
+    if (min < 100 || max > 599 || min > max) {
+      return undefined;
+    }
+    ranges.push([min, max]);
+  }
+
+  return (statusCode: number) => ranges.some(([min, max]) => statusCode >= min && statusCode <= max);
+}
+
+export function isValidExpectedStatusSpec(spec: string): boolean {
+  return parseExpectedStatusSpec(spec) !== undefined;
+}
+
+/** Default health rule when no expected-status option is configured: 2xx/3xx pass, 4xx/5xx (incl. 404) fail. */
+export function defaultExpectedStatus(statusCode: number): boolean {
+  return statusCode >= 200 && statusCode < 400;
+}
+
+export function expectedStatusPredicate(spec: string | undefined): (statusCode: number) => boolean {
+  if (!spec) {
+    return defaultExpectedStatus;
+  }
+  return parseExpectedStatusSpec(spec) ?? defaultExpectedStatus;
 }
 
 export class SentinelStore {
@@ -114,6 +181,17 @@ export class SentinelStore {
     });
   }
 
+  async setExpectedStatus(projectName: string, spec: string | undefined): Promise<SentinelProjectConfig> {
+    return this.mutateProject(projectName, (record) => {
+      const trimmed = spec?.trim();
+      if (trimmed && isValidExpectedStatusSpec(trimmed)) {
+        record.config.expectedStatus = trimmed;
+      } else {
+        delete record.config.expectedStatus;
+      }
+    });
+  }
+
   async addWatchPath(projectName: string, watchPath: string): Promise<SentinelProjectConfig> {
     return this.mutateProject(projectName, (record) => {
       const normalized = normalizeManualPath(watchPath);
@@ -139,7 +217,7 @@ export class SentinelStore {
   async saveWatchState(projectName: string, watchId: string, watch: WatchState): Promise<void> {
     await this.mutate((state) => {
       const record = ensureProjectRecord(state, projectName);
-      record.watches[watchId] = { ...watch };
+      record.watches[watchId] = sanitizeWatchForPersistence(watch);
     });
   }
 
@@ -206,11 +284,17 @@ export class SentinelStore {
     }
 
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as SentinelStateFile;
-      this.state = {
-        version: 1,
-        projects: parsed.projects && typeof parsed.projects === "object" ? parsed.projects : {}
-      };
+      const raw = await readFile(this.stateFile, "utf8");
+      await hardenPrivateFilePermissions(this.stateFile);
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Sentinel state must be a JSON object.");
+      }
+      const root = parsed as { version?: unknown; projects?: unknown };
+      if (root.version !== undefined && root.version !== 1) {
+        throw new Error(`Unsupported sentinel state version: ${String(root.version)}.`);
+      }
+      this.state = { version: 1, projects: normalizeLoadedProjects(root.projects) };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw new Error(`Unable to read sentinel state at ${this.stateFile}: ${(error as Error).message}`, { cause: error });
@@ -226,9 +310,15 @@ export class SentinelStore {
       return;
     }
 
-    await mkdir(path.dirname(this.stateFile), { recursive: true });
-    const tempFile = `${this.stateFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`);
+    const directory = path.dirname(this.stateFile);
+    await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    await hardenPrivateDirectoryPermissions(directory);
+    const tempFile = `${this.stateFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE
+    });
     await rename(tempFile, this.stateFile);
   }
 }
@@ -245,4 +335,118 @@ function ensureProjectRecord(state: SentinelStateFile, projectName: string): Sen
 
 function cloneConfig(config: SentinelProjectConfig): SentinelProjectConfig {
   return { ...config, manualPaths: [...config.manualPaths] };
+}
+
+function sanitizeWatchForPersistence(watch: WatchState): WatchState {
+  return {
+    ...watch,
+    target: redactSensitiveText(watch.target),
+    ...(watch.lastError !== undefined ? { lastError: redactSensitiveText(watch.lastError) } : {})
+  };
+}
+
+function normalizeLoadedProjects(value: unknown): Record<string, SentinelProjectRecord> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const projects: Record<string, SentinelProjectRecord> = {};
+  for (const [projectName, recordValue] of Object.entries(value as Record<string, unknown>)) {
+    if (!projectName.trim()) {
+      continue;
+    }
+    const raw =
+      recordValue && typeof recordValue === "object" && !Array.isArray(recordValue)
+        ? (recordValue as { config?: unknown; watches?: unknown })
+        : {};
+    projects[projectName] = {
+      config: normalizeLoadedConfig(raw.config),
+      watches: normalizeLoadedWatches(raw.watches)
+    };
+  }
+  return projects;
+}
+
+function normalizeLoadedConfig(value: unknown): SentinelProjectConfig {
+  const raw =
+    value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+
+  const manualPaths = Array.isArray(raw.manualPaths)
+    ? [
+        ...new Set(
+          raw.manualPaths
+            .filter((item): item is string => typeof item === "string")
+            .map(normalizeManualPath)
+            .filter(Boolean)
+        )
+      ]
+    : [];
+  const fastCommand = typeof raw.fastCommand === "string" && raw.fastCommand.trim() ? raw.fastCommand.trim() : undefined;
+  const expectedStatus =
+    typeof raw.expectedStatus === "string" && isValidExpectedStatusSpec(raw.expectedStatus.trim())
+      ? raw.expectedStatus.trim()
+      : undefined;
+
+  return {
+    enabled: raw.enabled === true,
+    intervalSeconds: clampIntervalSeconds(typeof raw.intervalSeconds === "number" ? raw.intervalSeconds : DEFAULT_INTERVAL_SECONDS),
+    manualPaths,
+    ...(fastCommand ? { fastCommand } : {}),
+    ...(expectedStatus ? { expectedStatus } : {})
+  };
+}
+
+function normalizeLoadedWatches(value: unknown): Record<string, WatchState> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const watches: Record<string, WatchState> = {};
+  for (const [watchId, watchValue] of Object.entries(value as Record<string, unknown>)) {
+    const normalized = normalizeLoadedWatch(watchId, watchValue);
+    if (normalized) {
+      watches[watchId] = normalized;
+    }
+  }
+  return watches;
+}
+
+function normalizeLoadedWatch(id: string, value: unknown): WatchState | undefined {
+  if (!id.trim() || !value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.target !== "string" || !raw.target.trim()) {
+    return undefined;
+  }
+  if (typeof raw.kind !== "string" || !(WATCH_KINDS as string[]).includes(raw.kind)) {
+    return undefined;
+  }
+  const kind = raw.kind as WatchKind;
+  const status = typeof raw.status === "string" && (WATCH_STATUSES as string[]).includes(raw.status)
+    ? (raw.status as WatchStatus)
+    : "unknown";
+  const consecutiveFailures =
+    typeof raw.consecutiveFailures === "number" && Number.isInteger(raw.consecutiveFailures) && raw.consecutiveFailures >= 0
+      ? raw.consecutiveFailures
+      : 0;
+
+  return {
+    id,
+    kind,
+    target: redactSensitiveText(raw.target),
+    status,
+    consecutiveFailures,
+    ...(validTimestamp(raw.lastCheckAt) ? { lastCheckAt: validTimestamp(raw.lastCheckAt)! } : {}),
+    ...(validTimestamp(raw.lastOkAt) ? { lastOkAt: validTimestamp(raw.lastOkAt)! } : {}),
+    ...(typeof raw.lastCode === "number" && Number.isInteger(raw.lastCode) ? { lastCode: raw.lastCode } : {}),
+    ...(typeof raw.lastError === "string" && raw.lastError.trim() ? { lastError: redactSensitiveText(raw.lastError) } : {}),
+    ...(typeof raw.alertMessageId === "string" && raw.alertMessageId.trim() ? { alertMessageId: raw.alertMessageId.trim() } : {}),
+    ...(typeof raw.alertChannelId === "string" && raw.alertChannelId.trim() ? { alertChannelId: raw.alertChannelId.trim() } : {}),
+    ...(validTimestamp(raw.mutedUntil) ? { mutedUntil: validTimestamp(raw.mutedUntil)! } : {})
+  };
+}
+
+function validTimestamp(value: unknown): string | undefined {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : undefined;
 }

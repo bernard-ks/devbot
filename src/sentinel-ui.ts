@@ -7,6 +7,35 @@ export type SentinelButtonAction = "fix" | "mute";
 const PROJECT_NAME_PATTERN = /^[a-z0-9_-]{1,64}$/i;
 const WATCH_ID_PATTERN = /^[a-z0-9-]{1,48}$/i;
 
+export interface SentinelAlertRoomInput {
+  /** A project's own bound ambient room, if `/setup project-room` has been used for it. */
+  boundRoomId?: string;
+  /** Whether that bound room's audience was just re-verified as safe (undefined when there is no bound room). */
+  boundRoomAudienceVerified?: boolean;
+  /** Whether the project's own policy narrows its audience below the general private room. */
+  hasProjectAudienceRestriction: boolean;
+  /** The general private room devbot is configured for, if any. */
+  generalRoomId?: string;
+}
+
+/**
+ * Decides where a sentinel alert may post without leaking a project's
+ * evidence to an audience broader than its own access policy: prefer the
+ * project's own bound room (only if its audience is currently verified),
+ * otherwise fall back to the general private room only when the project has
+ * no narrower allowlist of its own. Returns undefined when no room can
+ * guarantee the right audience, meaning the alert must be suppressed.
+ */
+export function sentinelAlertRoomId(input: SentinelAlertRoomInput): string | undefined {
+  if (input.boundRoomId) {
+    return input.boundRoomAudienceVerified ? input.boundRoomId : undefined;
+  }
+  if (input.hasProjectAudienceRestriction) {
+    return undefined;
+  }
+  return input.generalRoomId;
+}
+
 export function sentinelAlertRow(projectName: string, watchId: string): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     sentinelButton("fix", projectName, watchId, "Fix it", ButtonStyle.Danger),

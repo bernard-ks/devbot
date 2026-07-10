@@ -4,6 +4,7 @@ import {
   formatSentinelStatus,
   parseSentinelControl,
   sentinelAlertContent,
+  sentinelAlertRoomId,
   sentinelAlertRow,
   sentinelFixTaskPrompt,
   sentinelRecoveryNote
@@ -67,6 +68,38 @@ test("sentinel status formatting lists configuration and per-watch state", () =>
   assert.match(output, /Interval: 45s/);
   assert.match(output, /\/admin/);
   assert.match(output, /down/);
+});
+
+test("sentinelAlertRoomId prefers a project's bound room, falls back to the general room only when unrestricted, and suppresses otherwise", () => {
+  assert.equal(
+    sentinelAlertRoomId({ boundRoomId: "bound-1", boundRoomAudienceVerified: true, hasProjectAudienceRestriction: true, generalRoomId: "general-1" }),
+    "bound-1",
+    "a verified bound project room is used even though the project itself is restricted"
+  );
+
+  assert.equal(
+    sentinelAlertRoomId({ boundRoomId: "bound-1", boundRoomAudienceVerified: false, hasProjectAudienceRestriction: true, generalRoomId: "general-1" }),
+    undefined,
+    "a bound room whose audience no longer verifies must suppress rather than fall back to the broader general room"
+  );
+
+  assert.equal(
+    sentinelAlertRoomId({ hasProjectAudienceRestriction: true, generalRoomId: "general-1" }),
+    undefined,
+    "a project with its own narrower allowlist and no bound room must not leak into the general room"
+  );
+
+  assert.equal(
+    sentinelAlertRoomId({ hasProjectAudienceRestriction: false, generalRoomId: "general-1" }),
+    "general-1",
+    "an unrestricted project without a bound room still uses the general private room, matching prior behavior"
+  );
+
+  assert.equal(
+    sentinelAlertRoomId({ hasProjectAudienceRestriction: false }),
+    undefined,
+    "there is nowhere safe to post when devbot has no verified room at all"
+  );
 });
 
 function downWatch(): WatchState {

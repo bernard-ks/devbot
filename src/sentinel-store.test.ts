@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { clampIntervalSeconds, normalizeManualPath, SentinelStore } from "./sentinel-store.js";
+import {
+  clampIntervalSeconds,
+  isValidExpectedStatusSpec,
+  normalizeManualPath,
+  parseExpectedStatusSpec,
+  SentinelStore
+} from "./sentinel-store.js";
 
 test("clampIntervalSeconds enforces the 30 second floor and rejects non-finite input", () => {
   assert.equal(clampIntervalSeconds(120), 120);
@@ -24,6 +30,26 @@ test("normalizeManualPath normalizes bare paths and preserves absolute urls", ()
 test("normalizeManualPath rejects non-loopback urls to prevent sentinel from becoming an SSRF proxy", () => {
   assert.equal(normalizeManualPath("http://evil.example.com/admin"), "");
   assert.equal(normalizeManualPath("https://169.254.169.254/latest/meta-data"), "");
+});
+
+test("normalizeManualPath rejects urls carrying embedded credentials even on loopback", () => {
+  assert.equal(normalizeManualPath("http://admin:hunter2@127.0.0.1:9/status"), "");
+  assert.equal(normalizeManualPath("http://token@localhost:9/status"), "");
+});
+
+test("parseExpectedStatusSpec accepts a code, a range, and a comma list; rejects garbage", () => {
+  assert.equal(parseExpectedStatusSpec("404")?.(404), true);
+  assert.equal(parseExpectedStatusSpec("404")?.(200), false);
+  assert.equal(parseExpectedStatusSpec("200-299")?.(250), true);
+  assert.equal(parseExpectedStatusSpec("200-299")?.(404), false);
+  assert.equal(parseExpectedStatusSpec("200,301,304")?.(301), true);
+  assert.equal(parseExpectedStatusSpec("200,301,304")?.(302), false);
+  assert.equal(parseExpectedStatusSpec(""), undefined);
+  assert.equal(parseExpectedStatusSpec("not-a-status"), undefined);
+  assert.equal(parseExpectedStatusSpec("999"), undefined, "out of HTTP status range");
+  assert.equal(parseExpectedStatusSpec("300-200"), undefined, "an inverted range is invalid");
+  assert.equal(isValidExpectedStatusSpec("200-299"), true);
+  assert.equal(isValidExpectedStatusSpec("bogus"), false);
 });
 
 test("sentinel store defaults, persists config, and survives reload", async () => {
@@ -52,6 +78,95 @@ test("sentinel store defaults, persists config, and survives reload", async () =
   await store.removeWatchPath("demo", "/admin");
   const afterRemoval = await store.getProjectConfig("demo");
   assert.deepEqual(afterRemoval.manualPaths, ["/health"]);
+});
+
+test("sentinel store persists and reloads an expected-status option, rejecting an invalid one", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-status-store-"));
+  const store = new SentinelStore(path.join(root, "sentinel.json"));
+
+  const withStatus = await store.setExpectedStatus("demo", "200-299");
+  assert.equal(withStatus.expectedStatus, "200-299");
+
+  const rejected = await store.setExpectedStatus("demo", "not-a-status");
+  assert.equal(rejected.expectedStatus, undefined, "an invalid spec clears the option instead of persisting garbage");
+
+  const withStatusAgain = await store.setExpectedStatus("demo", "404");
+  const reloaded = await new SentinelStore(path.join(root, "sentinel.json")).getProjectConfig("demo");
+  assert.equal(withStatusAgain.expectedStatus, "404");
+  assert.equal(reloaded.expectedStatus, "404");
+});
+
+test("sentinel state file and directory are hardened to owner-only permissions", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-perms-"));
+  const filePath = path.join(root, "nested", "sentinel.json");
+  const store = new SentinelStore(filePath);
+  await store.setEnabled("demo", true);
+
+  const fileStat = await stat(filePath);
+  assert.equal(fileStat.mode & 0o777, 0o600, "the state file must not be group/world readable");
+
+  const dirStat = await stat(path.dirname(filePath));
+  assert.equal(dirStat.mode & 0o777, 0o700, "the state directory must not be group/world accessible");
+});
+
+test("sentinel store discards malformed watch entries instead of trusting arbitrary JSON, and rejects an unsupported version", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-schema-"));
+  const filePath = path.join(root, "sentinel.json");
+  await mkdir(root, { recursive: true });
+  await writeFile(
+    filePath,
+    JSON.stringify({
+      version: 1,
+      projects: {
+        demo: {
+          config: { enabled: "yes", intervalSeconds: "soon", manualPaths: ["admin", 42, "http://evil.example.com/x"], fastCommand: 7 },
+          watches: {
+            "url-a": { kind: "url", target: "http://127.0.0.1:3000", status: "bogus-status", consecutiveFailures: -3 },
+            "url-b": { kind: "not-a-kind", target: "http://127.0.0.1:3000" },
+            "url-c": "not even an object",
+            "url-d": { kind: "url", status: "up", consecutiveFailures: 1 }
+          }
+        }
+      }
+    })
+  );
+
+  const store = new SentinelStore(filePath);
+  const config = await store.getProjectConfig("demo");
+  assert.equal(config.enabled, false, "a non-boolean enabled value must not be trusted as true");
+  assert.equal(config.intervalSeconds, 120, "a non-numeric interval falls back to the default");
+  assert.deepEqual(config.manualPaths, ["/admin"], "non-string entries and rejected SSRF targets are dropped");
+  assert.equal(config.fastCommand, undefined, "a non-string fastCommand must not be trusted");
+
+  const watches = await store.listProjectWatches("demo");
+  assert.equal(watches.length, 1, "only the structurally valid watch entry survives normalization");
+  assert.equal(watches[0]?.id, "url-a");
+  assert.equal(watches[0]?.status, "unknown", "an invalid status falls back to unknown rather than being trusted");
+  assert.equal(watches[0]?.consecutiveFailures, 0, "a negative failure count is not trusted");
+
+  await writeFile(filePath, JSON.stringify({ version: 2, projects: {} }));
+  await assert.rejects(() => new SentinelStore(filePath).getProjectConfig("demo"), /Unsupported sentinel state version/);
+});
+
+test("sentinel store redacts secret-shaped error text and target strings before persisting", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-redact-"));
+  const store = new SentinelStore(path.join(root, "sentinel.json"));
+
+  await store.saveWatchState("demo", "cmd-test", {
+    id: "cmd-test",
+    kind: "command",
+    target: "npm test",
+    status: "down",
+    consecutiveFailures: 2,
+    lastError: "command failed: API_KEY=sk-abcdefghijklmnopqrstuvwxyz1234567890 request denied"
+  });
+
+  const saved = await store.getWatchState("demo", "cmd-test");
+  assert.ok(saved?.lastError && !saved.lastError.includes("sk-abcdefghijklmnopqrstuvwxyz1234567890"), "a secret-shaped token must be redacted before it ever reaches disk");
+  assert.match(saved?.lastError ?? "", /REDACTED/);
 });
 
 test("sentinel store tracks and mutes per-project watch state", async () => {

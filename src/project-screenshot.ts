@@ -456,7 +456,7 @@ export function isApprovedProjectScreenshotUrl(candidate: string, projectUrls: r
   });
 }
 
-function projectScreenshotOrigins(project: ProjectEntry, projectUrls: readonly string[]): Set<string> {
+export function projectScreenshotOrigins(project: ProjectEntry, projectUrls: readonly string[]): Set<string> {
   const values = [...projectUrls, project.metadata.backendUrl ?? ""];
   return new Set(
     values
@@ -494,7 +494,7 @@ function normalizeProjectUrl(value: string): string | undefined {
   }
 }
 
-function isLoopbackHost(hostname: string): boolean {
+export function isLoopbackHost(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 }

@@ -1,4 +1,5 @@
 import { configuredCommandNames } from "./command-runner.js";
+import { commandRequiresApproval } from "./safety.js";
 import type { PeerRecord } from "./peer.js";
 import type { TaskRecord } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
@@ -27,6 +28,20 @@ export function commandChoices(project: ProjectEntry | undefined, focused: strin
     .filter((command) => command.includes(query))
     .slice(0, 25)
     .map((command) => ({ name: command, value: `${prefix}${command}` }));
+}
+
+/** Only project-declared read-only commands may run unattended, so Sentinel's fast-command picker excludes everything else. */
+export function readOnlyCommandChoices(project: ProjectEntry | undefined, focused: string): AutocompleteChoice[] {
+  if (!project) {
+    return [];
+  }
+
+  const query = normalize(focused);
+  return configuredCommandNames(project)
+    .filter((command) => !commandRequiresApproval(project, command))
+    .filter((command) => command.includes(query))
+    .slice(0, 25)
+    .map((command) => ({ name: command, value: command }));
 }
 
 export function taskChoices(tasks: TaskRecord[], focused: string): AutocompleteChoice[] {
