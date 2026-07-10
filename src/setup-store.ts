@@ -14,6 +14,7 @@ export interface SetupState {
   repositories: Record<string, string>;
   defaultProjectName?: string;
   privateChannelId?: string;
+  workspaceMessageId?: string;
 }
 
 const EMPTY_SETUP: SetupState = {
@@ -92,6 +93,13 @@ export class SetupStore {
     });
   }
 
+  setWorkspaceMessage(messageId: string): Promise<SetupState> {
+    return this.mutate((state) => {
+      state.workspaceMessageId = messageId;
+      return cloneSetup(state);
+    });
+  }
+
   private mutate<T>(change: (draft: SetupState) => T): Promise<T> {
     const run = this.mutationQueue.then(async () => {
       const draft = cloneSetup(this.state);
@@ -132,6 +140,9 @@ function loadSetupState(filePath: string): SetupState {
       : {}),
     ...(typeof raw.privateChannelId === "string" && raw.privateChannelId.trim()
       ? { privateChannelId: raw.privateChannelId.trim() }
+      : {}),
+    ...(typeof raw.workspaceMessageId === "string" && raw.workspaceMessageId.trim()
+      ? { workspaceMessageId: raw.workspaceMessageId.trim() }
       : {})
   };
 }
@@ -176,6 +187,7 @@ function cloneSetup(state: SetupState): SetupState {
     peerBotIds: [...state.peerBotIds],
     repositories: { ...state.repositories },
     ...(state.defaultProjectName ? { defaultProjectName: state.defaultProjectName } : {}),
-    ...(state.privateChannelId ? { privateChannelId: state.privateChannelId } : {})
+    ...(state.privateChannelId ? { privateChannelId: state.privateChannelId } : {}),
+    ...(state.workspaceMessageId ? { workspaceMessageId: state.workspaceMessageId } : {})
   };
 }

@@ -219,7 +219,7 @@ export function renderSetupPage(sessionToken: string): string {
           </div>
           <div class="field">
             <label for="repo-name">Short name</label>
-            <input id="repo-name" type="text" autocomplete="off" spellcheck="false" placeholder="my-app">
+            <input id="repo-name" type="text" autocomplete="off" spellcheck="false" maxlength="40" placeholder="my-app">
           </div>
         </div>
         <div class="error" id="finish-error" role="alert"></div>
@@ -227,7 +227,7 @@ export function renderSetupPage(sessionToken: string): string {
 
       <section class="section">
         <div class="finish-row">
-          <div class="finish-copy"><strong>Finish local setup</strong><span>Creates the private room, deploys commands, saves local config, posts the quickstart, and starts Devbot.</span></div>
+          <div class="finish-copy"><strong>Finish local setup</strong><span>Creates the private room, deploys commands, saves local config, posts the workspace launcher, and starts Devbot.</span></div>
           <button class="primary" id="finish-button" type="button" disabled>Finish setup</button>
         </div>
       </section>
@@ -238,9 +238,9 @@ export function renderSetupPage(sessionToken: string): string {
       <h2>Devbot is ready.</h2>
       <p id="success-copy"></p>
       <div class="quickstart">
-        <div><span>Ask</span><code>@devbot explain this repo</code></div>
-        <div><span>Do</span><code>/do task:fix the failing test</code></div>
-        <div><span>Check</span><code>/status</code></div>
+        <div><span>Open</span><code>Open workspace</code></div>
+        <div><span>Explore</span><code>Ask or Status</code></div>
+        <div><span>Build</span><code>Make change</code></div>
       </div>
       <div class="actions">
         <a class="button primary" id="room-link" target="_blank" rel="noreferrer">Open private room</a>
@@ -404,7 +404,7 @@ export function renderSetupPage(sessionToken: string): string {
         byId("setup-workspace").classList.add("hidden");
         byId("success").classList.add("visible");
         byId("room-link").href = result.channelUrl;
-        byId("success-copy").textContent = "Private room created in " + result.guildName + " with " + result.repositoryName + " selected. " +
+        byId("success-copy").textContent = "Private room and workspace launcher created in " + result.guildName + " with " + result.repositoryName + " selected. " +
           (result.alreadyRunning ? "Your existing Devbot process is still running." : "Keep this terminal open while Devbot runs.");
         setStep("step-system", true, false);
         setStep("step-discord", true, false);

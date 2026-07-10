@@ -42,7 +42,7 @@ import {
 } from "./lab.js";
 import { renderStatusImage } from "./status-image.js";
 import { TaskStore } from "./task-store.js";
-import { parseTaskControl, taskControlRow } from "./task-controls.js";
+import { parseTaskControl, taskActionMatchesState, taskActionRows, taskControlRow } from "./task-controls.js";
 import type { ProjectEntry } from "./types.js";
 import { filterWorkForProjects, formatWorkStatus, parseExternalCodexWork, scopeStatusToProject, WorkTracker } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
@@ -363,7 +363,8 @@ test("task store persists task lifecycle to disk", async () => {
     projectName: "demo",
     requester: "tester",
     text: "inspect project state",
-    includePatterns: ["src/*"]
+    includePatterns: ["src/*"],
+    parentTaskId: "task-parent"
   });
 
   await store.succeed(task.id, {
@@ -388,6 +389,7 @@ test("task store persists task lifecycle to disk", async () => {
   assert.equal(saved?.modelTier, "standard");
   assert.equal(saved?.contextMode, "focused");
   assert.equal(saved?.routeSource, "model");
+  assert.equal(saved?.parentTaskId, "task-parent");
   assert.equal(recent[0]?.id, task.id);
 });
 
@@ -403,11 +405,58 @@ test("task store can mark running tasks as canceled", async () => {
   });
 
   const canceled = await store.cancel(task.id, "stopped");
+  assert.equal(await store.succeed(task.id, { resultPreview: "late success" }), false);
+  assert.equal(await store.fail(task.id, new Error("late failure")), false);
   const saved = await store.get(task.id);
 
   assert.equal(canceled?.status, "canceled");
   assert.equal(saved?.status, "canceled");
   assert.equal(saved?.error, "stopped");
+});
+
+test("task store reserves one durable retry or continuation action", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-dedupe-"));
+  const store = new TaskStore(path.join(root, "tasks.json"));
+  const input = {
+    source: "retry:test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    text: "retry work",
+    dedupeKey: "task-retry:task-parent"
+  };
+  const results = await Promise.allSettled([store.start(input), store.start(input)]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  assert.match(rejected?.reason?.message ?? "", /already started/);
+});
+
+test("task store recovers tasks interrupted by a restart", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-recovery-"));
+  const stateFile = path.join(root, "tasks.json");
+  const store = new TaskStore(stateFile);
+  const running = await store.start({
+    source: "test",
+    mode: "answer",
+    projectName: "demo",
+    requester: "tester",
+    text: "inspect project"
+  });
+  const finished = await store.start({
+    source: "test",
+    mode: "answer",
+    projectName: "demo",
+    requester: "tester",
+    text: "already done"
+  });
+  await store.succeed(finished.id, { resultPreview: "done" });
+
+  const recovered = new TaskStore(stateFile);
+  assert.equal(await recovered.interruptRunning(), 1);
+  assert.equal((await recovered.get(running.id))?.status, "canceled");
+  assert.match((await recovered.get(running.id))?.error ?? "", /restarted/);
+  assert.equal((await recovered.get(finished.id))?.status, "succeeded");
 });
 
 test("task store serializes concurrent agent task lifecycles", async () => {
@@ -571,11 +620,56 @@ test("workroom controls encode IDs and follow lifecycle state", () => {
   assert.equal(synthesized.find((button) => "custom_id" in button && button.custom_id.includes(":approve:"))?.disabled, false);
 });
 
-test("task controls keep task IDs behind native details and retry buttons", () => {
+test("task controls keep task IDs behind state-aware public and private actions", () => {
   const row = taskControlRow("task-abc").toJSON();
-  assert.deepEqual(row.components.map((component) => "label" in component ? component.label : undefined), ["Details", "Retry"]);
+  assert.deepEqual(row.components.map((component) => "label" in component ? component.label : undefined), ["Details", "Follow up", "Actions"]);
   assert.deepEqual(parseTaskControl("devbot:task-control:details:task-abc"), { action: "details", taskId: "task-abc" });
+  assert.deepEqual(parseTaskControl("devbot:task-control:promote:task-abc"), { action: "promote", taskId: "task-abc" });
   assert.equal(parseTaskControl("devbot:setup:refresh"), undefined);
+  assert.equal(parseTaskControl(`devbot:task-control:details:task-${"a".repeat(65)}`), undefined);
+
+  const actions = taskActionRows(
+    {
+      id: "task-abc",
+      status: "succeeded",
+      source: "test",
+      mode: "answer",
+      projectName: "webapp",
+      requester: "tester",
+      text: "Explain the change",
+      includePatterns: [],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:01:00.000Z"
+    },
+    { canControl: true, safeMode: false, hasChecks: true }
+  );
+  assert.deepEqual(
+    actions[0]?.toJSON().components.map((component) => "label" in component ? component.label : undefined),
+    ["Follow up", "Make change"]
+  );
+  const succeededAnswer = {
+    id: "task-state",
+    status: "succeeded" as const,
+    source: "test",
+    mode: "answer",
+    projectName: "webapp",
+    requester: "tester",
+    text: "Explain the change",
+    includePatterns: [],
+    startedAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z"
+  };
+  assert.equal(taskActionMatchesState("followup", succeededAnswer), true);
+  assert.equal(taskActionMatchesState("promote", succeededAnswer), true);
+  assert.equal(taskActionMatchesState("retry", succeededAnswer), false);
+  assert.equal(taskActionMatchesState("validate", { ...succeededAnswer, mode: "action" }), true);
+  assert.equal(taskActionMatchesState("cancel", { ...succeededAnswer, status: "running" }), true);
+  const safeModeRecovery = taskActionRows(
+    { ...succeededAnswer, status: "failed", mode: "action" },
+    { canControl: true, safeMode: true, hasChecks: true }
+  ).flatMap((row) => row.toJSON().components);
+  assert.deepEqual(safeModeRecovery.map((component) => "label" in component ? component.label : undefined), ["Adjust request", "Retry"]);
+  assert.equal(safeModeRecovery.every((component) => "disabled" in component && component.disabled), true);
 });
 
 interface CommandJson {

@@ -38,9 +38,8 @@ export function setupWizardView(
         `Room: <#${effectiveRoomId}>`,
         `Default repo: \`${defaultProject?.name}\``,
         "",
-        "Ask: mention `@devbot` with a question.",
-        "Do: use `/do` for an intentional project change.",
-        "Check: use `/status` for current work.",
+        "Your workspace launcher is ready in the private room.",
+        "Open it to ask, make changes, check status, or switch projects.",
         "",
         "Reopen `/setup wizard` whenever access or repositories change."
       ].join("\n")

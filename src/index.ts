@@ -63,7 +63,22 @@ import {
   screenshotRequiresApproval
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskStatus } from "./task-store.js";
-import { parseTaskControl, taskControlRow, type TaskControlAction } from "./task-controls.js";
+import {
+  parseTaskControl,
+  taskActionMatchesState,
+  taskActionRows,
+  taskControlRow,
+  type TaskControlAction
+} from "./task-controls.js";
+import {
+  continuationPrompt,
+  formatTaskProgress,
+  parseTaskModal,
+  taskRequestModal,
+  type TaskModalAction,
+  type TaskProgressEvent
+} from "./task-ui.js";
+import { UserPreferenceStore } from "./user-preferences.js";
 import {
   filterWorkForProjects,
   findExternalCodexWork,
@@ -78,6 +93,15 @@ import { clearRuntimeLock, markRuntimeRunning, runtimeLockPath } from "./runtime
 import { SetupStore, type SetupState, type SetupUserPermission } from "./setup-store.js";
 import { parseSetupWizardAction, setupRepositoryModal, setupWizardView, type SetupWizardAction } from "./setup-wizard.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
+import {
+  parseWorkspaceControl,
+  parseWorkspaceModal,
+  workspaceLauncherView,
+  workspacePanelView,
+  workspaceRequestModal,
+  type WorkspaceAction,
+  type WorkspaceModalAction
+} from "./workspace-ui.js";
 import {
   councilChallengePrompt,
   councilContributionPrompt,
@@ -108,9 +132,11 @@ applySetupState(config, bootstrapConfig, setupStore.snapshot());
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
+const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const activeTaskControllers = new Map<string, AbortController>();
+const activeTaskActions = new Set<string>();
 const activeWorkroomActions = new Set<string>();
 let verifiedPrivateRoomId: string | undefined;
 let slashCommandsReady = false;
@@ -121,6 +147,14 @@ const client = new Client({
 
 client.once("clientReady", async () => {
   markRuntimeRunning(runtimePidFile);
+  try {
+    const interrupted = await taskStore.interruptRunning();
+    if (interrupted > 0) {
+      console.log(`Recovered ${interrupted} interrupted task${interrupted === 1 ? "" : "s"} from the previous runtime.`);
+    }
+  } catch (error) {
+    console.warn(`Unable to recover interrupted tasks: ${(error as Error).message}`);
+  }
   if (config.autoDeployCommands && client.application) {
     try {
       const deployed = await syncCommandsIfChanged({
@@ -159,6 +193,11 @@ client.once("clientReady", async () => {
     `Request routing: ${config.routing.enabled ? "enabled" : "fallback only"} ` +
       `(fast=${config.routing.fastModel ?? "default"}, standard=${config.routing.standardModel ?? "default"}, deep=${config.routing.deepModel ?? "default"}).`
   );
+  if (verifiedPrivateRoomId && config.projects.length > 0) {
+    await ensureWorkspaceLauncher(config).catch((error) => {
+      console.warn(`Unable to synchronize the workspace launcher: ${(error as Error).message}`);
+    });
+  }
 });
 
 process.once("exit", () => clearRuntimeLock(runtimePidFile));
@@ -180,6 +219,18 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      const workspaceControl = parseWorkspaceControl(interaction.customId);
+      if (workspaceControl) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleWorkspaceButton(interaction, config, workspaceControl.action, workspaceControl.projectName);
+        return;
+      }
       const setupAction = parseSetupWizardAction(interaction.customId);
       if (setupAction) {
         if (!isOwner(interaction.user.id, config)) {
@@ -216,6 +267,18 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isUserSelectMenu() || interaction.isStringSelectMenu()) {
+      const workspaceControl = parseWorkspaceControl(interaction.customId);
+      if (workspaceControl?.action === "project" && interaction.isStringSelectMenu()) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleWorkspaceProjectSelect(interaction, config);
+        return;
+      }
       const setupAction = parseSetupWizardAction(interaction.customId);
       if (!setupAction) {
         return;
@@ -233,6 +296,30 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isModalSubmit()) {
+      const workspaceModal = parseWorkspaceModal(interaction.customId);
+      if (workspaceModal) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleWorkspaceModal(interaction, config, workspaceModal.action, workspaceModal.projectName);
+        return;
+      }
+      const taskModal = parseTaskModal(interaction.customId);
+      if (taskModal) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handleTaskModal(interaction, config, taskModal.action, taskModal.taskId);
+        return;
+      }
       const setupAction = parseSetupWizardAction(interaction.customId);
       if (!setupAction) {
         return;
@@ -328,7 +415,15 @@ client.on("messageCreate", async (message) => {
       return;
     }
     const visibleProjects = config.projects.filter((project) => isAllowedMessageForProject(message, project));
-    const visibleConfig = { ...config, projects: visibleProjects };
+    const preferredProjects = projectsWithUserPreference(visibleProjects, message.author.id);
+    const preferredProject = statusProjectRequest.project ?? defaultProjectIfAvailable(preferredProjects);
+    if (preferredProject && hasProjectAudienceRestriction(preferredProject)) {
+      await message.reply(
+        "This project has a scoped audience, so I will not post its results from a channel mention. Open the workspace or use `/ask` for a private response."
+      );
+      return;
+    }
+    const visibleConfig = { ...config, projects: preferredProject ? [preferredProject] : visibleProjects };
     const parsedStatusRequest = parseStatusRequest(statusProjectRequest.text);
     const statusRequest = parsedStatusRequest.isStatus
       ? parsedStatusRequest
@@ -337,7 +432,7 @@ client.on("messageCreate", async (message) => {
     if (statusRequest.isStatus) {
       await message.channel.sendTyping();
       console.log(`Status request from ${message.author.tag}: image=${statusRequest.wantsImage} question=${Boolean(statusRequest.question)}`);
-      const snapshot = await getStatusSnapshotResponse(visibleConfig, statusRequest.wantsImage, statusProjectRequest.project, statusRequest.question);
+      const snapshot = await getStatusSnapshotResponse(visibleConfig, statusRequest.wantsImage, preferredProject, statusRequest.question);
       await replyToMessageWithChunks(message, snapshot);
 
       if (statusRequest.question) {
@@ -345,14 +440,14 @@ client.on("messageCreate", async (message) => {
           appConfig: visibleConfig,
           question: statusRequest.question,
           requester: message.author.tag,
-          project: statusProjectRequest.project
+          project: preferredProject
         });
         await replyToMessageWithChunks(message, detail);
       }
       return;
     }
 
-    const request = parseMentionRequest(message.content, client.user.id, visibleProjects, botRoleMentionIds);
+    const request = parseMentionRequest(message.content, client.user.id, preferredProjects, botRoleMentionIds);
     if (!request.text) {
       await message.reply("Ask me a project question after the mention. Use `/do` when you want an intentional code change.");
       return;
@@ -373,27 +468,21 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
+    await userPreferences.setSelectedProject(message.author.id, request.project.name);
+
     await message.channel.sendTyping();
     const pending = await message.reply("Routing request...");
-    const { answer, route, taskId } = await runProjectRequest({
+    await executeMessageRequest({
+      message,
+      pending,
       appConfig: config,
       project: request.project,
       text: request.text,
       includePatterns: request.includePatterns,
       mode: request.mode,
       requester: message.author.tag,
-      source: "mention",
-      onRoute: async (selected) => {
-        await pending.edit(formatRouteProgress(selected, request.project, request.mode));
-      }
+      source: "mention"
     });
-
-    const chunks = splitDiscordMessage(`${answer}\n\n${formatResultFooter(request.project, route, request.mode)}`);
-    await pending.edit({ content: chunks[0] ?? "No answer generated.", components: [taskControlRow(taskId)] });
-
-    for (const chunk of chunks.slice(1)) {
-      await message.reply(chunk);
-    }
   } catch (error) {
     console.error(error);
     await message.reply(`Error: ${(error as Error).message}`);
@@ -417,17 +506,24 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
   }
 
   if (interaction.commandName === "status") {
-    await interaction.deferReply();
     const projectName = interaction.options.getString("project");
     const question = interaction.options.getString("question") ?? undefined;
-    const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
-    if (project && !(await ensureProjectAccess(interaction, project))) {
+    const project = projectName
+      ? mustFindProject(appConfig.projects, projectName)
+      : preferredProjectForInteraction(appConfig, interaction);
+    if (!project) {
+      await interaction.reply({ content: "No configured project is available to you.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const visibleProjects = appConfig.projects.filter((entry) => isAllowedForProject(interaction, entry));
-    const visibleConfig = { ...appConfig, projects: project ? [project] : visibleProjects };
+    const privateReply = hasProjectAudienceRestriction(project);
+    await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    await userPreferences.setSelectedProject(interaction.user.id, project.name);
+    const visibleConfig = { ...appConfig, projects: [project] };
     const snapshot = await getStatusSnapshotResponse(visibleConfig, interaction.options.getBoolean("image") ?? false, project, question);
-    await editInteractionWithChunks(interaction, snapshot);
+    await editInteractionWithChunks(interaction, snapshot, privateReply);
 
     if (question) {
       const detail = await getDetailedStatusResponse({
@@ -436,17 +532,18 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
         requester: interaction.user.tag,
         project
       });
-      await followUpWithChunks(interaction, detail);
+      await followUpWithChunks(interaction, detail, privateReply);
     }
     return;
   }
 
   if (interaction.commandName === "snip") {
-    await interaction.deferReply();
     const projectName = interaction.options.getString("project");
     const target = interaction.options.getString("target", true);
     const viewport = interaction.options.getString("viewport") as "desktop" | "tablet" | "mobile" | null;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : defaultProject(appConfig.projects);
+    const privateReply = hasProjectAudienceRestriction(project);
+    await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
@@ -460,7 +557,7 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
       content: formatScreenshotReply(project, screenshot),
       image: screenshot.image,
       imageName: screenshot.fileName
-    });
+    }, privateReply);
     return;
   }
 
@@ -508,61 +605,52 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
   }
 
   if (interaction.commandName === "ask") {
-    await interaction.deferReply();
-    const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
+    const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
+    await userPreferences.setSelectedProject(interaction.user.id, project.name);
     const question = interaction.options.getString("question", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
-    const { answer, route, taskId } = await runProjectRequest({
+    await executeInteractionRequest({
+      interaction,
       appConfig,
       project,
       text: question,
       includePatterns,
       mode: "answer",
       requester: interaction.user.tag,
-      source: "slash:ask"
+      source: "slash:ask",
+      ephemeral: hasProjectAudienceRestriction(project)
     });
-
-    const chunks = splitDiscordMessage(`${answer}\n\n${formatResultFooter(project, route, "answer")}`);
-    await interaction.editReply({ content: chunks[0] ?? "No answer generated.", components: [taskControlRow(taskId)] });
-
-    for (const chunk of chunks.slice(1)) {
-      await interaction.followUp(chunk);
-    }
-
     return;
   }
 
   if (interaction.commandName === "do") {
-    await interaction.deferReply();
     if (isWriteBlockedBySafeMode(appConfig, "action")) {
-      await interaction.editReply(safeModeActionMessage("/do"));
+      await interaction.reply({ content: safeModeActionMessage("/do"), flags: MessageFlags.Ephemeral });
       return;
     }
 
-    const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
+    const project = selectedProjectForInteraction(appConfig, interaction, interaction.options.getString("project"));
     if (!(await ensureProjectAccess(interaction, project))) {
       return;
     }
+    await userPreferences.setSelectedProject(interaction.user.id, project.name);
     const task = interaction.options.getString("task", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
-    const { answer, route, taskId } = await runProjectRequest({
+    await executeInteractionRequest({
+      interaction,
       appConfig,
       project,
       text: task,
       includePatterns,
       mode: "action",
       requester: interaction.user.tag,
-      source: "slash:do"
+      source: "slash:do",
+      ephemeral: hasProjectAudienceRestriction(project)
     });
-    const chunks = splitDiscordMessage(`${answer}\n\n${formatResultFooter(project, route, "action")}`);
-    await interaction.editReply({ content: chunks[0] ?? "No answer generated.", components: [taskControlRow(taskId)] });
-
-    for (const chunk of chunks.slice(1)) {
-      await interaction.followUp(chunk);
-    }
+    return;
   }
 }
 
@@ -680,6 +768,7 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
   }
 
   const channel = await createOrSyncPrivateRoom(interaction, appConfig, interaction.options.getString("name") ?? undefined);
+  await ensureWorkspaceLauncher(appConfig);
   await interaction.editReply(`Private Devbot room ready: <#${channel.id}>.`);
 }
 
@@ -700,6 +789,9 @@ async function handleSetupWizardButton(
   await interaction.editReply(
     setupWizardView(setupStore.snapshot(), appConfig, effectivePrivateRoomId(), action === "finish")
   );
+  if (action === "finish") {
+    await ensureWorkspaceLauncher(appConfig);
+  }
 }
 
 async function handleSetupUserSelect(
@@ -992,16 +1084,6 @@ function formatRoute(route: RequestRoute): string {
   return `${routeName(route)} / ${context}`;
 }
 
-function formatRouteProgress(route: RequestRoute, project: ProjectEntry, mode: CodexRequestMode): string {
-  if (route.contextMode === "none") {
-    return `Answering directly with ${routeName(route)}...`;
-  }
-  if (route.contextMode === "full") {
-    return `Taking a deeper look at \`${project.name}\` with ${routeName(route)}...`;
-  }
-  return `${mode === "action" ? "Working" : "Looking"} in \`${project.name}\` with ${routeName(route)}...`;
-}
-
 function routeName(route: RequestRoute): "Luna" | "Terra" | "Sol" {
   return route.tier === "fast" ? "Luna" : route.tier === "standard" ? "Terra" : "Sol";
 }
@@ -1019,7 +1101,9 @@ interface ProjectRequestOptions {
   requester: string;
   source: string;
   contextCharLimit?: number;
-  onRoute?: (route: RequestRoute) => Promise<void>;
+  parentTaskId?: string;
+  dedupeKey?: string;
+  onProgress?: (progress: TaskProgressEvent) => Promise<void>;
 }
 
 interface ProjectRequestResult {
@@ -1040,7 +1124,9 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     projectName: options.project.name,
     requester: options.requester,
     text: options.text,
-    includePatterns: options.includePatterns
+    includePatterns: options.includePatterns,
+    ...(options.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
+    ...(options.dedupeKey ? { dedupeKey: options.dedupeKey } : {})
   });
   const work = workTracker.start({
     mode: options.mode,
@@ -1051,6 +1137,16 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
   });
   const controller = new AbortController();
   activeTaskControllers.set(task.id, controller);
+  const progressBase = {
+    taskId: task.id,
+    projectName: options.project.name,
+    mode: options.mode,
+    text: options.text,
+    requester: options.requester,
+    startedAt: task.startedAt
+  };
+  await reportTaskProgress(options, { ...progressBase, phase: "routing" });
+  let selectedRoute: RequestRoute | undefined;
 
   try {
     const route = await routeRequest({
@@ -1063,12 +1159,13 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       hasExplicitIncludes: options.includePatterns.length > 0,
       signal: controller.signal
     });
+    selectedRoute = route;
     workTracker.update(work.id, {
       phase: "gathering-context",
       modelTier: route.tier,
       contextMode: route.contextMode
     });
-    await options.onRoute?.(route);
+    await reportTaskProgress(options, { ...progressBase, phase: "gathering-context", route });
     const contextCharLimit = contextLimitForRoute(
       route,
       options.appConfig.scanner.maxPackedContextChars,
@@ -1083,8 +1180,14 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       phase: "running-codex",
       contextFileCount: context.files.length
     });
+    await reportTaskProgress(options, {
+      ...progressBase,
+      phase: "running-codex",
+      route,
+      contextFileCount: context.files.length
+    });
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
-    await taskStore.succeed(task.id, {
+    const completed = await taskStore.succeed(task.id, {
       contextFileCount: context.files.length,
       resultPreview: answer,
       ...(route.model ? { model: route.model } : {}),
@@ -1093,18 +1196,128 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       routeReason: route.reason,
       routeSource: route.source
     });
+    if (!completed) {
+      const current = await taskStore.get(task.id);
+      if (current?.status === "canceled") {
+        controller.abort(current.error ?? "Canceled by user request.");
+      }
+      throw new Error(current?.error ?? `Task stopped while ${current?.status ?? "unavailable"}.`);
+    }
     return { answer, context, taskId: task.id, route };
   } catch (error) {
     if (controller.signal.aborted) {
       await taskStore.cancel(task.id, "Canceled by user request.");
+      await reportTaskProgress(options, {
+        ...progressBase,
+        phase: "canceled",
+        ...(selectedRoute ? { route: selectedRoute } : {}),
+        error: "Canceled by user request."
+      });
     } else {
       await taskStore.fail(task.id, error);
+      await reportTaskProgress(options, {
+        ...progressBase,
+        phase: "failed",
+        ...(selectedRoute ? { route: selectedRoute } : {}),
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
     throw error;
   } finally {
     activeTaskControllers.delete(task.id);
     workTracker.finish(work.id);
   }
+}
+
+async function reportTaskProgress(options: ProjectRequestOptions, progress: TaskProgressEvent): Promise<void> {
+  if (!options.onProgress) {
+    return;
+  }
+  try {
+    await options.onProgress(progress);
+  } catch (error) {
+    console.warn(`Unable to update Discord task progress for ${progress.taskId}: ${(error as Error).message}`);
+  }
+}
+
+interface InteractionRequestOptions extends Omit<ProjectRequestOptions, "onProgress"> {
+  interaction: ChatInputCommandInteraction | ModalSubmitInteraction | ButtonInteraction;
+  ephemeral?: boolean;
+}
+
+async function executeInteractionRequest(options: InteractionRequestOptions): Promise<void> {
+  const { interaction, ephemeral, ...requestOptions } = options;
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply(ephemeral ? { flags: MessageFlags.Ephemeral } : undefined);
+  }
+  let progressRendered = false;
+  try {
+    const result = await runProjectRequest({
+      ...requestOptions,
+      onProgress: async (progress) => {
+        await interaction.editReply({
+          content: formatTaskProgress(progress),
+          components: [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })]
+        });
+        progressRendered = true;
+      }
+    });
+    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`);
+    await interaction.editReply({
+      content: chunks.shift() ?? "Task completed without a response.",
+      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })]
+    });
+    for (const chunk of chunks) {
+      await interaction.followUp({
+        content: chunk,
+        ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {})
+      });
+    }
+  } catch (error) {
+    if (!progressRendered) {
+      throw error;
+    }
+    console.error(error);
+  }
+}
+
+interface MessageRequestOptions extends Omit<ProjectRequestOptions, "onProgress"> {
+  message: Message;
+  pending: Message;
+}
+
+async function executeMessageRequest(options: MessageRequestOptions): Promise<void> {
+  const { message, pending, ...requestOptions } = options;
+  let progressRendered = false;
+  try {
+    const result = await runProjectRequest({
+      ...requestOptions,
+      onProgress: async (progress) => {
+        await pending.edit({
+          content: formatTaskProgress(progress),
+          components: [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })]
+        });
+        progressRendered = true;
+      }
+    });
+    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`);
+    await pending.edit({
+      content: chunks.shift() ?? "Task completed without a response.",
+      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })]
+    });
+    for (const chunk of chunks) {
+      await message.reply(chunk);
+    }
+  } catch (error) {
+    if (!progressRendered) {
+      throw error;
+    }
+    console.error(error);
+  }
+}
+
+function taskStatusForProgress(progress: TaskProgressEvent): TaskStatus {
+  return progress.phase === "failed" ? "failed" : progress.phase === "canceled" ? "canceled" : "running";
 }
 
 async function getWorkStatusMessage(appConfig: AppConfig, requestedProject?: ProjectEntry): Promise<string> {
@@ -1201,7 +1414,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     appConfig.projects.filter((project) => isAllowedForProject(interaction, project)).map((project) => project.name)
   );
   if (subcommand === "recent") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const projectName = interaction.options.getString("project") ?? undefined;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
     if (project && !allowedProjectNames.has(project.name)) {
@@ -1225,7 +1438,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
   }
 
   if (subcommand === "show" || subcommand === "status") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const id = interaction.options.getString("id", true);
     const task = await taskStore.get(id);
     await interaction.editReply(
@@ -1235,7 +1448,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
   }
 
   if (subcommand === "logs") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const id = interaction.options.getString("id", true);
     const task = await taskStore.get(id);
     await interaction.editReply(
@@ -1245,7 +1458,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
   }
 
   if (subcommand === "cancel") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const id = interaction.options.getString("id", true);
     const existing = await taskStore.get(id);
     if (!existing || !allowedProjectNames.has(existing.projectName)) {
@@ -1259,7 +1472,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
   }
 
   if (subcommand === "retry") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const id = interaction.options.getString("id", true);
     const task = await taskStore.get(id);
     if (!task) {
@@ -1270,6 +1483,10 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
       await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
       return;
     }
+    if (!taskActionMatchesState("retry", task)) {
+      await interaction.editReply(`Task \`${id}\` is ${task.status}; only failed or canceled tasks can be retried.`);
+      return;
+    }
 
     if (isWriteBlockedBySafeMode(appConfig, task.mode === "action" ? "action" : "answer")) {
       await interaction.editReply(safeModeActionMessage("/task retry"));
@@ -1277,21 +1494,24 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     }
 
     const project = mustFindProject(appConfig.projects, task.projectName);
-    const { answer, taskId } = await runProjectRequest({
+    await executeInteractionRequest({
+      interaction,
       appConfig,
       project,
       text: task.text,
       includePatterns: task.includePatterns,
       mode: task.mode === "action" ? "action" : "answer",
       requester: interaction.user.tag,
-      source: `retry:${task.id}`
+      source: `retry:${task.id}`,
+      parentTaskId: task.id,
+      dedupeKey: `task-retry:${task.id}`,
+      ephemeral: true
     });
-    await editInteractionWithChunks(interaction, { content: `Retried \`${id}\` as \`${taskId}\`.\n\n${answer}` });
     return;
   }
 
   if (subcommand === "stale") {
-    await interaction.deferReply();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const minutes = interaction.options.getInteger("minutes") ?? 30;
     const projectName = interaction.options.getString("project") ?? undefined;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
@@ -1338,7 +1558,104 @@ async function handleTaskControl(
   }
 
   const mode: CodexRequestMode = task.mode === "action" ? "action" : "answer";
-  if (mode === "action" && !isControllerUser(interaction.user.id, appConfig)) {
+  const canControl = isControllerUser(interaction.user.id, appConfig);
+
+  if (action === "actions") {
+    const rows = taskActionRows(task, {
+      canControl,
+      safeMode: appConfig.safeMode,
+      hasChecks: configuredCommandNames(project).length > 0
+    });
+    const safeModeBlocksRecovery = appConfig.safeMode && mode === "action" && (task.status === "failed" || task.status === "canceled");
+    await interaction.reply({
+      content: [
+        `**${project.name} task actions**`,
+        `Status: ${task.status} | ${mode === "action" ? "write-capable" : "read-only"}`,
+        `Request: \`${inlineDiscordCode(truncateForLog(task.text))}\``,
+        "",
+        safeModeBlocksRecovery
+          ? "Safe mode is on, so write-capable recovery is unavailable until it is disabled locally and Devbot restarts."
+          : rows.length > 0
+            ? "Choose an available action."
+            : "No additional actions are available for your access level and this task state."
+      ].join("\n"),
+      components: rows,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (!taskActionMatchesState(action, task)) {
+    await interaction.reply({
+      content: `That action is not available while this task is ${task.status}. Open Actions to see the current choices.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (action === "followup" || action === "promote" || action === "adjust") {
+    if ((action === "promote" || (action === "adjust" && mode === "action")) && !canControl) {
+      await interaction.reply({
+        content: "Only the owner or an approved controller can start write-capable work.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    const requestedMode: CodexRequestMode = action === "promote" ? "action" : action === "adjust" ? mode : "answer";
+    if (isWriteBlockedBySafeMode(appConfig, requestedMode)) {
+      await interaction.reply({ content: safeModeActionMessage("this task action"), flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.showModal(taskRequestModal(action, task));
+    return;
+  }
+
+  if (action === "review") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const packet = await createReviewPacket(project, task);
+    await editButtonReplyWithChunks(interaction, formatReviewPacket(packet));
+    return;
+  }
+
+  if (action === "cancel") {
+    if (!canControl) {
+      await interaction.reply({ content: "Only the owner or an approved controller can cancel work.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    activeTaskControllers.get(task.id)?.abort();
+    const canceled = await taskStore.cancel(task.id, `Canceled by ${interaction.user.tag}.`);
+    await interaction.reply({
+      content: canceled?.status === "canceled" ? "Task canceled." : `This task is already ${canceled?.status ?? "unavailable"}.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (action === "validate") {
+    if (!canControl) {
+      await interaction.reply({ content: "Only the owner or an approved controller can run project checks.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (appConfig.safeMode) {
+      await interaction.reply({ content: safeModeActionMessage("project checks"), flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (configuredCommandNames(project).length === 0) {
+      await interaction.reply({ content: "No project checks are configured yet.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await runTaskActionOnce(interaction, `${task.id}:validate`, async () => {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const results = await validateReview(project);
+      await editButtonReplyWithChunks(interaction, formatValidationResults(project, results));
+    });
+    return;
+  }
+
+  if (action !== "retry") {
+    return;
+  }
+  if (mode === "action" && !canControl) {
     await interaction.reply({
       content: "Only the owner or an approved controller can retry write-capable work.",
       flags: MessageFlags.Ephemeral
@@ -1350,83 +1667,265 @@ async function handleTaskControl(
     return;
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const result = await runProjectRequest({
+  await runTaskActionOnce(interaction, `${task.id}:retry`, async () => {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await executeInteractionRequest({
+      interaction,
+      appConfig,
+      project,
+      text: task.text,
+      includePatterns: task.includePatterns,
+      mode,
+      requester: interaction.user.tag,
+      source: `button:retry:${task.id}`,
+      ephemeral: true,
+      parentTaskId: task.id,
+      dedupeKey: `task-retry:${task.id}`
+    });
+  });
+}
+
+async function runTaskActionOnce(interaction: ButtonInteraction, key: string, run: () => Promise<void>): Promise<void> {
+  if (activeTaskActions.has(key)) {
+    await interaction.reply({ content: "That task action is already running.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  activeTaskActions.add(key);
+  try {
+    await run();
+  } finally {
+    activeTaskActions.delete(key);
+  }
+}
+
+async function handleTaskModal(
+  interaction: ModalSubmitInteraction,
+  appConfig: AppConfig,
+  action: TaskModalAction,
+  taskId: string
+): Promise<void> {
+  const task = await taskStore.get(taskId);
+  if (!task) {
+    await interaction.reply({ content: "That saved task is no longer available.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, task.projectName);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That task's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const originalMode: CodexRequestMode = task.mode === "action" ? "action" : "answer";
+  if (!taskActionMatchesState(action, task)) {
+    await interaction.reply({
+      content: `That action is no longer available because this task is ${task.status}.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  const mode: CodexRequestMode = action === "promote" ? "action" : action === "adjust" ? originalMode : "answer";
+  if (mode === "action" && !isControllerUser(interaction.user.id, appConfig)) {
+    await interaction.reply({
+      content: "Only the owner or an approved controller can start write-capable work.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  if (isWriteBlockedBySafeMode(appConfig, mode)) {
+    await interaction.reply({ content: safeModeActionMessage("this task action"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const request = interaction.fields.getTextInputValue("request").trim();
+  await userPreferences.setSelectedProject(interaction.user.id, project.name);
+  await executeInteractionRequest({
+    interaction,
     appConfig,
     project,
-    text: task.text,
-    includePatterns: task.includePatterns,
+    text: continuationPrompt(action, task, request),
+    includePatterns: action === "adjust" ? task.includePatterns : [],
     mode,
     requester: interaction.user.tag,
-    source: `button:retry:${task.id}`
+    source: `task:${action}:${task.id}`,
+    parentTaskId: task.id,
+    ...(mode === "action" ? { dedupeKey: `task-${action}:${task.id}` } : {}),
+    ephemeral: hasProjectAudienceRestriction(project)
   });
-  const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(project, result.route, mode)}`);
-  await interaction.editReply({
-    content: chunks.shift() ?? "Retry completed without a response.",
-    components: [taskControlRow(result.taskId)]
-  });
-  for (const chunk of chunks) {
-    await interaction.followUp({ content: chunk, flags: MessageFlags.Ephemeral });
+}
+
+async function handleWorkspaceButton(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: WorkspaceAction,
+  projectName?: string
+): Promise<void> {
+  if (action === "open") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const project = preferredProjectForInteraction(appConfig, interaction);
+    if (!project) {
+      await interaction.editReply("No configured project is available to you.");
+      return;
+    }
+    await userPreferences.setSelectedProject(interaction.user.id, project.name);
+    await interaction.editReply(await buildWorkspacePanel(interaction, appConfig, project));
+    return;
   }
+
+  const project = projectName ? findProject(appConfig.projects, projectName) : undefined;
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await userPreferences.setSelectedProject(interaction.user.id, project.name);
+
+  if (action === "ask" || action === "act") {
+    if (action === "act" && !isControllerUser(interaction.user.id, appConfig)) {
+      await interaction.reply({
+        content: "You have view access, but only the owner or an approved controller can make project changes.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    if (action === "act" && appConfig.safeMode) {
+      await interaction.reply({ content: safeModeActionMessage("workspace changes"), flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.showModal(workspaceRequestModal(action, project.name));
+    return;
+  }
+
+  if (action === "refresh") {
+    await interaction.deferUpdate();
+    await interaction.editReply(await buildWorkspacePanel(interaction, appConfig, project));
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (action === "status") {
+    const status = await getStatusSnapshotResponse(scopeStatusToProject(appConfig, project), false, project);
+    await editButtonReplyWithChunks(interaction, status.content);
+    return;
+  }
+  if (action === "recent") {
+    const tasks = await taskStore.listRecent({ projectName: project.name, limit: 10 });
+    await editButtonReplyWithChunks(interaction, formatTaskList(tasks));
+  }
+}
+
+async function handleWorkspaceProjectSelect(
+  interaction: StringSelectMenuInteraction,
+  appConfig: AppConfig
+): Promise<void> {
+  const projectName = interaction.values[0];
+  const project = projectName ? findProject(appConfig.projects, projectName) : undefined;
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferUpdate();
+  await userPreferences.setSelectedProject(interaction.user.id, project.name);
+  await interaction.editReply(await buildWorkspacePanel(interaction, appConfig, project));
+}
+
+async function handleWorkspaceModal(
+  interaction: ModalSubmitInteraction,
+  appConfig: AppConfig,
+  action: WorkspaceModalAction,
+  projectName: string
+): Promise<void> {
+  const project = findProject(appConfig.projects, projectName);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const mode: CodexRequestMode = action === "act" ? "action" : "answer";
+  if (mode === "action" && !isControllerUser(interaction.user.id, appConfig)) {
+    await interaction.reply({
+      content: "You have view access, but only the owner or an approved controller can make project changes.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  if (isWriteBlockedBySafeMode(appConfig, mode)) {
+    await interaction.reply({ content: safeModeActionMessage("workspace changes"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await userPreferences.setSelectedProject(interaction.user.id, project.name);
+  await executeInteractionRequest({
+    interaction,
+    appConfig,
+    project,
+    text: interaction.fields.getTextInputValue("request").trim(),
+    includePatterns: [],
+    mode,
+    requester: interaction.user.tag,
+    source: `workspace:${action}`,
+    ephemeral: hasProjectAudienceRestriction(project)
+  });
+}
+
+async function buildWorkspacePanel(
+  interaction: ButtonInteraction | StringSelectMenuInteraction | ChatInputCommandInteraction,
+  appConfig: AppConfig,
+  project: ProjectEntry
+) {
+  const projects = appConfig.projects.filter((entry) => isAllowedForProject(interaction, entry));
+  const status = await getWorkStatusMessage(scopeStatusToProject(appConfig, project), project);
+  const recentTasks = await taskStore.listRecent({ projectName: project.name, limit: 25 });
+  return workspacePanelView({
+    projects,
+    selectedProject: project,
+    canControl: isControllerUser(interaction.user.id, appConfig),
+    safeMode: appConfig.safeMode,
+    status,
+    recentTasks
+  });
 }
 
 async function handleDashboardCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
-  await interaction.deferReply();
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const projectName = interaction.options.getString("project") ?? undefined;
-  const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
-  if (project && !isAllowedForProject(interaction, project)) {
+  const project = projectName
+    ? mustFindProject(appConfig.projects, projectName)
+    : preferredProjectForInteraction(appConfig, interaction);
+  if (!project) {
+    await interaction.editReply("No configured project is available to you.");
+    return;
+  }
+  if (!isAllowedForProject(interaction, project)) {
     await interaction.editReply(`You are not allowed to use project \`${project.name}\`.`);
     return;
   }
-  const projects = project ? [project] : appConfig.projects.filter((entry) => isAllowedForProject(interaction, entry));
-  const visibleProjectNames = new Set(projects.map((entry) => entry.name));
-  const status = await getWorkStatusMessage({ ...appConfig, projects });
-  const recentTasks = (await taskStore.listRecent({ limit: 25, ...(project ? { projectName: project.name } : {}) }))
-    .filter((task) => visibleProjectNames.has(task.projectName))
-    .slice(0, 5);
-  const lines = [
-    `Devbot dashboard for ${project ? `\`${project.name}\`` : "configured projects"}`,
-    `Bot: \`${appConfig.botIdentity.displayName}\` owned by ${appConfig.botIdentity.owner}`,
-    `Safe mode: ${appConfig.safeMode ? "on" : "off"}`,
-    "",
-    "Projects:",
-    projects.map(formatProjectSummary).join("\n"),
-    "",
-    "Active work:",
-    status,
-    "",
-    "Recent tasks:",
-    formatTaskList(recentTasks)
-  ];
-
-  await editInteractionWithChunks(interaction, { content: lines.join("\n") });
+  await userPreferences.setSelectedProject(interaction.user.id, project.name);
+  await interaction.editReply(await buildWorkspacePanel(interaction, appConfig, project));
 }
 
 async function handleRunCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
-  await interaction.deferReply();
+  const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
+  const privateReply = hasProjectAudienceRestriction(project);
+  await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
   if (appConfig.safeMode) {
     await interaction.editReply("Safe mode is on, so configured project command runs are disabled.");
     return;
   }
 
-  const project = selectedProject(appConfig.projects, interaction.options.getString("project"));
   if (!(await ensureProjectAccess(interaction, project))) {
     return;
   }
   const command = interaction.options.getString("command", true);
   const result = await runConfiguredProjectCommand(project, command);
-  await editInteractionWithChunks(interaction, { content: formatProjectCommandResult(result) });
+  await editInteractionWithChunks(interaction, { content: formatProjectCommandResult(result) }, privateReply);
 }
 
 async function handleReviewCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   const subcommand = interaction.options.getSubcommand();
   const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+  const privateReply = hasProjectAudienceRestriction(project);
   if (!(await ensureProjectAccess(interaction, project))) {
     return;
   }
 
   if (subcommand === "packet") {
-    await interaction.deferReply();
+    await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
     const taskId = interaction.options.getString("task") ?? undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
     if (task && task.projectName !== project.name) {
@@ -1434,7 +1933,7 @@ async function handleReviewCommand(interaction: ChatInputCommandInteraction, app
       return;
     }
     const packet = await createReviewPacket(project, task);
-    await editInteractionWithChunks(interaction, { content: formatReviewPacket(packet) });
+    await editInteractionWithChunks(interaction, { content: formatReviewPacket(packet) }, privateReply);
     return;
   }
 
@@ -1443,17 +1942,17 @@ async function handleReviewCommand(interaction: ChatInputCommandInteraction, app
     return;
   }
 
-  await interaction.deferReply();
+  await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
   const commandNames = parseCommandNames(interaction.options.getString("commands"));
   if (subcommand === "validate") {
     const results = await validateReview(project, commandNames);
-    await editInteractionWithChunks(interaction, { content: formatValidationResults(project, results) });
+    await editInteractionWithChunks(interaction, { content: formatValidationResults(project, results) }, privateReply);
     return;
   }
 
   if (subcommand === "gates") {
     const result = await evaluateMergeGates(project, commandNames);
-    await editInteractionWithChunks(interaction, { content: formatMergeGateResult(project, result) });
+    await editInteractionWithChunks(interaction, { content: formatMergeGateResult(project, result) }, privateReply);
   }
 }
 
@@ -2773,23 +3272,45 @@ async function replyToMessageWithChunks(message: Message, response: BotResponse)
   }
 }
 
-async function editInteractionWithChunks(interaction: ChatInputCommandInteraction, response: BotResponse): Promise<void> {
+async function editInteractionWithChunks(
+  interaction: ChatInputCommandInteraction,
+  response: BotResponse,
+  ephemeral = false
+): Promise<void> {
   const chunks = splitDiscordMessage(response.content);
   const files = attachmentFiles(response);
+  const privateFollowUps = ephemeral || interaction.ephemeral === true;
   await interaction.editReply({ content: chunks[0] ?? "No status generated.", files });
 
   for (const chunk of chunks.slice(1)) {
-    await interaction.followUp(chunk);
+    await interaction.followUp({ content: chunk, ...(privateFollowUps ? { flags: MessageFlags.Ephemeral } : {}) });
   }
 }
 
-async function followUpWithChunks(interaction: ChatInputCommandInteraction, response: BotResponse): Promise<void> {
+async function followUpWithChunks(
+  interaction: ChatInputCommandInteraction,
+  response: BotResponse,
+  ephemeral = false
+): Promise<void> {
   const chunks = splitDiscordMessage(response.content);
   const files = attachmentFiles(response);
-  await interaction.followUp({ content: chunks[0] ?? "No status generated.", files });
+  const privateFollowUps = ephemeral || interaction.ephemeral === true;
+  await interaction.followUp({
+    content: chunks[0] ?? "No status generated.",
+    files,
+    ...(privateFollowUps ? { flags: MessageFlags.Ephemeral } : {})
+  });
 
   for (const chunk of chunks.slice(1)) {
-    await interaction.followUp(chunk);
+    await interaction.followUp({ content: chunk, ...(privateFollowUps ? { flags: MessageFlags.Ephemeral } : {}) });
+  }
+}
+
+async function editButtonReplyWithChunks(interaction: ButtonInteraction, content: string): Promise<void> {
+  const chunks = splitDiscordMessage(content);
+  await interaction.editReply(chunks.shift() ?? "No result generated.");
+  for (const chunk of chunks) {
+    await interaction.followUp({ content: chunk, flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -3310,6 +3831,42 @@ function selectedProject(projects: ProjectEntry[], requestedName: string | null)
   return requestedName ? mustFindProject(projects, requestedName) : defaultProject(projects);
 }
 
+function selectedProjectForInteraction(
+  appConfig: AppConfig,
+  interaction: ChatInputCommandInteraction,
+  requestedName: string | null
+): ProjectEntry {
+  if (requestedName) {
+    return mustFindProject(appConfig.projects, requestedName);
+  }
+  const preferred = preferredProjectForInteraction(appConfig, interaction);
+  if (!preferred) {
+    throw new Error("No configured project is available to you.");
+  }
+  return preferred;
+}
+
+function preferredProjectForInteraction(
+  appConfig: AppConfig,
+  interaction: ChatInputCommandInteraction | ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
+): ProjectEntry | undefined {
+  const allowedProjects = appConfig.projects.filter((project) => isAllowedForProject(interaction, project));
+  const preferredName = userPreferences.selectedProject(interaction.user.id);
+  return allowedProjects.find((project) => project.name === preferredName) ?? defaultProjectIfAvailable(allowedProjects);
+}
+
+function projectsWithUserPreference(projects: ProjectEntry[], userId: string): ProjectEntry[] {
+  const preferredName = userPreferences.selectedProject(userId);
+  if (!preferredName || !projects.some((project) => project.name === preferredName)) {
+    return projects;
+  }
+  return projects.map((project) => ({ ...project, isDefault: project.name === preferredName }));
+}
+
+function defaultProjectIfAvailable(projects: ProjectEntry[]): ProjectEntry | undefined {
+  return projects.find((project) => project.isDefault) ?? projects[0];
+}
+
 function parseFallbackStatusRequest(text: string): { isStatus: boolean; question: string | undefined; wantsImage: boolean } {
   const normalized = text.toLowerCase();
   const isStatus = /\b(status|state|progress|wip|working|work|snip|screenshot|screen shot|output)\b/.test(normalized);
@@ -3324,6 +3881,10 @@ function parseFallbackStatusRequest(text: string): { isStatus: boolean; question
 function truncateForLog(value: string): string {
   const compact = value.replace(/\s+/g, " ").trim();
   return compact.length > 220 ? `${compact.slice(0, 217)}...` : compact;
+}
+
+function inlineDiscordCode(value: string): string {
+  return value.replace(/`/g, "'").replace(/[\r\n]+/g, " ");
 }
 
 function getBotRoleMentionIds(message: Message, botUsername: string): string[] {
@@ -3347,7 +3908,10 @@ async function ensureProjectAccess(interaction: ChatInputCommandInteraction, pro
   return false;
 }
 
-function isAllowed(interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction, appConfig: AppConfig): boolean {
+function isAllowed(
+  interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
+  appConfig: AppConfig
+): boolean {
   if (!appConfig.ownerUserId) {
     return false;
   }
@@ -3382,7 +3946,7 @@ function isAllowed(interaction: ChatInputCommandInteraction | ButtonInteraction 
 }
 
 function isAllowedForProject(
-  interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction,
+  interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
   project: ProjectEntry
 ): boolean {
   const policy = project.metadata.policy;
@@ -3409,6 +3973,11 @@ function isAllowedForProject(
   }
 
   return false;
+}
+
+function hasProjectAudienceRestriction(project: ProjectEntry): boolean {
+  const policy = project.metadata.policy;
+  return policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
 }
 
 function isAllowedMessage(message: Message, appConfig: AppConfig): boolean {
@@ -3472,7 +4041,9 @@ async function ensureControllerAccess(interaction: ChatInputCommandInteraction, 
   return false;
 }
 
-async function ensureConfiguredRoom(interaction: ChatInputCommandInteraction | ButtonInteraction): Promise<boolean> {
+async function ensureConfiguredRoom(
+  interaction: ChatInputCommandInteraction | ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
+): Promise<boolean> {
   const privateChannelId = effectivePrivateRoomId();
   if (!privateChannelId) {
     await interaction.reply({
@@ -3493,6 +4064,34 @@ async function ensureConfiguredRoom(interaction: ChatInputCommandInteraction | B
 
 function effectivePrivateRoomId(): string | undefined {
   return verifiedPrivateRoomId;
+}
+
+async function ensureWorkspaceLauncher(appConfig: AppConfig): Promise<void> {
+  const roomId = effectivePrivateRoomId();
+  if (!roomId || appConfig.projects.length === 0 || !client.user) {
+    return;
+  }
+  const channel = await client.channels.fetch(roomId);
+  if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.PrivateThread)) {
+    throw new Error("The configured private room cannot host the workspace launcher.");
+  }
+  const room = channel as GuildTextBasedChannel;
+  const state = setupStore.snapshot();
+  let launcher = state.workspaceMessageId
+    ? await room.messages.fetch(state.workspaceMessageId).catch(() => undefined)
+    : undefined;
+  if (launcher && launcher.author.id !== client.user.id) {
+    launcher = undefined;
+  }
+  if (launcher) {
+    await launcher.edit(workspaceLauncherView());
+  } else {
+    launcher = await room.send(workspaceLauncherView());
+    await setupStore.setWorkspaceMessage(launcher.id);
+  }
+  if (!launcher.pinned && launcher.pinnable) {
+    await launcher.pin("Devbot workspace launcher").catch(() => undefined);
+  }
 }
 
 async function verifyPrivateRoom(channelId: string | undefined): Promise<string | undefined> {
@@ -3548,7 +4147,9 @@ function canAccessConversation(
   return Boolean(project && isAllowedForProject(interaction, project));
 }
 
-function interactionNameSource(interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction) {
+function interactionNameSource(
+  interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
+) {
   return {
     username: interaction.user.username,
     globalName: interaction.user.globalName,

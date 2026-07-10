@@ -9,7 +9,7 @@ npm install
 npm run setup
 ```
 
-The local browser tool validates Discord, opens the bot install flow, discovers the selected server, chooses the server owner as the bootstrap owner, registers a repository, creates the private room, writes ignored local state, deploys commands, and starts Devbot.
+The local browser tool validates Discord, opens the bot install flow, discovers the selected server, chooses the server owner as the bootstrap owner, registers a repository, creates the private room, posts the workspace launcher, writes ignored local state, deploys commands, and starts Devbot.
 
 For an already-configured installation:
 
@@ -52,7 +52,11 @@ It creates or adopts the private room, registers local repository paths, chooses
 /projects
 ```
 
-The default repo is used by mentions and by `/ask`, `/do`, `/run`, and `/lab council` when their optional `project` field is omitted. Other project-aware commands retain autocomplete so an operator can choose a different root per request.
+The Discord workspace stores a selected project per approved user. Mentions, `/ask`, `/do`, `/status`, and `/dashboard` use that selection when their optional project is omitted, then fall back to the setup default. Other project-aware commands retain autocomplete so an operator can choose a different root per request.
+
+Open the shared launcher or run `/dashboard` to get a personal ephemeral workspace. Its project selector only includes roots the user can access. Ask and Make change open Discord modals; task messages update in place and expose safe public controls plus a role-aware private Actions panel.
+
+When Devbot restarts, saved tasks that were still marked running are recovered as canceled with an interruption reason. This keeps the workspace from presenting orphaned work as active after a process restart.
 
 Configure project roots with `config/projects.json`:
 
@@ -97,6 +101,8 @@ Project metadata can also include a `policy` block:
 ```
 
 Empty `allowedUsers`, `allowedUsernames`, and `allowedRoles` preserve the global bot allow-list for project-specific commands. Empty `allowedPeers` means any globally allow-listed peer can ask about the project. `screenshotPolicy` can be `allow`, `approval`, or `deny`.
+
+If any project user or role allowlist is populated, Devbot sends workspace, `/ask`, `/do`, `/status`, `/snip`, `/task`, `/run`, `/review`, continuation, and retry output ephemerally. It declines channel-mention results for that project because Discord cannot make one ordinary channel reply visible to only a subset of room members.
 
 For global bot access, set one or more of:
 
@@ -150,6 +156,7 @@ By default, devbot writes local runtime state under `.devbot/` in this repo:
 - `.devbot/peers.json`
 - `.devbot/collab.json`
 - `.devbot/setup.json`
+- `.devbot/preferences.json`
 - `.devbot/runtime.pid`
 
 Override these paths with:
@@ -158,6 +165,7 @@ Override these paths with:
 - `DEVBOT_PEER_STORE`
 - `DEVBOT_COLLAB_STORE`
 - `DEVBOT_SETUP_STORE`
+- `DEVBOT_PREFERENCES_STORE`
 - `DEVBOT_RUNTIME_LOCK`
 
 Relative override paths are resolved from the devbot process working directory.

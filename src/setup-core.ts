@@ -5,6 +5,7 @@ import { PermissionFlagsBits, PermissionsBitField } from "discord.js";
 import { commandDefinitions } from "./commands.js";
 import { normalizeProjectName } from "./config.js";
 import { SetupStore } from "./setup-store.js";
+import { workspaceLauncherView } from "./workspace-ui.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
 
@@ -70,6 +71,10 @@ interface DiscordChannel {
   name?: string;
   type: number;
   permission_overwrites?: Array<{ id: string; type: number; allow: string; deny: string }>;
+}
+
+interface DiscordMessage {
+  id: string;
 }
 
 export async function validateDiscordBotToken(tokenValue: string, fetchImpl: FetchLike = fetch): Promise<DiscordBotIdentity> {
@@ -182,7 +187,8 @@ export async function finishInitialSetup(input: SetupFinishInput): Promise<Setup
 
   const warnings: string[] = [];
   try {
-    await discordJson(
+    const workspace = workspaceLauncherView();
+    const welcome = await discordJson<DiscordMessage>(
       token,
       `/channels/${channel.id}/messages`,
       {
@@ -191,17 +197,15 @@ export async function finishInitialSetup(input: SetupFinishInput): Promise<Setup
           content: [
             `Devbot is ready for <@${guild.owner_id}>.`,
             "",
-            "Ask: mention `@devbot` with a question.",
-            "Do: use `/do` for an intentional project change.",
-            "Check: use `/status` for current work.",
-            "",
-            "Run `/setup wizard` here to add viewers, controllers, or peer Devbots."
+            workspace.content
           ].join("\n"),
+          components: workspace.components.map((row) => row.toJSON()),
           allowed_mentions: { parse: [] }
         })
       },
       fetchImpl
     );
+    await setupStore.setWorkspaceMessage(welcome.id);
   } catch (error) {
     warnings.push(`The room was created, but the welcome message could not be posted: ${(error as Error).message}`);
   }

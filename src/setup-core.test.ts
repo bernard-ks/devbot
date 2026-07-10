@@ -16,7 +16,8 @@ test("setup page uses the dark theme and exposes the guided controls", () => {
   assert.match(html, /<meta name="color-scheme" content="dark">/);
   assert.match(html, /--canvas: #0d0f13/);
   assert.match(html, /id="choose-folder"/);
-  assert.match(html, /Ask/);
+  assert.match(html, /Open workspace/);
+  assert.match(html, /Make change/);
   assert.doesNotMatch(html, /content="light"/);
 });
 
@@ -126,6 +127,7 @@ test("initial setup provisions a private room, local repo, commands, and welcome
 
   const setup = JSON.parse(await readFile(setupFile, "utf8")) as Record<string, unknown>;
   assert.equal(setup.privateChannelId, "channel-1");
+  assert.equal(setup.workspaceMessageId, "message-1");
   assert.equal(setup.defaultProjectName, "sample-app");
   assert.deepEqual(setup.repositories, { "sample-app": repoRoot });
 
@@ -142,6 +144,9 @@ test("initial setup provisions a private room, local repo, commands, and welcome
   assert.ok(Array.isArray(commandCall?.body));
   assert.ok((commandCall?.body as Array<{ name: string }>).some((command) => command.name === "do"));
   assert.ok(calls.some((call) => call.url.endsWith("/channels/channel-1/messages")));
+  const welcomeCall = calls.find((call) => call.url.endsWith("/channels/channel-1/messages"));
+  const welcomeBody = welcomeCall?.body as { components?: Array<{ components?: Array<{ custom_id?: string }> }> } | undefined;
+  assert.equal(welcomeBody?.components?.[0]?.components?.[0]?.custom_id, "devbot:workspace:open");
 });
 
 function jsonResponse(value: unknown, status = 200): Response {

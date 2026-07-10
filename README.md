@@ -33,7 +33,7 @@ Prerequisites: Node.js 20 or newer, a signed-in Codex CLI or app, and a Discord 
    - uses the Discord server owner as the initial Devbot owner
    - registers the local repository with a native folder picker
    - creates a deny-by-default `devbot-private` room
-   - deploys slash commands and posts the Ask / Do / Check quickstart
+   - deploys slash commands and posts a reusable Discord workspace launcher
    - writes the ignored local `.env` and `.devbot/setup.json` with owner-only file permissions
    - starts Devbot in the same terminal, or reuses an already-running local process
 
@@ -57,11 +57,11 @@ Then use it:
 /status
 ```
 
-![Dark Devbot setup completion screen showing Ask, Do, and Check examples](docs/images/setup-ready-dark.png)
+![Dark Devbot setup completion screen showing the Discord workspace launcher flow](docs/images/setup-ready-dark.png)
 
 *The completion screen opens the private room and leaves users with the three everyday actions.*
 
-Answers include **Details** and **Retry** buttons. Internal task IDs, model IDs, and routing tiers stay out of the normal conversation and remain available in task details when needed.
+The launcher opens a personal, ephemeral workspace with project selection and native **Ask**, **Make change**, **Status**, **Recent**, and **Refresh** controls. Tasks update one shared message through routing, context preparation, work, completion, failure, or cancellation. Safe public controls open role-aware private actions for follow-up, review, validation, retry, adjustment, and cancellation. Internal task and model IDs remain in task details instead of normal conversation.
 
 For production, run:
 
@@ -72,10 +72,13 @@ npm start
 
 ## Everyday Use
 
+- **Workspace:** open the shared Devbot launcher or run `/dashboard`; choose a project and use its native controls.
 - **Ask:** `@devbot <question>` or `/ask question:<text>` keeps the request read-only.
 - **Do:** `/do task:<text>` is the intentional write-capable path for the owner and controllers.
-- **Check:** `/status` reports current work; `/dashboard` opens the denser operator view.
+- **Check:** `/status` reports current work, blockers, repository evidence, and the next action.
 - **Set up:** `/setup wizard` is owner-only and resumable; `/setup doctor` diagnoses the full path.
+
+The workspace remembers each approved user's selected project locally. Mentions, `/ask`, `/do`, `/status`, and `/dashboard` use that project when no explicit project is supplied. Every interaction rechecks current project access, controller authority, safe mode, and task state.
 
 ## Advanced Command Reference
 
@@ -94,7 +97,7 @@ npm start
 - `/task cancel id:<task-id>`: Mark a running saved task as canceled in local history.
 - `/task retry id:<task-id>`: Retry a saved task with the same project, mode, text, and include patterns.
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
-- `/dashboard project:<optional>`: Show active work, recent tasks, project metadata, and configured commands.
+- `/dashboard project:<optional>`: Open the personal interactive workspace with project selection, current status, recent work, and native Ask / Change controls.
 - `/run command:<name> project:<optional>`: Run a configured command from `<project>/.devbot/project.json`, using the selected default project when omitted.
 - `/review packet project:<name> task:<optional>`: Create a provider-neutral review handoff packet from git status, diff stat, last commit, and optional task context.
 - `/review validate project:<name> commands:<optional>`: Run configured validation commands.
@@ -132,13 +135,13 @@ You can also mention the bot in a channel:
 @devbot what's the status on the web build, send me a snip of the browse page
 ```
 
-Mentions are read-only by default and use the project selected in `/setup wizard`. This keeps ordinary conversation safe; write-capable work is a deliberate `/do`. With no selected default, a single configured project is used automatically; multiple projects require `project:<name>`.
+Mentions are read-only by default and use the invoking user's workspace project, then the setup-selected default as a fallback. This keeps ordinary conversation safe; write-capable work remains a deliberate workspace **Make change** action or `/do`. Use `project:<name>` to override the selection for one mention.
 
 Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@devbot give me a breakdown of what you are working on` return the decision-ready brief without invoking Codex. Devbot distinguishes confirmed work from an open Codex app session, because an open session can be working, waiting, or idle. It never exposes process IDs or private external prompts. Generic requests for blockers and next steps stay deterministic; diagnostic questions about failures, diffs, remaining work, or merge readiness trigger the deeper read-only Codex inspection. If the message asks for a snip, screenshot, image, or picture, the bot tries to attach a live project UI screenshot. Page hints such as `browse page` or `watchlist` are handled by opening the running app and navigating through visible UI controls instead of reading framework routes from disk. Explicit paths like `/cards/op01-016` are still supported when you want an exact target.
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Peer registry state is stored in `.devbot/peers.json`, collaboration workrooms are stored in `.devbot/collab.json`, and owner-managed setup is stored in `.devbot/setup.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, or `DEVBOT_SETUP_STORE` to use different files; relative paths resolve from the devbot process working directory.
+Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, and owner-managed setup in `.devbot/setup.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, or `DEVBOT_SETUP_STORE` to use different files; relative paths resolve from the devbot process working directory.
 
 ## Owner Setup And Visibility
 
@@ -182,6 +185,8 @@ Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true
 Global access can be limited with `ALLOWED_USER_IDS`, `ALLOWED_USERNAMES`, and `ALLOWED_ROLE_IDS`. User IDs are the most stable option. Account usernames are matched case-insensitively; mutable global display names and guild nicknames are intentionally ignored.
 
 Project policy lets each repo narrow collaboration behavior. `allowedUsers`, `allowedUsernames`, and `allowedRoles` scope project-specific slash command access, `allowedPeers` limits peer bot access per project, `screenshotPolicy` can be `allow`, `approval`, or `deny`, and command policy marks presets that are safe to run versus approval-gated.
+
+When a project has any user or role allowlist, Devbot keeps workspace, `/ask`, `/do`, `/status`, `/snip`, `/task`, `/run`, `/review`, continuation, and retry results ephemeral so other members of the shared room cannot read them. Because channel mentions cannot be selectively hidden, Devbot declines mention-based results for those projects and points the user to the private workspace or `/ask`.
 
 ## Peer Bots
 
