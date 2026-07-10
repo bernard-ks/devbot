@@ -2,7 +2,7 @@ import { constants } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { lstat, mkdir, open, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { canAccessScopedRecord, type TaskAccessContext } from "./task-access.js";
+import { canAccessScopedRecord, type AccessScopedRecord, type TaskAccessContext } from "./task-access.js";
 import { selectRelevantMemories } from "./memory-recall.js";
 import {
   hardenPrivateDirectoryPermissions,
@@ -19,6 +19,16 @@ export type MemoryAccessScope = "project" | "workroom";
 export type MemoryStatus = "active" | "proposed" | "superseded";
 export type MemoryTrust = "trusted" | "untrusted";
 export type MemoryAccessContext = TaskAccessContext;
+
+/**
+ * Minimal read-only view of the authoritative task record used to recover the
+ * access scope of a legacy memory entry that predates the scope/requester
+ * fields. Structurally satisfied by TaskStore so the concrete store can be
+ * passed straight in without a circular import.
+ */
+export interface TaskAccessLookup {
+  get(taskId: string): Promise<AccessScopedRecord | undefined>;
+}
 
 export const MEMORY_SCHEMA_VERSION = 1;
 
@@ -87,7 +97,8 @@ export class MemoryStore {
     storeRoot: string = DEFAULT_MEMORY_STORE_ROOT,
     private readonly maxOutcomes = DEFAULT_MAX_OUTCOMES,
     private readonly maxTotalEntries = MAX_TOTAL_ENTRIES,
-    private readonly maxFileBytes = MAX_FILE_BYTES
+    private readonly maxFileBytes = MAX_FILE_BYTES,
+    private readonly taskLookup?: TaskAccessLookup
   ) {
     this.root = path.resolve(storeRoot);
   }
@@ -218,11 +229,14 @@ export class MemoryStore {
 
   /**
    * Reads a memory file that an earlier Devbot build wrote inside the managed
-   * project checkout, merges its records into the central store (invalid lines
-   * are quarantined, migrated entries keep their normalized untrusted-by-default
-   * state so they are never auto-recalled without promotion), then retires the
-   * stray file so it can never be committed to the target repository or read
-   * from the project root. Symlinked or oversized legacy files are left alone.
+   * project checkout, merges its records into the central store, then retires
+   * the stray file so it can never be committed to the target repository or read
+   * from the project root. Records fail closed: a legacy entry without a
+   * trustworthy access scope is only imported when its scope and requester can
+   * be recovered from the authoritative task record; everything else is
+   * quarantined rather than widened to project visibility. Migrated entries keep
+   * their untrusted-by-default state so they are never auto-recalled without
+   * promotion. Symlinked or oversized legacy files are left alone.
    */
   private async migrateLegacyProjectMemory(project: Pick<ProjectEntry, "root">, centralFile: string): Promise<void> {
     const legacyDirectory = path.join(project.root, ".devbot");
@@ -239,7 +253,7 @@ export class MemoryStore {
       throw new Error(`legacy memory file exceeds the ${this.maxFileBytes}-byte budget; leaving it in place`);
     }
 
-    const legacy = parseJsonl(await readFileRejectingSymlinks(legacyFile));
+    const legacy = await this.parseLegacyState(await readFileRejectingSymlinks(legacyFile));
     const current = await this.readStateFromFile(centralFile);
     const knownIds = new Set(current.entries.map((entry) => entry.id));
     const merged: MemoryFileState = {
@@ -249,6 +263,74 @@ export class MemoryStore {
     await writeAll(centralFile, merged, this.maxFileBytes);
     await rm(legacyFile, { force: true });
     await rmdir(legacyDirectory).catch(() => undefined);
+  }
+
+  /** Parses a legacy JSONL file, resolving each record's scope fail-closed; unresolvable lines are quarantined. */
+  private async parseLegacyState(raw: string): Promise<MemoryFileState> {
+    const entries: MemoryEntry[] = [];
+    const quarantined: string[] = [];
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        quarantined.push(trimmed);
+        continue;
+      }
+
+      const entry = await this.normalizeLegacyEntry(parsed);
+      if (entry) {
+        entries.push(entry);
+      } else {
+        quarantined.push(trimmed);
+      }
+    }
+    return { entries, quarantined };
+  }
+
+  /** Normalizes a legacy record, recovering an untrustworthy scope from the task record or returning undefined to quarantine. */
+  private async normalizeLegacyEntry(value: unknown): Promise<MemoryEntry | undefined> {
+    const core = normalizeEntryCore(value);
+    if (!core) return undefined;
+    const scope = await this.resolveLegacyScope(core);
+    return scope ? assembleEntry(core, scope) : undefined;
+  }
+
+  /**
+   * Determines the access scope of a legacy entry without ever widening unknown
+   * visibility. An explicit scope on the record is honored; a missing scope is
+   * recovered from the authoritative task record. The result is the most
+   * restrictive of what the record claims and what the task record says, so a
+   * private workroom outcome can never surface as project memory. Returns
+   * undefined when no trustworthy basis exists, forcing the caller to quarantine.
+   */
+  private async resolveLegacyScope(core: EntryCore): Promise<ScopeDecision | undefined> {
+    const task = core.taskId && this.taskLookup
+      ? await this.taskLookup.get(core.taskId).catch(() => undefined)
+      : undefined;
+
+    if (core.claimedScope === undefined && !task) {
+      return undefined;
+    }
+
+    const taskRestricted = Boolean(task) && (task!.accessScope === "workroom" || task!.internal === true);
+    const restricted = core.claimedScope === "workroom" || core.claimedInternal || taskRestricted;
+    if (!restricted) {
+      return { accessScope: "project" };
+    }
+
+    const requesterId = task?.requesterId ? boundedField(task.requesterId) : core.claimedRequesterId;
+    const internal = core.claimedInternal || task?.internal === true;
+    return {
+      accessScope: "workroom",
+      ...(requesterId ? { requesterId } : {}),
+      ...(internal ? { internal: true } : {})
+    };
   }
 
   private async mutate(
@@ -490,8 +572,50 @@ function parseJsonl(raw: string): MemoryFileState {
   return { entries, quarantined };
 }
 
-/** Strictly validates and normalizes a raw parsed JSON value into a MemoryEntry, or returns undefined to quarantine it. */
+/** Everything a validated memory record carries except its final access scope, plus the record's own (untrusted) scope claim. */
+interface EntryCore {
+  schemaVersion: 1;
+  id: string;
+  kind: MemoryKind;
+  text: string;
+  source: MemorySource;
+  taskId?: string;
+  branch?: string;
+  author: string;
+  actorId?: string;
+  createdAt: string;
+  tags: string[];
+  status: MemoryStatus;
+  trust: MemoryTrust;
+  claimedScope: MemoryAccessScope | undefined;
+  claimedRequesterId?: string;
+  claimedInternal: boolean;
+}
+
+interface ScopeDecision {
+  accessScope: MemoryAccessScope;
+  requesterId?: string;
+  internal?: boolean;
+}
+
+/**
+ * Strictly validates and normalizes a raw parsed JSON value into a MemoryEntry,
+ * or returns undefined to quarantine it. A record without an explicit, valid
+ * access scope fails closed: it is quarantined rather than defaulted to project
+ * visibility, so an unrelated viewer can never read a scope that was never set.
+ */
 function normalizeStoredEntry(value: unknown): MemoryEntry | undefined {
+  const core = normalizeEntryCore(value);
+  if (!core || core.claimedScope === undefined) return undefined;
+  return assembleEntry(core, {
+    accessScope: core.claimedScope,
+    ...(core.claimedRequesterId ? { requesterId: core.claimedRequesterId } : {}),
+    ...(core.claimedInternal ? { internal: true } : {})
+  });
+}
+
+/** Validates every field except the access-scope decision, which the caller finalizes (fail-closed for stored reads, recovered for legacy migration). */
+function normalizeEntryCore(value: unknown): EntryCore | undefined {
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Partial<MemoryEntry> & Record<string, unknown>;
 
@@ -516,9 +640,9 @@ function normalizeStoredEntry(value: unknown): MemoryEntry | undefined {
   const tags = Array.isArray(raw.tags) ? dedupeTags(raw.tags.filter((tag): tag is string => typeof tag === "string")) : [];
 
   const accessScopes: MemoryAccessScope[] = ["project", "workroom"];
-  const accessScope = typeof raw.accessScope === "string" && accessScopes.includes(raw.accessScope as MemoryAccessScope)
+  const claimedScope = typeof raw.accessScope === "string" && accessScopes.includes(raw.accessScope as MemoryAccessScope)
     ? (raw.accessScope as MemoryAccessScope)
-    : "project";
+    : undefined;
 
   const statuses: MemoryStatus[] = ["active", "proposed", "superseded"];
   const status = typeof raw.status === "string" && statuses.includes(raw.status as MemoryStatus) ? (raw.status as MemoryStatus) : "active";
@@ -538,11 +662,33 @@ function normalizeStoredEntry(value: unknown): MemoryEntry | undefined {
     ...(stringValue(raw.actorId) ? { actorId: boundedField(stringValue(raw.actorId)!) } : {}),
     createdAt,
     tags,
-    accessScope,
-    ...(stringValue(raw.requesterId) ? { requesterId: boundedField(stringValue(raw.requesterId)!) } : {}),
-    ...(raw.internal === true ? { internal: true } : {}),
     status,
-    trust
+    trust,
+    claimedScope,
+    ...(stringValue(raw.requesterId) ? { claimedRequesterId: boundedField(stringValue(raw.requesterId)!) } : {}),
+    claimedInternal: raw.internal === true
+  };
+}
+
+/** Builds a MemoryEntry from a validated core and a finalized scope decision. */
+function assembleEntry(core: EntryCore, scope: ScopeDecision): MemoryEntry {
+  return {
+    schemaVersion: MEMORY_SCHEMA_VERSION,
+    id: core.id,
+    kind: core.kind,
+    text: core.text,
+    source: core.source,
+    ...(core.taskId ? { taskId: core.taskId } : {}),
+    ...(core.branch ? { branch: core.branch } : {}),
+    author: core.author,
+    ...(core.actorId ? { actorId: core.actorId } : {}),
+    createdAt: core.createdAt,
+    tags: core.tags,
+    accessScope: scope.accessScope,
+    ...(scope.requesterId ? { requesterId: scope.requesterId } : {}),
+    ...(scope.internal ? { internal: true } : {}),
+    status: core.status,
+    trust: core.trust
   };
 }
 

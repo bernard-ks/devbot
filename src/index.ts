@@ -199,7 +199,13 @@ setActiveBackendId(process.env.DEVBOT_AGENT_BACKEND?.trim() || setupStore.snapsh
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
-const memoryStore = new MemoryStore(process.env.DEVBOT_MEMORY_STORE?.trim() || undefined);
+const memoryStore = new MemoryStore(
+  process.env.DEVBOT_MEMORY_STORE?.trim() || undefined,
+  undefined,
+  undefined,
+  undefined,
+  taskStore
+);
 const userPreferences = new UserPreferenceStore(process.env.DEVBOT_PREFERENCES_STORE?.trim() || undefined);
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);

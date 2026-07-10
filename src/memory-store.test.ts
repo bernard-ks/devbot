@@ -11,6 +11,7 @@ import {
   type MemoryAccessContext,
   type MemoryEntry
 } from "./memory-store.js";
+import { TaskStore } from "./task-store.js";
 
 async function tempProject(): Promise<{ root: string }> {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-memory-project-"));
@@ -179,7 +180,8 @@ test("memory store redacts secrets in legacy entries lazily on read", async () =
     source: "manual",
     author: "tom",
     createdAt: new Date().toISOString(),
-    tags: []
+    tags: [],
+    accessScope: "project"
   };
   await writeFile(file, `${JSON.stringify(legacyEntry)}\n`, "utf8");
 
@@ -401,7 +403,8 @@ test("memory store treats a valid entry missing tags as an empty tag list instea
     text: "Entry recorded before tags existed.",
     source: "manual",
     author: "tom",
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    accessScope: "project"
   };
   await writeFile(file, `${JSON.stringify(withoutTags)}\n`, "utf8");
 
@@ -534,7 +537,8 @@ function legacyLine(id: string, text: string): string {
     source: "manual",
     author: "tom",
     createdAt: "2026-06-01T00:00:00.000Z",
-    tags: ["legacy"]
+    tags: ["legacy"],
+    accessScope: "project"
   });
 }
 
@@ -605,4 +609,127 @@ test("memory store legacy migration leaves oversized legacy files in place", asy
   const entries = await store.list(project, { access: owner });
   assert.equal(entries.length, 0);
   assert.ok(await stat(legacyFile), "an oversized legacy file is skipped, not deleted");
+});
+
+test("memory store quarantines a stored entry that lacks an explicit access scope instead of defaulting to project", async () => {
+  const project = await tempProject();
+  const store = new MemoryStore(await tempStoreRoot());
+  const file = await store.fileFor(project);
+  await mkdir(path.dirname(file), { recursive: true });
+  const scopeless = {
+    id: "mem-scopeless-aaa",
+    kind: "outcome",
+    text: "succeeded: touched a private workroom secret outcome.",
+    source: "task",
+    taskId: "task-unknown",
+    author: "tom",
+    createdAt: new Date().toISOString(),
+    tags: []
+  };
+  await writeFile(file, `${JSON.stringify(scopeless)}\n`, "utf8");
+
+  assert.equal(
+    (await store.list(project, { access: owner })).length,
+    0,
+    "an entry with no explicit scope is never surfaced as project memory, even for the owner"
+  );
+  const health = await checkMemoryStoreHealth(project, store.root);
+  assert.equal(health.quarantinedCount, 1);
+});
+
+test("legacy migration quarantines a scopeless private outcome when no authoritative task record can vouch for it", async () => {
+  const project = await tempProject();
+  const legacyDirectory = path.join(project.root, ".devbot");
+  const legacyFile = path.join(legacyDirectory, "memory.jsonl");
+  await mkdir(legacyDirectory, { recursive: true });
+  const secret = {
+    id: "mem-secret-aaa",
+    kind: "outcome",
+    text: "succeeded: private workroom secret outcome.",
+    source: "task",
+    taskId: "task-gone",
+    author: "tom",
+    createdAt: "2026-06-01T00:00:00.000Z",
+    tags: []
+  };
+  await writeFile(legacyFile, `${JSON.stringify(secret)}\n`, "utf8");
+
+  // No task lookup is wired, so the migrator cannot establish the record's scope and must fail closed.
+  const store = new MemoryStore(await tempStoreRoot());
+  for (const viewer of [owner, controller, requester, otherViewer, peer]) {
+    const listed = await store.list(project, { access: viewer });
+    assert.ok(!listed.some((entry) => entry.id === secret.id), "a scopeless private outcome must never surface after migration");
+    const recalled = await store.recallFor(project, "private workroom secret outcome", viewer);
+    assert.ok(!recalled.some((entry) => entry.id === secret.id), "a scopeless private outcome must never be recallable after migration");
+  }
+  const health = await checkMemoryStoreHealth(project, store.root);
+  assert.equal(health.quarantinedCount, 1, "the unresolved private outcome is quarantined, not imported");
+  await assert.rejects(() => stat(legacyFile), "the legacy file is still retired");
+});
+
+test("legacy migration recovers scope and requester from the authoritative task record and keeps a private outcome private", async () => {
+  const project = await tempProject();
+  const legacyDirectory = path.join(project.root, ".devbot");
+  const legacyFile = path.join(legacyDirectory, "memory.jsonl");
+  await mkdir(legacyDirectory, { recursive: true });
+  const secret = {
+    id: "mem-secret-bbb",
+    kind: "outcome",
+    text: "succeeded: private workroom secret outcome to recover.",
+    source: "task",
+    taskId: "task-secret",
+    author: "tom",
+    createdAt: "2026-06-01T00:00:00.000Z",
+    tags: []
+  };
+  await writeFile(legacyFile, `${JSON.stringify(secret)}\n`, "utf8");
+
+  const taskStateFile = path.join(await tempStoreRoot(), "tasks.json");
+  await writeFile(
+    taskStateFile,
+    JSON.stringify({
+      version: 1,
+      tasks: [
+        {
+          id: "task-secret",
+          status: "succeeded",
+          source: "discord",
+          mode: "action",
+          projectName: "demo",
+          requester: "tom",
+          text: "rotate the private staging credentials",
+          includePatterns: [],
+          accessScope: "workroom",
+          requesterId: "requester",
+          startedAt: "2026-06-01T00:00:00.000Z",
+          updatedAt: "2026-06-01T00:00:00.000Z"
+        }
+      ]
+    }),
+    "utf8"
+  );
+  const taskStore = new TaskStore(taskStateFile);
+  const store = new MemoryStore(await tempStoreRoot(), undefined, undefined, undefined, taskStore);
+
+  const asOtherViewer = await store.list(project, { access: otherViewer });
+  assert.ok(!asOtherViewer.some((entry) => entry.id === secret.id), "an unrelated project viewer must not list a recovered private outcome");
+  const asPeer = await store.list(project, { access: peer });
+  assert.ok(!asPeer.some((entry) => entry.id === secret.id), "a peer bot must not list a recovered private outcome");
+
+  const asRequester = await store.list(project, { access: requester });
+  const recovered = asRequester.find((entry) => entry.id === secret.id);
+  assert.ok(recovered, "the original requester recovered from the task record can still list the outcome");
+  assert.equal(recovered?.accessScope, "workroom");
+  assert.equal(recovered?.requesterId, "requester");
+
+  const asController = await store.list(project, { access: controller });
+  assert.ok(asController.some((entry) => entry.id === secret.id), "a project controller can list the recovered outcome");
+
+  await store.promote(project, secret.id);
+  const requesterRecall = await store.recallFor(project, "private workroom secret outcome to recover", requester);
+  assert.ok(requesterRecall.some((entry) => entry.id === secret.id), "after promotion the requester can recall the outcome");
+  const otherViewerRecall = await store.recallFor(project, "private workroom secret outcome to recover", otherViewer);
+  assert.ok(!otherViewerRecall.some((entry) => entry.id === secret.id), "recall still respects the recovered workroom scope");
+
+  await assert.rejects(() => stat(legacyFile), "the legacy file is retired after a successful recovery");
 });
