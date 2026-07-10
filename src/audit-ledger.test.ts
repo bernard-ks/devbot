@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -176,6 +176,61 @@ test("a tampered middle record blocks future appends instead of extending a forg
   await writeFile(filePath, `${tampered.join("\n")}\n`, "utf8");
 
   await assert.rejects(new AuditLedger(directory).record(sampleEvent(9)), /integrity checks/);
+});
+
+test("a wrong-hash behind anchor refuses appends and is not silently rewritten", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "devbot-audit-wrong-hash-behind-"));
+  const ledger = new AuditLedger(directory);
+  for (let index = 1; index <= 5; index += 1) {
+    await ledger.record(sampleEvent(index));
+  }
+
+  // Point the anchor at an earlier sequence but with a hash that does not match
+  // the retained record there. A cold append must cross-check this and refuse,
+  // rather than reconciling it as an interrupted (behind) anchor update.
+  const forgedAnchor = { version: 1, seq: 3, hash: "b".repeat(64), updatedAt: new Date().toISOString() };
+  await writeFile(path.join(directory, "head.json"), `${JSON.stringify(forgedAnchor, null, 2)}\n`, "utf8");
+  assert.equal((await new AuditLedger(directory).verify()).anchor, "divergent");
+
+  await assert.rejects(new AuditLedger(directory).record(sampleEvent(6)), /diverges from its anchor/);
+
+  // The rejected append must not repair the anchor: the forged hash is still on
+  // disk and verify still reports divergence.
+  const persisted = JSON.parse(await readFile(path.join(directory, "head.json"), "utf8")) as { seq: number; hash: string };
+  assert.equal(persisted.seq, 3);
+  assert.equal(persisted.hash, "b".repeat(64));
+  assert.equal((await new AuditLedger(directory).verify()).anchor, "divergent");
+});
+
+test("a malformed head anchor refuses appends without rewriting it", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "devbot-audit-malformed-anchor-"));
+  const ledger = new AuditLedger(directory);
+  for (let index = 1; index <= 4; index += 1) {
+    await ledger.record(sampleEvent(index));
+  }
+
+  const anchorPath = path.join(directory, "head.json");
+  const malformed = "{ this is not valid anchor json";
+  await writeFile(anchorPath, malformed, "utf8");
+  assert.equal((await new AuditLedger(directory).verify()).anchor, "divergent");
+
+  await assert.rejects(new AuditLedger(directory).record(sampleEvent(5)), /diverges from its anchor/);
+  assert.equal(await readFile(anchorPath, "utf8"), malformed);
+});
+
+test("a missing anchor on a nonempty ledger fails closed and is not recreated", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "devbot-audit-missing-anchor-"));
+  const ledger = new AuditLedger(directory);
+  for (let index = 1; index <= 4; index += 1) {
+    await ledger.record(sampleEvent(index));
+  }
+
+  const anchorPath = path.join(directory, "head.json");
+  await rm(anchorPath);
+  assert.equal((await new AuditLedger(directory).verify()).anchor, "missing");
+
+  await assert.rejects(new AuditLedger(directory).record(sampleEvent(5)), /head anchor is missing/);
+  await assert.rejects(stat(anchorPath), /ENOENT/);
 });
 
 test("rotation chains files together and retention prunes to an anchored prefix", async () => {

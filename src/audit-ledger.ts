@@ -324,23 +324,34 @@ export class AuditLedger implements AuditRecorder {
       break;
     }
 
-    const anchor = await this.readAnchor();
-    if (anchor !== "missing" && anchor !== "unreadable") {
-      if (anchor.seq > tail.seq || (anchor.seq === tail.seq && anchor.hash !== tail.hash)) {
-        throw new Error(
-          `The audit ledger head (seq ${tail.seq}) diverges from its anchor (seq ${anchor.seq}). Appends are refused until the divergence is investigated; run /audit verify.`
-        );
-      }
-    }
-
     // Fail closed on a cold load: walk the entire retained chain before trusting
-    // it as the base for new appends. The tail-only check above cannot see an
-    // interior tamper, so without this a forged middle record could be silently
-    // extended by the next append.
+    // it as the base for new appends. A tail-only check cannot see an interior
+    // tamper, so without this a forged middle record could be silently extended
+    // by the next append.
     const walk = await this.walk();
     if (walk.failure) {
       throw new Error(
         `The audit ledger failed integrity checks at ${walk.failure.file} line ${walk.failure.line}: ${walk.failure.reason} Appends are refused; run /audit verify.`
+      );
+    }
+
+    // Cross-check the head anchor against the walked chain before trusting the
+    // tail. This is the same reconciliation verify() and records() apply, so an
+    // append can never be looser than a read. A behind anchor is reconciled only
+    // when its hash matches the retained record at that sequence (an interrupted
+    // anchor update). An unreadable, hash-divergent, or same/ahead-sequence
+    // mismatch is refused WITHOUT rewriting head.json, and a missing anchor on a
+    // nonempty ledger fails closed: append must never silently repair the
+    // evidence of divergence.
+    const { status: anchorStatus, detail: anchorDetail } = await this.computeAnchorStatus(walk.records);
+    if (anchorStatus === "missing") {
+      throw new Error(
+        `The audit ledger head anchor is missing but the ledger holds ${walk.records.length} record(s). Appends are refused until the anchor is restored; run /audit verify.`
+      );
+    }
+    if (anchorStatus === "divergent") {
+      throw new Error(
+        `The audit ledger head diverges from its anchor: ${anchorDetail ?? "the head anchor does not match the retained chain."} Appends are refused until the divergence is investigated; run /audit verify.`
       );
     }
 
