@@ -687,7 +687,7 @@ test("task store recovers tasks interrupted by a restart", async () => {
   await store.succeed(finished.id, { resultPreview: "done" });
 
   const recovered = new TaskStore(stateFile);
-  assert.equal(await recovered.interruptRunning(), 1);
+  assert.equal((await recovered.interruptRunning()).length, 1);
   assert.equal((await recovered.get(running.id))?.status, "canceled");
   assert.match((await recovered.get(running.id))?.error ?? "", /restarted/);
   assert.equal((await recovered.get(finished.id))?.status, "succeeded");
@@ -911,12 +911,21 @@ test("task controls keep task IDs behind state-aware public and private actions"
     mode: "action",
     checkpointRef: "refs/devbot/checkpoints/task-undo",
     checkpointHeadSha: "abc123",
-    checkpointBranch: "main"
+    checkpointBranch: "main",
+    checkpointPostTaskTree: "def456"
   };
   const controllerLabels = taskActionRows(checkpointedAction, { canControl: true, safeMode: false, hasChecks: false })
     .flatMap((row) => row.toJSON().components)
     .map((component) => ("label" in component ? component.label : undefined));
   assert.equal(controllerLabels.includes("Undo"), true);
+
+  // Undo must never be offered until the post-task tree exists, otherwise the
+  // control would appear and then refuse at click time.
+  const { checkpointPostTaskTree: _omitTree, ...checkpointedActionNoTree } = checkpointedAction;
+  const missingTreeLabels = taskActionRows(checkpointedActionNoTree, { canControl: true, safeMode: false, hasChecks: false })
+    .flatMap((row) => row.toJSON().components)
+    .map((component) => ("label" in component ? component.label : undefined));
+  assert.equal(missingTreeLabels.includes("Undo"), false);
 
   const viewerLabels = taskActionRows(checkpointedAction, { canControl: false, safeMode: false, hasChecks: false })
     .flatMap((row) => row.toJSON().components)

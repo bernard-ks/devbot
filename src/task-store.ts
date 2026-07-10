@@ -388,10 +388,10 @@ export class TaskStore {
     return canceled;
   }
 
-  async interruptRunning(reason = "Interrupted when Devbot restarted."): Promise<number> {
+  async interruptRunning(reason = "Interrupted when Devbot restarted."): Promise<TaskRecord[]> {
     return this.mutate((state) => {
       const now = new Date().toISOString();
-      let interrupted = 0;
+      const interrupted: TaskRecord[] = [];
       for (const task of state.tasks) {
         if (task.status !== "running") {
           continue;
@@ -401,7 +401,7 @@ export class TaskStore {
         task.attention = "blocked";
         task.finishedAt = now;
         task.updatedAt = now;
-        interrupted += 1;
+        interrupted.push(cloneTask(task));
       }
       return interrupted;
     });

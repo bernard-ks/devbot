@@ -31,6 +31,7 @@ export function taskHasRestorableCheckpoint(task: TaskRecord): boolean {
     task.mode === "action" &&
     (task.status === "succeeded" || task.status === "failed" || task.status === "canceled") &&
     Boolean(task.checkpointRef) &&
+    Boolean(task.checkpointPostTaskTree) &&
     !task.reverted
   );
 }

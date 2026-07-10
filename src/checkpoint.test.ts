@@ -15,8 +15,9 @@ import {
   restoreCheckpoint
 } from "./checkpoint.js";
 import { createTaskWorktree, inspectTaskWorktree } from "./task-worktree.js";
-import { TaskStore } from "./task-store.js";
+import { TaskStore, type TaskRecord } from "./task-store.js";
 import { taskHasRestorableCheckpoint } from "./task-controls.js";
+import { recoverInterruptedTasks, type TaskRecoveryDeps } from "./task-recovery.js";
 import { hardenedGitEnvironment } from "./security.js";
 
 const execFileAsync = promisify(execFile);
@@ -600,6 +601,189 @@ test("end-to-end: a canceled mid-write task stays undo-eligible and restores its
     assert.equal(await git(sourceRepo, ["rev-parse", "HEAD"]), sourceHeadBefore);
     assert.equal(await git(sourceRepo, ["status", "--porcelain"]), "");
     assert.equal(await readFile(path.join(sourceRepo, "tracked.txt"), "utf8"), "original\n");
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+// Resolver that mirrors index.ts's projectForTaskWorkspace: it trusts a task's
+// isolated worktree only when the worktree still validates, and returns undefined
+// otherwise so finalization fails closed.
+function recoveryResolver(sourceRepo: string): TaskRecoveryDeps["resolveWorkspaceRoot"] {
+  return async (task: TaskRecord): Promise<string | undefined> => {
+    if (!task.workspaceIsolated || !task.workspacePath || !task.branchName || !task.baseBranch) {
+      return undefined;
+    }
+    const inspection = await inspectTaskWorktree({
+      sourcePath: sourceRepo,
+      path: task.workspacePath,
+      branch: task.branchName,
+      baseRevision: task.baseBranch
+    });
+    return inspection.available ? task.workspacePath : undefined;
+  };
+}
+
+test("end-to-end: restart recovery finalizes a task interrupted mid-write through the production path, leaving Undo usable", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-cp-recover-"));
+  const sourceRepo = path.join(root, "source");
+  try {
+    await git(root, ["init", "-q", "-b", "main", "source"]);
+    await git(sourceRepo, ["config", "user.name", "Devbot Test"]);
+    await git(sourceRepo, ["config", "user.email", "devbot-test@example.invalid"]);
+    await write(sourceRepo, "tracked.txt", "original\n");
+    await git(sourceRepo, ["add", "-A"]);
+    await git(sourceRepo, ["commit", "-qm", "seed"]);
+    const sourceHeadBefore = await git(sourceRepo, ["rev-parse", "HEAD"]);
+
+    const created = await createTaskWorktree({
+      sourcePath: sourceRepo,
+      taskName: "task-recover-undo",
+      worktreeRoot: path.join(root, "worktrees")
+    });
+    assert.equal(created.available, true);
+    if (!created.available) return;
+    const worktree = created.worktree;
+
+    // Runtime A: a write-capable task starts, checkpoints, and begins writing, then
+    // the process dies mid-write. No post-task tree is ever recorded and the task
+    // stays "running" in the persisted state file — exactly a crash mid-write.
+    const stateFile = path.join(root, "tasks.json");
+    const runtimeA = new TaskStore(stateFile);
+    const task = await runtimeA.start({
+      source: "test",
+      mode: "action",
+      projectName: "demo",
+      requester: "tester",
+      text: "isolated write interrupted by a crash"
+    });
+    await runtimeA.setWorkspace(task.id, {
+      workspacePath: worktree.path,
+      branchName: worktree.branch,
+      baseBranch: worktree.baseRevision,
+      isolated: true
+    });
+    const checkpoint = await createCheckpoint(worktree.path, task.id);
+    await runtimeA.attachCheckpoint(task.id, {
+      ref: checkpoint.ref,
+      headSha: checkpoint.headSha,
+      branch: checkpoint.branch,
+      createdAt: checkpoint.createdAt
+    });
+    await write(worktree.path, "tracked.txt", "half-written before the crash\n");
+    await write(worktree.path, "scratch.txt", "partial artifact\n");
+
+    const crashed = await runtimeA.get(task.id);
+    assert.equal(crashed?.status, "running");
+    assert.equal(crashed?.checkpointPostTaskTree, undefined);
+    // The dangerous middle state must never be reachable: a checkpointed task with
+    // no post-task tree is not undo-eligible, so no Undo control is offered.
+    assert.equal(taskHasRestorableCheckpoint(crashed!), false);
+
+    // Runtime B: a fresh TaskStore over the same state file runs the real recovery
+    // path, which cancels the interrupted task and finalizes it (hash + record).
+    const runtimeB = new TaskStore(stateFile);
+    const recovered = await recoverInterruptedTasks({
+      store: runtimeB,
+      hashWorkingTree,
+      resolveWorkspaceRoot: recoveryResolver(sourceRepo)
+    });
+    assert.equal(recovered, 1);
+
+    const savedTask = await runtimeB.get(task.id);
+    assert.equal(savedTask?.status, "canceled");
+
+    // The code guarantees Undo is exposed only when it will actually run. Assert
+    // exactly that contract: either it is eligible and restores end-to-end, or it
+    // is absent — never eligible-but-refusing.
+    if (taskHasRestorableCheckpoint(savedTask!)) {
+      assert.ok(savedTask?.checkpointPostTaskTree);
+      const summary = await restoreCheckpoint(savedTask!.workspacePath!, savedTask!.checkpointRef!, {
+        expectedHeadSha: savedTask!.checkpointHeadSha ?? "",
+        expectedBranch: savedTask!.checkpointBranch ?? "HEAD",
+        expectedPostTaskTree: savedTask!.checkpointPostTaskTree!
+      });
+      await runtimeB.markReverted(task.id);
+      assert.deepEqual(summary.restored.sort(), ["tracked.txt"]);
+      assert.deepEqual(summary.deleted.sort(), ["scratch.txt"]);
+      assert.equal(await readFile(path.join(savedTask!.workspacePath!, "tracked.txt"), "utf8"), "original\n");
+      assert.equal(existsSync(path.join(savedTask!.workspacePath!, "scratch.txt")), false);
+      assert.equal(taskHasRestorableCheckpoint((await runtimeB.get(task.id))!), false);
+    } else {
+      assert.equal(savedTask?.checkpointPostTaskTree, undefined);
+    }
+
+    // Recovery must never touch the source checkout.
+    assert.equal(await git(sourceRepo, ["rev-parse", "HEAD"]), sourceHeadBefore);
+    assert.equal(await git(sourceRepo, ["status", "--porcelain"]), "");
+    assert.equal(await readFile(path.join(sourceRepo, "tracked.txt"), "utf8"), "original\n");
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("end-to-end: restart recovery hides Undo when an interrupted task's workspace can no longer be trusted", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-cp-recover-closed-"));
+  const sourceRepo = path.join(root, "source");
+  try {
+    await git(root, ["init", "-q", "-b", "main", "source"]);
+    await git(sourceRepo, ["config", "user.name", "Devbot Test"]);
+    await git(sourceRepo, ["config", "user.email", "devbot-test@example.invalid"]);
+    await write(sourceRepo, "tracked.txt", "original\n");
+    await git(sourceRepo, ["add", "-A"]);
+    await git(sourceRepo, ["commit", "-qm", "seed"]);
+
+    const created = await createTaskWorktree({
+      sourcePath: sourceRepo,
+      taskName: "task-recover-closed",
+      worktreeRoot: path.join(root, "worktrees")
+    });
+    assert.equal(created.available, true);
+    if (!created.available) return;
+    const worktree = created.worktree;
+
+    const stateFile = path.join(root, "tasks.json");
+    const runtimeA = new TaskStore(stateFile);
+    const task = await runtimeA.start({
+      source: "test",
+      mode: "action",
+      projectName: "demo",
+      requester: "tester",
+      text: "isolated write whose worktree is lost before recovery"
+    });
+    await runtimeA.setWorkspace(task.id, {
+      workspacePath: worktree.path,
+      branchName: worktree.branch,
+      baseBranch: worktree.baseRevision,
+      isolated: true
+    });
+    const checkpoint = await createCheckpoint(worktree.path, task.id);
+    await runtimeA.attachCheckpoint(task.id, {
+      ref: checkpoint.ref,
+      headSha: checkpoint.headSha,
+      branch: checkpoint.branch,
+      createdAt: checkpoint.createdAt
+    });
+    await write(worktree.path, "tracked.txt", "half-written before the crash\n");
+
+    // The isolated worktree is gone by the time the runtime comes back (cleaned up,
+    // pruned, or on a volume that did not survive the restart).
+    await rm(worktree.path, { force: true, recursive: true });
+
+    const runtimeB = new TaskStore(stateFile);
+    const recovered = await recoverInterruptedTasks({
+      store: runtimeB,
+      hashWorkingTree,
+      resolveWorkspaceRoot: recoveryResolver(sourceRepo)
+    });
+    assert.equal(recovered, 1);
+
+    const savedTask = await runtimeB.get(task.id);
+    assert.equal(savedTask?.status, "canceled");
+    // Finalization could not capture a post-task tree, so Undo must stay absent
+    // rather than appearing and then refusing.
+    assert.equal(savedTask?.checkpointPostTaskTree, undefined);
+    assert.equal(taskHasRestorableCheckpoint(savedTask!), false);
   } finally {
     await rm(root, { force: true, recursive: true });
   }

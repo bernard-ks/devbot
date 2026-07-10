@@ -103,6 +103,7 @@ import {
   screenshotRequiresApproval
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord, type TaskStatus } from "./task-store.js";
+import { finalizeCanceledActionTask, recoverInterruptedTasks, type TaskRecoveryDeps } from "./task-recovery.js";
 import { canAccessTaskRecord, taskSyncRefusal, type TaskSyncRefusal } from "./task-access.js";
 import {
   describeBranchFreshness,
@@ -217,6 +218,16 @@ const verifiedProjectRoomAudiences = new Map<string, number>();
 let slashCommandsReady = false;
 const runtimePidFile = runtimeLockPath(process.env.DEVBOT_RUNTIME_LOCK);
 markRuntimeRunning(runtimePidFile);
+
+const taskRecoveryDeps: TaskRecoveryDeps = {
+  store: taskStore,
+  hashWorkingTree,
+  resolveWorkspaceRoot: async (task) => {
+    const base = findProject(config.projects, task.projectName);
+    if (!base) return undefined;
+    return (await projectForTaskWorkspace(base, task)).root;
+  }
+};
 const gatewayIntents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
 if (process.env.DEVBOT_MESSAGE_CONTENT_INTENT?.trim().toLowerCase() === "true") {
   gatewayIntents.push(GatewayIntentBits.MessageContent);
@@ -228,7 +239,7 @@ const client = new Client({
 
 client.once("clientReady", async () => {
   try {
-    const interrupted = await taskStore.interruptRunning();
+    const interrupted = await recoverInterruptedTasks(taskRecoveryDeps);
     if (interrupted > 0) {
       console.log(`Recovered ${interrupted} interrupted task${interrupted === 1 ? "" : "s"} from the previous runtime.`);
     }
@@ -1646,13 +1657,14 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree, false).catch(() => undefined);
     }
     if (controller.signal.aborted) {
-      await taskStore.cancel(task.id, "Canceled by user request.");
+      const canceled = await taskStore.cancel(task.id, "Canceled by user request.");
       // The worker has already stopped: runCodex only rejects once the child has
       // closed (or been force-killed), so the isolated worktree is now quiescent.
-      // Snapshot its exact post-cancel tree so a canceled action task's partial
-      // writes stay undo-eligible under the same drift guard as succeed/fail.
-      if (options.mode === "action") {
-        await recordPostTaskCheckpointTree(executionProject, task.id);
+      // Finalize through the same helper the restart-recovery path uses, so a
+      // canceled action task's partial writes stay undo-eligible under the same
+      // drift guard as succeed/fail (or show no Undo control when they cannot).
+      if (canceled) {
+        await finalizeCanceledActionTask(taskRecoveryDeps, canceled);
       }
       await reportTaskProgress(options, {
         ...progressBase,
