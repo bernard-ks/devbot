@@ -173,6 +173,82 @@ test("restart reconciliation stops a live orphaned child with an observed exit",
   }
 });
 
+test("an unconfirmed hard kill keeps the execution record and reports unverified cleanup", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-recovery-unconfirmed-"));
+  const taskFile = path.join(root, "tasks.json");
+  const ledgerFile = path.join(root, "executions.json");
+
+  const store = new TaskStore(taskFile);
+  const task = await store.start({
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    requesterId: "42",
+    text: "still writing"
+  });
+  const ledger = new ExecutionLedger(ledgerFile);
+  await ledger.record({
+    taskId: task.id,
+    projectName: "demo",
+    mode: "action",
+    requester: "tester",
+    startedAt: task.startedAt
+  });
+  await ledger.setChild(task.id, { pid: 987654, startedAt: "Mon Jan  1 00:00:00 2001", command: "node" });
+
+  const notices: InterruptedTaskNotice[] = [];
+  const summary = await reconcileInterruptedTasks({
+    ledger: new ExecutionLedger(ledgerFile),
+    tasks: new TaskStore(taskFile),
+    terminate: async () => "kill-unconfirmed",
+    notify: async (notice) => {
+      notices.push(notice);
+    }
+  });
+
+  assert.equal(summary.interruptedTasks, 1);
+  assert.equal(summary.orphansStopped, 0);
+  assert.equal(summary.staleRecordsCleared, 0);
+  assert.equal(notices[0]?.childOutcome, "kill-unconfirmed");
+  const retained = await new ExecutionLedger(ledgerFile).listActive();
+  assert.equal(retained.length, 1);
+  assert.equal(retained[0]?.taskId, task.id);
+  const recovered = await new TaskStore(taskFile).get(task.id);
+  assert.equal(recovered?.status, "interrupted");
+  assert.match(recovered?.error ?? "", /exit could not be confirmed/);
+  assert.equal(/stopped with an observed exit/.test(recovered?.error ?? ""), false);
+});
+
+test("a child that survives the post-SIGKILL wait is reported unconfirmed, not killed", posixOnly, async () => {
+  const child = spawn("/bin/sh", ["-c", 'trap "" TERM; while true; do sleep 1; done'], {
+    stdio: "ignore",
+    detached: true
+  });
+  child.unref();
+  assert.ok(child.pid);
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  try {
+    const identity = await captureChildIdentity(child.pid!);
+    assert.ok(identity);
+    const outcome = await terminateOrphanedChild(identity!, { gracePeriodMs: 150, killWaitMs: 0, pollIntervalMs: 25 });
+    assert.equal(outcome, "kill-unconfirmed");
+    assert.match(interruptionNote(undefined, "kill-unconfirmed"), /could not be confirmed/);
+  } finally {
+    try {
+      process.kill(-child.pid!, "SIGKILL");
+    } catch {
+      // Already stopped.
+    }
+    try {
+      process.kill(child.pid!, "SIGKILL");
+    } catch {
+      // Already stopped.
+    }
+    await exited;
+  }
+});
+
 test("a recycled pid with a different spawn identity is never signaled", posixOnly, async () => {
   const identity = await captureChildIdentity(process.pid);
   assert.ok(identity);

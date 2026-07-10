@@ -94,7 +94,7 @@ import {
   screenshotRequiresApproval
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord, type TaskStatus } from "./task-store.js";
-import { canAccessTaskRecord, taskSyncRefusal, type TaskSyncRefusal } from "./task-access.js";
+import { canAccessTaskRecord, taskRetryRefusal, taskSyncRefusal, type TaskRetryRefusal, type TaskSyncRefusal } from "./task-access.js";
 import {
   describeBranchFreshness,
   inspectBranchFreshness,
@@ -3251,19 +3251,16 @@ async function handleTaskControl(
   if (action !== "retry") {
     return;
   }
-  if (task.status === "interrupted") {
-    if (!canRecover) {
-      await interaction.reply({
-        content: "Only the requester or an approved controller can retry work that a restart interrupted.",
-        flags: MessageFlags.Ephemeral
-      });
-      return;
-    }
-  } else if (mode === "action" && !canControl) {
-    await interaction.reply({
-      content: "Only the owner or an approved controller can retry write-capable work.",
-      flags: MessageFlags.Ephemeral
-    });
+  const retryRefusal = taskRetryRefusal({
+    interrupted: task.status === "interrupted",
+    writeCapable: mode === "action",
+    globalAllowed: isAllowed(interaction, appConfig),
+    projectAllowed: isAllowedForProject(interaction, project),
+    controller: canControl,
+    requester: Boolean(task.requesterId) && task.requesterId === interaction.user.id
+  });
+  if (retryRefusal) {
+    await interaction.reply({ content: taskRetryRefusalMessage(retryRefusal), flags: MessageFlags.Ephemeral });
     return;
   }
   if (isWriteBlockedBySafeMode(appConfig, mode)) {
@@ -3357,6 +3354,19 @@ async function handleScreenshotFixControl(
       }
     });
   });
+}
+
+function taskRetryRefusalMessage(refusal: TaskRetryRefusal): string {
+  switch (refusal) {
+    case "not-allowed":
+      return "You are not allowed to use this bot.";
+    case "not-project":
+      return "That task's project is unavailable to you.";
+    case "needs-controller":
+      return "Only the owner or an approved controller can retry write-capable work.";
+    case "needs-requester-or-controller":
+      return "Only the requester or an approved controller can retry work that a restart interrupted.";
+  }
 }
 
 function resumeWorkspaceForRetry(task: TaskRecord): Pick<ProjectRequestOptions, "resumeWorkspace"> | undefined {

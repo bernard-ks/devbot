@@ -259,13 +259,20 @@ export async function captureChildIdentity(pid: number): Promise<ExecutionChildI
   return { pid, startedAt, command };
 }
 
-export type OrphanTerminationOutcome = "already-exited" | "not-ours" | "terminated" | "killed" | "unverifiable";
+export type OrphanTerminationOutcome =
+  | "already-exited"
+  | "not-ours"
+  | "terminated"
+  | "killed"
+  | "kill-unconfirmed"
+  | "unverifiable";
 
 /**
  * Stops an orphaned child from a previous runtime with an observed exit:
  * verify spawn identity, SIGTERM its process group, wait, then SIGKILL after
  * re-verifying identity. A pid whose identity no longer matches is never
- * signaled.
+ * signaled. If the process still has not exited after the post-SIGKILL wait,
+ * the exit is left unconfirmed rather than reported as an observed kill.
  */
 export async function terminateOrphanedChild(
   child: ExecutionChildIdentity,
@@ -292,8 +299,10 @@ export async function terminateOrphanedChild(
   if (!sameIdentity(beforeKill, child)) return "not-ours";
 
   signalProcessGroup(child.pid, "SIGKILL");
-  await waitForExit(child.pid, killWaitMs, pollIntervalMs);
-  return "killed";
+  if (await waitForExit(child.pid, killWaitMs, pollIntervalMs)) {
+    return "killed";
+  }
+  return "kill-unconfirmed";
 }
 
 export interface RecoveryTaskStore {
@@ -344,6 +353,7 @@ export async function reconcileInterruptedTasks(options: ReconcileOptions): Prom
 
   const recordsByTask = new Map(records.map((record) => [record.taskId, record]));
   const running = await options.tasks.listRunning();
+  const retainedRecords = new Set<string>();
   const summary: ReconcileSummary = {
     interruptedTasks: 0,
     orphansStopped: 0,
@@ -369,6 +379,10 @@ export async function reconcileInterruptedTasks(options: ReconcileOptions): Prom
       if (childOutcome === "terminated" || childOutcome === "killed") {
         summary.orphansStopped += 1;
       }
+      if (!childExitObserved(childOutcome)) {
+        retainedRecords.add(task.id);
+        log(`Kept the durable record of task ${task.id}; its worker exit was not observed (${childOutcome}).`);
+      }
     }
     const interrupted = await options.tasks.interrupt(task.id, interruptionNote(record, childOutcome));
     if (!interrupted) {
@@ -388,6 +402,9 @@ export async function reconcileInterruptedTasks(options: ReconcileOptions): Prom
     if (options.isActive?.(record.taskId)) {
       continue;
     }
+    if (retainedRecords.has(record.taskId)) {
+      continue;
+    }
     await options.ledger.clear(record.taskId);
     if (!running.some((task) => task.id === record.taskId)) {
       summary.staleRecordsCleared += 1;
@@ -395,6 +412,21 @@ export async function reconcileInterruptedTasks(options: ReconcileOptions): Prom
   }
 
   return summary;
+}
+
+/**
+ * A durable execution record is only cleared once the previous runtime's worker
+ * is known to be gone. An unconfirmed hard kill or an unverifiable outcome
+ * leaves the record in place so the execution stays visible for cleanup.
+ */
+function childExitObserved(outcome: OrphanTerminationOutcome | "no-child"): boolean {
+  return (
+    outcome === "no-child" ||
+    outcome === "already-exited" ||
+    outcome === "not-ours" ||
+    outcome === "terminated" ||
+    outcome === "killed"
+  );
 }
 
 export function interruptionNote(
@@ -407,6 +439,10 @@ export function interruptionNote(
   }
   if (childOutcome === "terminated" || childOutcome === "killed") {
     parts.push("The previous runtime's worker process was still running and was stopped with an observed exit.");
+  } else if (childOutcome === "kill-unconfirmed") {
+    parts.push(
+      "The previous runtime's worker process was sent a hard kill but its exit could not be confirmed, so it is left flagged as unverified cleanup and its record is kept until the exit is observed."
+    );
   } else if (childOutcome === "not-ours") {
     parts.push("The recorded process id now belongs to a different program and was left untouched.");
   } else if (childOutcome === "already-exited") {

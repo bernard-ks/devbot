@@ -28,3 +28,29 @@ export function taskSyncRefusal(task: TaskRecord, context: TaskAccessContext & {
   if (context.safeMode) return "safe-mode";
   return undefined;
 }
+
+export interface TaskRetryContext {
+  interrupted: boolean;
+  writeCapable: boolean;
+  globalAllowed: boolean;
+  projectAllowed: boolean;
+  controller: boolean;
+  requester: boolean;
+}
+
+export type TaskRetryRefusal = "not-allowed" | "not-project" | "needs-controller" | "needs-requester-or-controller";
+
+/**
+ * Fail-closed authorization for retrying a saved task, evaluated against current
+ * authority at the moment of retry rather than whoever first requested the task.
+ * Write-capable retries always require current controller authority, so a
+ * since-demoted requester cannot resume them; requester-only recovery is limited
+ * to read-only work that a restart interrupted.
+ */
+export function taskRetryRefusal(context: TaskRetryContext): TaskRetryRefusal | undefined {
+  if (!context.globalAllowed) return "not-allowed";
+  if (!context.projectAllowed) return "not-project";
+  if (context.writeCapable && !context.controller) return "needs-controller";
+  if (context.interrupted && !context.controller && !context.requester) return "needs-requester-or-controller";
+  return undefined;
+}
