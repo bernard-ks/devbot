@@ -124,7 +124,7 @@ The safety contract is explicit: only the requester or an approved controller ca
   - review links or branch references and merge state
   - screenshot URLs and capture metadata
 - Migrate durable local task state to SQLite while keeping task IDs out of normal conversation UI.
-- Persist recoverable active execution across bot restarts instead of closing interrupted tasks as canceled.
+- Persist recoverable active execution across bot restarts instead of closing interrupted tasks as canceled. Implemented with a durable execution ledger (`.devbot/executions.json`): running tasks are marked `interrupted` on startup, identity-verified orphan worker processes are stopped with an observed exit, the original task message gains Retry and Dismiss controls, and preserved isolated worktrees are reused on retry when they still verify. Model work itself is not resumed.
 - Add structured logs with request IDs.
 
 ### 2. Better Project Awareness

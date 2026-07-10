@@ -33,6 +33,8 @@ export interface AnswerOptions {
   contextMode?: RequestContextMode;
   history?: string;
   signal?: AbortSignal;
+  onSpawn?: (pid: number) => void | Promise<void>;
+  onExit?: () => void | Promise<void>;
 }
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
@@ -47,7 +49,9 @@ export async function answerWithProjectContext(options: AnswerOptions): Promise<
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     ...(options.tier ? { tier: options.tier } : {}),
-    ...(options.signal ? { signal: options.signal } : {})
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.onSpawn ? { onSpawn: options.onSpawn } : {}),
+    ...(options.onExit ? { onExit: options.onExit } : {})
   });
 }
 
@@ -64,6 +68,8 @@ export interface CompleteCodexOptions {
   skipGitRepoCheck?: boolean;
   imagePaths?: string[];
   signal?: AbortSignal;
+  onSpawn?: (pid: number) => void | Promise<void>;
+  onExit?: () => void | Promise<void>;
 }
 
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
@@ -105,7 +111,7 @@ export async function completeCodexPrompt(options: CompleteCodexOptions): Promis
           );
         }
       }
-      const output = await runBackend(spec, options.signal);
+      const output = await runBackend(spec, options.signal, options.onSpawn, options.onExit);
       const answer = redactSensitiveText(output.trim());
       return answer || `${backend.displayName} did not produce a final text answer.`;
     } finally {
@@ -308,15 +314,25 @@ export function parseLocateResponse(raw: string): LocatedError {
   };
 }
 
-async function runBackend(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
-  const stdout = await runSpec(spec, signal);
+async function runBackend(
+  spec: SpawnSpec,
+  signal?: AbortSignal,
+  onSpawn?: (pid: number) => void | Promise<void>,
+  onExit?: () => void | Promise<void>
+): Promise<string> {
+  const stdout = await runSpec(spec, signal, onSpawn, onExit);
   if (spec.outputFile) {
     return (await readFile(spec.outputFile, "utf8")).trim();
   }
   return stdout;
 }
 
-function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
+function runSpec(
+  spec: SpawnSpec,
+  signal?: AbortSignal,
+  onSpawn?: (pid: number) => void | Promise<void>,
+  onExit?: () => void | Promise<void>
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(spec.bin, spec.args, {
       cwd: spec.cwd,
@@ -327,6 +343,7 @@ function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let closeObserved = false;
     let terminationError: Error | undefined;
     let terminationFallback: NodeJS.Timeout | undefined;
 
@@ -345,16 +362,32 @@ function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
     });
     child.on("error", (error) => finish(error));
     child.on("close", (code) => {
-      if (terminationError) {
-        finish(terminationError);
-        return;
-      }
-      if (code === 0) {
-        finish();
-        return;
-      }
+      closeObserved = true;
+      // The worker is finished. Freeze execution-time accounting before any
+      // potentially slow durable bookkeeping so a successful near-deadline run
+      // cannot be relabeled as a timeout after its close was observed.
+      clearTimeout(timer);
+      if (terminationFallback) clearTimeout(terminationFallback);
+      signal?.removeEventListener("abort", abort);
+      const observedTerminationError = terminationError;
+      void (async () => {
+        try {
+          await onExit?.();
+        } catch {
+          // Exit bookkeeping is recovery metadata. Its caller retains the
+          // existing worker record on failure, so the retry gate stays closed.
+        }
+        if (observedTerminationError) {
+          finish(observedTerminationError);
+          return;
+        }
+        if (code === 0) {
+          finish();
+          return;
+        }
 
-      finish(new Error(`Agent exited with code ${code}.\n${trimProcessOutput(stderr || stdout)}`));
+        finish(new Error(`Agent exited with code ${code}.\n${trimProcessOutput(stderr || stdout)}`));
+      })();
     });
     if (spec.stdin !== undefined && child.stdin) {
       child.stdin.on("error", (error) => {
@@ -369,12 +402,39 @@ function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
 
     signal?.addEventListener("abort", abort, { once: true });
 
-    if (spec.stdin !== undefined && child.stdin) {
-      child.stdin.end(spec.stdin);
-    }
+    // Durably record the worker before sending it any work. The spawn observer
+    // persists the child's identity to the execution ledger; awaiting it here
+    // means a task can never receive work through a worker that was not written
+    // to the durable ledger first. If the observer rejects (identity could not
+    // be persisted), the child is stopped and the run fails, leaving the task's
+    // retry gate blocked rather than sending work to an unrecorded worker.
+    // Residual window: a crash between spawn() returning and this write landing
+    // still leaves an unrecorded OS process, but no work was sent to it and the
+    // ledger record remains at its running phase, so reconciliation treats the
+    // worker as unaccounted and keeps retry blocked.
+    void (async () => {
+      if (child.pid && onSpawn) {
+        try {
+          await onSpawn(child.pid);
+        } catch (error) {
+          requestTermination(
+            error instanceof Error
+              ? error
+              : new Error("Failed to durably record the worker process before sending work.")
+          );
+          return;
+        }
+      }
+      if (settled || terminationError) {
+        return;
+      }
+      if (spec.stdin !== undefined && child.stdin) {
+        child.stdin.end(spec.stdin);
+      }
+    })();
 
     function requestTermination(error: Error): void {
-      if (settled || terminationError) return;
+      if (settled || closeObserved || terminationError) return;
       terminationError = error;
       terminateChild(child.pid);
       terminationFallback = setTimeout(() => finish(error), 5_000);
