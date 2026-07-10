@@ -2,10 +2,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { duelDecisionRow, duelReviewButton, isBoundDuelControl, parseDuelControl } from "./duel-ui.js";
 
-test("the decision row exposes only read-only controls: copy fix prompt and dismiss", () => {
+test("the default decision row exposes only read-only controls: copy fix prompt and dismiss", () => {
   const row = duelDecisionRow("collab-abc123-def456").toJSON();
   const customIds = row.components.map((component) => ("custom_id" in component ? component.custom_id : undefined));
   assert.deepEqual(customIds, ["devbot:duel-control:prompt:collab-abc123-def456", "devbot:duel-control:dismiss:collab-abc123-def456"]);
+});
+
+test("Accept & fix is only present when the caller explicitly verified the reviewed snapshot", () => {
+  const withAccept = duelDecisionRow("collab-abc123-def456", { acceptAndFix: true }).toJSON();
+  const customIds = withAccept.components.map((component) => ("custom_id" in component ? component.custom_id : undefined));
+  assert.deepEqual(customIds, [
+    "devbot:duel-control:accept:collab-abc123-def456",
+    "devbot:duel-control:prompt:collab-abc123-def456",
+    "devbot:duel-control:dismiss:collab-abc123-def456"
+  ]);
+  const withoutAccept = duelDecisionRow("collab-abc123-def456", { acceptAndFix: false }).toJSON();
+  assert.equal(withoutAccept.components.length, 2);
 });
 
 test("control encoding refuses values that are not well-formed ids", () => {
@@ -22,7 +34,11 @@ test("control parsing accepts only known actions with matching id shapes", () =>
     action: "dismiss",
     targetId: "collab-abc123-def456"
   });
-  assert.equal(parseDuelControl("devbot:duel-control:accept:collab-abc123-def456"), undefined);
+  assert.deepEqual(parseDuelControl("devbot:duel-control:accept:collab-abc123-def456"), {
+    action: "accept",
+    targetId: "collab-abc123-def456"
+  });
+  assert.equal(parseDuelControl("devbot:duel-control:accept:task-123"), undefined);
   assert.equal(parseDuelControl("devbot:duel-control:prompt:task-123"), undefined);
   assert.equal(parseDuelControl("devbot:duel-control:prompt:collab-abc123-def456:extra"), undefined);
   assert.equal(parseDuelControl("devbot:other-control:prompt:collab-abc123-def456"), undefined);
