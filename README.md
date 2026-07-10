@@ -167,9 +167,10 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/do task:<text> project:<optional> include:<optional patterns>`: Ask local Codex to perform a focused project task. Requires owner or controller access.
 - `/ship task:<task-id>`: Compose a 1200x675 shareable card for a completed `/do` task with the project name and task summary. Action tasks run in an isolated Git worktree with no managed preview, so their card is text-only with an explicit "visual proof unavailable" note; a live screenshot is only attempted for non-isolated tasks. Requires owner or controller access; also available as a "Ship it" button on completed action tasks.
 - `/remember text:<text> project:<optional> kind:<decision|note>`: Record a project decision or note for Devbot to recall later. Requires owner or controller access.
-- `/memory list project:<optional> kind:<optional> limit:<optional>`: List recent memory entries for a project.
+- `/memory list project:<optional> kind:<optional> limit:<optional>`: List recent memory entries you have access to for a project (workroom-private outcomes are hidden unless you were the requester or are a controller).
 - `/memory search query:<text> project:<optional>`: Search memory entries by relevance to a query.
-- `/memory forget id:<memory-id> project:<optional>`: Owner-only; permanently delete a memory entry.
+- `/memory promote id:<memory-id> project:<optional>`: Owner/controller-only; approve an automatically captured outcome so it becomes eligible for automatic recall.
+- `/memory forget id:<memory-id> project:<optional>`: Owner-only; permanently delete a memory entry. This removes it from Devbot's memory only, not from git, Discord, task, or backup history.
 
 You can also mention the bot in a channel:
 
@@ -186,7 +187,7 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, and owner-managed setup in `.devbot/setup.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, or `DEVBOT_SETUP_STORE` to use different files; relative paths resolve from the devbot process working directory.
+Task history is stored locally in `.devbot/tasks.json` by default. Per-user project selection lives in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, owner-managed setup in `.devbot/setup.json`, and per-project memory in `.devbot/memory/<project-key>.jsonl` (one owner-only file per project, keyed by its resolved root, never inside the managed project's own checkout). Set `DEVBOT_TASK_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, `DEVBOT_SETUP_STORE`, or `DEVBOT_MEMORY_STORE` to use different files/directories; relative paths resolve from the devbot process working directory.
 
 ## Owner Setup And Visibility
 

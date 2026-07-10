@@ -91,10 +91,12 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
 - Project memory:
-  - Persists decisions, manual notes, and completed action-task outcomes per project in `.devbot/memory.jsonl`.
-  - Automatically records a terse outcome (result, changed files, detail) when an action task succeeds or fails.
-  - Ranks memory entries against each `/ask`/`/do` request using the same relevance scoring as file context, then folds the top matches into the prompt as a clearly delimited, explicitly untrusted "project history" block that the model is instructed never to treat as instructions.
-  - `/status` and `/setup doctor` surface memory entry counts and store health.
+  - Persists decisions, manual notes, and completed action-task outcomes in a central Devbot-owned store (`.devbot/memory/<project-key>.jsonl`, owner-only permissions) outside the managed project checkout, keyed by the project's canonical (resolved) root so it survives repository renames within setup.
+  - Carries the originating task's access scope, requester, and internal flag onto every automatically captured outcome, and applies the same access rule used for task records to every list/search/recall/autocomplete path, so workroom-private or internal task results stay restricted to their requester and controllers.
+  - Automatically records a terse outcome (result, changed files, detail) when an action task succeeds or fails; automatic outcomes start `proposed`/`untrusted` and are excluded from automatic recall until a controller runs `/memory promote` to mark them `active`/`trusted`. Manual `/remember` decisions and notes are `active`/`trusted` immediately.
+  - Redacts secrets from entry text, tags, and author at write time and again defensively on read/output/recall; validates and normalizes every entry against a versioned schema, quarantining (never silently destroying) corrupt or invalid lines.
+  - Only the intentional `/ask`, `/do`, and direct-mention answer routes recall memory into a prompt (status, labs, council, and peer routes do not); recall is access-filtered, restricted to active/trusted entries, uses exact-token relevance with a generic-term stoplist, and its rendered size is reserved out of the route's context budget. Entries are HTML-escaped before insertion so they cannot forge or close the prompt's delimiter tags, and the influencing memory IDs are recorded on the task.
+  - `/status` and `/setup doctor` surface memory entry counts and store health without ever touching the managed project's checkout; `/setup repo remove` purges that project's memory file.
 
 ## Current Constraints
 
