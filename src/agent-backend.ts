@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
-import { minimalChildEnvironment } from "./security.js";
+import { minimalChildEnvironment, scopedChildEnvironment, type ChildEnvironmentAllowList } from "./security.js";
 import type { CodexConfig } from "./types.js";
 
 export type AgentRequestMode = "answer" | "action";
@@ -43,12 +43,37 @@ export function buildImageExecArgs(imagePaths: string[]): string[] {
   return args;
 }
 
+/**
+ * The security contract every backend must declare. These fields are the spec
+ * the reviewer requires: they are asserted in tests and drive fail-closed
+ * behavior (a backend that cannot enforce read-only refuses answer mode).
+ */
+export interface BackendCapabilities {
+  /** Child process receives a minimal, curated environment, never process.env. */
+  minimalEnvironment: boolean;
+  /** Ambient user rules/plugins/extensions/MCP servers are not loaded. */
+  isolatesUserConfig: boolean;
+  /** The backend's task run cannot reach the network. */
+  constrainsNetwork: boolean;
+  /** Answer mode is guaranteed read-only by the CLI (not by prompt wording). */
+  enforcesAnswerReadOnly: boolean;
+  /** Action-mode writes are confined to the supplied task worktree. */
+  confinesActionWorkspace: boolean;
+  /** The run can be canceled/timed out via process termination. */
+  supportsCancellation: boolean;
+  /** The prompt is delivered off-argv so it never appears in process listings. */
+  promptTransport: "stdin" | "input-file";
+  /** Where the final answer is read from. */
+  outputTransport: "output-file" | "stdout";
+}
+
 export interface BackendAvailability {
   id: BackendId;
   displayName: string;
   binary: string;
   installed: boolean;
   experimental: boolean;
+  capabilities: BackendCapabilities;
   version?: string;
   error?: string;
 }
@@ -59,9 +84,20 @@ export interface AgentBackend {
   binary: string;
   experimental: boolean;
   usesOutputFile: boolean;
+  capabilities: BackendCapabilities;
   detect(): Promise<BackendAvailability>;
   buildAnswerCommand(options: BuildCommandOptions): SpawnSpec;
   buildActionCommand(options: BuildCommandOptions): SpawnSpec;
+}
+
+export class ReadOnlyUnsupportedError extends Error {
+  constructor(displayName: string) {
+    super(
+      `${displayName} cannot guarantee a read-only run, so Devbot refuses answer-mode (/ask) requests on it. ` +
+        `Switch to a read-only-capable backend with /setup backend id:codex (or id:claude).`
+    );
+    this.name = "ReadOnlyUnsupportedError";
+  }
 }
 
 type TierModels = Partial<Record<AgentModelTier, string>>;
@@ -110,7 +146,7 @@ function probeVersion(bin: string, timeoutMs = 5_000): Promise<DetectResult> {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(bin, ["--version"], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(bin, ["--version"], { env: minimalChildEnvironment(process.env), stdio: ["ignore", "pipe", "pipe"] });
     } catch (error) {
       resolve({ installed: false, stdout: "", error: (error as Error).message });
       return;
@@ -161,6 +197,7 @@ function detectBackend(backend: Omit<AgentBackend, "detect">, probe = probeVersi
       binary: backend.binary,
       installed: result.installed,
       experimental: backend.experimental,
+      capabilities: backend.capabilities,
       ...(version ? { version } : {}),
       ...(result.error && !result.installed ? { error: result.error } : {})
     };
@@ -173,7 +210,23 @@ export function clearDetectionCache(): void {
   detectionCache.clear();
 }
 
-function buildCodexArgs(options: BuildCommandOptions, codex: CodexConfig, defaultSandbox: CodexConfig["sandbox"]): SpawnSpec {
+const CODEX_CAPABILITIES: BackendCapabilities = {
+  minimalEnvironment: true,
+  isolatesUserConfig: true,
+  constrainsNetwork: true,
+  enforcesAnswerReadOnly: true,
+  confinesActionWorkspace: true,
+  supportsCancellation: true,
+  promptTransport: "stdin",
+  outputTransport: "output-file"
+};
+
+function buildCodexArgs(
+  options: BuildCommandOptions,
+  codex: CodexConfig,
+  defaultSandbox: CodexConfig["sandbox"],
+  environment: NodeJS.ProcessEnv
+): SpawnSpec {
   const outputFile = options.outputFile;
   if (!outputFile) {
     throw new Error("Codex backend requires an output file for the final message.");
@@ -241,7 +294,7 @@ function buildCodexArgs(options: BuildCommandOptions, codex: CodexConfig, defaul
     bin: codex.bin,
     args,
     cwd: options.cwd,
-    env: isolatedCodexEnvironment(process.env, path.dirname(outputFile)),
+    env: isolatedCodexEnvironment(environment, path.dirname(outputFile)),
     timeoutMs: options.timeoutMs,
     stdin: options.prompt,
     outputFile
@@ -259,26 +312,45 @@ function isolatedCodexEnvironment(environment: NodeJS.ProcessEnv, runtimeHome: s
   return isolated;
 }
 
-export function createCodexBackend(codex: CodexConfig, probe = probeVersion): AgentBackend {
+export function createCodexBackend(codex: CodexConfig, env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend {
   const backend: Omit<AgentBackend, "detect"> = {
     id: "codex",
     displayName: "Codex CLI",
     binary: codex.bin,
     experimental: false,
     usesOutputFile: true,
-    buildAnswerCommand: (options) => buildCodexArgs(options, codex, codex.sandbox),
-    buildActionCommand: (options) => buildCodexArgs(options, codex, codex.actionSandbox)
+    capabilities: CODEX_CAPABILITIES,
+    buildAnswerCommand: (options) => buildCodexArgs(options, codex, codex.sandbox, env),
+    buildActionCommand: (options) => buildCodexArgs(options, codex, codex.actionSandbox, env)
   };
   return { ...backend, detect: () => detectBackend(backend, probe) };
 }
+
+const CLAUDE_ENV_ALLOW: ChildEnvironmentAllowList = {
+  exactKeys: [
+    "AWS_REGION",
+    "CLOUD_ML_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS"
+  ],
+  keyPrefixes: ["ANTHROPIC_", "CLAUDE_CODE_"]
+};
+
+const CLAUDE_READ_ONLY_DENY_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "WebFetch", "WebSearch"];
 
 export function createClaudeBackend(env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend {
   const binary = envValue(env, "DEVBOT_CLAUDE_BIN") ?? "claude";
   const models = tierModels(env, "DEVBOT_CLAUDE");
   const base = (options: BuildCommandOptions, extra: string[]): SpawnSpec => {
     const model = modelForTier(models, options.tier);
-    const args = ["-p", ...extra, ...(model ? ["--model", model] : []), options.prompt];
-    return { bin: binary, args, cwd: options.cwd, env: process.env, timeoutMs: options.timeoutMs };
+    const args = ["-p", "--strict-mcp-config", ...extra, ...(model ? ["--model", model] : [])];
+    return {
+      bin: binary,
+      args,
+      cwd: options.cwd,
+      env: scopedChildEnvironment(env, CLAUDE_ENV_ALLOW),
+      timeoutMs: options.timeoutMs,
+      stdin: options.prompt
+    };
   };
   const backend: Omit<AgentBackend, "detect"> = {
     id: "claude",
@@ -286,47 +358,108 @@ export function createClaudeBackend(env: NodeJS.ProcessEnv = process.env, probe 
     binary,
     experimental: false,
     usesOutputFile: false,
-    buildAnswerCommand: (options) => base(options, ["--permission-mode", "plan"]),
+    capabilities: {
+      minimalEnvironment: true,
+      isolatesUserConfig: true,
+      constrainsNetwork: false,
+      enforcesAnswerReadOnly: true,
+      confinesActionWorkspace: true,
+      supportsCancellation: true,
+      promptTransport: "stdin",
+      outputTransport: "stdout"
+    },
+    buildAnswerCommand: (options) =>
+      base(options, ["--permission-mode", "plan", "--disallowedTools", ...CLAUDE_READ_ONLY_DENY_TOOLS]),
     buildActionCommand: (options) => base(options, ["--permission-mode", "acceptEdits", "--add-dir", options.cwd])
   };
   return { ...backend, detect: () => detectBackend(backend, probe) };
 }
+
+const GEMINI_ENV_ALLOW: ChildEnvironmentAllowList = {
+  exactKeys: ["GOOGLE_APPLICATION_CREDENTIALS"],
+  keyPrefixes: ["GEMINI_", "GOOGLE_"]
+};
 
 export function createGeminiBackend(env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend {
   const binary = envValue(env, "DEVBOT_GEMINI_BIN") ?? "gemini";
   const models = tierModels(env, "DEVBOT_GEMINI");
   const base = (options: BuildCommandOptions, extra: string[]): SpawnSpec => {
     const model = modelForTier(models, options.tier);
-    const args = [...extra, ...(model ? ["--model", model] : []), "-p", options.prompt];
-    return { bin: binary, args, cwd: options.cwd, env: process.env, timeoutMs: options.timeoutMs };
+    const args = [...extra, ...(model ? ["--model", model] : [])];
+    return {
+      bin: binary,
+      args,
+      cwd: options.cwd,
+      env: scopedChildEnvironment(env, GEMINI_ENV_ALLOW),
+      timeoutMs: options.timeoutMs,
+      stdin: options.prompt
+    };
   };
+  const displayName = "Gemini CLI";
   const backend: Omit<AgentBackend, "detect"> = {
     id: "gemini",
-    displayName: "Gemini CLI",
+    displayName,
     binary,
     experimental: true,
     usesOutputFile: false,
-    buildAnswerCommand: (options) => base(options, []),
+    capabilities: {
+      minimalEnvironment: true,
+      isolatesUserConfig: false,
+      constrainsNetwork: false,
+      enforcesAnswerReadOnly: false,
+      confinesActionWorkspace: false,
+      supportsCancellation: true,
+      promptTransport: "stdin",
+      outputTransport: "stdout"
+    },
+    buildAnswerCommand: () => {
+      throw new ReadOnlyUnsupportedError(displayName);
+    },
     buildActionCommand: (options) => base(options, ["--yolo"])
   };
   return { ...backend, detect: () => detectBackend(backend, probe) };
 }
+
+const OPENCODE_ENV_ALLOW: ChildEnvironmentAllowList = {
+  exactKeys: ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY"],
+  keyPrefixes: ["OPENCODE_"]
+};
 
 export function createOpencodeBackend(env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend {
   const binary = envValue(env, "DEVBOT_OPENCODE_BIN") ?? "opencode";
   const models = tierModels(env, "DEVBOT_OPENCODE");
   const base = (options: BuildCommandOptions): SpawnSpec => {
     const model = modelForTier(models, options.tier);
-    const args = ["run", ...(model ? ["--model", model] : []), options.prompt];
-    return { bin: binary, args, cwd: options.cwd, env: process.env, timeoutMs: options.timeoutMs };
+    const args = ["run", ...(model ? ["--model", model] : [])];
+    return {
+      bin: binary,
+      args,
+      cwd: options.cwd,
+      env: scopedChildEnvironment(env, OPENCODE_ENV_ALLOW),
+      timeoutMs: options.timeoutMs,
+      stdin: options.prompt
+    };
   };
+  const displayName = "opencode";
   const backend: Omit<AgentBackend, "detect"> = {
     id: "opencode",
-    displayName: "opencode",
+    displayName,
     binary,
     experimental: true,
     usesOutputFile: false,
-    buildAnswerCommand: (options) => base(options),
+    capabilities: {
+      minimalEnvironment: true,
+      isolatesUserConfig: false,
+      constrainsNetwork: false,
+      enforcesAnswerReadOnly: false,
+      confinesActionWorkspace: false,
+      supportsCancellation: true,
+      promptTransport: "stdin",
+      outputTransport: "stdout"
+    },
+    buildAnswerCommand: () => {
+      throw new ReadOnlyUnsupportedError(displayName);
+    },
     buildActionCommand: (options) => base(options)
   };
   return { ...backend, detect: () => detectBackend(backend, probe) };
@@ -334,7 +467,7 @@ export function createOpencodeBackend(env: NodeJS.ProcessEnv = process.env, prob
 
 export function createBackends(codex: CodexConfig, env: NodeJS.ProcessEnv = process.env, probe = probeVersion): AgentBackend[] {
   return [
-    createCodexBackend(codex, probe),
+    createCodexBackend(codex, env, probe),
     createClaudeBackend(env, probe),
     createGeminiBackend(env, probe),
     createOpencodeBackend(env, probe)
