@@ -156,6 +156,7 @@ import {
   isSentinelMutationSubcommand,
   recentCommits,
   sentinelScreenshotAllowed,
+  userAuthorizedForProjectPolicy,
   SentinelManager,
   type SentinelEvent
 } from "./sentinel.js";
@@ -3670,10 +3671,21 @@ async function resolveSentinelAlertRoomId(project: ProjectEntry): Promise<string
  * removed, runs no checks until a current controller re-enables it.
  */
 function sentinelCycleAuthorized(project: ProjectEntry, watchConfig: SentinelProjectConfig): boolean {
-  if (!config.projects.some((candidate) => candidate.name === project.name)) {
+  const current = config.projects.find((candidate) => candidate.name === project.name);
+  if (!current) {
     return false;
   }
-  if (watchConfig.enabledBy && !isControllerUser(watchConfig.enabledBy, config)) {
+  // Require an attributable enabling actor: legacy records without one fail closed.
+  if (!watchConfig.enabledBy) {
+    return false;
+  }
+  // The enabling actor must still be a global controller...
+  if (!isControllerUser(watchConfig.enabledBy, config)) {
+    return false;
+  }
+  // ...and must still be authorized under the project's CURRENT .devbot policy.
+  // A controller removed from this project's allowlist stops running its cycles.
+  if (!userAuthorizedForProjectPolicy(watchConfig.enabledBy, current.metadata.policy)) {
     return false;
   }
   return true;

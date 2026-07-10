@@ -271,6 +271,27 @@ export function isSentinelMutationSubcommand(subcommand: string): boolean {
   return SENTINEL_MUTATION_SUBCOMMANDS.has(subcommand);
 }
 
+/**
+ * Whether `userId` is authorized under a project's current `.devbot` policy for an
+ * unattended sentinel cycle. Only the userId is attributable to a background cycle,
+ * so role/username grants (which require a live Discord member to resolve) do not
+ * authorize one: an actor is allowed only when the project has no allowlist at all
+ * or is explicitly present in `allowedUsers`. Fail closed otherwise. This is the
+ * per-cycle project-policy recheck: a controller removed from a project's allowlist
+ * stops running that project's cycles even though they remain a global controller.
+ */
+export function userAuthorizedForProjectPolicy(
+  userId: string,
+  policy: Pick<ProjectEntry["metadata"]["policy"], "allowedUsers" | "allowedUsernames" | "allowedRoles">
+): boolean {
+  const hasAllowList =
+    policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
+  if (!hasAllowList) {
+    return true;
+  }
+  return policy.allowedUsers.includes(userId);
+}
+
 export async function checkCommand(
   project: ProjectEntry,
   commandName: string,

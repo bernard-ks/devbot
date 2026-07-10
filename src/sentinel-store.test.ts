@@ -62,7 +62,7 @@ test("sentinel store defaults, persists config, and survives reload", async () =
   assert.equal(defaults.intervalSeconds, 120);
   assert.deepEqual(defaults.manualPaths, []);
 
-  await store.setEnabled("demo", true);
+  await store.setEnabled("demo", true, "controller-1");
   await store.setIntervalSeconds("demo", 20);
   await store.addWatchPath("demo", "admin");
   await store.addWatchPath("demo", "admin");
@@ -70,7 +70,7 @@ test("sentinel store defaults, persists config, and survives reload", async () =
   await store.setFastCommand("demo", "test");
 
   const reloaded = await new SentinelStore(filePath).getProjectConfig("demo");
-  assert.equal(reloaded.enabled, true);
+  assert.equal(reloaded.enabled, true, "an enabled record with an attributable actor survives reload");
   assert.equal(reloaded.intervalSeconds, 30, "interval below the floor is clamped on write");
   assert.deepEqual(reloaded.manualPaths, ["/admin", "/health"], "duplicate watch paths are not added twice");
   assert.equal(reloaded.fastCommand, "test");
@@ -167,6 +167,31 @@ test("sentinel store discards malformed watch entries instead of trusting arbitr
 
   await writeFile(filePath, JSON.stringify({ version: 2, projects: {} }));
   await assert.rejects(() => new SentinelStore(filePath).getProjectConfig("demo"), /Unsupported sentinel state version/);
+});
+
+test("an enabled legacy record with no enabledBy is disabled on load, not left running without an actor", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-legacy-"));
+  const filePath = path.join(root, "sentinel.json");
+  await mkdir(root, { recursive: true });
+  await writeFile(
+    filePath,
+    JSON.stringify({
+      version: 1,
+      projects: {
+        legacy: { config: { enabled: true, intervalSeconds: 120 }, watches: {} },
+        attributed: { config: { enabled: true, enabledBy: "controller-1", intervalSeconds: 120 }, watches: {} }
+      }
+    })
+  );
+
+  const store = new SentinelStore(filePath);
+  const legacy = await store.getProjectConfig("legacy");
+  assert.equal(legacy.enabled, false, "an enabled record without an enabling actor is disabled on load, fail closed");
+  assert.equal(legacy.enabledBy, undefined, "no stale actor attribution is fabricated");
+
+  const attributed = await store.getProjectConfig("attributed");
+  assert.equal(attributed.enabled, true, "an enabled record with an attributable actor stays enabled");
+  assert.equal(attributed.enabledBy, "controller-1", "the enabling actor survives for per-cycle revalidation");
 });
 
 test("sentinel store redacts secret-shaped error text and target strings before persisting", async () => {

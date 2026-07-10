@@ -15,6 +15,7 @@ import {
   resolveWatchTargets,
   SentinelManager,
   sentinelScreenshotAllowed,
+  userAuthorizedForProjectPolicy,
   watchIdForCommand,
   watchIdForUrl,
   type WatchCheckResult,
@@ -361,6 +362,80 @@ test("isSentinelMutationSubcommand gates every configuration change but not read
     assert.equal(isSentinelMutationSubcommand(sub), true, `${sub} must be controller-only`);
   }
   assert.equal(isSentinelMutationSubcommand("status"), false, "status is read-only and stays viewable");
+});
+
+test("a viewer can read status but no configuration subcommand runs unattended", () => {
+  // The dispatcher requires a controller for every mutating subcommand and only
+  // exempts read-only status, so a plain viewer reaches status and nothing else.
+  assert.equal(isSentinelMutationSubcommand("status"), false, "a viewer can read status");
+  for (const sub of ["on", "off", "interval", "watch", "fast-command", "expected-status"]) {
+    assert.equal(isSentinelMutationSubcommand(sub), true, `a viewer cannot run ${sub}`);
+  }
+});
+
+test("project-policy removal mid-schedule de-authorizes the enabling controller", () => {
+  const policy = fakeProject().metadata.policy;
+
+  // Open project: any enabling actor is authorized.
+  assert.equal(userAuthorizedForProjectPolicy("controller-1", policy), true, "an open project authorizes any actor");
+
+  // Controller is explicitly allow-listed by id.
+  policy.allowedUsers = ["controller-1", "controller-2"];
+  assert.equal(userAuthorizedForProjectPolicy("controller-1", policy), true, "an allow-listed controller is authorized");
+
+  // The controller is removed from the project's allowlist mid-schedule: fail closed.
+  policy.allowedUsers = ["controller-2"];
+  assert.equal(
+    userAuthorizedForProjectPolicy("controller-1", policy),
+    false,
+    "a controller removed from the project allowlist can no longer run its cycles"
+  );
+
+  // Role/username-only grants cannot be resolved for a background cycle: fail closed.
+  policy.allowedUsers = [];
+  policy.allowedUsernames = ["controller-name"];
+  policy.allowedRoles = ["role-1"];
+  assert.equal(
+    userAuthorizedForProjectPolicy("controller-1", policy),
+    false,
+    "a role/username-only grant does not authorize an unattended, actor-by-id cycle"
+  );
+});
+
+test("SentinelManager.runCycle stops when project policy removes the enabling controller", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-sentinel-policy-"));
+  const store = new SentinelStore(path.join(root, "sentinel.json"));
+  const project = fakeProject();
+  project.metadata.policy.allowedUsers = ["controller-1"];
+  await store.setEnabled(project.name, true, "controller-1");
+
+  let urlChecks = 0;
+  const manager = new SentinelManager(
+    [project],
+    store,
+    {
+      discoverUrls: async () => ["http://127.0.0.1:4000"],
+      checkUrlFn: async () => {
+        urlChecks += 1;
+        return ok();
+      },
+      checkCommandFn: async () => ok(),
+      now: () => new Date(),
+      authorizeCycle: (candidate, watchConfig) =>
+        Boolean(watchConfig.enabledBy) &&
+        userAuthorizedForProjectPolicy(watchConfig.enabledBy as string, candidate.metadata.policy)
+    },
+    async () => undefined
+  );
+
+  await manager.runCycle(project.name);
+  const authorizedChecks = urlChecks;
+  assert.ok(authorizedChecks > 0, "checks run while the enabling controller is authorized");
+
+  // Remove the enabling controller from the project's current .devbot policy.
+  project.metadata.policy.allowedUsers = ["controller-2"];
+  await manager.runCycle(project.name);
+  assert.equal(urlChecks, authorizedChecks, "no check runs once the enabling controller is dropped from the project policy");
 });
 
 test("sentinelScreenshotAllowed captures only under an allow policy, never deny or approval", () => {

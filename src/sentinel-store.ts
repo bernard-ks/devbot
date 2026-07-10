@@ -402,8 +402,11 @@ function normalizeLoadedConfig(value: unknown): SentinelProjectConfig {
     typeof raw.expectedStatus === "string" && isValidExpectedStatusSpec(raw.expectedStatus.trim())
       ? raw.expectedStatus.trim()
       : undefined;
-  const enabled = raw.enabled === true;
-  const enabledBy = enabled && typeof raw.enabledBy === "string" && raw.enabledBy.trim() ? raw.enabledBy.trim() : undefined;
+  const rawEnabled = raw.enabled === true;
+  const enabledBy = rawEnabled && typeof raw.enabledBy === "string" && raw.enabledBy.trim() ? raw.enabledBy.trim() : undefined;
+  // Fail closed: an enabled record with no attributable enabling actor cannot be
+  // reauthorized per cycle, so it is disabled on load rather than left running.
+  const enabled = rawEnabled && Boolean(enabledBy);
 
   return {
     enabled,
