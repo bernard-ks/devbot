@@ -23,11 +23,17 @@ export type MemoryAccessContext = TaskAccessContext;
 /**
  * Minimal read-only view of the authoritative task record used to recover the
  * access scope of a legacy memory entry that predates the scope/requester
- * fields. Structurally satisfied by TaskStore so the concrete store can be
+ * fields. `projectName` carries the task's project identity so a recovery can
+ * confirm the vouching task belongs to a concrete project before its scope is
+ * trusted. Structurally satisfied by TaskStore so the concrete store can be
  * passed straight in without a circular import.
  */
+export interface LegacyTaskAuthority extends AccessScopedRecord {
+  projectName?: string;
+}
+
 export interface TaskAccessLookup {
-  get(taskId: string): Promise<AccessScopedRecord | undefined>;
+  get(taskId: string): Promise<LegacyTaskAuthority | undefined>;
 }
 
 export const MEMORY_SCHEMA_VERSION = 1;
@@ -303,34 +309,45 @@ export class MemoryStore {
 
   /**
    * Determines the access scope of a legacy entry without ever widening unknown
-   * visibility. An explicit scope on the record is honored; a missing scope is
-   * recovered from the authoritative task record. The result is the most
-   * restrictive of what the record claims and what the task record says, so a
-   * private workroom outcome can never surface as project memory. Returns
+   * visibility. A record that declares its own scope (or marks itself internal)
+   * is self-authoritative and is honored as written. A scopeless record has
+   * unknown confidentiality: it is recovered ONLY from the authoritative task
+   * record, and only when that task itself supplies an explicit, valid scope
+   * (or internal marker) tied to a concrete project identity. The mere
+   * existence of a task is not authority; a task that is itself scopeless and
+   * not internal — the state TaskStore legitimately preserves on legacy reload
+   * — cannot vouch for anything, so unknown-on-both-sides fails closed. Returns
    * undefined when no trustworthy basis exists, forcing the caller to quarantine.
    */
   private async resolveLegacyScope(core: EntryCore): Promise<ScopeDecision | undefined> {
+    if (core.claimedScope !== undefined || core.claimedInternal) {
+      if (core.claimedScope === "workroom" || core.claimedInternal) {
+        return {
+          accessScope: "workroom",
+          ...(core.claimedRequesterId ? { requesterId: core.claimedRequesterId } : {}),
+          ...(core.claimedInternal ? { internal: true } : {})
+        };
+      }
+      return { accessScope: "project" };
+    }
+
     const task = core.taskId && this.taskLookup
       ? await this.taskLookup.get(core.taskId).catch(() => undefined)
       : undefined;
 
-    if (core.claimedScope === undefined && !task) {
+    if (!taskSuppliesTrustworthyScope(task)) {
       return undefined;
     }
 
-    const taskRestricted = Boolean(task) && (task!.accessScope === "workroom" || task!.internal === true);
-    const restricted = core.claimedScope === "workroom" || core.claimedInternal || taskRestricted;
-    if (!restricted) {
-      return { accessScope: "project" };
+    if (task.accessScope === "workroom" || task.internal === true) {
+      const requesterId = task.requesterId ? boundedField(task.requesterId) : undefined;
+      return {
+        accessScope: "workroom",
+        ...(requesterId ? { requesterId } : {}),
+        ...(task.internal === true ? { internal: true } : {})
+      };
     }
-
-    const requesterId = task?.requesterId ? boundedField(task.requesterId) : core.claimedRequesterId;
-    const internal = core.claimedInternal || task?.internal === true;
-    return {
-      accessScope: "workroom",
-      ...(requesterId ? { requesterId } : {}),
-      ...(internal ? { internal: true } : {})
-    };
+    return { accessScope: "project" };
   }
 
   private async mutate(
@@ -442,6 +459,21 @@ function buildEntry(input: AddMemoryInput): MemoryEntry {
 
 function boundedField(value: string): string {
   return redactSensitiveText(value.trim()).slice(0, MAX_ID_FIELD_LENGTH);
+}
+
+/**
+ * A task record may only vouch for a scopeless legacy memory entry when it is a
+ * complete authority: it carries a concrete project identity AND it declares an
+ * explicit access scope or is marked internal. A task that is itself scopeless
+ * and not internal supplies no trustworthy scope, so it cannot lift a memory
+ * entry out of quarantine.
+ */
+function taskSuppliesTrustworthyScope(
+  task: LegacyTaskAuthority | undefined
+): task is LegacyTaskAuthority {
+  if (!task) return false;
+  if (typeof task.projectName !== "string" || !task.projectName.trim()) return false;
+  return task.accessScope === "project" || task.accessScope === "workroom" || task.internal === true;
 }
 
 function pruneEntries(entries: MemoryEntry[], maxOutcomes: number, maxTotalEntries: number): MemoryEntry[] {
