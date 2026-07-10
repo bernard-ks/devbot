@@ -1,19 +1,45 @@
 import path from "node:path";
 import { accessSync, constants } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { findProjectWebUrls } from "./project-screenshot.js";
+import { hardenedGitArguments, hardenedGitEnvironment, minimalChildEnvironment } from "./security.js";
 import type { ProjectEntry } from "./types.js";
+
+const execFileAsync = promisify(execFile);
 
 export const DEFAULT_TTL_MINUTES = 15;
 export const MAX_TTL_MINUTES = 60;
 export const MIN_TTL_MINUTES = 1;
+export const MAX_CONCURRENT_TUNNELS = 3;
+export const PENDING_CONFIRM_TIMEOUT_MS = 120_000;
 const DEFAULT_URL_TIMEOUT_MS = 20_000;
+const DEFAULT_KILL_GRACE_MS = 5_000;
 const TUNNEL_URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 
-export type TunnelExpireReason = "ttl" | "stop" | "shutdown" | "process-exit";
+export type TunnelExpireReason = "ttl" | "stop" | "shutdown" | "process-exit" | "disabled";
+export type PendingExpireReason = "confirm-timeout" | "cancel";
+
+export interface PendingTunnel {
+  id: string;
+  projectName: string;
+  origin: string;
+  port: number;
+  ttlMinutes: number;
+  requestedBy: string;
+  channelId: string;
+  createdAt: string;
+  messageId?: string;
+}
 
 export interface ActiveTunnel {
+  id: string;
   projectName: string;
   url: string;
+  origin: string;
   port: number;
   ttlMinutes: number;
   startedAt: string;
@@ -31,10 +57,11 @@ export interface TunnelChildProcess {
   stdout: TunnelReadableLike | null;
   stderr: TunnelReadableLike | null;
   on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+  on(event: "error", listener: (error: Error) => void): unknown;
   kill(signal?: NodeJS.Signals): boolean;
 }
 
-export type TunnelSpawnFn = (command: string, args: string[]) => TunnelChildProcess;
+export type TunnelSpawnFn = (command: string, args: string[], env: NodeJS.ProcessEnv) => TunnelChildProcess;
 
 export function findCloudflaredPath(
   pathEnv: string = process.env.PATH ?? "",
@@ -76,10 +103,46 @@ export function parseTunnelUrl(chunk: string): string | undefined {
   return chunk.match(TUNNEL_URL_PATTERN)?.[0];
 }
 
+export interface ValidatedLoopbackOrigin {
+  origin: string;
+  port: number;
+}
+
+/**
+ * Independently re-validates a candidate URL as an explicit loopback origin,
+ * regardless of any filtering already done upstream. Preserves scheme and
+ * port instead of discarding them; rejects remote hosts, credentials, and
+ * out-of-range ports.
+ */
+export function validateLoopbackOrigin(value: string): ValidatedLoopbackOrigin | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return undefined;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return undefined;
+  }
+  if (parsed.username || parsed.password) {
+    return undefined;
+  }
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (hostname !== "127.0.0.1" && hostname !== "localhost" && hostname !== "::1") {
+    return undefined;
+  }
+  const port = parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80;
+  if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+    return undefined;
+  }
+  return { origin: `${parsed.protocol}//127.0.0.1:${port}`, port };
+}
+
 export interface StartCloudflaredOptions {
   spawnFn: TunnelSpawnFn;
   cloudflaredPath: string;
-  port: number;
+  origin: string;
+  env: NodeJS.ProcessEnv;
   urlTimeoutMs?: number;
 }
 
@@ -89,7 +152,12 @@ export interface StartCloudflaredResult {
 }
 
 export function startCloudflaredTunnel(options: StartCloudflaredOptions): Promise<StartCloudflaredResult> {
-  const child = options.spawnFn(options.cloudflaredPath, ["tunnel", "--url", `http://127.0.0.1:${options.port}`]);
+  const child = options.spawnFn(options.cloudflaredPath, ["tunnel", "--url", options.origin], options.env);
+  return waitForTunnelUrl(child, options.urlTimeoutMs).then((url) => ({ url, child }));
+}
+
+/** Races cloudflared's stdout/stderr for the reported URL against exit, error, and a timeout. */
+export function waitForTunnelUrl(child: TunnelChildProcess, urlTimeoutMs?: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let settled = false;
 
@@ -98,7 +166,7 @@ export function startCloudflaredTunnel(options: StartCloudflaredOptions): Promis
       settled = true;
       child.kill("SIGTERM");
       reject(new Error("Timed out waiting for cloudflared to report a tunnel URL."));
-    }, options.urlTimeoutMs ?? DEFAULT_URL_TIMEOUT_MS);
+    }, urlTimeoutMs ?? DEFAULT_URL_TIMEOUT_MS);
 
     const onData = (chunk: Buffer | string): void => {
       if (settled) return;
@@ -106,7 +174,7 @@ export function startCloudflaredTunnel(options: StartCloudflaredOptions): Promis
       if (!url) return;
       settled = true;
       clearTimeout(timeout);
-      resolve({ url, child });
+      resolve(url);
     };
 
     child.stdout?.on("data", onData);
@@ -117,20 +185,40 @@ export function startCloudflaredTunnel(options: StartCloudflaredOptions): Promis
       clearTimeout(timeout);
       reject(new Error(`cloudflared exited before reporting a tunnel URL (code ${code ?? "unknown"}).`));
     });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    });
   });
 }
 
 export type PreviewGateReason = "no-owner" | "not-owner" | "disabled";
+export type PreviewOwnerGateReason = "no-owner" | "not-owner";
 
-export function previewGateReason(
-  config: { previewTunnelsEnabled: boolean; ownerUserId: string | undefined },
+/** Owner-only gate shared by every /preview subcommand, including stop/status. */
+export function previewOwnerGateReason(
+  config: { ownerUserId: string | undefined },
   requesterId: string
-): PreviewGateReason | undefined {
+): PreviewOwnerGateReason | undefined {
   if (!config.ownerUserId) {
     return "no-owner";
   }
   if (requesterId !== config.ownerUserId) {
     return "not-owner";
+  }
+  return undefined;
+}
+
+/** Full gate for /preview share: owner-only, plus the default-off feature flag. */
+export function previewGateReason(
+  config: { previewTunnelsEnabled: boolean; ownerUserId: string | undefined },
+  requesterId: string
+): PreviewGateReason | undefined {
+  const ownerGate = previewOwnerGateReason(config, requesterId);
+  if (ownerGate) {
+    return ownerGate;
   }
   if (!config.previewTunnelsEnabled) {
     return "disabled";
@@ -138,33 +226,32 @@ export function previewGateReason(
   return undefined;
 }
 
-export async function findRunningProjectPort(
+/** Per-project preview policy is owner-controlled runtime state, never checked-in repo metadata. */
+export function projectPreviewGateReason(projectPreviewAllowed: boolean): "project-disabled" | undefined {
+  return projectPreviewAllowed ? undefined : "project-disabled";
+}
+
+export async function findRunningProjectOrigin(
   project: ProjectEntry,
-  probeUrl: (url: string) => Promise<boolean> = defaultProbeUrl,
+  probeUrl: (origin: string) => Promise<boolean> = defaultProbeUrl,
   listUrls: (project: ProjectEntry) => Promise<string[]> = findProjectWebUrls
-): Promise<number | undefined> {
+): Promise<ValidatedLoopbackOrigin | undefined> {
   const urls = await listUrls(project);
   for (const url of urls) {
-    if (await probeUrl(url)) {
-      return portFromUrl(url);
+    const validated = validateLoopbackOrigin(url);
+    if (!validated) continue;
+    if (await probeUrl(validated.origin)) {
+      return validated;
     }
   }
   return undefined;
-}
-
-function portFromUrl(url: string): number | undefined {
-  const parsed = new URL(url);
-  if (parsed.port) {
-    return Number(parsed.port);
-  }
-  return parsed.protocol === "https:" ? 443 : 80;
 }
 
 async function defaultProbeUrl(url: string): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3_000);
   try {
-    const response = await fetch(url, { method: "GET", signal: controller.signal });
+    const response = await fetch(url, { method: "GET", redirect: "manual", signal: controller.signal });
     return response.status < 500;
   } catch {
     return false;
@@ -173,19 +260,75 @@ async function defaultProbeUrl(url: string): Promise<boolean> {
   }
 }
 
-interface TrackedTunnel extends ActiveTunnel {
+export interface ProjectRevisionInfo {
+  branch: string;
+  revision: string;
+}
+
+/** Best-effort branch/revision for the pre-spawn confirmation; falls back to "unknown", never throws. */
+export async function describeProjectRevision(project: ProjectEntry): Promise<ProjectRevisionInfo> {
+  const [branch, revision] = await Promise.all([
+    gitField(project.root, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    gitField(project.root, ["rev-parse", "--short", "HEAD"])
+  ]);
+  return { branch, revision };
+}
+
+async function gitField(cwd: string, args: string[]): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync("git", hardenedGitArguments(cwd, args), {
+      timeout: 5_000,
+      maxBuffer: 10_000,
+      env: hardenedGitEnvironment()
+    });
+    return stdout.trim() || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+interface TrackedBase {
+  id: string;
+  projectName: string;
+  origin: string;
+  port: number;
+  ttlMinutes: number;
+  requestedBy: string;
+  channelId: string;
+  createdAt: string;
+  messageId?: string;
+}
+
+interface TrackedPending extends TrackedBase {
+  state: "pending";
+  aborted: boolean;
+  child?: TunnelChildProcess;
+  homeDir?: string;
+  pendingTimer: unknown;
+  onPendingExpire: (pending: PendingTunnel, reason: PendingExpireReason) => void;
+}
+
+interface TrackedActive extends TrackedBase {
+  state: "active" | "stopping";
+  url: string;
+  startedAt: string;
+  expiresAt: string;
   child: TunnelChildProcess;
+  homeDir: string;
   ttlTimer: unknown;
   onExpire: (tunnel: ActiveTunnel, reason: TunnelExpireReason) => void;
 }
 
-export interface StartTunnelInput {
+type Tracked = TrackedPending | TrackedActive;
+
+export interface ReserveTunnelInput {
   projectName: string;
+  origin: string;
   port: number;
   ttlMinutes?: number;
-  startedBy: string;
+  requestedBy: string;
   channelId: string;
-  onExpire: (tunnel: ActiveTunnel, reason: TunnelExpireReason) => void;
+  onPendingExpire: (pending: PendingTunnel, reason: PendingExpireReason) => void;
 }
 
 export interface TunnelManagerDeps {
@@ -195,117 +338,327 @@ export interface TunnelManagerDeps {
   scheduleTimeout?: (fn: () => void, ms: number) => unknown;
   clearScheduledTimeout?: (handle: unknown) => void;
   urlTimeoutMs?: number;
+  killGraceMs?: number;
+  pendingConfirmTimeoutMs?: number;
+  maxConcurrentTunnels?: number;
+  createTunnelHome?: () => Promise<string>;
+  removeTunnelHome?: (directory: string) => Promise<void>;
 }
 
+/**
+ * Tracks preview tunnels through pending (reserved, not yet spawned) -> active
+ * (cloudflared running, URL known) -> stopping (kill in flight) states. A
+ * project slot is reserved before anything is spawned so two concurrent
+ * requests for the same project cannot both spawn a child, and a pending
+ * reservation is abortable (stop/disable/shutdown) before it ever spawns.
+ */
 export class TunnelManager {
-  private readonly tunnels = new Map<string, TrackedTunnel>();
+  private readonly tunnels = new Map<string, Tracked>();
 
   constructor(private readonly deps: TunnelManagerDeps) {}
 
-  hasActive(projectName: string): boolean {
-    return this.tunnels.has(projectName);
+  hasActiveForProject(projectName: string): boolean {
+    return [...this.tunnels.values()].some((tracked) => tracked.projectName === projectName);
   }
 
-  get(projectName: string): ActiveTunnel | undefined {
-    const tracked = this.tunnels.get(projectName);
-    return tracked ? toActiveTunnel(tracked) : undefined;
+  get(id: string): ActiveTunnel | undefined {
+    const tracked = this.tunnels.get(id);
+    return tracked && tracked.state !== "pending" ? toActiveTunnel(tracked) : undefined;
+  }
+
+  getPending(id: string): PendingTunnel | undefined {
+    const tracked = this.tunnels.get(id);
+    return tracked && tracked.state === "pending" ? toPendingTunnel(tracked) : undefined;
   }
 
   list(): ActiveTunnel[] {
-    return [...this.tunnels.values()].map(toActiveTunnel);
+    return [...this.tunnels.values()]
+      .filter((tracked): tracked is TrackedActive => tracked.state !== "pending")
+      .map(toActiveTunnel);
   }
 
-  attachMessage(projectName: string, messageId: string): void {
-    const tracked = this.tunnels.get(projectName);
+  attachMessage(id: string, messageId: string): void {
+    const tracked = this.tunnels.get(id);
     if (tracked) {
       tracked.messageId = messageId;
     }
   }
 
-  async start(input: StartTunnelInput): Promise<ActiveTunnel> {
-    if (this.tunnels.has(input.projectName)) {
-      throw new Error(`Project \`${input.projectName}\` already has an active preview tunnel. Stop it before starting another.`);
+  reserve(input: ReserveTunnelInput): PendingTunnel {
+    if (this.hasActiveForProject(input.projectName)) {
+      throw new Error(
+        `Project \`${input.projectName}\` already has an active or pending preview tunnel. Stop it before starting another.`
+      );
     }
-
-    const cloudflaredPath = this.deps.findCloudflaredPath();
-    if (!cloudflaredPath) {
-      throw new Error("cloudflared is not installed. Install it with `brew install cloudflared` and try again.");
-    }
-
-    const ttlMinutes = clampTtlMinutes(input.ttlMinutes);
-    const { url, child } = await startCloudflaredTunnel({
-      spawnFn: this.deps.spawnFn,
-      cloudflaredPath,
-      port: input.port,
-      ...(this.deps.urlTimeoutMs !== undefined ? { urlTimeoutMs: this.deps.urlTimeoutMs } : {})
-    });
-
-    if (this.tunnels.has(input.projectName)) {
-      child.kill("SIGTERM");
-      throw new Error(`Project \`${input.projectName}\` already has an active preview tunnel. Stop it before starting another.`);
+    const maxConcurrent = this.deps.maxConcurrentTunnels ?? MAX_CONCURRENT_TUNNELS;
+    if (this.tunnels.size >= maxConcurrent) {
+      throw new Error(`Devbot already has ${maxConcurrent} preview tunnel(s) pending or active. Stop one before starting another.`);
     }
 
     const now = this.deps.now?.() ?? new Date();
-    const expiresAt = new Date(now.getTime() + ttlMinutes * 60_000);
+    const id = randomUUID();
+    const schedule = this.deps.scheduleTimeout ?? defaultSchedule;
+    const pendingTimeoutMs = this.deps.pendingConfirmTimeoutMs ?? PENDING_CONFIRM_TIMEOUT_MS;
+
+    const tracked: TrackedPending = {
+      id,
+      projectName: input.projectName,
+      origin: input.origin,
+      port: input.port,
+      ttlMinutes: clampTtlMinutes(input.ttlMinutes),
+      requestedBy: input.requestedBy,
+      channelId: input.channelId,
+      createdAt: now.toISOString(),
+      state: "pending",
+      aborted: false,
+      pendingTimer: undefined,
+      onPendingExpire: input.onPendingExpire
+    };
+    tracked.pendingTimer = schedule(() => this.expirePending(id, "confirm-timeout"), pendingTimeoutMs);
+    this.tunnels.set(id, tracked);
+    return toPendingTunnel(tracked);
+  }
+
+  /** Cancels a reservation that has not launched yet (Cancel button, disable, shutdown). */
+  cancelPending(id: string): PendingTunnel | undefined {
+    const tracked = this.tunnels.get(id);
+    if (!tracked || tracked.state !== "pending") {
+      return undefined;
+    }
+    this.expirePending(id, "cancel");
+    return toPendingTunnel(tracked);
+  }
+
+  private expirePending(id: string, reason: PendingExpireReason): void {
+    const tracked = this.tunnels.get(id);
+    if (!tracked || tracked.state !== "pending") {
+      return;
+    }
+    tracked.aborted = true;
+    this.tunnels.delete(id);
+    this.clearScheduled(tracked.pendingTimer);
+    if (tracked.child) {
+      tracked.child.kill("SIGTERM");
+    }
+    tracked.onPendingExpire(toPendingTunnel(tracked), reason);
+  }
+
+  /** Spawns cloudflared for a confirmed reservation. Aborts cleanly if cancelled mid-flight. */
+  async launch(id: string, onExpire: (tunnel: ActiveTunnel, reason: TunnelExpireReason) => void): Promise<ActiveTunnel> {
+    const tracked = this.tunnels.get(id);
+    if (!tracked || tracked.state !== "pending") {
+      throw new Error("This preview tunnel confirmation has expired. Run `/preview share` again.");
+    }
+    this.clearScheduled(tracked.pendingTimer);
+
+    const cloudflaredPath = this.deps.findCloudflaredPath();
+    if (!cloudflaredPath) {
+      this.tunnels.delete(id);
+      throw new Error("cloudflared is not installed. Install it with `brew install cloudflared` and try again.");
+    }
+
+    const createHome = this.deps.createTunnelHome ?? defaultCreateTunnelHome;
+    const homeDir = await createHome();
+    const env = isolatedTunnelEnvironment(homeDir);
+
+    // Spawn directly (rather than inside startCloudflaredTunnel) so the child
+    // is attached to the reservation before we start waiting for its URL: a
+    // cancel that arrives during that wait can then kill it immediately,
+    // instead of only after the wait settles on its own.
+    const child = this.deps.spawnFn(cloudflaredPath, ["tunnel", "--url", tracked.origin], env);
+    tracked.child = child;
+    if (tracked.aborted) {
+      child.kill("SIGTERM");
+      await this.removeHomeSafely(homeDir);
+      throw new Error("The preview tunnel was cancelled before it finished starting.");
+    }
+
+    let url: string;
+    try {
+      url = await waitForTunnelUrl(child, this.deps.urlTimeoutMs);
+    } catch (error) {
+      this.tunnels.delete(id);
+      await this.removeHomeSafely(homeDir);
+      throw error;
+    }
+
+    if (this.tunnels.get(id) !== tracked || tracked.aborted) {
+      child.kill("SIGTERM");
+      await this.removeHomeSafely(homeDir);
+      throw new Error("The preview tunnel was cancelled before it finished starting.");
+    }
+
+    const now = this.deps.now?.() ?? new Date();
+    const expiresAt = new Date(now.getTime() + tracked.ttlMinutes * 60_000);
     const schedule = this.deps.scheduleTimeout ?? defaultSchedule;
 
-    const tracked: TrackedTunnel = {
-      projectName: input.projectName,
+    const active: TrackedActive = {
+      id: tracked.id,
+      projectName: tracked.projectName,
+      origin: tracked.origin,
+      port: tracked.port,
+      ttlMinutes: tracked.ttlMinutes,
+      requestedBy: tracked.requestedBy,
+      channelId: tracked.channelId,
+      createdAt: tracked.createdAt,
+      ...(tracked.messageId ? { messageId: tracked.messageId } : {}),
+      state: "active",
       url,
-      port: input.port,
-      ttlMinutes,
       startedAt: now.toISOString(),
       expiresAt: expiresAt.toISOString(),
-      startedBy: input.startedBy,
-      channelId: input.channelId,
       child,
+      homeDir,
       ttlTimer: undefined,
-      onExpire: input.onExpire
+      onExpire
     };
-
-    tracked.ttlTimer = schedule(() => this.expire(input.projectName, "ttl"), ttlMinutes * 60_000);
+    active.ttlTimer = schedule(() => {
+      void this.expire(id, "ttl", false);
+    }, tracked.ttlMinutes * 60_000);
 
     child.on("exit", () => {
-      if (this.tunnels.get(input.projectName) === tracked) {
-        this.expire(input.projectName, "process-exit");
+      if (this.tunnels.get(id) === active) {
+        // The child has already exited; there is nothing left to signal.
+        void this.expire(id, "process-exit", true);
+      }
+    });
+    child.on("error", (error) => {
+      if (this.tunnels.get(id) === active) {
+        console.warn(`cloudflared for preview tunnel ${active.projectName} (${id}) reported an error: ${error.message}`);
+        // Node's 'error' event does not guarantee the process has exited, so
+        // still attempt a kill in case it is still running.
+        void this.expire(id, "process-exit", false);
       }
     });
 
-    this.tunnels.set(input.projectName, tracked);
-    return toActiveTunnel(tracked);
+    this.tunnels.set(id, active);
+    return toActiveTunnel(active);
   }
 
-  stop(projectName: string): ActiveTunnel | undefined {
-    const tracked = this.tunnels.get(projectName);
+  /** Stops an active tunnel by id. Waits for a confirmed exit (SIGTERM, then SIGKILL) before reporting stopped. */
+  async stop(id: string, reason: TunnelExpireReason = "stop"): Promise<ActiveTunnel | undefined> {
+    const tracked = this.tunnels.get(id);
+    if (!tracked || tracked.state === "pending") {
+      return undefined;
+    }
+    if (tracked.state === "stopping") {
+      return toActiveTunnel(tracked);
+    }
+    return this.finalizeActive(tracked, reason, false);
+  }
+
+  private async expire(
+    id: string,
+    reason: Extract<TunnelExpireReason, "ttl" | "process-exit">,
+    alreadyExited: boolean
+  ): Promise<void> {
+    const tracked = this.tunnels.get(id);
+    if (!tracked || tracked.state !== "active") {
+      return;
+    }
+    await this.finalizeActive(tracked, reason, alreadyExited);
+  }
+
+  private async finalizeActive(tracked: TrackedActive, reason: TunnelExpireReason, alreadyExited: boolean): Promise<ActiveTunnel> {
+    tracked.state = "stopping";
+    this.clearScheduled(tracked.ttlTimer);
+    // If the child is already confirmed gone (a real "exit" event fired), it
+    // will never emit another one — signalling and waiting here would just
+    // stall for the full grace period for no reason.
+    if (!alreadyExited) {
+      const exited = await this.killWithEscalation(tracked.child);
+      if (!exited) {
+        console.warn(
+          `cloudflared for preview tunnel ${tracked.projectName} (${tracked.id}) did not confirm exit after SIGTERM/SIGKILL; check for an orphaned process manually.`
+        );
+      }
+    }
+    this.tunnels.delete(tracked.id);
+    await this.removeHomeSafely(tracked.homeDir);
+    const result = toActiveTunnel(tracked);
+    tracked.onExpire(result, reason);
+    return result;
+  }
+
+  /** Stops or cancels whatever tunnel (pending or active) is tracked for a project. */
+  async stopByProject(
+    projectName: string,
+    reason: TunnelExpireReason = "stop"
+  ): Promise<{ kind: "active"; tunnel: ActiveTunnel } | { kind: "pending"; tunnel: PendingTunnel } | undefined> {
+    const tracked = [...this.tunnels.values()].find((entry) => entry.projectName === projectName);
     if (!tracked) {
       return undefined;
     }
-    this.tunnels.delete(projectName);
-    this.clearTimer(tracked);
-    tracked.child.kill("SIGTERM");
-    return toActiveTunnel(tracked);
-  }
-
-  stopAll(): ActiveTunnel[] {
-    return [...this.tunnels.keys()].map((name) => this.stop(name)).filter((tunnel): tunnel is ActiveTunnel => Boolean(tunnel));
-  }
-
-  private expire(projectName: string, reason: Exclude<TunnelExpireReason, "stop" | "shutdown">): void {
-    const tracked = this.tunnels.get(projectName);
-    if (!tracked) {
-      return;
+    if (tracked.state === "pending") {
+      const pending = this.cancelPending(tracked.id);
+      return pending ? { kind: "pending", tunnel: pending } : undefined;
     }
-    this.tunnels.delete(projectName);
-    this.clearTimer(tracked);
-    if (reason === "ttl") {
-      tracked.child.kill("SIGTERM");
-    }
-    tracked.onExpire(toActiveTunnel(tracked), reason);
+    const active = await this.stop(tracked.id, reason);
+    return active ? { kind: "active", tunnel: active } : undefined;
   }
 
-  private clearTimer(tracked: TrackedTunnel): void {
+  /** Stops/cancels every tracked tunnel (shutdown, or the owner disabling the feature). */
+  async stopAll(reason: TunnelExpireReason = "shutdown"): Promise<ActiveTunnel[]> {
+    const results: ActiveTunnel[] = [];
+    for (const id of [...this.tunnels.keys()]) {
+      const tracked = this.tunnels.get(id);
+      if (!tracked) continue;
+      if (tracked.state === "pending") {
+        this.cancelPending(id);
+        continue;
+      }
+      const stopped = await this.stop(id, reason);
+      if (stopped) results.push(stopped);
+    }
+    return results;
+  }
+
+  private async killWithEscalation(child: TunnelChildProcess): Promise<boolean> {
+    const graceMs = this.deps.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+    if (await this.waitForExit(child, graceMs, () => child.kill("SIGTERM"))) {
+      return true;
+    }
+    return this.waitForExit(child, graceMs, () => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // signal unsupported on this platform; nothing more we can do.
+      }
+    });
+  }
+
+  private waitForExit(child: TunnelChildProcess, timeoutMs: number, act: () => void): Promise<boolean> {
+    const schedule = this.deps.scheduleTimeout ?? defaultSchedule;
     const clear = this.deps.clearScheduledTimeout ?? defaultClear;
-    clear(tracked.ttlTimer);
+    return new Promise((resolve) => {
+      let settled = false;
+      const timer = schedule(() => {
+        if (settled) return;
+        settled = true;
+        resolve(false);
+      }, timeoutMs);
+      child.on("exit", () => {
+        if (settled) return;
+        settled = true;
+        clear(timer);
+        resolve(true);
+      });
+      act();
+    });
+  }
+
+  private async removeHomeSafely(homeDir: string | undefined): Promise<void> {
+    if (!homeDir) return;
+    const remove = this.deps.removeTunnelHome ?? defaultRemoveTunnelHome;
+    try {
+      await remove(homeDir);
+    } catch (error) {
+      console.warn(`Unable to remove isolated preview-tunnel home ${homeDir}: ${(error as Error).message}`);
+    }
+  }
+
+  private clearScheduled(handle: unknown): void {
+    const clear = this.deps.clearScheduledTimeout ?? defaultClear;
+    clear(handle);
   }
 }
 
@@ -319,16 +672,53 @@ function defaultClear(handle: unknown): void {
   clearTimeout(handle as NodeJS.Timeout);
 }
 
-function toActiveTunnel(tracked: TrackedTunnel): ActiveTunnel {
+async function defaultCreateTunnelHome(): Promise<string> {
+  return mkdtemp(path.join(tmpdir(), "devbot-tunnel-"));
+}
+
+async function defaultRemoveTunnelHome(directory: string): Promise<void> {
+  await rm(directory, { force: true, recursive: true });
+}
+
+/**
+ * cloudflared reads ~/.cloudflared for cached config/credentials; giving it
+ * an empty, single-use HOME keeps it from picking up ambient Cloudflare
+ * account state (and keeps it isolated from bot secrets, same as
+ * minimalChildEnvironment already does for tokens).
+ */
+function isolatedTunnelEnvironment(homeDir: string): NodeJS.ProcessEnv {
+  const env = minimalChildEnvironment();
+  env.HOME = homeDir;
+  env.USERPROFILE = homeDir;
+  return env;
+}
+
+function toActiveTunnel(tracked: TrackedActive): ActiveTunnel {
   return {
+    id: tracked.id,
     projectName: tracked.projectName,
     url: tracked.url,
+    origin: tracked.origin,
     port: tracked.port,
     ttlMinutes: tracked.ttlMinutes,
     startedAt: tracked.startedAt,
     expiresAt: tracked.expiresAt,
-    startedBy: tracked.startedBy,
+    startedBy: tracked.requestedBy,
     channelId: tracked.channelId,
+    ...(tracked.messageId ? { messageId: tracked.messageId } : {})
+  };
+}
+
+function toPendingTunnel(tracked: TrackedPending): PendingTunnel {
+  return {
+    id: tracked.id,
+    projectName: tracked.projectName,
+    origin: tracked.origin,
+    port: tracked.port,
+    ttlMinutes: tracked.ttlMinutes,
+    requestedBy: tracked.requestedBy,
+    channelId: tracked.channelId,
+    createdAt: tracked.createdAt,
     ...(tracked.messageId ? { messageId: tracked.messageId } : {})
   };
 }
