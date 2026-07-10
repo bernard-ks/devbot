@@ -89,6 +89,11 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Screenshots wait for two consecutive identical frames (animations/transitions disabled, `prefers-reduced-motion` emulated) before being used, so loading spinners and blinking carets don't get misread as content.
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
+- Video proof-of-work and live watch mode:
+  - `/clip` records a short scored multi-step local UI flow (up to ~4 interactions, 30s/1280x720 caps) and attaches it, shrinking viewport/duration once and falling back to a screenshot if it is still over Discord's attachment size limit.
+  - Transcodes the recording to MP4 with `ffmpeg` when it is present on PATH; otherwise attaches the WebM directly.
+  - Completed UI-related `/do` tasks automatically get a recorded flow attached, or an explicit "proof capture unavailable" note so proof is never silently missing.
+  - `/do` watch mode live-updates the task message with a screenshot roughly every 20s while a dev server is detected (default on, `watch:false` to opt out) and stitches up to the last 12 captured frames into an animated GIF timelapse with `sharp` on completion.
 
 ## Current Constraints
 

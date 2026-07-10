@@ -69,7 +69,15 @@ import {
 import { parseMentionRequest, parseStatusRequest, statusDetailQuestion, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natural-intent.js";
-import { captureProjectScreenshot, type ProjectScreenshot } from "./project-screenshot.js";
+import { captureProjectScreenshot, findProjectWebUrls, type ProjectScreenshot } from "./project-screenshot.js";
+import {
+  buildTimelapseGif,
+  isUiRelatedTask,
+  listChangedFiles,
+  recordProjectFlow,
+  type ProjectVideoOutcome,
+  type ProjectVideoResult
+} from "./project-video.js";
 import { configuredCommandNames, formatProjectCommandResult, runConfiguredProjectCommand } from "./command-runner.js";
 import { syncCommandsIfChanged } from "./command-sync.js";
 import { commandDefinitions } from "./commands.js";
@@ -741,6 +749,28 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     return;
   }
 
+  if (interaction.commandName === "clip") {
+    const projectName = interaction.options.getString("project");
+    const target = interaction.options.getString("target", true);
+    const extraSteps = interaction.options.getString("steps") ?? undefined;
+    const project = projectName ? mustFindProject(appConfig.projects, projectName) : defaultProject(appConfig.projects);
+    const privateReply = hasProjectAudienceRestriction(project);
+    await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+
+    const screenshotApproval = screenshotPolicyMessage(project, interaction.user.tag);
+    if (screenshotApproval) {
+      await interaction.editReply(screenshotApproval);
+      return;
+    }
+
+    const outcome = await recordProjectFlow(project, target, extraSteps ? { extraSteps } : {});
+    await replyWithVideoOutcome(interaction, project, outcome, privateReply);
+    return;
+  }
+
   if (interaction.commandName === "task") {
     await handleTaskCommand(interaction, appConfig);
     return;
@@ -825,7 +855,7 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     await userPreferences.setSelectedProject(interaction.user.id, project.name);
     const task = interaction.options.getString("task", true);
     const includePatterns = parseIncludePatterns(interaction.options.getString("include"));
-    await executeInteractionRequest({
+    await executeDoInteraction({
       interaction,
       appConfig,
       project,
@@ -834,7 +864,8 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
       mode: "action",
       requester: interaction.user.tag,
       source: "slash:do",
-      ephemeral: hasProjectAudienceRestriction(project)
+      ephemeral: hasProjectAudienceRestriction(project),
+      watch: interaction.options.getBoolean("watch") ?? true
     });
     return;
   }
@@ -1758,6 +1789,168 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
       throw error;
     }
     console.error(publicErrorMessage(error));
+  }
+}
+
+const WATCH_INTERVAL_MS = 20_000;
+
+interface DoInteractionOptions extends Omit<ProjectRequestOptions, "onProgress"> {
+  interaction: ChatInputCommandInteraction;
+  ephemeral?: boolean;
+  watch: boolean;
+}
+
+interface WatchSession {
+  frames: Buffer[];
+  stop(): void;
+}
+
+function startWatchSession(project: ProjectEntry, requestText: string, onFrame: (image: Buffer) => void): WatchSession {
+  const frames: Buffer[] = [];
+  let stopped = false;
+  const timer = setInterval(() => {
+    if (stopped) {
+      return;
+    }
+    void (async () => {
+      try {
+        const shot = await captureProjectScreenshot(project, { requestText });
+        if (shot && !stopped) {
+          frames.push(shot.image);
+          onFrame(shot.image);
+        }
+      } catch (error) {
+        console.warn(`Watch mode capture failed for ${project.name}: ${(error as Error).message}`);
+      }
+    })();
+  }, WATCH_INTERVAL_MS);
+
+  return {
+    frames,
+    stop() {
+      if (stopped) {
+        return;
+      }
+      stopped = true;
+      clearInterval(timer);
+    }
+  };
+}
+
+interface CompletionProof {
+  note: string;
+  attachment?: AttachmentBuilder;
+}
+
+async function captureCompletionProof(project: ProjectEntry, taskText: string, policyBlock: string | undefined): Promise<CompletionProof | undefined> {
+  try {
+    const changedFiles = await listChangedFiles(project);
+    if (!isUiRelatedTask(taskText, changedFiles)) {
+      return undefined;
+    }
+
+    if (policyBlock) {
+      return { note: "Proof capture unavailable: project policy blocks UI capture for this project." };
+    }
+
+    const urls = await findProjectWebUrls(project);
+    if (urls.length === 0) {
+      return { note: "Proof capture unavailable: no running local web UI was detected." };
+    }
+
+    const outcome = await recordProjectFlow(project, taskText, {});
+    if (outcome.kind === "video") {
+      const meta = outcome.metadata;
+      const errorNote = meta.consoleErrors.length > 0 ? ` (${meta.consoleErrors.length} console error(s) captured)` : "";
+      return {
+        note: `Proof: recorded a ${(meta.durationMs / 1000).toFixed(1)}s flow at ${meta.finalUrl}${errorNote}.`,
+        attachment: new AttachmentBuilder(outcome.video, { name: outcome.fileName })
+      };
+    }
+
+    if (outcome.kind === "screenshot-fallback") {
+      const screenshot = await captureProjectScreenshot(project, { requestText: taskText }).catch(() => undefined);
+      if (screenshot) {
+        return {
+          note: `Proof: ${outcome.reason} Attached a screenshot instead.`,
+          attachment: new AttachmentBuilder(screenshot.image, { name: screenshot.fileName })
+        };
+      }
+    }
+
+    return { note: `Proof capture unavailable: ${outcome.reason}` };
+  } catch (error) {
+    return { note: `Proof capture unavailable: ${(error as Error).message}` };
+  }
+}
+
+async function executeDoInteraction(options: DoInteractionOptions): Promise<void> {
+  const { interaction, ephemeral, watch, ...requestOptions } = options;
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply(ephemeral ? { flags: MessageFlags.Ephemeral } : undefined);
+  }
+
+  let editChain: Promise<unknown> = Promise.resolve();
+  const queueEdit = (payload: Parameters<typeof interaction.editReply>[0]): Promise<unknown> => {
+    editChain = editChain.then(() => interaction.editReply(payload)).catch((error) => {
+      console.warn(`Unable to update Discord task message for ${requestOptions.project.name}: ${(error as Error).message}`);
+    });
+    return editChain;
+  };
+
+  const policyBlock = screenshotPolicyMessage(requestOptions.project, requestOptions.requester);
+  const watchUrls = watch && !policyBlock ? await findProjectWebUrls(requestOptions.project) : [];
+  const watchSession = watchUrls.length > 0
+    ? startWatchSession(requestOptions.project, requestOptions.text, (image) => {
+        queueEdit({ files: [new AttachmentBuilder(image, { name: "devbot-watch.png" })] });
+      })
+    : undefined;
+
+  let progressRendered = false;
+  try {
+    const result = await runProjectRequest({
+      ...requestOptions,
+      onProgress: async (progress) => {
+        await queueEdit({
+          content: formatTaskProgress(progress),
+          components: [taskControlRow(progress.taskId, { status: taskStatusForProgress(progress), mode: progress.mode })]
+        });
+        progressRendered = true;
+      }
+    });
+    watchSession?.stop();
+
+    const proof = await captureCompletionProof(requestOptions.project, requestOptions.text, policyBlock);
+    const timelapse = watchSession && watchSession.frames.length > 0 ? await buildTimelapseGif(watchSession.frames) : undefined;
+
+    const footer = formatResultFooter(requestOptions.project, result.route, requestOptions.mode);
+    const proofNote = proof ? `\n\n${proof.note}` : "";
+    const chunks = splitDiscordMessage(`${result.answer}\n\n${footer}${proofNote}`);
+    const files = [
+      ...(proof?.attachment ? [proof.attachment] : []),
+      ...(timelapse ? [new AttachmentBuilder(timelapse, { name: "devbot-timelapse.gif" })] : [])
+    ];
+
+    await queueEdit({
+      content: chunks.shift() ?? "Task completed without a response.",
+      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })],
+      files
+    });
+    await editChain;
+    for (const chunk of chunks) {
+      await interaction.followUp({
+        content: chunk,
+        ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {})
+      });
+    }
+  } catch (error) {
+    if (!progressRendered) {
+      watchSession?.stop();
+      throw error;
+    }
+    console.error(error);
+  } finally {
+    watchSession?.stop();
   }
 }
 
@@ -4953,6 +5146,56 @@ function formatScreenshotReply(project: ProjectEntry, screenshot: ProjectScreens
   }
 
   return lines.filter(Boolean).join("\n");
+}
+
+async function replyWithVideoOutcome(
+  interaction: ChatInputCommandInteraction,
+  project: ProjectEntry,
+  outcome: ProjectVideoOutcome,
+  privateReply: boolean
+): Promise<void> {
+  if (outcome.kind === "video") {
+    await editInteractionWithChunks(
+      interaction,
+      {
+        content: formatVideoReply(project, outcome),
+        image: outcome.video,
+        imageName: outcome.fileName
+      },
+      privateReply
+    );
+    return;
+  }
+
+  if (outcome.kind === "screenshot-fallback") {
+    const screenshot = await captureProjectScreenshot(project, {});
+    if (screenshot) {
+      await editInteractionWithChunks(
+        interaction,
+        {
+          content: `${outcome.reason}\n\n${formatScreenshotReply(project, screenshot)}`,
+          image: screenshot.image,
+          imageName: screenshot.fileName
+        },
+        privateReply
+      );
+      return;
+    }
+  }
+
+  await interaction.editReply(outcome.reason);
+}
+
+function formatVideoReply(project: ProjectEntry, video: ProjectVideoResult): string {
+  const meta = video.metadata;
+  const issueCount = meta.consoleErrors.length;
+  return [
+    `Attached a ${(meta.durationMs / 1000).toFixed(1)}s live UI recording for \`${project.name}\`.`,
+    `URL: ${meta.finalUrl}`,
+    `Viewport: ${meta.width}x${meta.height}`,
+    meta.stepsPerformed.length > 0 ? `Steps performed: ${meta.stepsPerformed.join(" -> ")}` : "Steps performed: none (no matching UI elements found).",
+    `Console errors: ${issueCount === 0 ? "none captured." : `${issueCount} captured.`}`
+  ].join("\n");
 }
 
 function formatDiagnosticList(label: string, values: string[]): string {

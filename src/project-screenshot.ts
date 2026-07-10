@@ -398,7 +398,7 @@ function extractPort(command: string): number | undefined {
   return undefined;
 }
 
-async function canReach(url: string, allowedOrigins: ReadonlySet<string>): Promise<boolean> {
+export async function canReach(url: string, allowedOrigins: ReadonlySet<string>): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4_000);
 
@@ -456,7 +456,7 @@ export function isApprovedProjectScreenshotUrl(candidate: string, projectUrls: r
   });
 }
 
-function projectScreenshotOrigins(project: ProjectEntry, projectUrls: readonly string[]): Set<string> {
+export function projectScreenshotOrigins(project: ProjectEntry, projectUrls: readonly string[]): Set<string> {
   const values = [...projectUrls, project.metadata.backendUrl ?? ""];
   return new Set(
     values
@@ -527,7 +527,7 @@ function wordInText(text: string, word: string): boolean {
   return new RegExp(`(?:^| )${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?: |$)`).test(text);
 }
 
-function sanitizeFilePart(value: string): string {
+export function sanitizeFilePart(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "project";
 }
 

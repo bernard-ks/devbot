@@ -140,6 +140,21 @@ const commandBuilders = [
         )
     ),
   new SlashCommandBuilder()
+    .setName("clip")
+    .setDescription("Record a short local UI flow and attach it as a video.")
+    .addStringOption((option) =>
+      option.setName("target").setDescription("Natural-language UI target or exact path/URL.").setRequired(true)
+    )
+    .addStringOption((option) =>
+      option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("steps")
+        .setDescription("Optional extra actions to perform, e.g. 'click sign in, scroll down'.")
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
     .setName("task")
     .setDescription("Inspect saved devbot task history.")
     .addSubcommand((subcommand) =>
@@ -536,6 +551,12 @@ const commandBuilders = [
       option
         .setName("include")
         .setDescription("Optional comma-separated path patterns, e.g. src/*,README.md,*.json.")
+        .setRequired(false)
+    )
+    .addBooleanOption((option) =>
+      option
+        .setName("watch")
+        .setDescription("Live screenshots while working; default on when a dev server is detected.")
         .setRequired(false)
     ),
   new SlashCommandBuilder()

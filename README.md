@@ -127,6 +127,7 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/projects`: List configured projects.
 - `/status project:<optional> question:<optional> image:<optional>`: Show a decision-ready brief with confirmed Devbot tasks, task phase, external Codex runs, activity-unknown app sessions, repository evidence, visible blockers or risks, and the best next step. Add a question for a deeper read-only inspection, and set `image:true` to attach a live project UI screenshot when a local web app is detected.
 - `/snip project:<optional> target:<text>`: Attach a live project UI screenshot by opening the running app and navigating visible UI controls from the target text. Explicit paths and local URLs are also supported.
+- `/clip project:<optional> target:<text> steps:<optional>`: Record a short local UI flow (up to ~4 scored interactions) and attach it as a video, transcoding to MP4 with `ffmpeg` when available and falling back to a screenshot if the recording is too large.
 - `/task recent project:<optional> status:<optional> limit:<optional>`: List recent saved devbot tasks from local task history.
 - `/task show id:<task-id>`: Show one saved task with request, status, and result or error preview.
 - `/task status id:<task-id>`: Alias for showing one saved task.
@@ -164,7 +165,7 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/lab safety project:<optional>`: Show active collaboration safety rules and approval boundaries.
 - `/refresh project:<name>`: Rebuild the in-memory file index for a project.
 - `/ask question:<text> project:<optional> include:<optional patterns>`: Ask the model a question with local project context.
-- `/do task:<text> project:<optional> include:<optional patterns>`: Ask local Codex to perform a focused project task. Requires owner or controller access.
+- `/do task:<text> project:<optional> include:<optional patterns> watch:<optional, default true>`: Ask local Codex to perform a focused project task. Requires owner or controller access. While a dev server is detected, the task message live-updates with screenshots every ~20s (set `watch:false` to opt out) and stitches the captured frames into a timelapse GIF on completion. UI-related completed tasks also get a recorded flow video (or an explicit "proof capture unavailable" note) attached automatically.
 - `/ship task:<task-id>`: Compose a 1200x675 shareable card for a completed `/do` task with the project name and task summary. Action tasks run in an isolated Git worktree with no managed preview, so their card is text-only with an explicit "visual proof unavailable" note; a live screenshot is only attempted for non-isolated tasks. Requires owner or controller access; also available as a "Ship it" button on completed action tasks.
 
 You can also mention the bot in a channel:
