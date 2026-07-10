@@ -72,9 +72,8 @@ import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natur
 import { captureProjectScreenshot, findProjectWebUrls, type ProjectScreenshot } from "./project-screenshot.js";
 import {
   buildTimelapseGif,
-  isolatedProofNote,
-  isUiRelatedTask,
   listChangedFiles,
+  planCompletionProof,
   pushBoundedFrame,
   recordProjectFlow,
   type ProjectVideoOutcome,
@@ -1481,6 +1480,7 @@ interface ProjectRequestResult {
   visualProofNote?: string;
   isolated: boolean;
   workspaceBranch?: string;
+  changedFiles?: string[];
 }
 
 async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
@@ -1623,8 +1623,10 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       contextFileCount: context.files.length
     });
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
+    const isolatedChangedFiles = isolatedWorktree
+      ? await recordTaskWorktreeEvidence(task.id, isolatedWorktree)
+      : undefined;
     if (isolatedWorktree) {
-      await recordTaskWorktreeEvidence(task.id, isolatedWorktree);
       // Every action task runs in an isolated Git worktree (task-worktree.ts); Codex's edits land
       // on a review branch, never in options.project.root. Devbot has no managed preview of that
       // isolated workspace, so there is no server it could honestly screenshot "after" against —
@@ -1659,7 +1661,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       route,
       ...(isolatedWorktree ? { visualProofNote: isolatedVisualProofNote(task.id, isolatedWorktree.branch) } : {}),
       isolated: Boolean(isolatedWorktree),
-      ...(isolatedWorktree ? { workspaceBranch: isolatedWorktree.branch } : {})
+      ...(isolatedWorktree ? { workspaceBranch: isolatedWorktree.branch, changedFiles: isolatedChangedFiles ?? [] } : {})
     };
   } catch (error) {
     if (isolatedWorktree) {
@@ -1711,13 +1713,13 @@ async function recordTaskWorktreeEvidence(
   taskId: string,
   worktree: TaskWorktree,
   completed = true
-): Promise<void> {
+): Promise<string[]> {
   const inspection = await inspectTaskWorktree(worktree);
   if (!inspection.available) {
     await taskStore.setEvidence(taskId, {
       verification: [`Isolated branch created, but evidence collection failed: ${inspection.message}`]
     });
-    return;
+    return [];
   }
 
   const changedFiles = [...new Set(inspection.changes.map((change) => change.path))];
@@ -1740,6 +1742,7 @@ async function recordTaskWorktreeEvidence(
     diffStat: `${changedFiles.length} changed ${changedFiles.length === 1 ? "file" : "files"}`,
     verification
   });
+  return changedFiles;
 }
 
 async function reportTaskProgress(options: ProjectRequestOptions, progress: TaskProgressEvent): Promise<void> {
@@ -1856,6 +1859,7 @@ interface CompletionProofOptions {
   policyBlock?: string | undefined;
   isolated: boolean;
   branch?: string | undefined;
+  changedFiles?: readonly string[] | undefined;
 }
 
 async function captureCompletionProof(
@@ -1864,13 +1868,18 @@ async function captureCompletionProof(
   options: CompletionProofOptions
 ): Promise<CompletionProof | undefined> {
   try {
-    const changedFiles = await listChangedFiles(project);
-    if (!isUiRelatedTask(taskText, changedFiles)) {
+    const changedFiles = options.isolated ? [...(options.changedFiles ?? [])] : await listChangedFiles(project);
+    const plan = planCompletionProof(taskText, {
+      isolated: options.isolated,
+      branch: options.branch,
+      changedFiles
+    });
+    if (plan.action === "none") {
       return undefined;
     }
 
-    if (options.isolated) {
-      return { note: isolatedProofNote(options.branch) };
+    if (plan.action === "isolated-note") {
+      return { note: plan.note };
     }
 
     if (options.policyBlock) {
@@ -1947,7 +1956,8 @@ async function executeDoInteraction(options: DoInteractionOptions): Promise<void
     const proof = await captureCompletionProof(requestOptions.project, requestOptions.text, {
       policyBlock,
       isolated: result.isolated,
-      branch: result.workspaceBranch
+      branch: result.workspaceBranch,
+      changedFiles: result.changedFiles
     });
     const timelapse = watchSession && watchSession.frames.length > 0 ? await buildTimelapseGif(watchSession.frames) : undefined;
 

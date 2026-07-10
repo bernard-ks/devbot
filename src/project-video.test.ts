@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { safeReportedUrl } from "./project-screenshot.js";
 import {
   buildTimelapseGif,
   computeGifPageLayout,
   decideSizeCap,
   deriveFlowSteps,
+  isAllowedWebSocketUrl,
+  isNavigationHref,
   isolatedProofNote,
   isUiRelatedTask,
+  planCompletionProof,
   pushBoundedFrame,
   selectRecentFrames,
   DISCORD_MAX_ATTACHMENT_BYTES,
@@ -92,6 +96,62 @@ test("isolatedProofNote is honest that the recording would show unchanged source
   const withoutBranch = isolatedProofNote();
   assert.match(withoutBranch, /isolated worktree/i);
   assert.doesNotMatch(withoutBranch, /branch/i);
+});
+
+test("planCompletionProof emits the isolated skip note for neutral wording with UI-only isolated changes", () => {
+  const plan = planCompletionProof("Fix the bug", {
+    isolated: true,
+    branch: "devbot/task-42",
+    changedFiles: ["src/components/Header.tsx"]
+  });
+  assert.equal(plan.action, "isolated-note");
+  assert.match((plan as { note: string }).note, /isolated worktree/i);
+  assert.match((plan as { note: string }).note, /devbot\/task-42/);
+});
+
+test("planCompletionProof skips proof entirely for neutral wording with non-UI isolated changes", () => {
+  assert.deepEqual(
+    planCompletionProof("Fix the bug", { isolated: true, changedFiles: ["src/server/db.ts"] }),
+    { action: "none" }
+  );
+});
+
+test("planCompletionProof records only for non-isolated UI tasks", () => {
+  assert.deepEqual(
+    planCompletionProof("Fix the button color", { isolated: false, changedFiles: [] }),
+    { action: "record" }
+  );
+  assert.deepEqual(
+    planCompletionProof("Fix the bug", { isolated: false, changedFiles: ["src/styles/theme.css"] }),
+    { action: "record" }
+  );
+  assert.equal(planCompletionProof("Fix the button color", { isolated: true, changedFiles: [] }).action, "isolated-note");
+});
+
+test("isAllowedWebSocketUrl permits only loopback sockets on approved origins", () => {
+  const allowed = new Set(["http://127.0.0.1:3000"]);
+  assert.equal(isAllowedWebSocketUrl("ws://127.0.0.1:3000/live", allowed), true);
+  assert.equal(isAllowedWebSocketUrl("ws://127.0.0.1:4000/live", allowed), false);
+  assert.equal(isAllowedWebSocketUrl("wss://example.com/socket", allowed), false);
+  assert.equal(isAllowedWebSocketUrl("ws://user:pass@127.0.0.1:3000/live", allowed), false);
+  assert.equal(isAllowedWebSocketUrl("http://127.0.0.1:3000/", allowed), false);
+  assert.equal(isAllowedWebSocketUrl("not a url", allowed), false);
+});
+
+test("isNavigationHref accepts document links and rejects script-scheme or empty targets", () => {
+  assert.equal(isNavigationHref("/settings"), true);
+  assert.equal(isNavigationHref("http://127.0.0.1:3000/detail"), true);
+  assert.equal(isNavigationHref(""), false);
+  assert.equal(isNavigationHref("#"), false);
+  assert.equal(isNavigationHref("javascript:doThing()"), false);
+  assert.equal(isNavigationHref("data:text/html,hi"), false);
+});
+
+test("safeReportedUrl strips credentials, query, and fragment from reported URLs", () => {
+  assert.equal(
+    safeReportedUrl("http://user:secret@127.0.0.1:3000/reset?token=abc123#step"),
+    "http://127.0.0.1:3000/reset"
+  );
 });
 
 test("computeGifPageLayout stacks frames vertically and caps pages at the max", () => {

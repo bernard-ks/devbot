@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { Page } from "playwright";
+import type { Page, Route } from "playwright";
 import { minimalChildEnvironment } from "./security.js";
 import type { ProjectEntry } from "./types.js";
 
@@ -78,13 +78,7 @@ export async function captureProjectScreenshot(
       const browser = await chromium.launch({ headless: true, env: definedEnvironment(minimalChildEnvironment()) });
       try {
         const page = await browser.newPage({ viewport });
-        await page.route("**/*", async (route) => {
-          if (isAllowedScreenshotResource(route.request().url(), allowedOrigins)) {
-            await route.continue();
-          } else {
-            await route.abort("blockedbyclient");
-          }
-        });
+        await page.route("**/*", approvedOriginRouteHandler(allowedOrigins));
         const diagnostics = collectScreenshotDiagnostics(page);
         await page.emulateMedia({ reducedMotion: "reduce" }).catch(() => undefined);
         await page.goto(startUrl, { waitUntil: "networkidle", timeout: 20_000 });
@@ -466,6 +460,26 @@ export function projectScreenshotOrigins(project: ProjectEntry, projectUrls: rea
   );
 }
 
+/**
+ * Continuing a request lets the browser follow server redirects without
+ * re-invoking route handlers, so redirects are re-issued as fresh, routed
+ * requests instead: fetch without following redirects and fulfill verbatim.
+ */
+export function approvedOriginRouteHandler(allowedOrigins: ReadonlySet<string>): (route: Route) => Promise<void> {
+  return async (route) => {
+    if (!isAllowedScreenshotResource(route.request().url(), allowedOrigins)) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    try {
+      const response = await route.fetch({ maxRedirects: 0 });
+      await route.fulfill({ response });
+    } catch {
+      await route.abort("failed").catch(() => undefined);
+    }
+  };
+}
+
 export function isAllowedScreenshotResource(value: string, allowedOrigins: ReadonlySet<string>): boolean {
   try {
     const url = new URL(value);
@@ -499,7 +513,7 @@ function isLoopbackHost(hostname: string): boolean {
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 }
 
-function safeReportedUrl(value: string): string {
+export function safeReportedUrl(value: string): string {
   const url = new URL(value);
   url.username = "";
   url.password = "";
@@ -508,7 +522,7 @@ function safeReportedUrl(value: string): string {
   return url.toString();
 }
 
-function definedEnvironment(environment: NodeJS.ProcessEnv): Record<string, string> {
+export function definedEnvironment(environment: NodeJS.ProcessEnv): Record<string, string> {
   return Object.fromEntries(
     Object.entries(environment).filter((entry): entry is [string, string] => typeof entry[1] === "string")
   );
