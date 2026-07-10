@@ -51,12 +51,14 @@ export interface ProjectAccessPolicy {
 }
 
 /**
- * Re-checks a requester against the current global/setup-managed allowlist. Mirrors
- * `isAllowedGuildMember` (an empty allowlist means allow-all), so it never regresses a
- * no-allowlist deployment. `identity` is undefined when the member can no longer be resolved
- * (left the server, fetch failed); in that case anything beyond an explicit id/owner match
- * fails closed. `allowedUserIds` already folds in setup-managed viewer/controller ids, so a
- * user revoked through setup is denied here.
+ * Re-checks a requester against the current global/setup-managed allowlist at the
+ * queue/schedule execution boundary. Delegates to `isAccessSubjectAllowed`, the live
+ * deny-by-default authority: access requires a configured owner plus the owner or an
+ * explicit id/name/role match, so an empty allowlist denies everyone but the owner rather
+ * than allowing all. `identity` is undefined when the member can no longer be resolved
+ * (left the server, fetch failed); in that case the subject carries no name/role, so
+ * anything beyond an explicit id/owner match fails closed. `allowedUserIds` already folds in
+ * setup-managed viewer/controller ids, so a user revoked through setup is denied here.
  */
 export function requesterHasGlobalAccess(
   policy: GlobalAccessPolicy,
@@ -66,23 +68,17 @@ export function requesterHasGlobalAccess(
   if (!requesterId || requesterId === "unknown") {
     return false;
   }
-  if (policy.ownerUserId && requesterId === policy.ownerUserId) {
-    return true;
-  }
-  const hasAllowList = policy.allowedUserIds.size > 0 || policy.allowedUsernames.size > 0 || policy.allowedRoleIds.size > 0;
-  if (!hasAllowList) {
-    return true;
-  }
-  if (policy.allowedUserIds.has(requesterId)) {
-    return true;
-  }
-  if (!identity) {
-    return false;
-  }
-  if (isApprovedDiscordUsername(identity, policy.allowedUsernames)) {
-    return true;
-  }
-  return identity.roleIds.some((roleId) => policy.allowedRoleIds.has(roleId));
+  const subject: AccessSubject = {
+    userId: requesterId,
+    nameSource: identity ?? {},
+    roleIds: identity?.roleIds ?? []
+  };
+  return isAccessSubjectAllowed(subject, {
+    ownerUserId: policy.ownerUserId,
+    allowedUserIds: policy.allowedUserIds,
+    allowedUsernames: policy.allowedUsernames,
+    allowedRoleIds: policy.allowedRoleIds
+  });
 }
 
 /**

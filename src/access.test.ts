@@ -127,9 +127,29 @@ function identity(id: string, overrides: Partial<RequesterIdentity> = {}): Reque
   };
 }
 
-test("global re-auth allows all when no global allowlist is configured", () => {
+test("global re-auth denies non-owners when the allowlist is empty (deny-by-default)", () => {
+  // Corrected from the prior allow-all policy. Live access is deny-by-default
+  // (isAccessSubjectAllowed): empty allowlists no longer reauthorize everyone. Only the
+  // configured owner passes; anyone else is refused.
   const policy = globalPolicy();
-  assert.equal(requesterHasGlobalAccess(policy, "anyone", identity("anyone")), true);
+  assert.equal(requesterHasGlobalAccess(policy, "owner", identity("owner")), true);
+  assert.equal(requesterHasGlobalAccess(policy, "anyone", identity("anyone")), false);
+});
+
+test("global re-auth refuses persisted work when the final allowlist entry is cleared", () => {
+  // Bernard's exact reproduction: removing the last allowlist entry must not reauthorize a
+  // revoked user's queued/scheduled work.
+  const withEntry = globalPolicy({ allowedUserIds: new Set(["revoked"]) });
+  assert.equal(requesterHasGlobalAccess(withEntry, "revoked", identity("revoked")), true);
+  const cleared = globalPolicy();
+  assert.equal(requesterHasGlobalAccess(cleared, "revoked", identity("revoked")), false);
+});
+
+test("global re-auth refuses execution when no owner is configured", () => {
+  // A missing configured owner is deny-all, even for an id that is otherwise on the allowlist.
+  const policy = globalPolicy({ ownerUserId: undefined, allowedUserIds: new Set(["listed"]) });
+  assert.equal(requesterHasGlobalAccess(policy, "listed", identity("listed")), false);
+  assert.equal(requesterHasGlobalAccess(policy, "anyone", identity("anyone")), false);
 });
 
 test("global re-auth denies a user revoked from the allowlist even on the unrestricted path", () => {
