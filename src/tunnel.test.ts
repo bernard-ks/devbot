@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import {
   clampTtlMinutes,
+  cloudflaredVersion,
   describeProjectRevision,
   findCloudflaredPath,
   findRunningProjectOrigin,
@@ -68,18 +69,46 @@ test("projectPreviewGateReason defaults to deny", () => {
   assert.equal(projectPreviewGateReason(true), undefined);
 });
 
-test("validateLoopbackOrigin preserves scheme and port, normalizes localhost/IPv6, and rejects remote or credentialed URLs", () => {
+test("validateLoopbackOrigin preserves exact scheme, address, and port, and rejects remote or credentialed URLs", () => {
   assert.deepEqual(validateLoopbackOrigin("http://127.0.0.1:3000"), { origin: "http://127.0.0.1:3000", port: 3000 });
-  assert.deepEqual(validateLoopbackOrigin("http://localhost:5173"), { origin: "http://127.0.0.1:5173", port: 5173 });
-  assert.deepEqual(validateLoopbackOrigin("http://[::1]:8080"), { origin: "http://127.0.0.1:8080", port: 8080 });
+  // The address is preserved, never rewritten: a server bound only to
+  // localhost or [::1] is not necessarily the service on 127.0.0.1.
+  assert.deepEqual(validateLoopbackOrigin("http://localhost:5173"), { origin: "http://localhost:5173", port: 5173 });
+  assert.deepEqual(validateLoopbackOrigin("http://LOCALHOST:5173"), { origin: "http://localhost:5173", port: 5173 });
+  assert.deepEqual(validateLoopbackOrigin("http://[::1]:8080"), { origin: "http://[::1]:8080", port: 8080 });
+  assert.deepEqual(validateLoopbackOrigin("https://[::1]:8443/path"), { origin: "https://[::1]:8443", port: 8443 });
   assert.deepEqual(validateLoopbackOrigin("https://127.0.0.1:8443"), { origin: "https://127.0.0.1:8443", port: 8443 });
   assert.deepEqual(validateLoopbackOrigin("https://127.0.0.1"), { origin: "https://127.0.0.1:443", port: 443 });
   assert.deepEqual(validateLoopbackOrigin("http://127.0.0.1"), { origin: "http://127.0.0.1:80", port: 80 });
+  assert.deepEqual(validateLoopbackOrigin("http://localhost"), { origin: "http://localhost:80", port: 80 });
 
   assert.equal(validateLoopbackOrigin("https://example.com/app"), undefined);
+  assert.equal(validateLoopbackOrigin("https://example.com:3000"), undefined);
+  assert.equal(validateLoopbackOrigin("http://127.0.0.2:3000"), undefined);
+  assert.equal(validateLoopbackOrigin("http://[2001:db8::1]:3000"), undefined);
   assert.equal(validateLoopbackOrigin("http://attacker:pw@127.0.0.1:3000"), undefined);
   assert.equal(validateLoopbackOrigin("ftp://127.0.0.1:21"), undefined);
   assert.equal(validateLoopbackOrigin("not a url"), undefined);
+});
+
+test("a remote candidate never derives a local port, even when an unrelated service answers on it", async () => {
+  // The round-1 bug: https://example.com became http://127.0.0.1:443. A probe
+  // answering on the derived port must not resurrect that path.
+  const origin = await findRunningProjectOrigin(
+    fakeProject("web"),
+    async () => true,
+    async () => ["https://example.com", "https://example.com:3000"]
+  );
+  assert.equal(origin, undefined);
+});
+
+test("findRunningProjectOrigin keeps the validated origin even when the probe answers with a redirect", async () => {
+  const origin = await findRunningProjectOrigin(
+    fakeProject("web"),
+    async () => true, // defaultProbeUrl treats manual-redirect 3xx as reachable
+    async () => ["http://[::1]:8080"]
+  );
+  assert.deepEqual(origin, { origin: "http://[::1]:8080", port: 8080 });
 });
 
 test("findRunningProjectOrigin independently re-validates candidates, ignoring anything upstream missed", async () => {
@@ -199,8 +228,13 @@ test("TunnelManager launch spawns with an isolated HOME, no bot secrets, and the
     assert.equal(tunnel.url, "https://web.trycloudflare.com");
     assert.deepEqual(capturedArgs[0], ["tunnel", "--url", "https://127.0.0.1:8443"]);
     assert.equal(capturedEnvs[0]?.DISCORD_TOKEN, undefined);
-    assert.notEqual(capturedEnvs[0]?.HOME, process.env.HOME);
-    await assert.rejects(stat(capturedEnvs[0]?.HOME as string), /ENOENT/);
+    const isolatedHome = capturedEnvs[0]?.HOME as string;
+    assert.notEqual(isolatedHome, process.env.HOME);
+    assert.equal(capturedEnvs[0]?.USERPROFILE, isolatedHome);
+    for (const key of ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] as const) {
+      assert.ok((capturedEnvs[0]?.[key] as string).startsWith(isolatedHome), `${key} must live under the isolated home`);
+    }
+    await assert.rejects(stat(isolatedHome), /ENOENT/);
   } finally {
     if (previousToken === undefined) delete process.env.DISCORD_TOKEN;
     else process.env.DISCORD_TOKEN = previousToken;
@@ -401,7 +435,71 @@ test("TunnelManager stopAll cancels pending reservations and stops every active 
   assert.equal(manager.hasActiveForProject("queued"), false);
 });
 
+test("cloudflaredVersion returns the version line only when the binary runs and identifies as cloudflared", async () => {
+  assert.equal(
+    await cloudflaredVersion("/usr/local/bin/cloudflared", async () => "cloudflared version 2026.7.0 (built 2026-07-01)\n"),
+    "cloudflared version 2026.7.0 (built 2026-07-01)"
+  );
+  assert.equal(await cloudflaredVersion("/usr/local/bin/cloudflared", async () => "some-other-binary 1.0\n"), undefined);
+  assert.equal(
+    await cloudflaredVersion("/usr/local/bin/cloudflared", async () => {
+      throw new Error("spawn ENOENT");
+    }),
+    undefined
+  );
+});
+
+test("TunnelManager records the spawned pid in the process ledger and releases it only on a confirmed exit", async () => {
+  const recorded: Array<{ id: string; pid: number; origin: string }> = [];
+  const released: string[] = [];
+  const ledger = {
+    record: async (entry: { id: string; pid: number; origin: string; createdAt: string }) => {
+      recorded.push({ id: entry.id, pid: entry.pid, origin: entry.origin });
+    },
+    release: async (id: string) => {
+      released.push(id);
+    }
+  };
+  const { manager } = makeManager({ processLedger: ledger });
+  const pending = manager.reserve(reserveInput({ projectName: "web" }));
+  const tunnel = await launchAndReportUrl(manager, pending.id, () => {}, "https://web.trycloudflare.com");
+
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0]?.id, tunnel.id);
+  assert.ok((recorded[0]?.pid ?? 0) > 0);
+  assert.equal(released.length, 0);
+
+  await manager.stop(tunnel.id, "stop");
+  await sleep(0);
+  assert.deepEqual(released, [tunnel.id]);
+});
+
+test("TunnelManager keeps the ledger record when a kill never confirms, so the next startup can reconcile it", async () => {
+  const released: string[] = [];
+  const ledger = {
+    record: async () => {},
+    release: async (id: string) => {
+      released.push(id);
+    }
+  };
+  const spawnFn: TunnelSpawnFn = () => fakeChild({ killBehavior: "ignore-all" });
+  const { manager } = makeManager({ killGraceMs: 10, processLedger: ledger }, spawnFn);
+  const pending = manager.reserve(reserveInput({ projectName: "web" }));
+  const tunnel = await launchAndReportUrl(manager, pending.id, () => {}, "https://web.trycloudflare.com");
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await manager.stop(tunnel.id, "stop");
+  } finally {
+    console.warn = originalWarn;
+  }
+  await sleep(0);
+  assert.deepEqual(released, []);
+});
+
 let lastSpawnedChild: FakeChild | undefined;
+let nextFakePid = 40_000;
 
 interface FakeChildOptions {
   killBehavior?: "respond" | "ignore-sigterm" | "ignore-all";
@@ -424,6 +522,7 @@ function fakeChild(options: FakeChildOptions = {}): FakeChild {
   let exited = false;
   const killSignals: NodeJS.Signals[] = [];
   const child: FakeChild = {
+    pid: nextFakePid++,
     stdout,
     stderr,
     killed: false,

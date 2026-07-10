@@ -54,6 +54,7 @@ export interface TunnelReadableLike {
 }
 
 export interface TunnelChildProcess {
+  pid?: number | undefined;
   stdout: TunnelReadableLike | null;
   stderr: TunnelReadableLike | null;
   on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
@@ -86,6 +87,33 @@ function defaultIsExecutable(candidate: string): boolean {
   }
 }
 
+/**
+ * Doctor-level validation that the found binary actually runs and identifies
+ * itself as cloudflared, without ever creating a tunnel. Returns the version
+ * line, or undefined when it fails to run or reports something else.
+ */
+export async function cloudflaredVersion(
+  cloudflaredPath: string,
+  runVersion: (command: string) => Promise<string> = defaultRunVersion
+): Promise<string | undefined> {
+  try {
+    const output = await runVersion(cloudflaredPath);
+    const line = output.split("\n").map((entry) => entry.trim()).find(Boolean);
+    return line && /cloudflared/i.test(line) ? line : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function defaultRunVersion(command: string): Promise<string> {
+  const { stdout } = await execFileAsync(command, ["--version"], {
+    timeout: 5_000,
+    maxBuffer: 10_000,
+    env: minimalChildEnvironment()
+  });
+  return stdout;
+}
+
 export function clampTtlMinutes(
   minutes: number | undefined,
   options: { defaultMinutes?: number; maxMinutes?: number; minMinutes?: number } = {}
@@ -110,9 +138,10 @@ export interface ValidatedLoopbackOrigin {
 
 /**
  * Independently re-validates a candidate URL as an explicit loopback origin,
- * regardless of any filtering already done upstream. Preserves scheme and
- * port instead of discarding them; rejects remote hosts, credentials, and
- * out-of-range ports.
+ * regardless of any filtering already done upstream. Preserves the exact
+ * scheme, address, and port instead of discarding or rewriting them (a
+ * service bound only to `[::1]` is not the service on `127.0.0.1`); rejects
+ * remote hosts, credentials, and out-of-range ports.
  */
 export function validateLoopbackOrigin(value: string): ValidatedLoopbackOrigin | undefined {
   let parsed: URL;
@@ -127,15 +156,15 @@ export function validateLoopbackOrigin(value: string): ValidatedLoopbackOrigin |
   if (parsed.username || parsed.password) {
     return undefined;
   }
-  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (hostname !== "127.0.0.1" && hostname !== "localhost" && hostname !== "::1") {
+  const host = parsed.hostname.toLowerCase();
+  if (host !== "127.0.0.1" && host !== "localhost" && host !== "[::1]") {
     return undefined;
   }
   const port = parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80;
   if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
     return undefined;
   }
-  return { origin: `${parsed.protocol}//127.0.0.1:${port}`, port };
+  return { origin: `${parsed.protocol}//${host}:${port}`, port };
 }
 
 export interface StartCloudflaredOptions {
@@ -331,6 +360,11 @@ export interface ReserveTunnelInput {
   onPendingExpire: (pending: PendingTunnel, reason: PendingExpireReason) => void;
 }
 
+export interface TunnelProcessLedgerLike {
+  record(entry: { id: string; pid: number; origin: string; createdAt: string }): Promise<void>;
+  release(id: string): Promise<void>;
+}
+
 export interface TunnelManagerDeps {
   spawnFn: TunnelSpawnFn;
   findCloudflaredPath: () => string | undefined;
@@ -343,6 +377,7 @@ export interface TunnelManagerDeps {
   maxConcurrentTunnels?: number;
   createTunnelHome?: () => Promise<string>;
   removeTunnelHome?: (directory: string) => Promise<void>;
+  processLedger?: TunnelProcessLedgerLike;
 }
 
 /**
@@ -467,6 +502,7 @@ export class TunnelManager {
     // instead of only after the wait settles on its own.
     const child = this.deps.spawnFn(cloudflaredPath, ["tunnel", "--url", tracked.origin], env);
     tracked.child = child;
+    this.recordChildProcess(tracked.id, tracked.origin, child);
     if (tracked.aborted) {
       child.kill("SIGTERM");
       await this.removeHomeSafely(homeDir);
@@ -646,6 +682,27 @@ export class TunnelManager {
     });
   }
 
+  /**
+   * Records the spawned pid so a restart can reconcile orphans, and releases
+   * the record only once a real exit is observed: a kill that never confirms
+   * keeps its entry, so the next startup still knows to hunt it down.
+   */
+  private recordChildProcess(id: string, origin: string, child: TunnelChildProcess): void {
+    const ledger = this.deps.processLedger;
+    if (!ledger || typeof child.pid !== "number") {
+      return;
+    }
+    const createdAt = (this.deps.now?.() ?? new Date()).toISOString();
+    void ledger
+      .record({ id, pid: child.pid, origin, createdAt })
+      .catch((error: unknown) => console.warn(`Unable to record preview tunnel process ${id}: ${(error as Error).message}`));
+    child.on("exit", () => {
+      void ledger
+        .release(id)
+        .catch((error: unknown) => console.warn(`Unable to release preview tunnel process record ${id}: ${(error as Error).message}`));
+    });
+  }
+
   private async removeHomeSafely(homeDir: string | undefined): Promise<void> {
     if (!homeDir) return;
     const remove = this.deps.removeTunnelHome ?? defaultRemoveTunnelHome;
@@ -681,15 +738,20 @@ async function defaultRemoveTunnelHome(directory: string): Promise<void> {
 }
 
 /**
- * cloudflared reads ~/.cloudflared for cached config/credentials; giving it
- * an empty, single-use HOME keeps it from picking up ambient Cloudflare
- * account state (and keeps it isolated from bot secrets, same as
- * minimalChildEnvironment already does for tokens).
+ * cloudflared reads ~/.cloudflared (and XDG directories on some platforms)
+ * for cached config/credentials; giving it an empty, single-use HOME and
+ * XDG tree keeps it from picking up ambient Cloudflare account state (and
+ * keeps it isolated from bot secrets, same as minimalChildEnvironment
+ * already does for tokens).
  */
-function isolatedTunnelEnvironment(homeDir: string): NodeJS.ProcessEnv {
+export function isolatedTunnelEnvironment(homeDir: string): NodeJS.ProcessEnv {
   const env = minimalChildEnvironment();
   env.HOME = homeDir;
   env.USERPROFILE = homeDir;
+  env.XDG_CONFIG_HOME = path.join(homeDir, ".config");
+  env.XDG_CACHE_HOME = path.join(homeDir, ".cache");
+  env.XDG_DATA_HOME = path.join(homeDir, ".local", "share");
+  env.XDG_STATE_HOME = path.join(homeDir, ".local", "state");
   return env;
 }
 
