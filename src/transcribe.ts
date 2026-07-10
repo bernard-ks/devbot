@@ -9,13 +9,30 @@ import { minimalChildEnvironment } from "./security.js";
 const execFileAsync = promisify(execFile);
 
 export const MAX_VOICE_SECONDS = 300;
+// Applies to every attachment (not just ones with no reported duration) and doubles as the
+// streaming download cap in downloadBoundedAttachment.
 export const MAX_FALLBACK_AUDIO_BYTES = 20 * 1024 * 1024;
 export const FFMPEG_TIMEOUT_MS = 60_000;
 export const WHISPER_TIMEOUT_MS = 120_000;
+export const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
+export const MAX_ATTACHMENT_REDIRECTS = 3;
+export const MAX_CONCURRENT_TRANSCRIPTIONS = 2;
+let activeTranscriptions = 0;
 
 export const WHISPER_BINARY_NAMES = ["whisper-cli", "whisper-cpp", "main"];
 
 const MODEL_FILE_PATTERN = /^ggml-.*\.bin$/i;
+
+export const ALLOWED_ATTACHMENT_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
+
+const AUDIO_MAGIC_CHECKS: ReadonlyArray<(head: Buffer) => boolean> = [
+  (head) => head.subarray(0, 4).toString("latin1") === "OggS",
+  (head) => head.subarray(0, 4).toString("latin1") === "RIFF" && head.subarray(8, 12).toString("latin1") === "WAVE",
+  (head) => (head[0] ?? 0) === 0x49 && (head[1] ?? 0) === 0x44 && (head[2] ?? 0) === 0x33,
+  (head) => (head[0] ?? 0) === 0xff && ((head[1] ?? 0) & 0xe0) === 0xe0,
+  (head) => head.subarray(4, 8).toString("latin1") === "ftyp",
+  (head) => (head[0] ?? 0) === 0x1a && (head[1] ?? 0) === 0x45 && (head[2] ?? 0) === 0xdf && (head[3] ?? 0) === 0xa3
+];
 
 export interface AudioAttachmentLike {
   name: string;
@@ -43,10 +60,117 @@ export function audioGateMessage(input: { durationSeconds: number | null; sizeBy
   if (typeof input.durationSeconds === "number" && input.durationSeconds > MAX_VOICE_SECONDS) {
     return `That clip is about ${Math.ceil(input.durationSeconds)}s long, over the ${MAX_VOICE_SECONDS / 60}-minute limit. Send a shorter voice note.`;
   }
-  if (input.durationSeconds == null && input.sizeBytes > MAX_FALLBACK_AUDIO_BYTES) {
+  // Enforced regardless of whether a duration was reported: a reported duration under the
+  // cap does not guarantee the underlying attachment is actually that short.
+  if (input.sizeBytes > MAX_FALLBACK_AUDIO_BYTES) {
     return `That audio file is too large to transcribe locally (${Math.round(MAX_FALLBACK_AUDIO_BYTES / (1024 * 1024))}MB limit). Send a shorter clip.`;
   }
   return undefined;
+}
+
+export function isAllowedAttachmentUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      ALLOWED_ATTACHMENT_HOSTS.has(url.hostname.toLowerCase())
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function looksLikeAudioBuffer(buffer: Buffer): boolean {
+  if (buffer.length < 12) {
+    return false;
+  }
+  const head = buffer.subarray(0, 12);
+  return AUDIO_MAGIC_CHECKS.some((check) => check(head));
+}
+
+export interface DownloadBoundedAttachmentOptions {
+  maxBytes?: number;
+  maxRedirects?: number;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * Downloads a Discord attachment while enforcing an origin allowlist on every hop (including
+ * redirects), a byte cap enforced while streaming (not just via the `content-length` header),
+ * and a bounded number of redirects.
+ */
+export async function downloadBoundedAttachment(url: string, options: DownloadBoundedAttachmentOptions = {}): Promise<Buffer> {
+  const maxBytes = options.maxBytes ?? MAX_FALLBACK_AUDIO_BYTES;
+  const maxRedirects = options.maxRedirects ?? MAX_ATTACHMENT_REDIRECTS;
+  const timeoutMs = options.timeoutMs ?? ATTACHMENT_FETCH_TIMEOUT_MS;
+  const fetchImpl = options.fetchImpl ?? fetch;
+
+  let currentUrl = url;
+  for (let redirects = 0; ; redirects++) {
+    if (!isAllowedAttachmentUrl(currentUrl)) {
+      throw new Error("The attachment URL is not from an allowed Discord media host.");
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let response: Response;
+    try {
+      response = await fetchImpl(currentUrl, { redirect: "manual", signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new Error("The attachment redirected without a location header.");
+      }
+      if (redirects >= maxRedirects) {
+        throw new Error("The attachment redirected too many times.");
+      }
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(`Failed to download the audio attachment (HTTP ${response.status}).`);
+    }
+
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      throw new Error(`Attachment exceeds the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
+    }
+
+    if (!response.body) {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.byteLength > maxBytes) {
+        throw new Error(`Attachment exceeds the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
+      }
+      return buffer;
+    }
+
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => undefined);
+          throw new Error(`Attachment exceeds the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
+        }
+        chunks.push(value);
+      }
+    }
+    return Buffer.concat(chunks);
+  }
 }
 
 export function ffmpegArgs(inputPath: string, wavPath: string): string[] {
@@ -250,16 +374,23 @@ export interface TranscribeAttachmentOptions {
 }
 
 export async function transcribeAttachment(options: TranscribeAttachmentOptions): Promise<string> {
+  if (activeTranscriptions >= MAX_CONCURRENT_TRANSCRIPTIONS) {
+    throw new Error("Devbot is at its voice transcription limit. Try again after an active transcription finishes.");
+  }
+  activeTranscriptions += 1;
   const tempDir = await mkdtemp(path.join(tmpdir(), "devbot-voice-"));
+  const runtimeHome = await mkdtemp(path.join(tmpdir(), "devbot-voice-home-"));
   try {
     const inputPath = path.join(tempDir, `input${options.sourceExtension ?? ".ogg"}`);
-    const response = await fetch(options.url);
-    if (!response.ok) {
-      throw new Error(`Failed to download the audio attachment (HTTP ${response.status}).`);
+    const audioBuffer = await downloadBoundedAttachment(options.url);
+    if (!looksLikeAudioBuffer(audioBuffer)) {
+      throw new Error("The downloaded attachment does not look like a supported audio file.");
     }
-    await writeFile(inputPath, Buffer.from(await response.arrayBuffer()));
+    await writeFile(inputPath, audioBuffer);
 
     const childEnvironment = minimalChildEnvironment();
+    childEnvironment.HOME = runtimeHome;
+    childEnvironment.USERPROFILE = runtimeHome;
     const wavPath = path.join(tempDir, "audio.wav");
     await execFileAsync(options.ffmpegBin, ffmpegArgs(inputPath, wavPath), {
       timeout: FFMPEG_TIMEOUT_MS,
@@ -275,6 +406,8 @@ export async function transcribeAttachment(options: TranscribeAttachmentOptions)
     const transcript = await readFile(`${outputBase}.txt`, "utf8");
     return transcript.trim();
   } finally {
+    activeTranscriptions -= 1;
     await rm(tempDir, { force: true, recursive: true });
+    await rm(runtimeHome, { force: true, recursive: true });
   }
 }

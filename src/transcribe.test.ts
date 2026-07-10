@@ -9,10 +9,13 @@ import {
   defaultModelDirs,
   defaultPathDirs,
   detectVoicePipeline,
+  downloadBoundedAttachment,
   ffmpegArgs,
   findBinaryInDirs,
+  isAllowedAttachmentUrl,
   isSupportedAudioAttachment,
   listModelCandidates,
+  looksLikeAudioBuffer,
   MAX_FALLBACK_AUDIO_BYTES,
   MAX_VOICE_SECONDS,
   quoteTranscript,
@@ -49,6 +52,110 @@ test("audioGateMessage enforces the five minute duration cap and a size fallback
   assert.match(audioGateMessage({ durationSeconds: MAX_VOICE_SECONDS + 1, sizeBytes: 1000 }) ?? "", /5-minute limit/);
   assert.equal(audioGateMessage({ durationSeconds: null, sizeBytes: MAX_FALLBACK_AUDIO_BYTES - 1 }), undefined);
   assert.match(audioGateMessage({ durationSeconds: null, sizeBytes: MAX_FALLBACK_AUDIO_BYTES + 1 }) ?? "", /too large/);
+});
+
+test("audioGateMessage enforces the byte cap even when a short duration is reported", () => {
+  const message = audioGateMessage({ durationSeconds: 5, sizeBytes: MAX_FALLBACK_AUDIO_BYTES + 1 });
+  assert.match(message ?? "", /too large/);
+});
+
+test("isAllowedAttachmentUrl only trusts Discord's own media hosts over https", () => {
+  assert.equal(isAllowedAttachmentUrl("https://cdn.discordapp.com/attachments/1/2/voice.ogg"), true);
+  assert.equal(isAllowedAttachmentUrl("https://media.discordapp.net/attachments/1/2/voice.ogg"), true);
+  assert.equal(isAllowedAttachmentUrl("http://cdn.discordapp.com/attachments/1/2/voice.ogg"), false);
+  assert.equal(isAllowedAttachmentUrl("https://evil.example.com/voice.ogg"), false);
+  assert.equal(isAllowedAttachmentUrl("https://cdn.discordapp.com.evil.example.com/voice.ogg"), false);
+  assert.equal(isAllowedAttachmentUrl("https://user:pass@cdn.discordapp.com/voice.ogg"), false);
+  assert.equal(isAllowedAttachmentUrl("not a url"), false);
+});
+
+test("looksLikeAudioBuffer recognizes common audio containers and rejects arbitrary bytes", () => {
+  assert.equal(looksLikeAudioBuffer(Buffer.from("OggS0000000000000")), true);
+  assert.equal(looksLikeAudioBuffer(Buffer.concat([Buffer.from("RIFF"), Buffer.from([0, 0, 0, 0]), Buffer.from("WAVEfmt ")])), true);
+  assert.equal(looksLikeAudioBuffer(Buffer.from([0x49, 0x44, 0x33, 0, 0, 0, 0, 0, 0, 0, 0, 0])), true);
+  assert.equal(looksLikeAudioBuffer(Buffer.concat([Buffer.from([0, 0, 0, 0]), Buffer.from("ftypM4A "), Buffer.from([0, 0, 0, 0])])), true);
+  assert.equal(looksLikeAudioBuffer(Buffer.from("<html><body>not audio</body></html>")), false);
+  assert.equal(looksLikeAudioBuffer(Buffer.from([1, 2, 3])), false);
+});
+
+function fakeResponse(init: {
+  status?: number;
+  headers?: Record<string, string>;
+  body?: Uint8Array[];
+}): Response {
+  const headers = new Headers(init.headers ?? {});
+  const chunks = init.body ?? [];
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    }
+  });
+  return new Response(chunks.length > 0 ? stream : null, { status: init.status ?? 200, headers });
+}
+
+test("downloadBoundedAttachment refuses hosts outside the Discord media allowlist", async () => {
+  await assert.rejects(
+    downloadBoundedAttachment("https://evil.example.com/voice.ogg", { fetchImpl: async () => fakeResponse({}) }),
+    /allowed Discord media host/
+  );
+});
+
+test("downloadBoundedAttachment follows an allowlisted redirect but rejects one that leaves the allowlist", async () => {
+  const redirectedOut = downloadBoundedAttachment("https://cdn.discordapp.com/attachments/1/2/voice.ogg", {
+    fetchImpl: async () => fakeResponse({ status: 302, headers: { location: "https://evil.example.com/voice.ogg" } })
+  });
+  await assert.rejects(redirectedOut, /allowed Discord media host/);
+
+  let calls = 0;
+  const buffer = await downloadBoundedAttachment("https://cdn.discordapp.com/attachments/1/2/voice.ogg", {
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return fakeResponse({ status: 302, headers: { location: "https://media.discordapp.net/attachments/1/2/voice.ogg" } });
+      }
+      return fakeResponse({ body: [Buffer.from("OggS")] });
+    }
+  });
+  assert.equal(buffer.toString("latin1"), "OggS");
+});
+
+test("downloadBoundedAttachment caps redirects", async () => {
+  await assert.rejects(
+    downloadBoundedAttachment("https://cdn.discordapp.com/a", {
+      maxRedirects: 1,
+      fetchImpl: async () => fakeResponse({ status: 302, headers: { location: "https://cdn.discordapp.com/b" } })
+    }),
+    /redirected too many times/
+  );
+});
+
+test("downloadBoundedAttachment rejects an oversized declared content-length before streaming", async () => {
+  await assert.rejects(
+    downloadBoundedAttachment("https://cdn.discordapp.com/a", {
+      maxBytes: 10,
+      fetchImpl: async () => fakeResponse({ headers: { "content-length": "1000" }, body: [Buffer.from("x".repeat(20))] })
+    }),
+    /exceeds the/
+  );
+});
+
+test("downloadBoundedAttachment enforces the byte cap while streaming even without a content-length header", async () => {
+  await assert.rejects(
+    downloadBoundedAttachment("https://cdn.discordapp.com/a", {
+      maxBytes: 8,
+      fetchImpl: async () => fakeResponse({ body: [Buffer.from("x".repeat(4)), Buffer.from("x".repeat(10))] })
+    }),
+    /exceeds the/
+  );
+});
+
+test("downloadBoundedAttachment returns the buffer when within the cap", async () => {
+  const buffer = await downloadBoundedAttachment("https://cdn.discordapp.com/a", {
+    maxBytes: 100,
+    fetchImpl: async () => fakeResponse({ body: [Buffer.from("hello "), Buffer.from("world")] })
+  });
+  assert.equal(buffer.toString("utf8"), "hello world");
 });
 
 test("ffmpegArgs converts to 16kHz mono wav and whisperArgs targets the model and output base", () => {
