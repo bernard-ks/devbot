@@ -59,6 +59,13 @@ import {
   transcribeErrorImages,
   type CodexRequestMode
 } from "./codex-client.js";
+import {
+  detectBackends,
+  getActiveBackendId,
+  initActiveBackend,
+  setActiveBackendId,
+  type BackendAvailability
+} from "./agent-backend.js";
 import { parseMentionRequest, parseStatusRequest, statusDetailQuestion, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natural-intent.js";
@@ -183,6 +190,7 @@ const config = loadConfig();
 const setupStore = new SetupStore(process.env.DEVBOT_SETUP_STORE?.trim() || undefined);
 const bootstrapConfig = captureBootstrapConfig(config);
 applySetupState(config, bootstrapConfig, setupStore.snapshot());
+setActiveBackendId(process.env.DEVBOT_AGENT_BACKEND?.trim() || setupStore.snapshot().agentBackendId);
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
@@ -254,6 +262,16 @@ client.once("clientReady", async () => {
     `Request routing: ${config.routing.enabled ? "enabled" : "fallback only"} ` +
       `(fast=${config.routing.fastModel ?? "default"}, standard=${config.routing.standardModel ?? "default"}, deep=${config.routing.deepModel ?? "default"}).`
   );
+  try {
+    const { activeId, availabilities } = await initActiveBackend(config.codex, {
+      envBackend: process.env.DEVBOT_AGENT_BACKEND?.trim(),
+      setupBackend: setupStore.snapshot().agentBackendId
+    });
+    const installed = availabilities.filter((backend) => backend.installed).map((backend) => backend.id);
+    console.log(`Agent backend: ${activeId} active. Detected: ${installed.length ? installed.join(", ") : "none"}.`);
+  } catch (error) {
+    console.warn(`Unable to detect coding-agent backends: ${(error as Error).message}`);
+  }
   if (verifiedPrivateRoomId && config.projects.length > 0) {
     await ensureWorkspaceLauncher(config).catch((error) => {
       console.warn(`Unable to synchronize the workspace launcher: ${publicErrorMessage(error)}`);
@@ -851,6 +869,16 @@ async function handleSetupCommand(interaction: ChatInputCommandInteraction, appC
     return;
   }
 
+  if (subcommand === "backend") {
+    const requested = interaction.options.getString("id");
+    if (requested) {
+      const state = await setupStore.setAgentBackend(requested);
+      setActiveBackendId(process.env.DEVBOT_AGENT_BACKEND?.trim() || state.agentBackendId);
+    }
+    await interaction.editReply(await formatBackendReport(appConfig, requested ?? undefined));
+    return;
+  }
+
   if (subcommand === "user") {
     const action = interaction.options.getString("action", true);
     const user = interaction.options.getUser("user", true);
@@ -1297,26 +1325,71 @@ function formatSetupSummary(state: SetupState, appConfig: AppConfig): string {
 async function formatSetupDoctor(appConfig: AppConfig): Promise<string> {
   const defaultProject = appConfig.projects.find((project) => project.isDefault);
   const repoReady = defaultProject ? Boolean((await stat(defaultProject.root).catch(() => undefined))?.isDirectory()) : false;
-  const codexReady = path.isAbsolute(appConfig.codex.bin)
-    ? Boolean((await stat(appConfig.codex.bin).catch(() => undefined))?.isFile())
-    : Boolean(appConfig.codex.bin);
+  const backends = await detectBackends(appConfig.codex).catch(() => [] as BackendAvailability[]);
+  const activeBackendId = getActiveBackendId();
+  const activeBackend = backends.find((backend) => backend.id === activeBackendId);
+  const backendReady = Boolean(activeBackend?.installed && activeBackend.compatible);
+  const answerReadOnly = activeBackend ? activeBackend.capabilities.enforcesAnswerReadOnly : true;
+  const actionConfined = activeBackend ? activeBackend.capabilities.confinesActionWorkspace : true;
   const checks = [
     [Boolean(appConfig.ownerUserId), "Owner identity", "Set DEVBOT_OWNER_USER_ID locally and restart."],
     [Boolean(effectivePrivateRoomId()), "Private room", "Run /setup wizard and choose Use private room."],
     [repoReady, "Default repository", "Add or repair a repository in /setup wizard."],
-    [codexReady, "Codex executable", "Set CODEX_BIN to an installed Codex CLI."],
+    [backendReady, `Agent backend (${activeBackendId})`, activeBackend?.compatibilityError ?? "Install the selected agent CLI or pick another with /setup backend."],
+    [answerReadOnly, `Read-only answers (${activeBackendId})`, "This backend cannot guarantee read-only /ask runs; switch to codex or claude with /setup backend."],
+    [actionConfined, `Workspace-confined actions (${activeBackendId})`, "This backend cannot confine /do writes to the task workspace; switch to codex with /setup backend."],
     [appConfig.routing.enabled && Boolean(appConfig.routing.fastModel && appConfig.routing.standardModel && appConfig.routing.deepModel), "Luna / Terra / Sol routing", "Check CODEX_ROUTER_MODEL and tier model settings."],
     [slashCommandsReady || !appConfig.autoDeployCommands, "Slash commands", "Restart Devbot or run npm run commands:deploy."]
   ] as const;
   const passed = checks.filter(([ready]) => ready).length;
+  const backendSummary = backends.length
+    ? backends.map((backend) => `${backend.id === activeBackendId ? "*" : "-"} ${backend.id}: ${backend.installed ? backend.version ?? "installed" : "not installed"}${backend.experimental ? " (experimental)" : ""}${backend.capabilities.enforcesAnswerReadOnly ? "" : " (no read-only /ask)"}${backend.capabilities.confinesActionWorkspace ? "" : " (no /do actions)"}${backend.installed && !backend.compatible ? " (execution disabled)" : ""}`)
+    : ["- backend detection unavailable"];
   return [
     "Devbot doctor",
     `Readiness: ${passed}/${checks.length}`,
     "",
     ...checks.map(([ready, label, fix]) => `${ready ? "READY" : "FIX"}  ${label}${ready ? "" : ` - ${fix}`}`),
     "",
+    "Coding-agent backends:",
+    ...backendSummary,
+    "",
     passed === checks.length ? "Ready. Ask with @devbot, change with /do, and check with /status." : "No changes were made. Resolve FIX items, then run /setup doctor again."
   ].join("\n");
+}
+
+function formatBackendLine(backend: BackendAvailability, activeId: string): string {
+  const marker = backend.id === activeId ? "ACTIVE " : "       ";
+  const status = backend.installed ? backend.version ?? "installed" : "not installed";
+  const tags = [
+    backend.experimental ? "experimental" : "",
+    backend.capabilities.enforcesAnswerReadOnly ? "" : "no read-only /ask",
+    backend.capabilities.confinesActionWorkspace ? "" : "no /do actions",
+    backend.installed && !backend.compatible ? backend.compatibilityError ?? "execution disabled" : "",
+    backend.error && !backend.installed ? backend.error : ""
+  ].filter(Boolean);
+  return `${marker}${backend.id} (${backend.displayName}): ${status}${tags.length ? ` [${tags.join("; ")}]` : ""}`;
+}
+
+async function formatBackendReport(appConfig: AppConfig, requested?: string): Promise<string> {
+  const availabilities = await detectBackends(appConfig.codex);
+  const activeId = getActiveBackendId();
+  const envForced = process.env.DEVBOT_AGENT_BACKEND?.trim();
+  const active = availabilities.find((backend) => backend.id === activeId);
+  const lines = [
+    "Devbot coding-agent backends",
+    `Active: ${activeId}${active && !active.installed ? " (selected but not detected on this machine)" : ""}`,
+    "",
+    ...availabilities.map((backend) => formatBackendLine(backend, activeId)),
+    "",
+    "Selection order: DEVBOT_AGENT_BACKEND env, then /setup backend. Only codex is auto-selected; every other backend requires an explicit choice here."
+  ];
+  if (requested && envForced && envForced.toLowerCase() !== requested.toLowerCase()) {
+    lines.push(`Saved ${requested}, but DEVBOT_AGENT_BACKEND=${envForced} overrides it until the env var is cleared.`);
+  } else if (requested) {
+    lines.push(`Active backend set to ${requested}.`);
+  }
+  return lines.join("\n");
 }
 
 function formatSetupMentions(ids: string[]): string {
@@ -5282,6 +5355,7 @@ async function runCodex(
     mode,
     ...(route.model ? { model: route.model } : {}),
     ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
+    tier: route.tier,
     contextMode: route.contextMode,
     ...(signal ? { signal } : {})
   });

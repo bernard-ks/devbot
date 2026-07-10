@@ -141,6 +141,7 @@ test("slash schema exposes owner setup and optional default-project commands", (
     "wizard",
     "doctor",
     "show",
+    "backend",
     "user",
     "devbot",
     "repo",

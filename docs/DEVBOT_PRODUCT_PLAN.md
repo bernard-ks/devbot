@@ -31,7 +31,8 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Discord application creation and bot-token retrieval remain the only required Developer Portal step.
 - Discord slash commands:
   - `/setup wizard` provides resumable owner setup for viewers, controllers, peer bots, a private room, and runtime project roots.
-  - `/setup doctor` diagnoses the complete local and Discord setup path.
+  - `/setup doctor` diagnoses the complete local and Discord setup path, including detected coding-agent backends.
+  - `/setup backend` lists detected coding agents with versions and selects the active one.
   - `/projects` lists configured local projects.
   - `/status` reports a decision-ready brief: confirmed bot work and phases, external runs, activity-unknown app sessions, repository evidence, risks, and a recommended next step.
   - `/status image:true` can attach a live local UI screenshot when a web dev server is detected.
@@ -60,6 +61,11 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Ignores dependency/build folders and common secret files.
   - Redacts secret-looking values from indexed text.
   - Ranks local files against the user request before building the Codex prompt.
+- Bring-your-own coding-agent backends:
+  - Pluggable executor abstraction with Codex CLI as the default and reference backend (unchanged flags) and Claude Code as an opt-in, answers-only alternative.
+  - Selection is explicit: `DEVBOT_AGENT_BACKEND`, then the `/setup backend` choice; only Codex is ever auto-selected, so an incidentally installed CLI never becomes the executor.
+  - Every backend declares an explicit, tested capability contract (environment policy, user-config/plugin isolation, network behavior, read-only enforcement, action-workspace confinement, cancellation, prompt/output transport, image input) and inherits Codex's hardening: a minimal child environment that never carries Devbot secrets and admits only exact named keys (no prefix admission), and prompts delivered over stdin rather than argv.
+  - Both modes are fail-closed from the capability contract: a backend that cannot guarantee read-only refuses answer mode, and a backend that cannot confine writes to the task workspace refuses action mode (Claude answers run under `--safe-mode` with a read-only tool allow list; only Codex runs actions). Screenshot transcription is fail-closed the same way: a request carrying image paths is refused unless the active backend declares `acceptsImageInput`, so a backend whose command builder does not actually forward the image (only Codex does today) can never be asked to inspect one it never receives. Gemini CLI and opencode are detection-only until they pass real-CLI verification; they never execute. Claude compatibility is probed against `--help` for every required safety flag, and Luna / Terra / Sol tiers map to a backend's own model when configured.
 - Local Codex execution:
   - Uses the installed Codex CLI/app session instead of OpenAI API keys.
   - Supports read-only answer mode and workspace-write action mode.
@@ -287,7 +293,7 @@ MVP multi-bot flow:
 - Add bot capability passports and evidence-backed trust levels.
 - Add an experiment arena that compares isolated implementations and independent evaluation.
 - Add provenance-backed team memory and cross-repository contract negotiation.
-- Add adapters for coding agents beyond the local Codex runtime.
+- Add adapters for coding agents beyond the local Codex runtime. Delivered so far: the pluggable backend contract with Codex (answers and actions, unchanged) and opt-in Claude Code read-only answers; Gemini CLI and opencode are detection-only placeholders. Future work is real-CLI verification for the placeholder adapters, action-workspace confinement beyond Codex, and deeper per-backend model routing.
 
 ## Near-Term Backlog
 

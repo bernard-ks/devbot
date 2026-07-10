@@ -74,6 +74,38 @@ export function minimalChildEnvironment(
 }
 
 /**
+ * Devbot secrets must never reach a third-party CLI even if a backend allow list
+ * were misconfigured, so these prefixes are stripped unconditionally.
+ */
+const NEVER_FORWARD_PREFIXES = ["DISCORD", "DEVBOT"] as const;
+
+/**
+ * Builds a minimal child environment and then re-admits only exact, documented
+ * authentication/config variable names a specific backend needs. Prefix
+ * admission is deliberately unsupported: every forwarded key must be named, so
+ * an unrelated secret that happens to share a provider prefix can never cross
+ * the boundary. Devbot's own credentials can never be forwarded: the
+ * sensitive-name filter still applies to core keys, and the Discord/Devbot
+ * prefixes are always dropped even from the allow list.
+ */
+export function scopedChildEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+  allowedExactKeys: readonly string[] = []
+): NodeJS.ProcessEnv {
+  const output = minimalChildEnvironment(environment, "project");
+  const exact = new Set(allowedExactKeys.map((key) => key.toUpperCase()));
+  for (const [key, value] of Object.entries(environment)) {
+    if (value === undefined) continue;
+    const normalized = key.toUpperCase();
+    if (NEVER_FORWARD_PREFIXES.some((prefix) => normalized.startsWith(prefix))) continue;
+    if (exact.has(normalized)) {
+      output[key] = value;
+    }
+  }
+  return output;
+}
+
+/**
  * Git must not inherit bot credentials or execute ambient user helpers. These
  * overrides keep repository inspection non-interactive and disable hooks,
  * filesystem monitors, signing programs, pagers, and external diff commands.

@@ -8,7 +8,19 @@ The everyday model is intentionally small:
 - **Do:** approve a proposal, use the private task workroom, or use `/do` for an intentional project change.
 - **Check:** use `/status` to see what is happening.
 
-Devbot uses your signed-in local Codex CLI or app session and does not need a separate OpenAI API key or hosted Devbot backend. Selected project context is handled through that Codex session; Discord messages still travel through Discord.
+Devbot uses your signed-in local Codex CLI or app session and does not need a separate OpenAI API key or hosted Devbot backend. Selected project context is handled through that session; Discord messages still travel through Discord.
+
+## Works with your agent
+
+Devbot is the Discord front-end for whichever coding agent you already run locally. The executor is pluggable, so the same Ask / Do / Check workflow drives any of these command-line agents:
+
+- **Codex CLI** (`codex`) — the default and reference backend, and the only one Devbot ever selects automatically; behavior is unchanged from earlier releases. This is currently the only backend that runs `/do` actions, because its sandbox confines writes to the task workspace.
+- **Claude Code** (`claude`) — answers only, after an explicit opt-in (`/setup backend id:claude` or `DEVBOT_AGENT_BACKEND=claude`). Read-only answers run with `--safe-mode` (the CLI's documented switch that disables CLAUDE.md, hooks, plugins, skills, MCP servers, and other user customization), `plan` permission mode, a read-only tool allow list plus a write/network tool denylist, `--strict-mcp-config`, `--no-session-persistence`, and an isolated empty `HOME` (credentials still resolve through the real `CLAUDE_CONFIG_DIR`). The Claude CLI has no supported flag that confines filesystem writes to a single directory (`--add-dir` only grants extra access), so `/do` actions fail closed on this backend. Detection probes `claude --help` for every safety flag above and refuses to run an older CLI that would silently ignore them.
+- **Gemini CLI** (`gemini`) and **opencode** (`opencode`) — experimental and detection-only. Devbot lists them in `/setup backend`, but neither has passed a real-CLI verification of read-only answers or workspace-confined actions, so both `/ask` and `/do` fail closed and no process is ever spawned for them.
+
+Every executable backend runs under the same hardening Devbot applies to Codex: a minimal child environment (never `process.env`, so `DISCORD_TOKEN` and other Devbot secrets can never reach a third-party CLI — only exact, individually named auth variables are forwarded, with no prefix-based admission), and the prompt delivered over stdin so it never appears in process listings. Both modes are fail-closed capabilities: a backend that cannot guarantee a read-only run refuses answer mode, and a backend that cannot confine writes to the task workspace refuses action mode.
+
+Devbot picks a backend in this order: the `DEVBOT_AGENT_BACKEND` environment variable, then the `/setup backend` choice. Nothing else is automatic — if neither is set, Devbot uses Codex, so an incidentally installed CLI can never become the executor by mere presence. The Luna / Terra / Sol tiers map to a backend's own fast / balanced / deep model whenever you configure one (for example `DEVBOT_CLAUDE_DEEP_MODEL`). Run `/setup backend` to see detected agents and versions, or `/setup doctor` for the full readiness view, which gates on answer and action readiness for the active backend.
 
 ## One-Command Setup
 
@@ -229,7 +241,7 @@ The safety boundary is deliberate: peer bots can ask, observe, plan, review, and
 
 ## Security Boundaries
 
-- Discord-launched Codex processes receive a minimal environment without the bot token or application credentials. Prompts are sent over standard input instead of command-line arguments, user config and rules are ignored, optional tools are disabled, and `danger-full-access` is rejected.
+- Discord-launched agent processes — Codex and every alternative backend — receive a minimal environment without the bot token or application credentials; only exact, individually named auth/config variables are forwarded (prefix-based admission is not supported), and `DISCORD_*` / `DEVBOT_*` variables are dropped unconditionally. Prompts are sent over standard input instead of command-line arguments so they never surface in process listings. For Codex, user config and rules are ignored, optional tools are disabled, and `danger-full-access` is rejected. Claude answers run under `--safe-mode`, `plan` permissions, a read-only tool allow list, `--strict-mcp-config`, and an isolated `HOME`. Any backend that cannot guarantee a read-only run refuses answer mode, any backend that cannot confine writes to the task workspace refuses action mode, and unverified adapters (currently Gemini CLI and opencode) are never executed at all.
 - Git inspection and isolated-worktree operations run without inherited credentials, hooks, signing, filesystem monitors, pagers, or external diff helpers. Repositories with locally configured checkout filters are refused before a worktree is created.
 - Retained isolated worktrees are capped at 100 by default so abandoned task branches cannot grow without bound; remove reviewed worktrees before starting more. `/task freshness` and `/task show` detect task branches that are fully merged into the local default branch and mark their worktrees as eligible for that cleanup.
 - `/task sync` rewrites only the isolated task branch, never the source checkout. The pre-sync tip is preserved under an exact-format `refs/devbot/backup/<task-id>` ref before the rebase, conflicts are never auto-resolved, and a conflicted or failed sync restores the branch and reports honestly.
@@ -255,7 +267,7 @@ By default:
 
 - `/ask` uses `CODEX_SANDBOX=read-only`.
 - `/do` uses `CODEX_ACTION_SANDBOX=workspace-write`.
-- Discord-triggered Codex runs reject `danger-full-access`, receive a minimal credential-free child environment, and take prompts over stdin rather than process arguments.
+- Discord-triggered agent runs (any backend) receive a minimal credential-free child environment and take prompts over stdin rather than process arguments; Codex additionally rejects `danger-full-access`, non-Codex backends refuse any mode they cannot enforce (read-only for answers, workspace confinement for actions), and unverified backends never execute.
 - Local task, setup, peer, collaboration, preference, and runtime state use owner-only files; active task and collaboration directories are hardened to owner-only access on supported systems.
 
 Defaults are conservative:
