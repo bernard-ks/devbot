@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { redactSensitiveText } from "./security.js";
 import type { IntakeRecord, IntakeStatus } from "./intake-store.js";
 
@@ -239,6 +240,48 @@ export interface IntakeReproAssessment {
   evidence: string;
 }
 
+export interface DeterministicReproInput {
+  reportText: string;
+  evidence: readonly string[];
+  contextSnippets: string;
+}
+
+const RUNTIME_ERROR_EVIDENCE = /^(console error|failed request|bad response)/i;
+const NO_SNIPPETS_PATTERN = /^no project snippets/i;
+
+/**
+ * The genuinely tool-less repro boundary: a deterministic, model-free verdict
+ * over the report text, the already-redacted automated evidence lines, and the
+ * preselected bounded project snippets. Nothing here starts an agent, runs a
+ * command, or reads a file — so prompt-injected report content has no tool with
+ * which to inspect anything outside this fixed input, which is the boundary the
+ * `completeCodexPrompt` path could not actually guarantee.
+ */
+export function assessIntakeReproDeterministic(input: DeterministicReproInput): IntakeReproAssessment {
+  const runtimeErrors = input.evidence.filter((line) => RUNTIME_ERROR_EVIDENCE.test(line.trim()));
+  const snippets = input.contextSnippets ?? "";
+  const hasSnippets = snippets.trim().length > 0 && !NO_SNIPPETS_PATTERN.test(snippets.trim());
+  const errorSignature = extractErrorSignature(input.reportText);
+  const errorType = errorSignature ? errorSignature.split(" ")[0] : undefined;
+  const signatureInCode = Boolean(errorType) && snippets.toLowerCase().includes((errorType ?? "").toLowerCase());
+
+  if (runtimeErrors.length > 0) {
+    return finalizeAssessment("confirmed", `Automated read-only capture recorded a runtime failure: ${runtimeErrors[0]}`);
+  }
+  if (signatureInCode) {
+    return finalizeAssessment("confirmed", `Reported error "${errorType}" appears in the preselected project snippets.`);
+  }
+  if (hasSnippets) {
+    return finalizeAssessment("unconfirmed", "Report matched project code, but no automated evidence reproduced the failure.");
+  }
+  return finalizeAssessment("needs-info", "No project snippets matched the report and no automated evidence was captured.");
+}
+
+function finalizeAssessment(status: IntakeReproStatus, evidence: string): IntakeReproAssessment {
+  const clean = redactSensitiveText(evidence).replace(/\s+/g, " ").trim();
+  return { status, evidence: clean ? clean.slice(0, 600) : "No evidence text was available." };
+}
+
 export function parseReproResponse(raw: string): IntakeReproAssessment {
   const statusMatch = raw.match(/status\s*:\s*(confirmed|unconfirmed|needs-info)/i);
   let status: IntakeReproStatus;
@@ -331,7 +374,19 @@ export function extractRouteSignature(text: string): string | undefined {
   return (trimmed || "/").toLowerCase();
 }
 
+/**
+ * Groups reports of the same error or route, then hashes the grouping key so the
+ * persisted signature never carries raw report text. Two differently-worded
+ * reports of the same failure still collide (same semantic key → same hash), but
+ * secret-shaped content in the raw `text:` fallback can no longer land in the
+ * JSON state file.
+ */
 export function normalizeReportSignature(text: string): string {
+  const semantic = rawReportSignatureKey(text);
+  return `sig:${createHash("sha256").update(semantic).digest("hex").slice(0, 32)}`;
+}
+
+function rawReportSignatureKey(text: string): string {
   const errorSignature = extractErrorSignature(text);
   if (errorSignature) {
     return `error:${errorSignature}`;

@@ -8,9 +8,11 @@ import {
   PRIVATE_FILE_MODE,
   redactSensitiveText
 } from "./security.js";
+import { applyIntakeRateLimit } from "./intake.js";
 
 const INTAKE_RECORD_ID_PATTERN = /^intake-[a-z0-9-]{1,64}$/i;
 const MAX_TEXT_LENGTH = 4_000;
+const MAX_SIGNATURE_LENGTH = 200;
 const MAX_EVIDENCE_ENTRIES = 10;
 const MAX_EVIDENCE_LENGTH = 400;
 
@@ -150,7 +152,7 @@ export class IntakeStore {
         authorTag: input.authorTag,
         projectName: input.projectName,
         text: boundText(input.text),
-        signature: input.signature,
+        signature: boundSignature(input.signature),
         status: input.status,
         evidence: boundEvidenceList(input.evidence ?? []),
         ...(input.screenshotUrl ? { screenshotUrl: input.screenshotUrl } : {}),
@@ -215,11 +217,24 @@ export class IntakeStore {
     return match ? cloneRecord(match) : undefined;
   }
 
-  /** Finds the open "incomplete" record whose follow-up prompt is `promptMessageId`, used to correlate a reporter's reply without spending another rate-limit slot. */
-  async findByFollowupPrompt(promptMessageId: string): Promise<IntakeRecord | undefined> {
+  /**
+   * Finds the open "incomplete" record whose follow-up prompt is
+   * `promptMessageId`, but only when the reply comes from the same reporter in
+   * the same channel that opened the report. Binding to reporter + channel +
+   * prompt stops another user from answering a victim's prompt to bypass quota
+   * or overwrite the report under the victim's identity.
+   */
+  async findByFollowupPrompt(
+    promptMessageId: string,
+    binding: { authorId: string; channelId: string }
+  ): Promise<IntakeRecord | undefined> {
     const state = await this.readState();
     const match = state.records.find(
-      (item) => item.status === "incomplete" && item.followupPromptMessageId === promptMessageId
+      (item) =>
+        item.status === "incomplete" &&
+        item.followupPromptMessageId === promptMessageId &&
+        item.authorId === binding.authorId &&
+        item.channelId === binding.channelId
     );
     return match ? cloneRecord(match) : undefined;
   }
@@ -248,6 +263,31 @@ export class IntakeStore {
     await this.mutate((state) => {
       state.rateLimits[channelId] = { userHits: { ...bucket.userHits }, channelHits: [...bucket.channelHits] };
       return undefined;
+    });
+  }
+
+  /**
+   * Atomically reserves one rate-limit slot: the check and the increment happen
+   * inside a single serialized mutation, so two concurrent reports cannot both
+   * read the same bucket, both pass, and then have one write clobber the other.
+   * The hit is persisted only when the attempt is allowed; a blocked attempt
+   * leaves the bucket untouched so a lockout never extends itself.
+   */
+  async reserveRateLimitSlot(
+    channelId: string,
+    userId: string,
+    now = Date.now()
+  ): Promise<{ limited: boolean; scope?: "user" | "channel" }> {
+    return this.mutate((state) => {
+      const bucket = state.rateLimits[channelId] ?? { userHits: {}, channelHits: [] };
+      const result = applyIntakeRateLimit(bucket, userId, now);
+      if (!result.limited) {
+        state.rateLimits[channelId] = {
+          userHits: { ...result.state.userHits },
+          channelHits: [...result.state.channelHits]
+        };
+      }
+      return result.scope ? { limited: result.limited, scope: result.scope } : { limited: result.limited };
     });
   }
 
@@ -330,7 +370,7 @@ export class IntakeStore {
 function applyIntakeUpdate(record: IntakeRecord, patch: IntakeUpdate): void {
   if (patch.status !== undefined) record.status = patch.status;
   if (patch.text !== undefined) record.text = boundText(patch.text);
-  if (patch.signature !== undefined) record.signature = patch.signature;
+  if (patch.signature !== undefined) record.signature = boundSignature(patch.signature);
   if (patch.evidence !== undefined) record.evidence = boundEvidenceList(patch.evidence);
   if (patch.screenshotUrl !== undefined) record.screenshotUrl = patch.screenshotUrl;
   if (patch.duplicateOfId !== undefined) record.duplicateOfId = patch.duplicateOfId;
@@ -344,6 +384,16 @@ function applyIntakeUpdate(record: IntakeRecord, patch: IntakeUpdate): void {
 
 function boundText(value: string): string {
   return redactSensitiveText(value).slice(0, MAX_TEXT_LENGTH);
+}
+
+/**
+ * Signatures are hashed by `normalizeReportSignature` before they reach the
+ * store, but this is the persistence-layer backstop: any signature — including
+ * a legacy or directly-supplied one — is redacted and length-capped so no
+ * secret-shaped input can survive raw in the JSON state file.
+ */
+function boundSignature(value: string): string {
+  return redactSensitiveText(value).replace(/\s+/g, " ").trim().slice(0, MAX_SIGNATURE_LENGTH);
 }
 
 function boundEvidenceList(evidence: string[]): string[] {
@@ -397,7 +447,7 @@ function normalizeLoadedIntakeRecord(value: unknown): IntakeRecord | undefined {
     authorTag: record.authorTag,
     projectName: record.projectName,
     text: boundText(record.text),
-    signature: record.signature,
+    signature: boundSignature(record.signature),
     status,
     evidence: Array.isArray(record.evidence) ? boundEvidenceList(record.evidence.filter((line): line is string => typeof line === "string")) : [],
     ...(stringValue(record.screenshotUrl) ? { screenshotUrl: stringValue(record.screenshotUrl)! } : {}),

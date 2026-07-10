@@ -243,3 +243,47 @@ review's own acceptance terms, plus test coverage the review explicitly asked fo
 
 **Verification:** `npm test` — 151/151 green (+6 tests); `npm run build` and
 `npx tsc -p tsconfig.json --noEmit` clean; `git diff --check` clean.
+
+## Review round 2
+
+Rebased onto `main` (`45d8833`: security hardening #10, screenshot-to-fix #16, branch
+freshness #30). Additive conflicts resolved keeping both sides (new `intakeStore`, the
+`isAccessSubjectAllowed`/`isAllowedByProjectPolicy` access helpers, the screenshot-fix and
+intake button handlers side by side, and the `codex-client` import union). Each numbered
+item below maps to one of bernard's four public-input blockers.
+
+1. **Follow-up correlation now binds reporter + channel + prompt.** `findByFollowupPrompt`
+   (`src/intake-store.ts:227`) takes `{ authorId, channelId }` and only correlates a reply
+   from the same reporter in the same channel that opened the report, so another user can no
+   longer answer a victim's prompt to bypass quota or overwrite the report under the victim's
+   identity. Wired at `src/index.ts:5665`. Tests: cross-user and cross-channel rejection in
+   `src/intake.test.ts` ("intake follow-up correlation is bound to the original reporter and
+   channel").
+
+2. **Rate-limit reservation is atomic.** `IntakeStore.reserveRateLimitSlot`
+   (`src/intake-store.ts:276`) runs the check and the increment inside one serialized `mutate`,
+   mirroring `transitionStatus`'s compare-and-set. The handler's read/check/write sequence is
+   replaced by the single call at `src/index.ts:5681`. Test: concurrent reservations each
+   persist a distinct hit in `src/intake.test.ts` ("intake reserveRateLimitSlot is atomic").
+
+3. **Repro boundary is now genuinely tool-less (deterministic parser).** `completeCodexPrompt`
+   and the temp-cwd dance are removed from the intake path. `assessIntakeReproDeterministic`
+   (`src/intake.ts:260`) produces the confirmed/unconfirmed/needs-info verdict with pure string
+   checks over the preselected bounded snippets, the redacted automated evidence, and the
+   report text — no Codex process, so injected report content has no shell tools or host view.
+   Wired at `src/index.ts:5752`. Test: injection payload cannot change the verdict or leak into
+   evidence in `src/intake.test.ts` ("deterministic repro judges from fixed input only").
+
+4. **Signatures are hashed before persistence.** `normalizeReportSignature`
+   (`src/intake.ts`) groups by error/route as before, then SHA-256-hashes the grouping key to
+   `sig:<32 hex>`, so the raw `text:` fallback never reaches the state file while dedup still
+   collides. Persistence-layer backstop `boundSignature` (`src/intake-store.ts`) redacts and
+   caps any signature on add/update/load. Test: a secret-shaped signature never survives raw in
+   the JSON file in `src/intake.test.ts` ("intake store never persists a secret-shaped
+   signature raw").
+
+**Verification:** `npm run build` clean; `npm test` — 221 tests, 219 deterministic pass (+4
+intake tests, 37/37 in `intake.test.ts`). The remaining 2 are the pre-existing
+`security.test.ts` child-process cases with the hardcoded 5s timeout (untouched by this lane):
+under the machine's current load average of ~10-13 they time out, and pass 11/11 when the file
+is rerun in isolation (observed green on 2 of 3 solo reruns).

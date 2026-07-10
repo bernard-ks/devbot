@@ -21,8 +21,8 @@ import type {
   StringSelectMenuInteraction,
   UserSelectMenuInteraction
 } from "discord.js";
-import { mkdtemp, rm, stat } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { isAccessSubjectAllowed, isAllowedByProjectPolicy, isApprovedDiscordUsername } from "./access.js";
 import {
@@ -53,7 +53,6 @@ import { loadConfig, normalizeProjectName } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import {
   answerWithProjectContext,
-  completeCodexPrompt,
   locateErrorInProject,
   parseLocateResponse,
   parseTranscription,
@@ -133,15 +132,13 @@ import {
   type IntakeControlAction
 } from "./intake-controls.js";
 import {
-  applyIntakeRateLimit,
   askReporterFollowup,
+  assessIntakeReproDeterministic,
   attachmentsUnsupportedNote,
   boundEvidence,
-  buildReproQuestion,
   buildTriageCard,
   chooseIntakeDeliveryRoom,
   classifyIntakeReport,
-  createConcurrencyLimiter,
   INTAKE_CHANNEL_LIMIT,
   INTAKE_TRIGGER_PREFIX,
   INTAKE_USER_LIMIT,
@@ -152,7 +149,6 @@ import {
   normalizeReportSignature,
   OPEN_INTAKE_STATUSES,
   parseIntakeTrigger,
-  parseReproResponse,
   recordedWithoutDeliveryReply,
   type IntakeReproStatus
 } from "./intake.js";
@@ -232,7 +228,6 @@ const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefin
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const screenshotFixStore = new ScreenshotFixStore(process.env.DEVBOT_SNAPFIX_STORE?.trim() || undefined);
 const intakeStore = new IntakeStore(process.env.DEVBOT_INTAKE_STORE?.trim() || undefined);
-const intakeCodexGate = createConcurrencyLimiter(1);
 const INTAKE_MAX_CONTEXT_CHARS = 8_000;
 const activeTaskControllers = new Map<string, AbortController>();
 const activeTaskActions = new Set<string>();
@@ -5843,8 +5838,16 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
 
   // A reply to Devbot's own "need more detail" prompt continues the same report instead of
   // spending another rate-limit slot on what is really one bug report split across messages.
+  // The follow-up is bound to the original reporter and channel (and its still-authorized
+  // intake channel here), so another user cannot answer a victim's prompt to skip quota or
+  // overwrite the report under the victim's identity.
   const referencedMessageId = message.reference?.messageId;
-  const followupOf = referencedMessageId ? await intakeStore.findByFollowupPrompt(referencedMessageId) : undefined;
+  const followupOf = referencedMessageId
+    ? await intakeStore.findByFollowupPrompt(referencedMessageId, {
+        authorId: message.author.id,
+        channelId: message.channelId
+      })
+    : undefined;
 
   // Ordinary chatter never reaches the pipeline: a new report needs the explicit trigger
   // prefix, and only the trigger (or a correlated follow-up reply) spends any quota.
@@ -5854,15 +5857,14 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
   }
 
   if (!followupOf) {
-    const now = Date.now();
-    const limitState = await intakeStore.getRateLimitState(message.channelId);
-    const limit = applyIntakeRateLimit(limitState, message.author.id, now);
-    if (limit.limited) {
-      // Deliberately not persisted: attempts made while limited never extend the lockout.
+    // Atomic reserve: the check and the increment happen inside one serialized store
+    // mutation, so two concurrent reports cannot both pass and then lose an increment.
+    const reservation = await intakeStore.reserveRateLimitSlot(message.channelId, message.author.id);
+    if (reservation.limited) {
+      // Blocked attempts leave the bucket untouched, so a lockout never extends itself.
       await message.react("⏳").catch(() => undefined);
       return;
     }
-    await intakeStore.setRateLimitState(message.channelId, limit.state);
   }
 
   await message.react("👀").catch(() => undefined);
@@ -5922,27 +5924,13 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
 
   let assessment: { status: IntakeReproStatus; evidence: string };
   try {
-    // The report can steer which snippets rank into the small bounded window, but never past
-    // it — and the model itself runs tool-less in an empty directory outside the project, so
-    // public text never gets an agent with repository access, only these preselected snippets
-    // and redacted evidence. A dedicated low-concurrency gate keeps public reports from
-    // crowding out owner Codex work.
+    // Genuinely tool-less: the report can steer which snippets rank into the small bounded
+    // window, but the verdict is a deterministic, model-free judgement over exactly those
+    // preselected snippets, the redacted automated evidence, and the report text. No Codex
+    // process is started, so prompt-injected report content has no shell tools or read-only
+    // host view with which to inspect anything outside this fixed input.
     const packed = await contextService.pack(project, reportText, [], INTAKE_MAX_CONTEXT_CHARS);
-    const neutralDirectory = await mkdtemp(path.join(tmpdir(), "devbot-intake-"));
-    try {
-      const raw = await intakeCodexGate.run(() =>
-        completeCodexPrompt({
-          codex: appConfig.codex,
-          prompt: buildReproQuestion(reportText, evidence, packed.packedText),
-          cwd: neutralDirectory,
-          sandbox: "read-only",
-          skipGitRepoCheck: true
-        })
-      );
-      assessment = parseReproResponse(raw);
-    } finally {
-      await rm(neutralDirectory, { force: true, recursive: true });
-    }
+    assessment = assessIntakeReproDeterministic({ reportText, evidence, contextSnippets: packed.packedText });
   } catch (error) {
     console.warn(`Intake repro assessment failed: ${(error as Error).message}`);
     assessment = { status: "needs-info", evidence: "Automated repro assessment failed to run." };
