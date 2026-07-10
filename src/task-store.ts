@@ -45,6 +45,7 @@ export interface TaskRecord {
   branchName?: string;
   baseBranch?: string;
   workspaceIsolated?: boolean;
+  worker?: TaskWorkerIdentity;
   branchMerged?: boolean;
   changedFiles?: string[];
   diffStat?: string;
@@ -73,6 +74,19 @@ export interface TaskRecord {
 
 export interface TaskCaptureInput {
   captureNote?: string;
+}
+
+/**
+ * Durable identity of the detached worker process a running action task spawned.
+ * A bare pid is never trusted on its own: restart recovery only treats a pid as
+ * the same worker when its kernel start time and command still match, so a
+ * recycled pid can never masquerade as a live worker (or a live worker be
+ * mistaken for a terminated one).
+ */
+export interface TaskWorkerIdentity {
+  pid: number;
+  startedAt: string;
+  command: string;
 }
 
 export interface TaskCheckpoint {
@@ -250,6 +264,20 @@ export class TaskStore {
       updated = cloneTask(task);
     });
     return updated;
+  }
+
+  /**
+   * Persists the identity of the detached worker a running action task spawned,
+   * so a later runtime (after a crash) can probe whether that exact worker is
+   * still alive before it trusts the worktree enough to hash it for Undo.
+   */
+  async recordWorker(id: string, worker: TaskWorkerIdentity): Promise<void> {
+    if (!Number.isSafeInteger(worker.pid) || worker.pid <= 0 || !worker.startedAt.trim() || !worker.command.trim()) {
+      return;
+    }
+    await this.update(id, (task) => {
+      task.worker = { pid: worker.pid, startedAt: worker.startedAt, command: worker.command };
+    });
   }
 
   async setBranchSync(id: string, input: TaskBranchSyncUpdate): Promise<TaskRecord | undefined> {
@@ -640,13 +668,14 @@ function createTaskRecord(input: StartTaskInput, status: TaskStatus, now: string
 }
 
 function cloneTask(task: TaskRecord): TaskRecord {
-  const { agentRoles, changedFiles, verification, ...base } = task;
+  const { agentRoles, changedFiles, verification, worker, ...base } = task;
   return {
     ...base,
     includePatterns: [...task.includePatterns],
     ...(agentRoles ? { agentRoles: [...agentRoles] } : {}),
     ...(changedFiles ? { changedFiles: [...changedFiles] } : {}),
-    ...(verification ? { verification: [...verification] } : {})
+    ...(verification ? { verification: [...verification] } : {}),
+    ...(worker ? { worker: { ...worker } } : {})
   };
 }
 
@@ -708,6 +737,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
     ...(stringValue(task.branchName) ? { branchName: stringValue(task.branchName)! } : {}),
     ...(stringValue(task.baseBranch) ? { baseBranch: stringValue(task.baseBranch)! } : {}),
     ...(typeof task.workspaceIsolated === "boolean" ? { workspaceIsolated: task.workspaceIsolated } : {}),
+    ...(normalizeWorkerIdentity(task.worker) ? { worker: normalizeWorkerIdentity(task.worker)! } : {}),
     ...(task.branchMerged === true ? { branchMerged: true } : {}),
     ...(normalizedChangedFiles.length > 0 ? { changedFiles: normalizedChangedFiles } : {}),
     ...(stringValue(task.diffStat) ? { diffStat: stringValue(task.diffStat)! } : {}),
@@ -769,6 +799,21 @@ function normalizeCheckpointFields(task: Partial<TaskRecord>, taskId: string): P
     ...(postTaskTree ? { checkpointPostTaskTree: postTaskTree } : {}),
     reverted,
     ...(revertedAt ? { revertedAt } : {})
+  };
+}
+
+function normalizeWorkerIdentity(value: unknown): TaskWorkerIdentity | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const worker = value as Partial<TaskWorkerIdentity>;
+  const command = stringValue(worker.command);
+  const startedAt = stringValue(worker.startedAt);
+  if (typeof worker.pid !== "number" || !Number.isSafeInteger(worker.pid) || worker.pid <= 0 || !command || !startedAt) {
+    return undefined;
+  }
+  return {
+    pid: worker.pid,
+    startedAt: redactSensitiveText(startedAt.trim()),
+    command: redactSensitiveText(command.trim())
   };
 }
 

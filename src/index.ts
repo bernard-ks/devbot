@@ -57,7 +57,8 @@ import {
   parseLocateResponse,
   parseTranscription,
   transcribeErrorImages,
-  type CodexRequestMode
+  type CodexRequestMode,
+  type WorkerStartListener
 } from "./codex-client.js";
 import {
   detectBackends,
@@ -103,7 +104,7 @@ import {
   screenshotRequiresApproval
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord, type TaskStatus } from "./task-store.js";
-import { finalizeCanceledActionTask, recoverInterruptedTasks, type TaskRecoveryDeps } from "./task-recovery.js";
+import { captureWorkerIdentity, finalizeCanceledActionTask, recoverInterruptedTasks, type TaskRecoveryDeps } from "./task-recovery.js";
 import { canAccessTaskRecord, taskSyncRefusal, type TaskSyncRefusal } from "./task-access.js";
 import {
   describeBranchFreshness,
@@ -1612,7 +1613,17 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     if (options.mode === "action") {
       await ensureRollbackCheckpoint(executionProject, task.id);
     }
-    const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
+    // For write-capable tasks, persist the detached worker's identity the moment
+    // it spawns. If this runtime later crashes mid-write, restart recovery can
+    // probe that exact worker and refuse to hash the worktree until it is gone.
+    const onWorker: WorkerStartListener | undefined = options.mode === "action"
+      ? ({ pid }) => {
+          void captureWorkerIdentity(pid)
+            .then((identity) => (identity ? taskStore.recordWorker(task.id, identity) : undefined))
+            .catch(() => undefined);
+        }
+      : undefined;
+    const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal, onWorker);
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree);
       // Every action task runs in an isolated Git worktree (task-worktree.ts); Codex's edits land
@@ -1658,11 +1669,12 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     }
     if (controller.signal.aborted) {
       const canceled = await taskStore.cancel(task.id, "Canceled by user request.");
-      // The worker has already stopped: runCodex only rejects once the child has
-      // closed (or been force-killed), so the isolated worktree is now quiescent.
-      // Finalize through the same helper the restart-recovery path uses, so a
-      // canceled action task's partial writes stay undo-eligible under the same
-      // drift guard as succeed/fail (or show no Undo control when they cannot).
+      // runCodex's abort fallback can reject on a timer before the detached
+      // worker's close is observed, so the worker is not assumed gone. Finalize
+      // through the same helper the restart-recovery path uses: it probes the
+      // recorded worker and only records the post-cancel tree once that worker is
+      // proven terminated, keeping partial writes undo-eligible under the same
+      // drift guard as succeed/fail (or showing no Undo control when they cannot).
       if (canceled) {
         await finalizeCanceledActionTask(taskRecoveryDeps, canceled);
       }
@@ -5575,7 +5587,8 @@ async function runCodex(
   context: PackedProjectContext,
   mode: CodexRequestMode,
   route: RequestRoute,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onWorker?: WorkerStartListener
 ): Promise<string> {
   return answerWithProjectContext({
     codex: appConfig.codex,
@@ -5586,7 +5599,8 @@ async function runCodex(
     ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
     tier: route.tier,
     contextMode: route.contextMode,
-    ...(signal ? { signal } : {})
+    ...(signal ? { signal } : {}),
+    ...(onWorker ? { onWorker } : {})
   });
 }
 

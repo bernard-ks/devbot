@@ -32,7 +32,11 @@ export interface AnswerOptions {
   tier?: AgentModelTier;
   contextMode?: RequestContextMode;
   signal?: AbortSignal;
+  onWorker?: WorkerStartListener;
 }
+
+/** Notified with the detached worker's pid the instant it is spawned, so a caller can persist its identity for restart recovery. */
+export type WorkerStartListener = (info: { pid: number }) => void;
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
   const mode = options.mode ?? "answer";
@@ -46,7 +50,8 @@ export async function answerWithProjectContext(options: AnswerOptions): Promise<
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     ...(options.tier ? { tier: options.tier } : {}),
-    ...(options.signal ? { signal: options.signal } : {})
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.onWorker ? { onWorker: options.onWorker } : {})
   });
 }
 
@@ -63,6 +68,7 @@ export interface CompleteCodexOptions {
   skipGitRepoCheck?: boolean;
   imagePaths?: string[];
   signal?: AbortSignal;
+  onWorker?: WorkerStartListener;
 }
 
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
@@ -104,7 +110,7 @@ export async function completeCodexPrompt(options: CompleteCodexOptions): Promis
           );
         }
       }
-      const output = await runBackend(spec, options.signal);
+      const output = await runBackend(spec, options.signal, options.onWorker);
       const answer = redactSensitiveText(output.trim());
       return answer || `${backend.displayName} did not produce a final text answer.`;
     } finally {
@@ -303,15 +309,15 @@ export function parseLocateResponse(raw: string): LocatedError {
   };
 }
 
-async function runBackend(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
-  const stdout = await runSpec(spec, signal);
+async function runBackend(spec: SpawnSpec, signal?: AbortSignal, onWorker?: WorkerStartListener): Promise<string> {
+  const stdout = await runSpec(spec, signal, onWorker);
   if (spec.outputFile) {
     return (await readFile(spec.outputFile, "utf8")).trim();
   }
   return stdout;
 }
 
-function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
+function runSpec(spec: SpawnSpec, signal?: AbortSignal, onWorker?: WorkerStartListener): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(spec.bin, spec.args, {
       cwd: spec.cwd,
@@ -319,6 +325,15 @@ function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
       stdio: [spec.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });
+    if (onWorker && typeof child.pid === "number") {
+      // Detached worker: pgid == pid. Report it immediately so its identity can
+      // be persisted before any crash, letting restart recovery probe liveness.
+      try {
+        onWorker({ pid: child.pid });
+      } catch {
+        // A listener failure must never abort the run.
+      }
+    }
     let stdout = "";
     let stderr = "";
     let settled = false;

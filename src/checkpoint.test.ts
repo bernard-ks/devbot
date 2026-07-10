@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,7 +17,7 @@ import {
 import { createTaskWorktree, inspectTaskWorktree } from "./task-worktree.js";
 import { TaskStore, type TaskRecord } from "./task-store.js";
 import { taskHasRestorableCheckpoint } from "./task-controls.js";
-import { recoverInterruptedTasks, type TaskRecoveryDeps } from "./task-recovery.js";
+import { captureWorkerIdentity, recoverInterruptedTasks, type TaskRecoveryDeps } from "./task-recovery.js";
 import { hardenedGitEnvironment } from "./security.js";
 
 const execFileAsync = promisify(execFile);
@@ -686,7 +686,10 @@ test("end-to-end: restart recovery finalizes a task interrupted mid-write throug
     const recovered = await recoverInterruptedTasks({
       store: runtimeB,
       hashWorkingTree,
-      resolveWorkspaceRoot: recoveryResolver(sourceRepo)
+      resolveWorkspaceRoot: recoveryResolver(sourceRepo),
+      // The previous runtime's worker is proven gone, so recovery is free to hash
+      // the now-quiescent worktree and record the post-cancel tree.
+      probeWorkerTermination: async () => "terminated"
     });
     assert.equal(recovered, 1);
 
@@ -774,7 +777,10 @@ test("end-to-end: restart recovery hides Undo when an interrupted task's workspa
     const recovered = await recoverInterruptedTasks({
       store: runtimeB,
       hashWorkingTree,
-      resolveWorkspaceRoot: recoveryResolver(sourceRepo)
+      resolveWorkspaceRoot: recoveryResolver(sourceRepo),
+      // The worker is gone; here it is the lost workspace, not a live worker, that
+      // must keep Undo hidden.
+      probeWorkerTermination: async () => "terminated"
     });
     assert.equal(recovered, 1);
 
@@ -785,6 +791,116 @@ test("end-to-end: restart recovery hides Undo when an interrupted task's workspa
     assert.equal(savedTask?.checkpointPostTaskTree, undefined);
     assert.equal(taskHasRestorableCheckpoint(savedTask!), false);
   } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("runtime-crash recovery keeps Undo unavailable when the previous runtime's detached worker survives and writes later", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-cp-survivor-"));
+  const sourceRepo = path.join(root, "source");
+  let workerPid: number | undefined;
+  try {
+    await git(root, ["init", "-q", "-b", "main", "source"]);
+    await git(sourceRepo, ["config", "user.name", "Devbot Test"]);
+    await git(sourceRepo, ["config", "user.email", "devbot-test@example.invalid"]);
+    await write(sourceRepo, "tracked.txt", "original\n");
+    await git(sourceRepo, ["add", "-A"]);
+    await git(sourceRepo, ["commit", "-qm", "seed"]);
+
+    const created = await createTaskWorktree({
+      sourcePath: sourceRepo,
+      taskName: "task-survivor",
+      worktreeRoot: path.join(root, "worktrees")
+    });
+    assert.equal(created.available, true);
+    if (!created.available) return;
+    const worktree = created.worktree;
+
+    // Runtime A: a write-capable task starts, checkpoints, and spawns a DETACHED
+    // worker that keeps running past the crash. The worker delays a write into the
+    // isolated worktree so the tree is still being mutated after the runtime is back.
+    const stateFile = path.join(root, "tasks.json");
+    const runtimeA = new TaskStore(stateFile);
+    const task = await runtimeA.start({
+      source: "test",
+      mode: "action",
+      projectName: "demo",
+      requester: "tester",
+      text: "detached worker survives a crash and writes late"
+    });
+    await runtimeA.setWorkspace(task.id, {
+      workspacePath: worktree.path,
+      branchName: worktree.branch,
+      baseBranch: worktree.baseRevision,
+      isolated: true
+    });
+    const checkpoint = await createCheckpoint(worktree.path, task.id);
+    await runtimeA.attachCheckpoint(task.id, {
+      ref: checkpoint.ref,
+      headSha: checkpoint.headSha,
+      branch: checkpoint.branch,
+      createdAt: checkpoint.createdAt
+    });
+
+    const delayedFile = path.join(worktree.path, "delayed-write.txt");
+    const workerScript = `const fs = require("fs"); setTimeout(() => { try { fs.writeFileSync(process.argv[1], "written after recovery\\n"); } catch {} }, 1500);`;
+    const workerChild = spawn(process.execPath, ["-e", workerScript, delayedFile], {
+      cwd: worktree.path,
+      detached: true,
+      stdio: "ignore"
+    });
+    workerChild.unref();
+    workerPid = workerChild.pid;
+    assert.ok(workerPid, "worker must have a pid");
+
+    // Persist the worker's strong identity exactly as the production spawn path does.
+    const identity = await captureWorkerIdentity(workerPid);
+    assert.ok(identity, "worker identity must be captured on this platform");
+    await runtimeA.recordWorker(task.id, identity!);
+
+    // The crash: the task is still "running", no post-task tree, and the worker is alive.
+    const crashed = await runtimeA.get(task.id);
+    assert.equal(crashed?.status, "running");
+    assert.equal(crashed?.checkpointPostTaskTree, undefined);
+    assert.equal(existsSync(delayedFile), false);
+
+    // Runtime B recovers with the REAL process-group probe, its grace window kept
+    // short so it resolves well before the worker's delayed write fires.
+    const runtimeB = new TaskStore(stateFile);
+    const recovered = await recoverInterruptedTasks({
+      store: runtimeB,
+      hashWorkingTree,
+      resolveWorkspaceRoot: recoveryResolver(sourceRepo),
+      workerTerminationGraceMs: 300
+    });
+    assert.equal(recovered, 1);
+
+    // The worker was still alive during recovery, so termination could not be
+    // proven: no post-task tree was recorded and Undo is not offered. Crucially,
+    // the worktree was never hashed while it could still change.
+    const savedTask = await runtimeB.get(task.id);
+    assert.equal(savedTask?.status, "canceled");
+    assert.equal(savedTask?.checkpointPostTaskTree, undefined);
+    assert.equal(taskHasRestorableCheckpoint(savedTask!), false);
+    // Recovery finished before the delayed write landed — proof the worker outlived it.
+    assert.equal(existsSync(delayedFile), false);
+
+    // The surviving worker now performs its delayed write. Because no tree was ever
+    // recorded, Undo stays unavailable rather than pointing at a mid-write snapshot.
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    assert.equal(existsSync(delayedFile), true);
+    assert.equal(await readFile(delayedFile, "utf8"), "written after recovery\n");
+    const afterWrite = await runtimeB.get(task.id);
+    assert.equal(afterWrite?.checkpointPostTaskTree, undefined);
+    assert.equal(taskHasRestorableCheckpoint(afterWrite!), false);
+  } finally {
+    if (workerPid) {
+      try {
+        process.kill(-workerPid, "SIGKILL");
+      } catch {
+        // Already exited.
+      }
+    }
     await rm(root, { force: true, recursive: true });
   }
 });
