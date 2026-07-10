@@ -127,6 +127,7 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/review packet project:<name> task:<optional>`: Create a provider-neutral review handoff packet from git status, diff stat, last commit, and optional task context.
 - `/review validate project:<name> commands:<optional>`: Run configured validation commands.
 - `/review gates project:<name> commands:<optional>`: Check merge gates without merging: clean working tree plus validation pass.
+- `/review duel task:<task-id>` (also a **Duel review** button on completed action tasks): Have an independent Codex session, on a different Luna/Terra/Sol tier than the author, adversarially review the task's actual diff, give the author one rebuttal round, then post the resolved issue list (conceded / disputed / withdrawn) to a dedicated thread with owner **Accept & fix** / **Dismiss** controls.
 - `/devbot capabilities`: Show this bot's owner, safe mode, projects, and command capabilities.
 - `/devbot announce`: Post a structured capability announcement for peer devbots.
 - `/devbot peers`: List peer devbots that have announced themselves.

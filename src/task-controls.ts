@@ -1,4 +1,5 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+import { duelReviewButton } from "./duel-ui.js";
 import { isTaskId, type TaskRecord, type TaskStatus } from "./task-store.js";
 
 export type TaskControlAction =
@@ -60,6 +61,9 @@ export function taskActionRows(
       buttons.push(button("review", task.id, "Review changes", ButtonStyle.Secondary));
       if (options.canControl && options.hasChecks && !options.safeMode) {
         buttons.push(button("validate", task.id, "Run checks", ButtonStyle.Success));
+      }
+      if (options.canControl) {
+        buttons.push(duelReviewButton(task.id));
       }
     }
   }
