@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   buildFixTaskPrompt,
+  DuelEvidenceError,
   formatDuelSummary,
   gatherDuelChangeEvidence,
   parseDuelRebuttal,
@@ -115,6 +116,31 @@ test("verdict parsing treats request-changes with zero parsable issues as indete
   const verdict = parseDuelVerdict("VERDICT: request-changes\nSomething is wrong but I won't say what.");
   assert.equal(verdict.overall, "indeterminate");
   assert.equal(verdict.issues.length, 0);
+});
+
+test("verdict parsing treats two contradictory verdict lines (approve + request-changes) as indeterminate, never approve", () => {
+  const verdict = parseDuelVerdict("VERDICT approve\nVERDICT request-changes");
+  assert.equal(verdict.overall, "indeterminate");
+  assert.ok(verdict.warnings.some((warning) => warning.includes("exactly one decisive verdict")));
+});
+
+test("verdict parsing treats two agreeing verdict lines as indeterminate: exactly one verdict is required", () => {
+  const verdict = parseDuelVerdict("VERDICT approve\nVERDICT approve");
+  assert.equal(verdict.overall, "indeterminate");
+  assert.ok(verdict.warnings.some((warning) => warning.includes("2 verdict lines")));
+});
+
+test("verdict parsing treats approve plus a malformed ISSUE line as indeterminate, never approve", () => {
+  const verdict = parseDuelVerdict("VERDICT approve\nISSUE severity=high file=src/x.ts line=1");
+  assert.equal(verdict.overall, "indeterminate");
+  assert.equal(verdict.issues.length, 0);
+  assert.ok(verdict.warnings.some((warning) => warning.includes("Could not parse issue line")));
+});
+
+test("verdict parsing treats a malformed VERDICT value as indeterminate rather than defaulting to request-changes", () => {
+  const verdict = parseDuelVerdict("VERDICT maybe-later\nISSUE severity=high file=src/x.ts line=1 claim=Real issue.");
+  assert.equal(verdict.overall, "indeterminate");
+  assert.ok(verdict.warnings.some((warning) => warning.includes("Could not parse verdict line")));
 });
 
 test("rebuttal parsing extracts concede/rebut stances and reasoning, flagging unresolved issues", () => {
@@ -278,6 +304,44 @@ test("gathers byte-pinned diff evidence covering committed, staged, unstaged, an
   assert.doesNotMatch(evidence.text, /do-not-leak/);
   assert.match(evidence.patchHash, /^[a-f0-9]{64}$/);
   assert.notEqual(evidence.patchHash, beforeAny.patchHash, "patch hash must change once real content changed");
+});
+
+test("evidence gathering treats an invalid recorded base as a terminal error, never a clean object", async () => {
+  const fixture = await createGitFixture();
+  await writeFile(path.join(fixture.repo, "tracked.txt"), "committed change\n");
+  await git(fixture.repo, ["add", "tracked.txt"]);
+  await git(fixture.repo, ["commit", "-m", "Committed change"]);
+  const project = fakeProject(fixture.repo);
+  const task = { workspaceIsolated: true, baseBranch: "0000000000000000000000000000000000000000" };
+
+  await assert.rejects(
+    () => gatherDuelChangeEvidence(project, task),
+    (error: unknown) => error instanceof DuelEvidenceError && /recorded base/i.test((error as Error).message)
+  );
+});
+
+test("evidence gathering fails closed when the diff/status operations cannot run", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-duel-nogit-"));
+  const project = fakeProject(root);
+  const task = { workspaceIsolated: false, baseBranch: "" };
+
+  await assert.rejects(
+    () => gatherDuelChangeEvidence(project, task),
+    (error: unknown) => error instanceof DuelEvidenceError
+  );
+});
+
+test("evidence gathering treats a missing HEAD in an isolated workspace as terminal, not empty", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-duel-emptyrepo-"));
+  const repo = path.join(root, "source");
+  await git(root, ["init", "source"]);
+  const project = fakeProject(repo);
+  const task = { workspaceIsolated: true, baseBranch: "main" };
+
+  await assert.rejects(
+    () => gatherDuelChangeEvidence(project, task),
+    (error: unknown) => error instanceof DuelEvidenceError && /HEAD/i.test((error as Error).message)
+  );
 });
 
 function summaryInput(overrides: Partial<Parameters<typeof formatDuelSummary>[0]> = {}): Parameters<typeof formatDuelSummary>[0] {

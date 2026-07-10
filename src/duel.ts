@@ -67,6 +67,18 @@ export interface DuelChangeEvidence {
 export const DEFAULT_DUEL_DIFF_BUDGET: DiffBudget = { maxTotalBytes: 24_000, maxFileBytes: 6_000 };
 const MAX_UNTRACKED_FILE_READ_BYTES = 512_000;
 
+/**
+ * Raised when a required Git evidence operation (base comparison, working-tree status, or a
+ * committed/staged/unstaged diff) fails. Such a failure is terminal: the reviewed snapshot cannot
+ * be trusted, so the duel is aborted rather than presenting a partial evidence object as clean.
+ */
+export class DuelEvidenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DuelEvidenceError";
+  }
+}
+
 export interface RunDuelInput {
   routing: RoutingConfig;
   task: Pick<TaskRecord, "id" | "text" | "projectName" | "modelTier" | "model">;
@@ -153,12 +165,21 @@ function capChunkBytes(chunk: string, maxBytes: number): string {
 }
 
 const VERDICT_LINE = /^\s*verdict\s*[:=]?\s*(approve|request[-_ ]changes)\b/i;
+const VERDICT_PREFIX = /^\s*verdict\b/i;
 const ISSUE_LINE = /^\s*issue\b[:\s]*(.*)$/i;
 
 /**
  * Fails closed: only a clean, non-contradictory VERDICT + issue set counts as approve or
  * request-changes. Anything empty, malformed, contradictory, or partially parsed is
  * "indeterminate" and must never be presented as a clean pass.
+ */
+/**
+ * Fail-closed verdict parsing. The verdict is only "approve" or "request-changes"
+ * when the reviewer output is unambiguous: exactly one valid VERDICT line, approve
+ * with zero valid issues, request-changes with at least one valid issue, and no
+ * parser warnings of any kind. Every contradictory, malformed, warned, or empty
+ * parse collapses to "indeterminate" so an unreadable response can never be
+ * presented as a clean approval.
  */
 export function parseDuelVerdict(response: string): DuelVerdict {
   const warnings: string[] = [];
@@ -167,13 +188,17 @@ export function parseDuelVerdict(response: string): DuelVerdict {
     warnings.push("Reviewer returned an empty response.");
   }
 
-  let declaredOverall: "approve" | "request-changes" | undefined;
+  const declaredVerdicts: ("approve" | "request-changes")[] = [];
   const issues: DuelIssue[] = [];
 
   for (const line of text.split(/\r?\n/)) {
     const verdictMatch = line.match(VERDICT_LINE);
-    if (verdictMatch?.[1] && declaredOverall === undefined) {
-      declaredOverall = normalizeOverall(verdictMatch[1]);
+    if (verdictMatch?.[1]) {
+      declaredVerdicts.push(normalizeOverall(verdictMatch[1]));
+      continue;
+    }
+    if (VERDICT_PREFIX.test(line)) {
+      warnings.push(`Could not parse verdict line: ${line.trim().slice(0, 200)}`);
       continue;
     }
     const issueMatch = line.match(ISSUE_LINE);
@@ -187,23 +212,27 @@ export function parseDuelVerdict(response: string): DuelVerdict {
     }
   }
 
-  if (declaredOverall === undefined) {
+  if (declaredVerdicts.length === 0) {
     warnings.push("Reviewer response did not include a valid VERDICT line.");
+  } else if (declaredVerdicts.length > 1) {
+    warnings.push(`Reviewer declared ${declaredVerdicts.length} verdict lines; exactly one decisive verdict is required.`);
+  }
+
+  const declaredOverall = declaredVerdicts.length === 1 ? declaredVerdicts[0] : undefined;
+
+  if (declaredOverall === "approve" && issues.length > 0) {
+    warnings.push(`Reviewer declared approve but also listed ${issues.length} issue(s); treating the verdict as indeterminate.`);
+  } else if (declaredOverall === "request-changes" && issues.length === 0) {
+    warnings.push("Reviewer requested changes but no valid issue line could be parsed; treating the verdict as indeterminate.");
   }
 
   let overall: DuelVerdictOverall;
-  if (declaredOverall === "approve" && issues.length === 0) {
+  if (warnings.length > 0 || declaredOverall === undefined) {
+    overall = "indeterminate";
+  } else if (declaredOverall === "approve") {
     overall = "approve";
-  } else if (declaredOverall === "request-changes" && issues.length > 0) {
-    overall = "request-changes";
-  } else if (declaredOverall === "approve" && issues.length > 0) {
-    warnings.push(`Reviewer declared approve but also listed ${issues.length} issue(s); treating the verdict as indeterminate.`);
-    overall = "indeterminate";
-  } else if (declaredOverall === "request-changes" && issues.length === 0) {
-    warnings.push("Reviewer requested changes but no valid issue line could be parsed; treating the verdict as indeterminate.");
-    overall = "indeterminate";
   } else {
-    overall = "indeterminate";
+    overall = "request-changes";
   }
 
   return { overall, issues, warnings };
@@ -490,27 +519,50 @@ export async function gatherDuelChangeEvidence(
   budget: DiffBudget = DEFAULT_DUEL_DIFF_BUDGET
 ): Promise<DuelChangeEvidence> {
   const diffArgs = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=all", "-M"];
+  const baseRevision = task.workspaceIsolated ? task.baseBranch : undefined;
+
   const headResult = await git(project.root, ["rev-parse", "HEAD"]);
   const headRevision = headResult.ok ? headResult.stdout.trim() : undefined;
-  const baseRevision = task.workspaceIsolated ? task.baseBranch : undefined;
 
   const sections: string[] = [];
 
-  if (baseRevision && headRevision && baseRevision !== headRevision) {
-    const committed = await git(project.root, ["diff", ...diffArgs, `${baseRevision}..HEAD`]);
-    if (committed.ok && committed.stdout.trim()) sections.push(committed.stdout);
+  // When the task is workspace-isolated, the recorded base and the committed range against it are
+  // required evidence. A missing HEAD or an invalid recorded base must abort the duel; silently
+  // dropping this section would let omitted committed changes be labeled clean.
+  if (baseRevision) {
+    if (!headRevision) {
+      throw new DuelEvidenceError("Could not resolve HEAD for the reviewed workspace; refusing to review partial evidence.");
+    }
+    if (baseRevision !== headRevision) {
+      const committed = await git(project.root, ["diff", ...diffArgs, `${baseRevision}..HEAD`]);
+      if (!committed.ok) {
+        throw new DuelEvidenceError(
+          `Could not diff committed changes against recorded base ${shortRevision(baseRevision)}; the recorded base may be invalid or unreachable.`
+        );
+      }
+      if (committed.stdout.trim()) sections.push(committed.stdout);
+    }
   }
+
   const staged = await git(project.root, ["diff", "--cached", ...diffArgs]);
-  if (staged.ok && staged.stdout.trim()) sections.push(staged.stdout);
+  if (!staged.ok) {
+    throw new DuelEvidenceError("Could not read staged changes for review; refusing to review partial evidence.");
+  }
+  if (staged.stdout.trim()) sections.push(staged.stdout);
+
   const unstaged = await git(project.root, ["diff", ...diffArgs]);
-  if (unstaged.ok && unstaged.stdout.trim()) sections.push(unstaged.stdout);
+  if (!unstaged.ok) {
+    throw new DuelEvidenceError("Could not read unstaged changes for review; refusing to review partial evidence.");
+  }
+  if (unstaged.stdout.trim()) sections.push(unstaged.stdout);
 
   const status = await git(project.root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"]);
-  if (status.ok) {
-    const untracked = parsePorcelainStatus(status.stdout).filter((change) => change.kind === "untracked");
-    for (const change of untracked) {
-      sections.push(await syntheticUntrackedDiff(project.root, change.path, budget.maxFileBytes));
-    }
+  if (!status.ok) {
+    throw new DuelEvidenceError("Could not read the working-tree status for untracked changes; refusing to review partial evidence.");
+  }
+  const untracked = parsePorcelainStatus(status.stdout).filter((change) => change.kind === "untracked");
+  for (const change of untracked) {
+    sections.push(await syntheticUntrackedDiff(project.root, change.path, budget.maxFileBytes));
   }
 
   const combined = redactSensitiveText(omitSensitivePaths(sections.join("\n")));
