@@ -10,7 +10,7 @@ import {
 } from "./security.js";
 import { neutralizeMentions } from "./messages.js";
 
-export type TaskStatus = "awaiting-approval" | "running" | "succeeded" | "failed" | "canceled";
+export type TaskStatus = "awaiting-approval" | "running" | "succeeded" | "failed" | "canceled" | "interrupted";
 export type TaskAttention = "approval" | "blocked" | "review";
 export type TaskApprovalStatus = "pending" | "approved" | "read-only" | "denied";
 export type TaskAccessScope = "project" | "workroom";
@@ -344,23 +344,39 @@ export class TaskStore {
     return canceled;
   }
 
-  async interruptRunning(reason = "Interrupted when Devbot restarted."): Promise<number> {
-    return this.mutate((state) => {
-      const now = new Date().toISOString();
-      let interrupted = 0;
-      for (const task of state.tasks) {
-        if (task.status !== "running") {
-          continue;
-        }
-        task.status = "canceled";
-        task.error = reason;
-        task.attention = "blocked";
-        task.finishedAt = now;
-        task.updatedAt = now;
-        interrupted += 1;
+  async interrupt(id: string, note = "Interrupted when Devbot restarted."): Promise<TaskRecord | undefined> {
+    let interrupted: TaskRecord | undefined;
+    await this.update(id, (task, now) => {
+      if (task.status !== "running") {
+        return;
       }
-      return interrupted;
+      task.status = "interrupted";
+      task.error = redactSensitiveText(note);
+      task.attention = "blocked";
+      task.finishedAt = now;
+      interrupted = cloneTask(task);
     });
+    return interrupted;
+  }
+
+  async dismiss(id: string, actor: string): Promise<TaskRecord | undefined> {
+    let dismissed: TaskRecord | undefined;
+    await this.update(id, (task, now) => {
+      if (task.status !== "interrupted") {
+        return;
+      }
+      task.status = "canceled";
+      task.error = redactSensitiveText(`Interrupted work dismissed by ${actor}.`);
+      task.finishedAt = now;
+      delete task.attention;
+      dismissed = cloneTask(task);
+    });
+    return dismissed;
+  }
+
+  async listRunning(): Promise<TaskRecord[]> {
+    const state = await this.readState();
+    return state.tasks.filter((task) => task.status === "running").map(cloneTask);
   }
 
   async get(id: string): Promise<TaskRecord | undefined> {
@@ -625,7 +641,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
     return undefined;
   }
 
-  const statuses: TaskStatus[] = ["awaiting-approval", "running", "succeeded", "failed", "canceled"];
+  const statuses: TaskStatus[] = ["awaiting-approval", "running", "succeeded", "failed", "canceled", "interrupted"];
   const status = statuses.includes(task.status as TaskStatus) ? (task.status as TaskStatus) : "canceled";
   const startedAt = validTimestamp(task.startedAt) ?? new Date(0).toISOString();
   const normalizedAgentRoles = Array.isArray(task.agentRoles) ? normalizedStrings(task.agentRoles) : [];

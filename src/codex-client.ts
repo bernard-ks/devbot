@@ -32,6 +32,7 @@ export interface AnswerOptions {
   tier?: AgentModelTier;
   contextMode?: RequestContextMode;
   signal?: AbortSignal;
+  onSpawn?: (pid: number) => void;
 }
 
 export async function answerWithProjectContext(options: AnswerOptions): Promise<string> {
@@ -46,7 +47,8 @@ export async function answerWithProjectContext(options: AnswerOptions): Promise<
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     ...(options.tier ? { tier: options.tier } : {}),
-    ...(options.signal ? { signal: options.signal } : {})
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.onSpawn ? { onSpawn: options.onSpawn } : {})
   });
 }
 
@@ -63,6 +65,7 @@ export interface CompleteCodexOptions {
   skipGitRepoCheck?: boolean;
   imagePaths?: string[];
   signal?: AbortSignal;
+  onSpawn?: (pid: number) => void;
 }
 
 export async function completeCodexPrompt(options: CompleteCodexOptions): Promise<string> {
@@ -104,7 +107,7 @@ export async function completeCodexPrompt(options: CompleteCodexOptions): Promis
           );
         }
       }
-      const output = await runBackend(spec, options.signal);
+      const output = await runBackend(spec, options.signal, options.onSpawn);
       const answer = redactSensitiveText(output.trim());
       return answer || `${backend.displayName} did not produce a final text answer.`;
     } finally {
@@ -303,15 +306,15 @@ export function parseLocateResponse(raw: string): LocatedError {
   };
 }
 
-async function runBackend(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
-  const stdout = await runSpec(spec, signal);
+async function runBackend(spec: SpawnSpec, signal?: AbortSignal, onSpawn?: (pid: number) => void): Promise<string> {
+  const stdout = await runSpec(spec, signal, onSpawn);
   if (spec.outputFile) {
     return (await readFile(spec.outputFile, "utf8")).trim();
   }
   return stdout;
 }
 
-function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
+function runSpec(spec: SpawnSpec, signal?: AbortSignal, onSpawn?: (pid: number) => void): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(spec.bin, spec.args, {
       cwd: spec.cwd,
@@ -319,6 +322,13 @@ function runSpec(spec: SpawnSpec, signal?: AbortSignal): Promise<string> {
       stdio: [spec.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });
+    if (child.pid && onSpawn) {
+      try {
+        onSpawn(child.pid);
+      } catch {
+        // Observers must not break the run.
+      }
+    }
     let stdout = "";
     let stderr = "";
     let settled = false;
