@@ -37,6 +37,7 @@ interface TaskStateFile {
 
 export class TaskStore {
   private state: TaskStateFile | undefined;
+  private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly stateFile = path.resolve(".devbot", "tasks.json"),
@@ -44,25 +45,25 @@ export class TaskStore {
   ) {}
 
   async start(input: StartTaskInput): Promise<TaskRecord> {
-    const state = await this.load();
-    const now = new Date().toISOString();
-    const task: TaskRecord = {
-      id: newTaskId(),
-      status: "running",
-      source: input.source,
-      mode: input.mode,
-      projectName: input.projectName,
-      requester: input.requester,
-      text: input.text,
-      includePatterns: input.includePatterns ?? [],
-      startedAt: now,
-      updatedAt: now
-    };
+    return this.mutate((state) => {
+      const now = new Date().toISOString();
+      const task: TaskRecord = {
+        id: newTaskId(),
+        status: "running",
+        source: input.source,
+        mode: input.mode,
+        projectName: input.projectName,
+        requester: input.requester,
+        text: input.text,
+        includePatterns: input.includePatterns ?? [],
+        startedAt: now,
+        updatedAt: now
+      };
 
-    state.tasks.unshift(task);
-    state.tasks = state.tasks.slice(0, this.maxRecords);
-    await this.save();
-    return task;
+      state.tasks.unshift(task);
+      state.tasks = retainRunningTasks(state.tasks, this.maxRecords);
+      return { ...task, includePatterns: [...task.includePatterns] };
+    });
   }
 
   async succeed(id: string, result: { contextFileCount?: number; resultPreview?: string }): Promise<void> {
@@ -103,30 +104,55 @@ export class TaskStore {
   }
 
   async get(id: string): Promise<TaskRecord | undefined> {
-    const state = await this.load();
-    return state.tasks.find((task) => task.id === id);
+    const state = await this.readState();
+    const task = state.tasks.find((item) => item.id === id);
+    return task ? { ...task, includePatterns: [...task.includePatterns] } : undefined;
   }
 
   async listRecent(options: { limit?: number; projectName?: string; status?: TaskStatus } = {}): Promise<TaskRecord[]> {
-    const state = await this.load();
+    const state = await this.readState();
     const limit = Math.max(1, Math.min(options.limit ?? 10, 25));
     return state.tasks
       .filter((task) => !options.projectName || task.projectName === options.projectName)
       .filter((task) => !options.status || task.status === options.status)
-      .slice(0, limit);
+      .slice(0, limit)
+      .map((task) => ({ ...task, includePatterns: [...task.includePatterns] }));
   }
 
   private async update(id: string, apply: (task: TaskRecord, now: string) => void): Promise<void> {
-    const state = await this.load();
-    const task = state.tasks.find((item) => item.id === id);
-    if (!task) {
-      return;
-    }
+    await this.mutate((state) => {
+      const task = state.tasks.find((item) => item.id === id);
+      if (!task) {
+        return;
+      }
 
-    const now = new Date().toISOString();
-    apply(task, now);
-    task.updatedAt = now;
-    await this.save();
+      const now = new Date().toISOString();
+      apply(task, now);
+      task.updatedAt = now;
+    });
+  }
+
+  private async readState(): Promise<TaskStateFile> {
+    await this.mutationTail;
+    return this.load();
+  }
+
+  private async mutate<T>(mutation: (state: TaskStateFile) => T): Promise<T> {
+    let result: T | undefined;
+    const operation = this.mutationTail.then(async () => {
+      const state = await this.load();
+      const previous = structuredClone(state);
+      result = mutation(state);
+      try {
+        await this.save();
+      } catch (error) {
+        this.state = previous;
+        throw error;
+      }
+    });
+    this.mutationTail = operation.catch(() => undefined);
+    await operation;
+    return result as T;
   }
 
   private async load(): Promise<TaskStateFile> {
@@ -137,7 +163,10 @@ export class TaskStore {
     try {
       const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as TaskStateFile;
       this.state = { version: 1, tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [] };
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`Unable to read task state at ${this.stateFile}: ${(error as Error).message}`, { cause: error });
+      }
       this.state = { version: 1, tasks: [] };
     }
 
@@ -150,10 +179,25 @@ export class TaskStore {
     }
 
     await mkdir(path.dirname(this.stateFile), { recursive: true });
-    const tempFile = `${this.stateFile}.${process.pid}.tmp`;
+    const tempFile = `${this.stateFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
     await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`);
     await rename(tempFile, this.stateFile);
   }
+}
+
+function retainRunningTasks(tasks: TaskRecord[], maxRecords: number): TaskRecord[] {
+  const runningCount = tasks.filter((task) => task.status === "running").length;
+  let finishedBudget = Math.max(0, maxRecords - runningCount);
+  return tasks.filter((task) => {
+    if (task.status === "running") {
+      return true;
+    }
+    if (finishedBudget <= 0) {
+      return false;
+    }
+    finishedBudget -= 1;
+    return true;
+  });
 }
 
 export function formatTaskList(tasks: TaskRecord[]): string {

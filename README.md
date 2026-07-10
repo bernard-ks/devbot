@@ -64,6 +64,7 @@ npm start
 - `/devbot peers`: List peer devbots that have announced themselves.
 - `/peer status bot:<id-or-mention> project:<optional>`: Ask an allow-listed peer bot for read-only status.
 - `/peer snip bot:<id-or-mention> target:<text> project:<optional>`: Ask an allow-listed peer bot for a live UI screenshot.
+- `/lab council project:<name> prompt:<text> seats:<optional 2-4>`: Open a persistent workroom with three independent local agent seats by default, plus invited peer bots, before the human reveals, challenges, synthesizes, approves, denies, or closes the room.
 - `/lab roundtable project:<name> prompt:<text>`: Start a private devbot strategy room with role-based product, frontend, backend, testing, and risk angles.
 - `/lab see target:<text> project:<optional>`: Collect a local screenshot plus peer screenshot requests for the same target.
 - `/lab handoff project:<name> target:<human-or-bot> task:<optional>`: Create a baton-pass review handoff card and send a peer review-packet request when the target is an allow-listed bot.
@@ -97,7 +98,7 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. Peer registry state is stored in `.devbot/peers.json`, and collaboration lab sessions are stored in `.devbot/collab.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PEER_STORE`, or `DEVBOT_COLLAB_STORE` to use different files; relative paths resolve from the devbot process working directory.
+Task history is stored locally in `.devbot/tasks.json` by default. Peer registry state is stored in `.devbot/peers.json`, and collaboration workrooms, participants, contributions, decisions, and event history are stored in `.devbot/collab.json`. Set `DEVBOT_TASK_STORE`, `DEVBOT_PEER_STORE`, or `DEVBOT_COLLAB_STORE` to use different files; relative paths resolve from the devbot process working directory.
 
 ## Project Metadata
 
@@ -120,6 +121,7 @@ Each target project can define optional metadata at `<project>/.devbot/project.j
   "policy": {
     "visibility": "team",
     "allowedUsers": [],
+    "allowedUsernames": [],
     "allowedRoles": [],
     "allowedPeers": [],
     "screenshotPolicy": "allow",
@@ -131,13 +133,17 @@ Each target project can define optional metadata at `<project>/.devbot/project.j
 
 Devbot only runs commands declared in that metadata file. `DEVBOT_SAFE_MODE=true` disables write-capable work: `/act`, action-style mentions, `/task retry` for action tasks, `/run`, `/review validate`, and `/review gates`.
 
-Project policy lets each repo narrow collaboration behavior. `allowedUsers` and `allowedRoles` scope project-specific slash command access, `allowedPeers` limits peer bot access per project, `screenshotPolicy` can be `allow`, `approval`, or `deny`, and command policy marks presets that are safe to run versus approval-gated.
+Global access can be limited with `ALLOWED_USER_IDS`, `ALLOWED_USERNAMES`, and `ALLOWED_ROLE_IDS`. User IDs are the most stable option. Account usernames are matched case-insensitively; mutable global display names and guild nicknames are intentionally ignored.
+
+Project policy lets each repo narrow collaboration behavior. `allowedUsers`, `allowedUsernames`, and `allowedRoles` scope project-specific slash command access, `allowedPeers` limits peer bot access per project, `screenshotPolicy` can be `allow`, `approval`, or `deny`, and command policy marks presets that are safe to run versus approval-gated.
 
 ## Peer Bots
 
 For multi-dev servers, each developer can run a separate bot application and add the other bot user IDs to `PEER_BOT_IDS`.
 
 Use `/devbot announce` to publish capabilities. Basic peer requests are sent as structured Discord messages for capabilities, status, and screenshots. The `/lab` workflows add versioned collaboration envelopes for planning, review packets, screenshot requests, approval cards, and event recording.
+
+`/lab council` is the first persistent multiplayer workflow. It runs independent Product Steward, Systems Builder, and Evidence Verifier seats in parallel by default; `seats:4` adds an Operations Guardian. It opens a private Discord thread when the channel and bot permissions support one, stores stable participant IDs and correlated peer invitations, hides proposals from normal workroom views during collection, and exposes native decision buttons. Peer fan-out requires a dedicated private text channel or private thread in `COORDINATION_CHANNEL_ID`; without both a private workroom and coordination room the council runs local-only in an ephemeral response. Devbot automatically unarchives a configured coordination thread and adds allow-listed peer bots before sending. Sealing prevents agents from anchoring on earlier responses; it is an application-level visibility rule, not encryption of the Discord transport or local state file. See [Collaboration Protocol](docs/COLLABORATION_PROTOCOL.md).
 
 The safety boundary is deliberate: peer bots can ask, observe, plan, review, and hand off inside allow-listed projects. Peer-triggered edits, command execution, validation with side effects, pushes, merges, deploys, dependency installs, and secret/config changes require explicit human approval.
 

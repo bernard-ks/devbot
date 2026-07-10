@@ -1,15 +1,25 @@
 import {
   AttachmentBuilder,
+  ChannelType,
   Client,
   GatewayIntentBits,
   GuildMember,
   MessageFlags,
+  ThreadAutoArchiveDuration,
 } from "discord.js";
-import type { AutocompleteInteraction, ChatInputCommandInteraction, Interaction, Message } from "discord.js";
+import type { AutocompleteInteraction, ButtonInteraction, ChatInputCommandInteraction, Interaction, Message } from "discord.js";
+import { isApprovedDiscordUsername } from "./access.js";
 import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
-import { createCollabEnvelope, formatCollabEnvelope, parseCollabEnvelope } from "./collab-protocol.js";
+import {
+  collabDeliveryKey,
+  createCollabEnvelope,
+  formatCollabEnvelope,
+  isFreshCollabEnvelope,
+  parseCollabEnvelope
+} from "./collab-protocol.js";
 import type { CollabCapability, CollabEnvelopeV2, CollabIntent, CollabMode } from "./collab-protocol.js";
 import { CollabStore, formatCollabRecent } from "./collab-store.js";
+import type { CollabContribution, CollabConversation } from "./collab-store.js";
 import { loadConfig } from "./config.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { answerWithProjectContext, type CodexRequestMode } from "./codex-client.js";
@@ -37,12 +47,19 @@ import {
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskStatus } from "./task-store.js";
 import { findExternalCodexWork, formatWorkStatus, WorkTracker } from "./work-status.js";
+import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
 import {
+  councilChallengePrompt,
+  councilContributionPrompt,
+  type CouncilSeatStatus,
+  formatCouncilProgress,
+  councilSynthesisPrompt,
   eventArtifact,
   formatApprovalCard,
   formatBossFight,
   formatCampfire,
+  formatCouncilContributions,
   formatCollabEvents,
   formatHandoffCard,
   formatLabHeader,
@@ -50,7 +67,9 @@ import {
   formatRitual,
   formatRoundtableResult,
   formatSafetySummary,
-  labPrompt
+  formatWorkroomPanel,
+  labPrompt,
+  localCouncilSeats
 } from "./lab.js";
 
 const config = loadConfig();
@@ -60,6 +79,7 @@ const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefin
 const peerStore = new PeerStore(process.env.DEVBOT_PEER_STORE?.trim() || undefined);
 const collabStore = new CollabStore(process.env.DEVBOT_COLLAB_STORE?.trim() || undefined);
 const activeTaskControllers = new Map<string, AbortController>();
+const activeWorkroomActions = new Set<string>();
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
@@ -73,7 +93,23 @@ client.once("clientReady", async () => {
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isAutocomplete()) {
+      if (!isAllowed(interaction, config)) {
+        await interaction.respond([]);
+        return;
+      }
       await handleAutocomplete(interaction, config);
+      return;
+    }
+
+    if (interaction.isButton()) {
+      if (!parseWorkroomButton(interaction.customId)) {
+        return;
+      }
+      if (!isAllowed(interaction, config)) {
+        await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await handleWorkroomButton(interaction, config);
       return;
     }
 
@@ -126,6 +162,12 @@ client.on("messageCreate", async (message) => {
     );
 
     const statusProjectRequest = parseOptionalProjectToken(mentionText, config.projects);
+    if (statusProjectRequest.project && !isAllowedMessageForProject(message, statusProjectRequest.project)) {
+      await message.reply(`You are not allowed to use project \`${statusProjectRequest.project.name}\` under its .devbot policy.`);
+      return;
+    }
+    const visibleProjects = config.projects.filter((project) => isAllowedMessageForProject(message, project));
+    const visibleConfig = { ...config, projects: visibleProjects };
     const parsedStatusRequest = parseStatusRequest(statusProjectRequest.text);
     const statusRequest = parsedStatusRequest.isStatus
       ? parsedStatusRequest
@@ -134,12 +176,12 @@ client.on("messageCreate", async (message) => {
     if (statusRequest.isStatus) {
       await message.channel.sendTyping();
       console.log(`Status request from ${message.author.tag}: image=${statusRequest.wantsImage} question=${Boolean(statusRequest.question)}`);
-      const snapshot = await getStatusSnapshotResponse(config, statusRequest.wantsImage, statusProjectRequest.project, statusRequest.question);
+      const snapshot = await getStatusSnapshotResponse(visibleConfig, statusRequest.wantsImage, statusProjectRequest.project, statusRequest.question);
       await replyToMessageWithChunks(message, snapshot);
 
       if (statusRequest.question) {
         const detail = await getDetailedStatusResponse({
-          appConfig: config,
+          appConfig: visibleConfig,
           question: statusRequest.question,
           requester: message.author.tag,
           project: statusProjectRequest.project
@@ -149,9 +191,14 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const request = parseMentionRequest(message.content, client.user.id, config.projects, botRoleMentionIds);
+    const request = parseMentionRequest(message.content, client.user.id, visibleProjects, botRoleMentionIds);
     if (!request.text) {
       await message.reply("Tell me what to do after the mention. Example: `@devbot fix the failing tests`");
+      return;
+    }
+
+    if (!isAllowedMessageForProject(message, request.project)) {
+      await message.reply(`You are not allowed to use project \`${request.project.name}\` under its .devbot policy.`);
       return;
     }
 
@@ -188,8 +235,9 @@ await client.login(config.discordToken);
 
 async function handleCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   if (interaction.commandName === "projects") {
+    const projects = appConfig.projects.filter((project) => isAllowedForProject(interaction, project));
     await interaction.reply({
-      content: appConfig.projects.map(formatProjectSummary).join("\n"),
+      content: projects.length ? projects.map(formatProjectSummary).join("\n") : "No configured projects are available to you.",
       flags: MessageFlags.Ephemeral
     });
     return;
@@ -203,12 +251,14 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     if (project && !(await ensureProjectAccess(interaction, project))) {
       return;
     }
-    const snapshot = await getStatusSnapshotResponse(appConfig, interaction.options.getBoolean("image") ?? false, project, question);
+    const visibleProjects = appConfig.projects.filter((entry) => isAllowedForProject(interaction, entry));
+    const visibleConfig = { ...appConfig, projects: project ? [project] : visibleProjects };
+    const snapshot = await getStatusSnapshotResponse(visibleConfig, interaction.options.getBoolean("image") ?? false, project, question);
     await editInteractionWithChunks(interaction, snapshot);
 
     if (question) {
       const detail = await getDetailedStatusResponse({
-        appConfig,
+        appConfig: visibleConfig,
         question,
         requester: interaction.user.tag,
         project
@@ -359,6 +409,7 @@ interface ProjectRequestOptions {
   mode: CodexRequestMode;
   requester: string;
   source: string;
+  contextCharLimit?: number;
 }
 
 interface ProjectRequestResult {
@@ -390,7 +441,12 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
   activeTaskControllers.set(task.id, controller);
 
   try {
-    const context = await contextService.pack(options.project, options.text, options.includePatterns);
+    const context = await contextService.pack(
+      options.project,
+      options.text,
+      options.includePatterns,
+      options.contextCharLimit
+    );
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, controller.signal);
     await taskStore.succeed(task.id, {
       contextFileCount: context.files.length,
@@ -480,10 +536,17 @@ async function getDetailedStatusResponse(options: StatusResponseOptions): Promis
 
 async function handleTaskCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   const subcommand = interaction.options.getSubcommand();
+  const allowedProjectNames = new Set(
+    appConfig.projects.filter((project) => isAllowedForProject(interaction, project)).map((project) => project.name)
+  );
   if (subcommand === "recent") {
     await interaction.deferReply();
     const projectName = interaction.options.getString("project") ?? undefined;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+    if (project && !allowedProjectNames.has(project.name)) {
+      await interaction.editReply(`You are not allowed to use project \`${project.name}\`.`);
+      return;
+    }
     const status = interaction.options.getString("status") as TaskStatus | null;
     const filters: { limit: number; projectName?: string; status?: TaskStatus } = {
       limit: interaction.options.getInteger("limit") ?? 10
@@ -496,7 +559,7 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     }
 
     const tasks = await taskStore.listRecent(filters);
-    await interaction.editReply(formatTaskList(tasks));
+    await interaction.editReply(formatTaskList(tasks.filter((task) => allowedProjectNames.has(task.projectName))));
     return;
   }
 
@@ -504,7 +567,9 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     await interaction.deferReply();
     const id = interaction.options.getString("id", true);
     const task = await taskStore.get(id);
-    await interaction.editReply(task ? formatTaskDetail(task) : `No saved task found for \`${id}\`.`);
+    await interaction.editReply(
+      task && allowedProjectNames.has(task.projectName) ? formatTaskDetail(task) : `No accessible saved task found for \`${id}\`.`
+    );
     return;
   }
 
@@ -512,13 +577,20 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     await interaction.deferReply();
     const id = interaction.options.getString("id", true);
     const task = await taskStore.get(id);
-    await interaction.editReply(task ? formatTaskLogs(task) : `No saved task found for \`${id}\`.`);
+    await interaction.editReply(
+      task && allowedProjectNames.has(task.projectName) ? formatTaskLogs(task) : `No accessible saved task found for \`${id}\`.`
+    );
     return;
   }
 
   if (subcommand === "cancel") {
     await interaction.deferReply();
     const id = interaction.options.getString("id", true);
+    const existing = await taskStore.get(id);
+    if (!existing || !allowedProjectNames.has(existing.projectName)) {
+      await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
+      return;
+    }
     activeTaskControllers.get(id)?.abort();
     const task = await taskStore.cancel(id, `Canceled by ${interaction.user.tag}.`);
     await interaction.editReply(task ? `Task \`${id}\` is now ${task.status}.` : `No saved task found for \`${id}\`.`);
@@ -531,6 +603,10 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     const task = await taskStore.get(id);
     if (!task) {
       await interaction.editReply(`No saved task found for \`${id}\`.`);
+      return;
+    }
+    if (!allowedProjectNames.has(task.projectName)) {
+      await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
       return;
     }
 
@@ -558,13 +634,19 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     const minutes = interaction.options.getInteger("minutes") ?? 30;
     const projectName = interaction.options.getString("project") ?? undefined;
     const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
+    if (project && !allowedProjectNames.has(project.name)) {
+      await interaction.editReply(`You are not allowed to use project \`${project.name}\`.`);
+      return;
+    }
     const running = await taskStore.listRecent({
       status: "running",
       limit: 25,
       ...(project ? { projectName: project.name } : {})
     });
     const cutoff = Date.now() - minutes * 60_000;
-    const stale = running.filter((task) => new Date(task.startedAt).getTime() < cutoff);
+    const stale = running.filter(
+      (task) => allowedProjectNames.has(task.projectName) && new Date(task.startedAt).getTime() < cutoff
+    );
     await interaction.editReply(stale.length ? formatTaskList(stale) : `No running tasks older than ${minutes}m.`);
   }
 }
@@ -573,9 +655,16 @@ async function handleDashboardCommand(interaction: ChatInputCommandInteraction, 
   await interaction.deferReply();
   const projectName = interaction.options.getString("project") ?? undefined;
   const project = projectName ? mustFindProject(appConfig.projects, projectName) : undefined;
-  const projects = project ? [project] : appConfig.projects;
-  const status = await getWorkStatusMessage(appConfig);
-  const recentTasks = await taskStore.listRecent({ limit: 5, ...(project ? { projectName: project.name } : {}) });
+  if (project && !isAllowedForProject(interaction, project)) {
+    await interaction.editReply(`You are not allowed to use project \`${project.name}\`.`);
+    return;
+  }
+  const projects = project ? [project] : appConfig.projects.filter((entry) => isAllowedForProject(interaction, entry));
+  const visibleProjectNames = new Set(projects.map((entry) => entry.name));
+  const status = await getWorkStatusMessage({ ...appConfig, projects });
+  const recentTasks = (await taskStore.listRecent({ limit: 25, ...(project ? { projectName: project.name } : {}) }))
+    .filter((task) => visibleProjectNames.has(task.projectName))
+    .slice(0, 5);
   const lines = [
     `Devbot dashboard for ${project ? `\`${project.name}\`` : "configured projects"}`,
     `Bot: \`${appConfig.botIdentity.displayName}\` owned by ${appConfig.botIdentity.owner}`,
@@ -621,6 +710,10 @@ async function handleReviewCommand(interaction: ChatInputCommandInteraction, app
     await interaction.deferReply();
     const taskId = interaction.options.getString("task") ?? undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
+    if (task && task.projectName !== project.name) {
+      await interaction.editReply(`Task \`${task.id}\` does not belong to project \`${project.name}\`.`);
+      return;
+    }
     const packet = await createReviewPacket(project, task);
     await editInteractionWithChunks(interaction, { content: formatReviewPacket(packet) });
     return;
@@ -699,22 +792,155 @@ async function handlePeerCommand(interaction: ChatInputCommandInteraction, appCo
     ...optionalPeerField("target", interaction.options.getString("target"))
   });
 
-  await sendPeerMessage(interaction, appConfig, `<@${peerBotId}>\n${formatPeerEnvelope(envelope)}`);
+  await sendPeerMessage(interaction, appConfig, `<@${peerBotId}>\n${formatPeerEnvelope(envelope)}`, peerBotId);
   await interaction.editReply(`Sent ${action} request \`${envelope.requestId}\` to <@${peerBotId}>.`);
 }
 
 async function handleLabCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   const subcommand = interaction.options.getSubcommand();
 
+  if (subcommand === "council") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const project = mustFindProject(appConfig.projects, interaction.options.getString("project", true));
+    if (!(await ensureProjectAccess(interaction, project))) {
+      return;
+    }
+    const brief = interaction.options.getString("prompt", true);
+    const seats = localCouncilSeats(interaction.options.getInteger("seats") ?? 3);
+    const conversation = await startLabConversation(interaction, subcommand, project, `Sealed Council: ${brief}`, brief);
+    const seatStatuses = new Map<string, CouncilSeatStatus>(seats.map((seat) => [seat.id, "working"]));
+    let progressUpdates = Promise.resolve();
+    const updateSeatProgress = (seatId: string, status: "ready" | "failed"): void => {
+      seatStatuses.set(seatId, status);
+      progressUpdates = progressUpdates
+        .then(() => interaction.editReply(formatCouncilProgress(conversation.id, seats, seatStatuses)))
+        .then(() => undefined)
+        .catch((error) => {
+          console.warn(`Unable to update council progress for ${conversation.id}: ${(error as Error).message}`);
+        });
+    };
+    await interaction.editReply(formatCouncilProgress(conversation.id, seats, seatStatuses));
+    const localRuns = await Promise.all(
+      seats.map(async (seat) => {
+        const seatPrompt = councilContributionPrompt(brief, seat);
+        try {
+          const result = await runProjectRequest({
+            appConfig,
+            project,
+            text: seatPrompt,
+            includePatterns: [],
+            mode: "answer",
+            requester: interaction.user.tag,
+            source: `lab:council:${seat.id}`,
+            contextCharLimit: 24_000
+          });
+          updateSeatProgress(seat.id, "ready");
+          return { seat, prompt: seatPrompt, ...result };
+        } catch (error) {
+          await collabStore.addEvent({
+            conversationId: conversation.id,
+            type: "note",
+            actor: `${appConfig.botIdentity.displayName} ${seat.name}`,
+            summary: `Local council seat failed: ${(error as Error).message.slice(0, 240)}`,
+            mode: "think"
+          });
+          updateSeatProgress(seat.id, "failed");
+          return undefined;
+        }
+      })
+    );
+    await progressUpdates;
+    const completedSeats = localRuns.flatMap((run) => (run ? [run] : []));
+    if (completedSeats.length === 0) {
+      await collabStore.close(conversation.id, appConfig.botIdentity.displayName);
+      throw new Error("All local council seats failed before submitting a proposal.");
+    }
+    await Promise.all(
+      completedSeats.map((run) =>
+        collabStore.addContribution({
+          conversationId: conversation.id,
+          actorId: `${client.user?.id ?? appConfig.botIdentity.displayName}:${run.seat.id}`,
+          actorName: `${appConfig.botIdentity.displayName} - ${run.seat.name}`,
+          kind: "proposal",
+          content: run.answer,
+          sealed: true,
+          artifacts: [eventArtifact("plan", run.taskId, `${run.seat.name} proposal`)]
+        })
+      )
+    );
+    const peerPrompt = councilContributionPrompt(brief);
+    let peerCount = 0;
+    if (conversation.threadId && appConfig.coordinationChannelId) {
+      peerCount = await fanOutLabRequest(interaction, appConfig, {
+        conversationId: conversation.id,
+        project,
+        intent: "council",
+        capability: "task.plan",
+        mode: "think",
+        target: brief,
+        payload: {
+          prompt: peerPrompt,
+          sealed: true
+        }
+      });
+    } else {
+      await collabStore.addEvent({
+        conversationId: conversation.id,
+        type: "note",
+        actor: appConfig.botIdentity.displayName,
+        summary: conversation.threadId
+          ? "Peer fan-out skipped because no dedicated coordination channel is configured."
+          : "Peer fan-out skipped because a private Discord thread could not be created.",
+        mode: "read"
+      });
+    }
+    const current = (await collabStore.get(conversation.id)) ?? conversation;
+    const contributions = await collabStore.contributions(conversation.id, { includeSealed: true });
+    await publishWorkroomPanel(interaction, current, contributions);
+    if (current.threadId) {
+      await interaction.editReply(
+        [
+          `Opened sealed council <#${current.threadId}> with ${completedSeats.length} independent local contribution(s) and ${peerCount} peer invitation(s).`,
+          !appConfig.coordinationChannelId && appConfig.peerBotIds.size > 0
+            ? "Peer fan-out was skipped because no dedicated coordination channel is configured."
+            : undefined
+        ]
+          .filter((line) => line !== undefined)
+          .join("\n")
+      );
+    } else {
+      const failedCount = seats.length - completedSeats.length;
+      await interaction.followUp({
+        content: [
+          "Private thread creation was unavailable, so this council is local-only and its controls remain in this ephemeral response.",
+          failedCount > 0
+            ? `${completedSeats.length}/${seats.length} local seats submitted; ${failedCount} timed out or failed.`
+            : `All ${seats.length} local seats submitted.`
+        ].join("\n"),
+        flags: MessageFlags.Ephemeral
+      });
+    }
+    return;
+  }
+
   if (subcommand === "recent") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    await interaction.editReply(formatCollabRecent(await collabStore.recent(interaction.options.getInteger("limit") ?? 10)));
+    const limit = interaction.options.getInteger("limit") ?? 10;
+    const visible = (await collabStore.recent(25))
+      .filter((conversation) => canAccessConversation(interaction, conversation, appConfig))
+      .slice(0, limit);
+    await interaction.editReply(formatCollabRecent(visible));
     return;
   }
 
   if (subcommand === "events") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const id = interaction.options.getString("id", true);
+    const conversation = await collabStore.get(id);
+    if (!conversation || !canAccessConversation(interaction, conversation, appConfig)) {
+      await interaction.editReply(`Unknown or inaccessible lab session: \`${id}\`.`);
+      return;
+    }
     const events = await collabStore.events(id);
     await interaction.editReply([`Events for \`${id}\`:`, formatCollabEvents(events)].join("\n"));
     return;
@@ -725,18 +951,48 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
     const id = interaction.options.getString("id", true);
     const decision = interaction.options.getString("decision", true);
     const action = interaction.options.getString("action") ?? "record";
-    const projectName = interaction.options.getString("project") ?? undefined;
+    const conversation = await collabStore.get(id);
+    if (!conversation) {
+      await interaction.editReply(`Unknown lab session: \`${id}\`.`);
+      return;
+    }
+    if (conversation.requesterId && conversation.requesterId !== interaction.user.id) {
+      await interaction.editReply(`Only the human who opened lab session \`${id}\` can record its decision.`);
+      return;
+    }
+    const projectName = interaction.options.getString("project") ?? conversation.projectName;
     const commandNames = parseCommandNames(interaction.options.getString("commands"));
     const note = interaction.options.getString("note") ?? "";
     let actionResult: string | undefined;
+    let project: ProjectEntry | undefined;
+
+    if (projectName) {
+      project = mustFindProject(appConfig.projects, projectName);
+      if (!isAllowedForProject(interaction, project)) {
+        await interaction.editReply(`You are not allowed to use project \`${project.name}\`.`);
+        return;
+      }
+    }
+
+    if (conversation.intent === "council") {
+      const decided = await collabStore.decide({
+        conversationId: id,
+        outcome: decision as "approve" | "deny" | "read-only",
+        actor: interaction.user.tag,
+        ...(note ? { note } : {})
+      });
+      if (!decided) {
+        await interaction.editReply("This council is closed, already decided, or not ready for approval.");
+        return;
+      }
+    }
 
     if (decision === "approve" && action !== "record") {
       if (appConfig.safeMode) {
         actionResult = "Safe mode is on, so the approval was recorded but no command was executed.";
-      } else if (!projectName) {
+      } else if (!project) {
         actionResult = "Approval recorded. Add `project:<name>` to execute validation or gates.";
       } else {
-        const project = mustFindProject(appConfig.projects, projectName);
         if (action === "validate") {
           const results = await validateReview(project, commandNames);
           actionResult = formatValidationResults(project, results);
@@ -747,17 +1003,19 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
       }
     }
 
-    await collabStore.addEvent({
-      conversationId: id,
-      type: "approval",
-      actor: interaction.user.tag,
-      summary: `${decision}${action !== "record" ? ` ${action}` : ""}${note ? `: ${note}` : ""}`,
-      mode: decision === "approve" ? "write" : "read",
-      artifacts: [
-        eventArtifact("approval", decision, note || undefined),
-        ...(actionResult ? [eventArtifact(action === "gates" ? "validation" : "validation", action, projectName)] : [])
-      ]
-    });
+    if (conversation.intent !== "council" || actionResult) {
+      await collabStore.addEvent({
+        conversationId: id,
+        type: "approval",
+        actor: interaction.user.tag,
+        summary: `${decision}${action !== "record" ? ` ${action}` : ""}${note ? `: ${note}` : ""}`,
+        mode: decision === "approve" ? "write" : "read",
+        artifacts: [
+          eventArtifact("approval", decision, note || undefined),
+          ...(actionResult ? [eventArtifact("validation", action, projectName)] : [])
+        ]
+      });
+    }
     await editInteractionWithChunks(interaction, {
       content: [
         `Recorded \`${decision}\` for lab session \`${id}\`${note ? `: ${note}` : "."}`,
@@ -925,6 +1183,10 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
     const target = interaction.options.getString("target", true);
     const taskId = interaction.options.getString("task") ?? undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
+    if (task && task.projectName !== project.name) {
+      await interaction.editReply(`Task \`${task.id}\` does not belong to project \`${project.name}\`.`);
+      return;
+    }
     const packet = await createReviewPacket(project, task);
     const conversation = await startLabConversation(interaction, subcommand, project, `Baton Pass to ${target}`);
     await collabStore.addEvent({
@@ -954,6 +1216,10 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
     }
     const taskId = interaction.options.getString("task") ?? undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
+    if (task && task.projectName !== project.name) {
+      await interaction.editReply(`Task \`${task.id}\` does not belong to project \`${project.name}\`.`);
+      return;
+    }
     const packet = await createReviewPacket(project, task);
     const conversation = await startLabConversation(interaction, subcommand, project, "Boss Fight Review");
     const commandNames = parseCommandNames(interaction.options.getString("commands"));
@@ -1053,6 +1319,10 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
     }
     const taskId = interaction.options.getString("task") ?? undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
+    if (task && task.projectName !== project.name) {
+      await interaction.editReply(`Task \`${task.id}\` does not belong to project \`${project.name}\`.`);
+      return;
+    }
     const packet = await createReviewPacket(project, task);
     const recentTasks = await taskStore.listRecent({ limit: 5, projectName: project.name });
     const conversation = await startLabConversation(interaction, subcommand, project, "Merge Ritual Thread");
@@ -1071,6 +1341,328 @@ async function handleLabCommand(interaction: ChatInputCommandInteraction, appCon
         safety: formatSafetySummary(appConfig, project)
       })
     });
+  }
+}
+
+async function handleWorkroomButton(interaction: ButtonInteraction, appConfig: AppConfig): Promise<void> {
+  const parsed = parseWorkroomButton(interaction.customId);
+  if (!parsed) {
+    return;
+  }
+
+  const conversation = await collabStore.get(parsed.conversationId);
+  if (!conversation) {
+    await interaction.reply({ content: "This workroom no longer exists in the local collaboration store.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (conversation.requesterId && conversation.requesterId !== interaction.user.id) {
+    await interaction.reply({
+      content: `Only the human who opened workroom \`${conversation.id}\` can operate its decision controls.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+  const expectedChannelId = conversation.controlChannelId ?? conversation.threadId ?? conversation.channelId;
+  if (
+    !conversation.controlMessageId ||
+    interaction.message.id !== conversation.controlMessageId ||
+    (expectedChannelId && interaction.channelId !== expectedChannelId)
+  ) {
+    await interaction.reply({ content: "This is not the active control panel for the workroom.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const project = conversation.projectName ? findProject(appConfig.projects, conversation.projectName) : undefined;
+  if (project && !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: `You are not allowed to use project \`${project.name}\`.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (conversation.status === "closed" || conversation.phase === "closed") {
+    await interaction.reply({ content: "This workroom is already closed.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (parsed.action === "approve" || parsed.action === "deny" || parsed.action === "close") {
+    await handleWorkroomDecisionButton(interaction, conversation, parsed.action);
+    return;
+  }
+
+  if (activeWorkroomActions.has(conversation.id)) {
+    await interaction.reply({ content: "Another workroom action is already in progress.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  activeWorkroomActions.add(conversation.id);
+  await interaction.deferUpdate();
+  try {
+    if (parsed.action === "challenge") {
+      if (conversation.phase !== "collecting") {
+        await replyToWorkroomAction(interaction, "Challenges must be added before the sealed contributions are revealed.");
+        return;
+      }
+      if (!project) {
+        await replyToWorkroomAction(interaction, "The project for this workroom is no longer configured.");
+        return;
+      }
+      const existing = await collabStore.contributions(conversation.id, { includeSealed: true });
+      if (existing.some((contribution) => contribution.kind === "challenge")) {
+        await replyToWorkroomAction(interaction, "This council already has an independent challenger.");
+        return;
+      }
+
+      const { answer, taskId } = await runProjectRequest({
+        appConfig,
+        project,
+        text: councilChallengePrompt(conversation.brief ?? conversation.title),
+        includePatterns: [],
+        mode: "answer",
+        requester: interaction.user.tag,
+        source: "lab:council:challenge",
+        contextCharLimit: 24_000
+      });
+      await collabStore.addContribution({
+        conversationId: conversation.id,
+        actorId: client.user?.id ?? appConfig.botIdentity.displayName,
+        actorName: `${appConfig.botIdentity.displayName} challenger`,
+        kind: "challenge",
+        content: answer,
+        sealed: true,
+        artifacts: [eventArtifact("plan", taskId, "independent council challenge")]
+      });
+      await sendWorkroomText(conversation.id, "An independent challenge has arrived and remains sealed.", interaction);
+      await refreshWorkroomPanelInteraction(interaction, conversation.id);
+      await replyToWorkroomAction(interaction, "Independent challenge added. It cannot see the other sealed proposals.");
+      return;
+    }
+
+    if (parsed.action === "reveal") {
+      if (conversation.phase !== "collecting") {
+        await replyToWorkroomAction(interaction, "This council has already been revealed.");
+        return;
+      }
+      const revealed = await collabStore.revealContributions(conversation.id, interaction.user.tag);
+      await sendWorkroomText(conversation.id, formatCouncilContributions(conversation, revealed), interaction);
+      await refreshWorkroomPanelInteraction(interaction, conversation.id);
+      await replyToWorkroomAction(interaction, `Revealed ${revealed.length} independent contribution(s) in the workroom.`);
+      return;
+    }
+
+    if (!project) {
+      await replyToWorkroomAction(interaction, "The project for this workroom is no longer configured.");
+      return;
+    }
+    if (conversation.phase === "synthesized" || conversation.phase === "decided") {
+      await replyToWorkroomAction(interaction, "This council has already been synthesized.");
+      return;
+    }
+    const pendingPeers = conversation.participants.filter(
+      (participant) => participant.kind === "bot" && participant.state === "invited"
+    );
+    if (conversation.phase === "collecting" && pendingPeers.length > 0) {
+      await replyToWorkroomAction(
+        interaction,
+        `${pendingPeers.length} invited peer contribution(s) are still pending. Wait for them, or use Reveal to close collection with the responses already present.`
+      );
+      return;
+    }
+    const revealed = await collabStore.revealContributions(conversation.id, interaction.user.tag);
+    if (revealed.length === 0) {
+      await replyToWorkroomAction(interaction, "There are no contributions to synthesize yet.");
+      return;
+    }
+    const { answer, taskId } = await runProjectRequest({
+      appConfig,
+      project,
+      text: councilSynthesisPrompt(conversation.brief ?? conversation.title, revealed),
+      includePatterns: [],
+      mode: "answer",
+      requester: interaction.user.tag,
+      source: "lab:council:synthesis",
+      contextCharLimit: 24_000
+    });
+    await collabStore.addSynthesis({
+      conversationId: conversation.id,
+      actorId: client.user?.id ?? appConfig.botIdentity.displayName,
+      actorName: `${appConfig.botIdentity.displayName} chair`,
+      content: answer,
+      artifacts: [eventArtifact("plan", taskId, "council synthesis")]
+    });
+    await sendWorkroomText(conversation.id, formatCouncilContributions(conversation, revealed), interaction);
+    await sendWorkroomText(conversation.id, [`Council synthesis for \`${conversation.id}\``, "", answer].join("\n"), interaction);
+    await refreshWorkroomPanelInteraction(interaction, conversation.id);
+    await replyToWorkroomAction(interaction, "Council revealed and synthesized. The workroom now awaits your decision.");
+  } finally {
+    activeWorkroomActions.delete(conversation.id);
+  }
+}
+
+async function handleWorkroomDecisionButton(
+  interaction: ButtonInteraction,
+  conversation: CollabConversation,
+  action: "approve" | "deny" | "close"
+): Promise<void> {
+  await interaction.deferUpdate();
+  let updated: CollabConversation | undefined;
+  if (action === "close") {
+    updated = await collabStore.close(conversation.id, interaction.user.tag);
+  } else {
+    if (action === "approve" && conversation.phase !== "synthesized") {
+      await interaction.followUp({ content: "Reveal and synthesize the council before approving its recommendation.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    updated = await collabStore.decide({
+      conversationId: conversation.id,
+      outcome: action,
+      actor: interaction.user.tag
+    });
+  }
+
+  if (!updated) {
+    await interaction.followUp({ content: "The workroom state changed before this decision could be recorded.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const contributions = await collabStore.contributions(conversation.id, { includeSealed: true });
+  await refreshWorkroomPanelInteraction(interaction, conversation.id);
+  await sendWorkroomText(
+    conversation.id,
+    action === "close"
+      ? `Workroom closed by ${interaction.user.tag}.`
+      : `Decision recorded: ${action} by ${interaction.user.tag}. No write action was executed.`,
+    interaction
+  );
+  await interaction.followUp({
+    content: action === "close" ? "Workroom closed." : `Recorded ${action}. This decision did not execute code or commands.`,
+    flags: MessageFlags.Ephemeral
+  });
+  if (action === "close") {
+    await archiveWorkroomThread(updated);
+  }
+}
+
+async function publishWorkroomPanel(
+  interaction: ChatInputCommandInteraction,
+  conversation: CollabConversation,
+  contributions: CollabContribution[]
+): Promise<void> {
+  const payload = {
+    content: formatWorkroomPanel(conversation, contributions),
+    components: workroomActionRows(conversation),
+    allowedMentions: { parse: [] as const }
+  };
+
+  if (conversation.threadId) {
+    try {
+      const channel = await client.channels.fetch(conversation.threadId);
+      const sent = (await sendToTextChannel(channel, payload)) as { id?: string } | undefined;
+      if (sent?.id) {
+        await collabStore.setControlMessage(conversation.id, sent.id, conversation.threadId);
+      }
+      return;
+    } catch (error) {
+      console.warn(`Unable to publish workroom panel in thread ${conversation.threadId}: ${(error as Error).message}`);
+    }
+  }
+
+  const message = await interaction.editReply(payload);
+  await collabStore.setControlMessage(conversation.id, message.id, interaction.channelId, true);
+}
+
+async function refreshWorkroomPanelInteraction(interaction: ButtonInteraction, conversationId: string): Promise<void> {
+  const conversation = await collabStore.get(conversationId);
+  if (!conversation) {
+    return;
+  }
+  const contributions = await collabStore.contributions(conversationId, { includeSealed: true });
+  await interaction.editReply({
+    content: formatWorkroomPanel(conversation, contributions),
+    components: workroomActionRows(conversation),
+    allowedMentions: { parse: [] }
+  });
+}
+
+async function replyToWorkroomAction(interaction: ButtonInteraction, content: string): Promise<void> {
+  await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+}
+
+async function refreshWorkroomPanelMessage(message: Message, conversationId: string): Promise<void> {
+  const conversation = await collabStore.get(conversationId);
+  if (!conversation) {
+    return;
+  }
+  const contributions = await collabStore.contributions(conversationId, { includeSealed: true });
+  await message.edit({
+    content: formatWorkroomPanel(conversation, contributions),
+    components: workroomActionRows(conversation),
+    allowedMentions: { parse: [] }
+  });
+}
+
+async function refreshStoredWorkroomPanel(conversationId: string): Promise<void> {
+  const conversation = await collabStore.get(conversationId);
+  if (conversation?.controlEphemeral) {
+    return;
+  }
+  const channelId = conversation?.controlChannelId ?? conversation?.threadId ?? conversation?.channelId;
+  if (!conversation?.controlMessageId || !channelId) {
+    return;
+  }
+
+  try {
+    const channel = await client.channels.fetch(channelId);
+    const fetchable = channel as { messages?: { fetch?: (id: string) => Promise<Message> } } | null;
+    const message = await fetchable?.messages?.fetch?.(conversation.controlMessageId);
+    if (message) {
+      await refreshWorkroomPanelMessage(message, conversationId);
+    }
+  } catch (error) {
+    console.warn(`Unable to refresh workroom panel ${conversation.controlMessageId}: ${(error as Error).message}`);
+  }
+}
+
+async function sendWorkroomText(
+  conversationId: string,
+  content: string,
+  fallbackInteraction?: ButtonInteraction
+): Promise<void> {
+  const conversation = await collabStore.get(conversationId);
+  const channelId = conversation?.threadId ?? (conversation?.intent === "council" ? undefined : conversation?.channelId);
+  if (channelId) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      for (const chunk of splitDiscordMessage(content)) {
+        await sendToTextChannel(channel, { content: chunk, allowedMentions: { parse: [] } });
+      }
+      return;
+    } catch (error) {
+      console.warn(`Unable to send workroom update to ${channelId}: ${(error as Error).message}`);
+    }
+  }
+
+  if (fallbackInteraction) {
+    for (const chunk of splitDiscordMessage(content)) {
+      await fallbackInteraction.followUp({ content: chunk, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+    }
+  }
+}
+
+async function archiveWorkroomThread(conversation: CollabConversation): Promise<void> {
+  if (!conversation.threadId) {
+    return;
+  }
+
+  try {
+    const channel = await client.channels.fetch(conversation.threadId);
+    if (!channel?.isThread()) {
+      return;
+    }
+    await channel.setArchived(true, "Devbot workroom closed");
+    try {
+      await channel.setLocked(true, "Devbot workroom closed");
+    } catch (error) {
+      console.warn(`Unable to lock workroom thread ${conversation.threadId}: ${(error as Error).message}`);
+    }
+  } catch (error) {
+    console.warn(`Unable to archive workroom thread ${conversation.threadId}: ${(error as Error).message}`);
   }
 }
 
@@ -1216,7 +1808,56 @@ async function maybeHandleCollabPeerMessage(
     return;
   }
 
+  if (
+    envelope.from.botId !== message.author.id ||
+    (envelope.to?.botId && envelope.to.botId !== client.user.id) ||
+    message.guildId !== appConfig.discordGuildId ||
+    (appConfig.coordinationChannelId && message.channelId !== appConfig.coordinationChannelId) ||
+    !isFreshCollabEnvelope(envelope)
+  ) {
+    return;
+  }
+  if (envelope.type === "devbot.peer.request" && !message.mentions.users.has(client.user.id)) {
+    return;
+  }
+  if (!(await collabStore.claimDelivery(collabDeliveryKey(envelope, message.author.id)))) {
+    return;
+  }
+
   if (envelope.type !== "devbot.peer.request") {
+    const conversation = await collabStore.get(envelope.conversationId);
+    const expectedRequestId = envelope.correlationId ?? envelope.requestId;
+    const expectedParticipant = conversation?.participants.find(
+      (participant) =>
+        participant.kind === "bot" && participant.id === message.author.id && participant.requestId === expectedRequestId
+    );
+    if (!conversation || !expectedParticipant) {
+      return;
+    }
+    if (
+      envelope.type === "devbot.peer.result" &&
+      envelope.intent === "council" &&
+      envelope.capability === "task.plan" &&
+      envelope.payload.ok === true &&
+      typeof envelope.payload.message === "string"
+    ) {
+      const actorName = envelope.from.botName ?? envelope.from.owner;
+      const contribution = await collabStore.acceptPeerContribution({
+        conversationId: envelope.conversationId,
+        actorId: message.author.id,
+        actorName,
+        sourceRequestId: envelope.correlationId ?? envelope.requestId,
+        content: envelope.payload.message,
+        artifacts: envelope.artifacts
+      });
+      if (contribution) {
+        await sendWorkroomText(
+          envelope.conversationId,
+          `${actorName} submitted an independent contribution. It remains sealed until the room is revealed.`
+        );
+        await refreshStoredWorkroomPanel(envelope.conversationId);
+      }
+    }
     await collabStore.addEvent({
       conversationId: envelope.conversationId,
       type: envelope.type === "devbot.peer.result" ? "peer-result" : envelope.type === "devbot.peer.approval" ? "approval" : "note",
@@ -1228,7 +1869,8 @@ async function maybeHandleCollabPeerMessage(
     return;
   }
 
-  if (!message.mentions.users.has(client.user.id)) {
+  if (envelope.payload.transportTruncated === true) {
+    await replyWithCollabResult(message, appConfig, envelope, false, "Request payload was truncated by the Discord transport. Send a shorter request.");
     return;
   }
 
@@ -1284,6 +1926,10 @@ async function maybeHandleCollabPeerMessage(
   if (envelope.capability === "review.packet") {
     const taskId = typeof envelope.payload.taskId === "string" ? envelope.payload.taskId : undefined;
     const task = taskId ? await taskStore.get(taskId) : undefined;
+    if (task && task.projectName !== project.name) {
+      await replyWithCollabResult(message, appConfig, envelope, false, `Task ${task.id} does not belong to project ${project.name}.`);
+      return;
+    }
     const packet = await createReviewPacket(project, task);
     await replyWithCollabResult(message, appConfig, envelope, true, formatReviewPacket(packet), undefined, [
       eventArtifact("review-packet", "peer review packet", project.name)
@@ -1342,7 +1988,8 @@ async function replyWithCollabResult(
   });
   await message.reply({
     content: formatCollabEnvelope(result),
-    files: screenshot ? [new AttachmentBuilder(screenshot.image, { name: screenshot.fileName })] : []
+    files: screenshot ? [new AttachmentBuilder(screenshot.image, { name: screenshot.fileName })] : [],
+    allowedMentions: { parse: [] }
   });
 }
 
@@ -1379,7 +2026,10 @@ async function replyWithCollabApproval(
     },
     artifacts: [eventArtifact("approval", "approval required", request.capability)]
   });
-  await message.reply([approval, "", formatCollabEnvelope(result)].join("\n"));
+  await message.reply({
+    content: [approval, "", formatCollabEnvelope(result, 1_200)].join("\n"),
+    allowedMentions: { parse: [] }
+  });
 }
 
 async function replyToMessageWithChunks(message: Message, response: BotResponse): Promise<void> {
@@ -1469,6 +2119,7 @@ function formatDevbotHelp(appConfig: AppConfig): string {
     "- Run configured validation: `/run project:<name> command:<preset>` or `/review validate`.",
     "- Prepare handoff: `/review packet project:<name> task:<task-id>`.",
     "- Coordinate peers: `/devbot announce`, `/devbot peers`, `/peer status`, `/peer snip`.",
+    "- Open a sealed agent council: `/lab council project:<name> prompt:<decision>`.",
     "- Collaborate in the private lab: `/lab roundtable`, `/lab see`, `/lab bossfight`, `/lab ritual`, `/lab safety`.",
     "",
     appConfig.safeMode
@@ -1489,14 +2140,27 @@ function parseBotId(value: string): string {
 async function sendPeerMessage(
   interaction: ChatInputCommandInteraction,
   appConfig: AppConfig,
-  content: string
+  content: string,
+  targetBotId?: string
 ): Promise<void> {
+  const payload = {
+    content,
+    allowedMentions: targetBotId ? { parse: [] as const, users: [targetBotId] } : { parse: [] as const }
+  };
   if (appConfig.coordinationChannelId) {
     const channel = await client.channels.fetch(appConfig.coordinationChannelId);
     if (!channel?.isTextBased()) {
       throw new Error(`Configured coordination channel ${appConfig.coordinationChannelId} is not text-based.`);
     }
-    await sendToTextChannel(channel, content);
+    if (channel.isThread()) {
+      if (channel.archived) {
+        await channel.setArchived(false, "Devbot peer coordination resumed");
+      }
+      if (targetBotId && channel.type === ChannelType.PrivateThread) {
+        await channel.members.add(targetBotId);
+      }
+    }
+    await sendToTextChannel(channel, payload);
     return;
   }
 
@@ -1504,16 +2168,16 @@ async function sendPeerMessage(
   if (!channel?.isTextBased()) {
     throw new Error("This command must be used in a text channel or COORDINATION_CHANNEL_ID must be configured.");
   }
-  await sendToTextChannel(channel, content);
+  await sendToTextChannel(channel, payload);
 }
 
-async function sendToTextChannel(channel: unknown, content: string): Promise<void> {
-  const sendable = channel as { send?: (message: string) => Promise<unknown> };
+async function sendToTextChannel(channel: unknown, content: unknown): Promise<unknown> {
+  const sendable = channel as { send?: (message: unknown) => Promise<unknown> };
   if (!sendable.send) {
     throw new Error("Target channel cannot send messages.");
   }
 
-  await sendable.send(content);
+  return sendable.send(content);
 }
 
 function optionalPeerField(key: "project" | "target", value: string | null): Partial<Record<"project" | "target", string>> {
@@ -1524,13 +2188,16 @@ async function startLabConversation(
   interaction: ChatInputCommandInteraction,
   intent: CollabIntent,
   project: ProjectEntry | undefined,
-  title: string
+  title: string,
+  brief?: string
 ) {
   const conversation = await collabStore.start({
     intent,
     title,
     requester: interaction.user.tag,
+    requesterId: interaction.user.id,
     channelId: interaction.channelId,
+    ...(brief ? { brief } : {}),
     ...(project ? { projectName: project.name } : {})
   });
   const thread = await createLabThread(interaction, conversation.id, intent, title);
@@ -1538,15 +2205,23 @@ async function startLabConversation(
     return conversation;
   }
 
-  const updated = await collabStore.setThread(conversation.id, thread.id);
-  const withThread = updated ?? { ...conversation, threadId: thread.id };
-  await sendToTextChannel(thread, [
-    formatLabHeader(withThread),
-    "",
-    `Started by ${interaction.user.tag}.`,
-    "This thread is the human-visible audit room for this lab session."
-  ].join("\n"));
-  return withThread;
+  const withThread = { ...conversation, threadId: thread.id };
+  try {
+    await sendToTextChannel(thread, {
+      content: [
+        formatLabHeader(withThread),
+        "",
+        `Started by ${interaction.user.tag}.`,
+        "This thread is the human-visible audit room for this lab session."
+      ].join("\n"),
+      allowedMentions: { parse: [] }
+    });
+  } catch (error) {
+    await thread.delete?.("Unable to initialize the Devbot workroom").catch(() => undefined);
+    console.warn(`Unable to initialize lab thread ${thread.id}: ${(error as Error).message}`);
+    return conversation;
+  }
+  return (await collabStore.setThread(conversation.id, thread.id)) ?? withThread;
 }
 
 async function createLabThread(
@@ -1554,13 +2229,26 @@ async function createLabThread(
   conversationId: string,
   intent: CollabIntent,
   title: string
-): Promise<{ id: string; send?: (message: string) => Promise<unknown> } | undefined> {
+): Promise<{
+  id: string;
+  send?: (message: unknown) => Promise<unknown>;
+  members?: { add?: (userId: string) => Promise<unknown> };
+  delete?: (reason?: string) => Promise<unknown>;
+} | undefined> {
   const threaded = interaction.channel as
     | {
         threads?: {
-          create?: (options: { name: string; autoArchiveDuration?: number; reason?: string }) => Promise<{
+          create?: (options: {
+            name: string;
+            autoArchiveDuration?: ThreadAutoArchiveDuration;
+            type?: ChannelType.PrivateThread;
+            invitable?: boolean;
+            reason?: string;
+          }) => Promise<{
             id: string;
-            send?: (message: string) => Promise<unknown>;
+            send?: (message: unknown) => Promise<unknown>;
+            members?: { add?: (userId: string) => Promise<unknown> };
+            delete?: (reason?: string) => Promise<unknown>;
           }>;
         };
       }
@@ -1570,11 +2258,25 @@ async function createLabThread(
   }
 
   try {
-    return await threaded.threads.create({
+    const privateCouncil = intent === "council";
+    const thread = await threaded.threads.create({
       name: labThreadName(conversationId, intent, title),
-      autoArchiveDuration: 1440,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      ...(privateCouncil ? { type: ChannelType.PrivateThread, invitable: false } : {}),
       reason: "Devbot collaboration lab session"
     });
+    if (privateCouncil) {
+      try {
+        if (!thread.members?.add) {
+          throw new Error("Private thread membership API is unavailable.");
+        }
+        await thread.members.add(interaction.user.id);
+      } catch (error) {
+        await thread.delete?.("Unable to add the council requester to the private workroom").catch(() => undefined);
+        throw error;
+      }
+    }
+    return thread;
   } catch (error) {
     console.warn(`Unable to create lab thread for ${conversationId}: ${(error as Error).message}`);
     return undefined;
@@ -1679,7 +2381,14 @@ async function fanOutLabRequest(
       payload: input.payload,
       artifacts: []
     });
-    await sendPeerMessage(interaction, appConfig, `<@${peer.botId}>\n${formatCollabEnvelope(envelope)}`);
+    await collabStore.inviteParticipant({
+      conversationId: input.conversationId,
+      id: peer.botId,
+      displayName: peer.botName,
+      owner: peer.owner,
+      requestId: envelope.requestId
+    });
+    await sendPeerMessage(interaction, appConfig, `<@${peer.botId}>\n${formatCollabEnvelope(envelope)}`, peer.botId);
     await collabStore.addEvent({
       conversationId: input.conversationId,
       type: "peer-request",
@@ -1728,7 +2437,13 @@ async function maybeSendTargetedReviewRequest(
     },
     artifacts: [eventArtifact("review-packet", "handoff packet", project.name)]
   });
-  await sendPeerMessage(interaction, appConfig, `<@${botId}>\n${formatCollabEnvelope(envelope)}`);
+  await collabStore.inviteParticipant({
+    conversationId,
+    id: botId,
+    displayName: botId,
+    requestId: envelope.requestId
+  });
+  await sendPeerMessage(interaction, appConfig, `<@${botId}>\n${formatCollabEnvelope(envelope)}`, botId);
   await collabStore.addEvent({
     conversationId,
     type: "peer-request",
@@ -1758,22 +2473,24 @@ async function runCodex(
 async function handleAutocomplete(interaction: AutocompleteInteraction, appConfig: AppConfig): Promise<void> {
   const focused = interaction.options.getFocused(true);
   const value = String(focused.value ?? "");
+  const allowedProjects = appConfig.projects.filter((project) => isAllowedForProject(interaction, project));
 
   if (focused.name === "project") {
-    await interaction.respond(projectChoices(appConfig.projects, value));
+    await interaction.respond(projectChoices(allowedProjects, value));
     return;
   }
 
   if (focused.name === "command" || focused.name === "commands") {
-    const project = findProjectFromAutocomplete(interaction, appConfig.projects);
+    const project = findProjectFromAutocomplete(interaction, allowedProjects);
     await interaction.respond(commandChoices(project, value));
     return;
   }
 
   if (focused.name === "id" || focused.name === "task") {
-    const project = findProjectFromAutocomplete(interaction, appConfig.projects);
+    const project = findProjectFromAutocomplete(interaction, allowedProjects);
     const tasks = await taskStore.listRecent({ limit: 25, ...(project ? { projectName: project.name } : {}) });
-    await interaction.respond(taskChoices(tasks, value));
+    const allowedProjectNames = new Set(allowedProjects.map((item) => item.name));
+    await interaction.respond(taskChoices(tasks.filter((task) => allowedProjectNames.has(task.projectName)), value));
     return;
   }
 
@@ -1866,14 +2583,19 @@ async function ensureProjectAccess(interaction: ChatInputCommandInteraction, pro
   return false;
 }
 
-function isAllowed(interaction: ChatInputCommandInteraction, appConfig: AppConfig): boolean {
+function isAllowed(interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction, appConfig: AppConfig): boolean {
   const hasUserAllowList = appConfig.allowedUserIds.size > 0;
+  const hasUsernameAllowList = appConfig.allowedUsernames.size > 0;
   const hasRoleAllowList = appConfig.allowedRoleIds.size > 0;
-  if (!hasUserAllowList && !hasRoleAllowList) {
+  if (!hasUserAllowList && !hasUsernameAllowList && !hasRoleAllowList) {
     return true;
   }
 
   if (appConfig.allowedUserIds.has(interaction.user.id)) {
+    return true;
+  }
+
+  if (isApprovedDiscordUsername(interactionNameSource(interaction), appConfig.allowedUsernames)) {
     return true;
   }
 
@@ -1889,14 +2611,21 @@ function isAllowed(interaction: ChatInputCommandInteraction, appConfig: AppConfi
   return false;
 }
 
-function isAllowedForProject(interaction: ChatInputCommandInteraction, project: ProjectEntry): boolean {
+function isAllowedForProject(
+  interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction,
+  project: ProjectEntry
+): boolean {
   const policy = project.metadata.policy;
-  const hasProjectAllowList = policy.allowedUsers.length > 0 || policy.allowedRoles.length > 0;
+  const hasProjectAllowList = policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
   if (!hasProjectAllowList) {
     return true;
   }
 
   if (policy.allowedUsers.includes(interaction.user.id)) {
+    return true;
+  }
+
+  if (isApprovedDiscordUsername(interactionNameSource(interaction), policy.allowedUsernames)) {
     return true;
   }
 
@@ -1914,8 +2643,9 @@ function isAllowedForProject(interaction: ChatInputCommandInteraction, project: 
 
 function isAllowedMessage(message: Message, appConfig: AppConfig): boolean {
   const hasUserAllowList = appConfig.allowedUserIds.size > 0;
+  const hasUsernameAllowList = appConfig.allowedUsernames.size > 0;
   const hasRoleAllowList = appConfig.allowedRoleIds.size > 0;
-  if (!hasUserAllowList && !hasRoleAllowList) {
+  if (!hasUserAllowList && !hasUsernameAllowList && !hasRoleAllowList) {
     return true;
   }
 
@@ -1923,7 +2653,59 @@ function isAllowedMessage(message: Message, appConfig: AppConfig): boolean {
     return true;
   }
 
+  if (isApprovedDiscordUsername(messageNameSource(message), appConfig.allowedUsernames)) {
+    return true;
+  }
+
   return message.member?.roles.cache.some((role) => appConfig.allowedRoleIds.has(role.id)) ?? false;
+}
+
+function isAllowedMessageForProject(message: Message, project: ProjectEntry): boolean {
+  const policy = project.metadata.policy;
+  const hasProjectAllowList = policy.allowedUsers.length > 0 || policy.allowedUsernames.length > 0 || policy.allowedRoles.length > 0;
+  if (!hasProjectAllowList) {
+    return true;
+  }
+  if (policy.allowedUsers.includes(message.author.id)) {
+    return true;
+  }
+  if (isApprovedDiscordUsername(messageNameSource(message), policy.allowedUsernames)) {
+    return true;
+  }
+  return message.member?.roles.cache.some((role) => policy.allowedRoles.includes(role.id)) ?? false;
+}
+
+function canAccessConversation(
+  interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction,
+  conversation: CollabConversation,
+  appConfig: AppConfig
+): boolean {
+  if (conversation.intent === "council" && conversation.requesterId && conversation.requesterId !== interaction.user.id) {
+    return false;
+  }
+  if (!conversation.projectName) {
+    return true;
+  }
+  const project = findProject(appConfig.projects, conversation.projectName);
+  return Boolean(project && isAllowedForProject(interaction, project));
+}
+
+function interactionNameSource(interaction: ChatInputCommandInteraction | ButtonInteraction | AutocompleteInteraction) {
+  return {
+    username: interaction.user.username,
+    globalName: interaction.user.globalName,
+    tag: interaction.user.tag,
+    displayName: interaction.member instanceof GuildMember ? interaction.member.displayName : undefined
+  };
+}
+
+function messageNameSource(message: Message) {
+  return {
+    username: message.author.username,
+    globalName: message.author.globalName,
+    tag: message.author.tag,
+    displayName: message.member?.displayName
+  };
 }
 
 async function replyWithError(interaction: Interaction, error: unknown): Promise<void> {

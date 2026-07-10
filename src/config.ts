@@ -2,6 +2,7 @@ import "dotenv/config";
 
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { normalizeDiscordUsernames } from "./access.js";
 import type { AppConfig, ProjectCommands, ProjectEntry, ProjectMap, ProjectMetadata } from "./types.js";
 
 const DEFAULT_SCANNER = {
@@ -18,6 +19,7 @@ export function loadConfig(): AppConfig {
     ...loadDiscordConfig(),
     codex: loadCodexConfig(),
     allowedUserIds: csvSet(process.env.ALLOWED_USER_IDS),
+    allowedUsernames: normalizedUsernameSet(process.env.ALLOWED_USERNAMES),
     allowedRoleIds: csvSet(process.env.ALLOWED_ROLE_IDS),
     safeMode: parseBoolean(process.env.DEVBOT_SAFE_MODE, false),
     botIdentity: {
@@ -43,12 +45,30 @@ function loadCodexConfig() {
   }
 
   return {
-    bin: process.env.CODEX_BIN?.trim() || "/Applications/Codex.app/Contents/Resources/codex",
+    bin: resolveCodexBin(process.env.CODEX_BIN),
     model: process.env.CODEX_MODEL?.trim() || undefined,
     sandbox,
     actionSandbox,
     timeoutMs: Number(process.env.CODEX_TIMEOUT_MS || 180_000)
   };
+}
+
+const BUNDLED_CODEX_CANDIDATES = [
+  "/Applications/ChatGPT.app/Contents/Resources/codex",
+  "/Applications/Codex.app/Contents/Resources/codex"
+];
+
+export function resolveCodexBin(
+  configured: string | undefined,
+  bundledCandidates = BUNDLED_CODEX_CANDIDATES,
+  fileExists: (candidate: string) => boolean = existsSync
+): string {
+  const preferred = configured?.trim();
+  if (preferred && (!path.isAbsolute(preferred) || fileExists(preferred))) {
+    return preferred;
+  }
+
+  return bundledCandidates.find(fileExists) ?? preferred ?? "codex";
 }
 
 export function loadDiscordConfig(): Pick<AppConfig, "discordToken" | "discordClientId" | "discordGuildId"> {
@@ -122,6 +142,10 @@ function csvSet(value: string | undefined): Set<string> {
   );
 }
 
+function normalizedUsernameSet(value: string | undefined): Set<string> {
+  return new Set(normalizeDiscordUsernames((value ?? "").split(",")));
+}
+
 function normalizeProjectName(name: string): string {
   return name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
 }
@@ -163,6 +187,7 @@ function readProjectPolicy(value: unknown): ProjectMetadata["policy"] {
   return {
     visibility: visibility === "team" || visibility === "public" ? visibility : "private",
     allowedUsers: stringArray(raw.allowedUsers),
+    allowedUsernames: normalizeDiscordUsernames(stringArray(raw.allowedUsernames)),
     allowedRoles: stringArray(raw.allowedRoles),
     allowedPeers: stringArray(raw.allowedPeers),
     screenshotPolicy: screenshotPolicy === "approval" || screenshotPolicy === "deny" ? screenshotPolicy : "allow",

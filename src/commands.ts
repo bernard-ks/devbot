@@ -203,6 +203,29 @@ export const commandDefinitions = [
     .setDescription("Run private devbot collaboration lab workflows.")
     .addSubcommand((subcommand) =>
       subcommand
+        .setName("council")
+        .setDescription("Collect independent sealed agent proposals, then reveal and synthesize them.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
+        )
+        .addStringOption((option) =>
+          option
+            .setName("prompt")
+            .setDescription("Question or decision for the council, up to 500 characters.")
+            .setRequired(true)
+            .setMaxLength(500)
+        )
+        .addIntegerOption((option) =>
+          option
+            .setName("seats")
+            .setDescription("Independent local agent seats, 2-4. Defaults to 3.")
+            .setRequired(false)
+            .setMinValue(2)
+            .setMaxValue(4)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
         .setName("roundtable")
         .setDescription("Invite devbots to give role-based angles on a project question.")
         .addStringOption((option) =>

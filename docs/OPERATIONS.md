@@ -57,6 +57,7 @@ Project metadata can also include a `policy` block:
   "policy": {
     "visibility": "team",
     "allowedUsers": [],
+    "allowedUsernames": [],
     "allowedRoles": [],
     "allowedPeers": ["123456789012345678"],
     "screenshotPolicy": "approval",
@@ -66,7 +67,17 @@ Project metadata can also include a `policy` block:
 }
 ```
 
-Empty `allowedUsers` and `allowedRoles` preserve the global bot allow-list for project-specific commands. Empty `allowedPeers` means any globally allow-listed peer can ask about the project. `screenshotPolicy` can be `allow`, `approval`, or `deny`.
+Empty `allowedUsers`, `allowedUsernames`, and `allowedRoles` preserve the global bot allow-list for project-specific commands. Empty `allowedPeers` means any globally allow-listed peer can ask about the project. `screenshotPolicy` can be `allow`, `approval`, or `deny`.
+
+For global bot access, set one or more of:
+
+```bash
+ALLOWED_USER_IDS=123456789012345678
+ALLOWED_USERNAMES=bernard-ks,team lead
+ALLOWED_ROLE_IDS=234567890123456789
+```
+
+If any global allow-list is configured, a Discord user must match at least one configured ID, account username, or role. User IDs are the most stable option. Account usernames are case-insensitive; mutable global display names and guild nicknames are intentionally ignored.
 
 ## Common Commands
 
@@ -144,6 +155,8 @@ PEER_BOT_IDS=123456789012345678,234567890123456789
 COORDINATION_CHANNEL_ID=123456789012345678
 ```
 
+For peer-backed `/lab council` sessions, `COORDINATION_CHANNEL_ID` is required and should reference a private text channel or private thread visible only to approved humans and allow-listed peer bots. Devbot automatically unarchives a configured coordination thread and adds a target peer before sending. The human workroom is a separate private thread. If private-thread creation or the coordination room is unavailable, the council deliberately falls back to local-only operation in an ephemeral response.
+
 Then run:
 
 ```text
@@ -160,6 +173,7 @@ Peer actions are read-only in this MVP. File edits, pushes, merges, and arbitrar
 Use `/lab` for private devbot collaboration in Discord:
 
 ```text
+/lab council project:webapp prompt:should we add Redis or keep the cache in process? seats:3
 /lab roundtable project:webapp prompt:what should we build first?
 /lab see project:webapp target:browse page
 /lab bossfight project:webapp task:<task-id>
@@ -173,7 +187,21 @@ Use `/lab` for private devbot collaboration in Discord:
 /lab safety project:webapp
 ```
 
-Lab sessions write an append-only local index to `.devbot/collab.json`. Discord remains the human-visible audit trail; the local store exists so the bot can list recent lab sessions, inspect events, record approvals, and correlate peer replies.
+Lab sessions persist workroom state to `.devbot/collab.json`. The store tracks lifecycle phase, stable participants, correlated peer invitations, sealed contributions, synthesis, decisions, and an event timeline. Existing version 1 files are migrated in memory and saved as version 2 after the next mutation. Malformed state fails loudly rather than being replaced.
+
+Run only one Devbot process against a given collaboration state file. In-process mutations are serialized and written atomically, but the JSON backend is not a multi-process database. Give each bot its own `DEVBOT_COLLAB_STORE` path.
+
+For `/lab council`, use the workroom buttons in the generated Discord thread:
+
+The command starts three independent local seats in parallel by default: Product Steward, Systems Builder, and Evidence Verifier. Set `seats:2`, `seats:3`, or `seats:4`; the fourth seat is Operations Guardian. Each response is persisted as a separate sealed task and no seat sees another seat's answer.
+
+- `Challenge` adds one independent skeptical contribution before reveal.
+- `Reveal` closes collection with the responses already present and publishes them.
+- `Synthesize` asks the local chair to weigh the revealed evidence and recommend one next action. It waits while invited peers are pending unless the human explicitly reveals early.
+- `Approve` and `Deny` record a decision but execute no code or commands.
+- `Close` makes the workroom terminal.
+
+Sealed contributions are hidden by Devbot's workroom APIs and UI until reveal. They are still present in the local state file and travel through the configured private Discord coordination channel, so this is anti-anchoring rather than cryptographic secrecy.
 
 Peer lab requests use versioned envelopes. Read-only peer actions can return status, screenshots, plans, and review packets. Validation and gates can be run after `/lab approve`; arbitrary command execution, writes, pushes, merges, deploys, installs, and secret/config changes should show an approval card and wait for the owner.
 

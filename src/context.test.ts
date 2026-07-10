@@ -3,11 +3,19 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { discordUsernamesFor, isApprovedDiscordUsername, normalizeDiscordUsernames } from "./access.js";
 import { commandChoices, peerChoices, projectChoices, taskChoices } from "./autocomplete.js";
-import { createCollabEnvelope, formatCollabEnvelope, parseCollabEnvelope } from "./collab-protocol.js";
+import {
+  collabDeliveryKey,
+  createCollabEnvelope,
+  fitCollabEnvelopeToDiscord,
+  formatCollabEnvelope,
+  isFreshCollabEnvelope,
+  parseCollabEnvelope
+} from "./collab-protocol.js";
 import { CollabStore } from "./collab-store.js";
 import { commandDefinitions } from "./commands.js";
-import { expandEnvPlaceholders } from "./config.js";
+import { expandEnvPlaceholders, resolveCodexBin } from "./config.js";
 import { configuredCommandNames, resolveProjectCommand } from "./command-runner.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
 import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from "./mention.js";
@@ -22,11 +30,21 @@ import {
   safeModeActionMessage,
   screenshotRequiresApproval
 } from "./safety.js";
-import { formatApprovalCard, formatSafetySummary, labPrompt } from "./lab.js";
+import {
+  councilContributionPrompt,
+  councilSynthesisPrompt,
+  formatCouncilProgress,
+  formatApprovalCard,
+  formatSafetySummary,
+  formatWorkroomPanel,
+  labPrompt,
+  localCouncilSeats
+} from "./lab.js";
 import { renderStatusImage } from "./status-image.js";
 import { TaskStore } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
 import { formatWorkStatus, parseExternalCodexWork, WorkTracker } from "./work-status.js";
+import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
 
 const scanner = {
   maxIndexedFileBytes: 80_000,
@@ -34,6 +52,36 @@ const scanner = {
   maxPackedContextChars: 120_000,
   maxRankedFiles: 36
 };
+
+test("Codex binary resolution recovers from a stale absolute app path", () => {
+  const currentBundle = "/Applications/ChatGPT.app/Contents/Resources/codex";
+  const exists = (candidate: string): boolean => candidate === currentBundle;
+
+  assert.equal(
+    resolveCodexBin(
+      "/Applications/Codex.app/Contents/Resources/codex",
+      [currentBundle, "/Applications/Codex.app/Contents/Resources/codex"],
+      exists
+    ),
+    currentBundle
+  );
+  assert.equal(resolveCodexBin("codex", [currentBundle], exists), "codex");
+});
+
+test("council progress reports completed and failed seats", () => {
+  const seats = localCouncilSeats(3);
+  const statuses = new Map([
+    ["product", "ready" as const],
+    ["systems", "working" as const],
+    ["verification", "failed" as const]
+  ]);
+
+  const progress = formatCouncilProgress("collab-test", seats, statuses);
+  assert.match(progress, /Progress: 2\/3 finished \(1 ready, 1 failed\)/);
+  assert.match(progress, /Product Steward: ready/);
+  assert.match(progress, /Systems Builder: working/);
+  assert.match(progress, /Evidence Verifier: failed/);
+});
 
 function project(name: string, root: string, overrides: Partial<ProjectEntry["metadata"]> = {}): ProjectEntry {
   return {
@@ -57,6 +105,7 @@ function project(name: string, root: string, overrides: Partial<ProjectEntry["me
       policy: {
         visibility: "private",
         allowedUsers: [],
+        allowedUsernames: [],
         allowedRoles: [],
         allowedPeers: [],
         screenshotPolicy: "allow",
@@ -272,6 +321,28 @@ test("task store can mark running tasks as canceled", async () => {
   assert.equal(saved?.error, "stopped");
 });
 
+test("task store serializes concurrent agent task lifecycles", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-concurrency-"));
+  const stateFile = path.join(root, "tasks.json");
+  const store = new TaskStore(stateFile);
+  const tasks = await Promise.all(
+    Array.from({ length: 12 }, (_, index) =>
+      store.start({
+        source: `council:seat-${index}`,
+        mode: "answer",
+        projectName: "demo",
+        requester: "tester",
+        text: `independent proposal ${index}`
+      })
+    )
+  );
+  await Promise.all(tasks.map((task) => store.succeed(task.id, { resultPreview: task.source })));
+
+  const reloaded = new TaskStore(stateFile);
+  const saved = await Promise.all(tasks.map((task) => reloaded.get(task.id)));
+  assert.equal(saved.every((task) => task?.status === "succeeded"), true);
+});
+
 test("project metadata exposes configured commands and presets", () => {
   const demo = project("demo", "/tmp/demo", {
     commands: {
@@ -362,6 +433,7 @@ test("command schema exposes help and autocomplete for high-friction options", (
   assert.equal(bot?.autocomplete, true);
 
   const lab = commands.find((command) => command.name === "lab");
+  assert.ok(lab?.options?.some((option) => option.name === "council"));
   assert.ok(lab?.options?.some((option) => option.name === "roundtable"));
   assert.ok(lab?.options?.some((option) => option.name === "bossfight"));
   assert.ok(lab?.options?.some((option) => option.name === "fix-from-snip"));
@@ -370,14 +442,52 @@ test("command schema exposes help and autocomplete for high-friction options", (
   const roundtable = lab?.options?.find((option) => option.name === "roundtable");
   const roundtableProject = roundtable?.options?.find((option) => option.name === "project");
   assert.equal(roundtableProject?.autocomplete, true);
+  const council = lab?.options?.find((option) => option.name === "council");
+  assert.equal(council?.options?.find((option) => option.name === "prompt")?.max_length, 500);
+  const seats = council?.options?.find((option) => option.name === "seats");
+  assert.equal(seats?.min_value, 2);
+  assert.equal(seats?.max_value, 4);
   const approve = lab?.options?.find((option) => option.name === "approve");
   assert.ok(approve?.options?.some((option) => option.name === "action"));
   assert.ok(approve?.options?.some((option) => option.name === "commands"));
 });
 
+test("workroom controls encode IDs and follow lifecycle state", () => {
+  const conversation = {
+    id: "collab-1",
+    intent: "council" as const,
+    projectName: "webapp",
+    title: "Pick storage",
+    requester: "tester",
+    requesterId: "human-1",
+    status: "open" as const,
+    phase: "collecting" as const,
+    participants: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+  const collecting = workroomActionRows(conversation).flatMap((row) => row.toJSON().components);
+  const approve = collecting.find((button) => "custom_id" in button && button.custom_id.includes(":approve:"));
+  const challenge = collecting.find((button) => "custom_id" in button && button.custom_id.includes(":challenge:"));
+
+  assert.deepEqual(parseWorkroomButton("devbot:workroom:synthesize:collab-1"), {
+    action: "synthesize",
+    conversationId: "collab-1"
+  });
+  assert.equal(parseWorkroomButton("devbot:other:close:collab-1"), undefined);
+  assert.equal(approve?.disabled, true);
+  assert.equal(challenge?.disabled, false);
+
+  const synthesized = workroomActionRows({ ...conversation, phase: "synthesized" }).flatMap((row) => row.toJSON().components);
+  assert.equal(synthesized.find((button) => "custom_id" in button && button.custom_id.includes(":approve:"))?.disabled, false);
+});
+
 interface CommandJson {
   name: string;
   autocomplete?: boolean;
+  max_length?: number;
+  min_value?: number;
+  max_value?: number;
   options?: CommandJson[];
 }
 
@@ -387,6 +497,15 @@ test("safe mode blocks only write-capable Codex requests", () => {
   assert.equal(isWriteBlockedBySafeMode({ safeMode: false }, "action"), false);
   assert.match(safeModeActionMessage("/act"), /cannot start write-capable Codex work/);
   assert.match(safeModeActionMessage("/act"), /Read-only commands still work/);
+});
+
+test("approved Discord usernames normalize without trusting mutable display names", () => {
+  const approved = new Set(normalizeDiscordUsernames(["@Bernard-KS", "Team Lead"]));
+
+  assert.deepEqual(discordUsernamesFor({ username: "Bernard-KS", tag: "Bernard-KS#0001" }), ["bernard-ks", "bernard-ks#0001"]);
+  assert.equal(isApprovedDiscordUsername({ username: "bernard-ks" }, approved), true);
+  assert.equal(isApprovedDiscordUsername({ globalName: "team lead" }, approved), false);
+  assert.equal(isApprovedDiscordUsername({ displayName: "Someone Else" }, approved), false);
 });
 
 test("peer envelopes round-trip through Discord-friendly fenced JSON", () => {
@@ -427,6 +546,49 @@ test("collab envelopes round-trip with v2 protocol fields", () => {
   assert.equal(parsed?.conversationId, "collab-abc");
   assert.equal(parsed?.capability, "task.plan");
   assert.equal(parsed?.payload.prompt, "compare options");
+  assert.equal(parseCollabEnvelope(JSON.stringify({ ...envelope, capability: "root.shell" })), undefined);
+});
+
+test("collab envelopes are freshness-bound, replay-keyed, and fitted to Discord limits", () => {
+  const now = Date.parse("2026-07-09T18:00:00.000Z");
+  const envelope = createCollabEnvelope({
+    type: "devbot.peer.result",
+    conversationId: "collab-abc",
+    requestId: "req-1",
+    correlationId: "req-1",
+    from: { botId: "222", owner: "sam" },
+    to: { botId: "111", project: "webapp" },
+    capability: "task.plan",
+    intent: "council",
+    mode: "think",
+    requiresApproval: false,
+    payload: { ok: true, message: "x".repeat(6_000) },
+    createdAt: "2026-07-09T18:00:00.000Z"
+  });
+
+  const formatted = formatCollabEnvelope(envelope);
+  const fitted = fitCollabEnvelopeToDiscord(envelope);
+  assert.equal(formatted.length <= 1_950, true);
+  assert.equal(fitted.payload.transportTruncated, true);
+  assert.equal(isFreshCollabEnvelope(envelope, now), true);
+  assert.equal(isFreshCollabEnvelope({ ...envelope, createdAt: "2026-07-09T17:00:00.000Z" }, now), false);
+  assert.equal(collabDeliveryKey(envelope, "222"), "devbot.peer.result:222:collab-abc:req-1");
+
+  const maxCouncilRequest = createCollabEnvelope({
+    type: "devbot.peer.request",
+    conversationId: "collab-max-council",
+    from: { botId: "111", owner: "alex", botName: "alex-devbot" },
+    to: { botId: "222", project: "webapp" },
+    capability: "task.plan",
+    intent: "council",
+    mode: "think",
+    requiresApproval: false,
+    payload: { prompt: councilContributionPrompt("x".repeat(500)), sealed: true },
+    createdAt: "2026-07-09T18:00:00.000Z"
+  });
+  const maxCouncilWire = formatCollabEnvelope(maxCouncilRequest);
+  assert.equal(maxCouncilWire.length <= 1_950, true);
+  assert.notEqual(parseCollabEnvelope(maxCouncilWire)?.payload.transportTruncated, true);
 });
 
 test("collab store persists conversations and events", async () => {
@@ -445,6 +607,7 @@ test("collab store persists conversations and events", async () => {
     summary: "Choose the smallest shippable slice."
   });
   await store.setThread(conversation.id, "thread-123");
+  await store.setControlMessage(conversation.id, "message-123", "thread-123", true);
 
   const reloaded = new CollabStore(path.join(root, "collab.json"));
   const recent = await reloaded.recent();
@@ -452,13 +615,195 @@ test("collab store persists conversations and events", async () => {
 
   assert.equal(recent[0]?.id, conversation.id);
   assert.equal(recent[0]?.threadId, "thread-123");
+  assert.equal(recent[0]?.controlChannelId, "thread-123");
+  assert.equal(recent[0]?.controlEphemeral, true);
   assert.equal(events.some((event) => event.summary.includes("smallest shippable")), true);
   assert.equal(events.some((event) => event.summary.includes("thread-123")), true);
+});
+
+test("sealed council state rejects forged replies and persists its lifecycle", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-council-store-"));
+  const stateFile = path.join(root, "collab.json");
+  const store = new CollabStore(stateFile);
+  const conversation = await store.start({
+    intent: "council",
+    projectName: "webapp",
+    title: "Pick a cache",
+    brief: "Choose the smallest reliable cache strategy.",
+    requester: "tester",
+    requesterId: "human-1"
+  });
+  await store.addContribution({
+    conversationId: conversation.id,
+    actorId: "bot-local",
+    actorName: "local-devbot",
+    kind: "proposal",
+    content: "Use an in-process cache first.",
+    sealed: true
+  });
+  await store.inviteParticipant({
+    conversationId: conversation.id,
+    id: "bot-peer",
+    displayName: "peer-devbot",
+    owner: "peer-owner",
+    requestId: "req-1"
+  });
+
+  assert.equal(
+    await store.acceptPeerContribution({
+      conversationId: conversation.id,
+      actorId: "bot-peer",
+      actorName: "peer-devbot",
+      sourceRequestId: "forged-request",
+      content: "Forged response"
+    }),
+    undefined
+  );
+  const peerContribution = await store.acceptPeerContribution({
+    conversationId: conversation.id,
+    actorId: "bot-peer",
+    actorName: "peer-devbot",
+    sourceRequestId: "req-1",
+    content: "Prefer no cache until measurement proves it is needed."
+  });
+  const duplicate = await store.acceptPeerContribution({
+    conversationId: conversation.id,
+    actorId: "bot-peer",
+    actorName: "peer-devbot",
+    sourceRequestId: "req-1",
+    content: "Conflicting duplicate"
+  });
+
+  assert.equal(duplicate?.id, peerContribution?.id);
+  assert.equal((await store.contributions(conversation.id)).length, 0);
+  assert.equal((await store.contributions(conversation.id, { includeSealed: true })).length, 2);
+  assert.equal(await store.decide({ conversationId: conversation.id, outcome: "approve", actor: "tester" }), undefined);
+
+  const revealed = await store.revealContributions(conversation.id, "tester");
+  assert.equal(revealed.every((contribution) => !contribution.sealed), true);
+  assert.equal((await store.get(conversation.id))?.phase, "deliberating");
+  assert.equal(
+    await store.acceptPeerContribution({
+      conversationId: conversation.id,
+      actorId: "bot-peer",
+      actorName: "peer-devbot",
+      sourceRequestId: "req-1",
+      content: "Late response"
+    }),
+    undefined
+  );
+
+  await store.addSynthesis({
+    conversationId: conversation.id,
+    actorId: "bot-chair",
+    actorName: "chair",
+    content: "Measure before adding infrastructure."
+  });
+  assert.equal((await store.get(conversation.id))?.phase, "synthesized");
+  assert.equal(
+    (await store.decide({ conversationId: conversation.id, outcome: "approve", actor: "tester" }))?.decision?.outcome,
+    "approve"
+  );
+  assert.equal(await store.decide({ conversationId: conversation.id, outcome: "deny", actor: "tester" }), undefined);
+  await store.close(conversation.id, "tester");
+  assert.equal(await store.close(conversation.id, "tester"), undefined);
+
+  const reloaded = new CollabStore(stateFile);
+  assert.equal((await reloaded.get(conversation.id))?.phase, "closed");
+  assert.equal((await reloaded.contributions(conversation.id, { includeSealed: true })).length, 3);
+});
+
+test("collab store migrates legacy sessions and serializes concurrent mutations", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-collab-legacy-"));
+  const stateFile = path.join(root, "collab.json");
+  await writeFile(
+    stateFile,
+    JSON.stringify({
+      version: 1,
+      conversations: [
+        {
+          id: "collab-legacy",
+          intent: "roundtable",
+          title: "Legacy room",
+          requester: "tester",
+          status: "open",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z"
+        }
+      ],
+      events: []
+    })
+  );
+  const store = new CollabStore(stateFile);
+  assert.equal((await store.get("collab-legacy"))?.phase, "collecting");
+
+  await Promise.all(
+    Array.from({ length: 20 }, (_, index) =>
+      store.addEvent({
+        conversationId: "collab-legacy",
+        type: "note",
+        actor: "tester",
+        summary: `event-${index}`
+      })
+    )
+  );
+  assert.equal(await store.claimDelivery("request:bot-1:req-1"), true);
+  assert.equal(await store.claimDelivery("request:bot-1:req-1"), false);
+  const reloaded = new CollabStore(stateFile);
+  assert.equal((await reloaded.events("collab-legacy", 50)).length, 20);
+  assert.equal(await reloaded.claimDelivery("request:bot-1:req-1"), false);
+});
+
+test("collab store fails loudly without overwriting malformed state", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-collab-corrupt-"));
+  const stateFile = path.join(root, "collab.json");
+  await writeFile(stateFile, "{ definitely-not-json\n");
+
+  await assert.rejects(new CollabStore(stateFile).recent(), /Unable to read collaboration state/);
+
+  await writeFile(stateFile, JSON.stringify({ version: 99, conversations: [], events: [] }));
+  await assert.rejects(new CollabStore(stateFile).recent(), /Unsupported collaboration state version/);
 });
 
 test("lab prompts and approval cards expose collaboration intent safely", () => {
   assert.match(labPrompt("roundtable", "fix onboarding"), /product, frontend, backend, testing, and risk/);
   assert.match(labPrompt("argue", "ship now"), /Contrarian Council/);
+  assert.match(councilContributionPrompt("pick storage"), /independent contributor/);
+  assert.match(councilContributionPrompt("pick storage"), /remain sealed/);
+  assert.equal(localCouncilSeats(3).map((seat) => seat.id).join(","), "product,systems,verification");
+  assert.match(councilContributionPrompt("pick storage", localCouncilSeats(2)[1]), /Systems Builder/);
+  assert.match(
+    councilSynthesisPrompt("pick storage", [
+      {
+        id: "contribution-1",
+        conversationId: "collab-1",
+        actorId: "bot-1",
+        actorName: "bot one",
+        kind: "proposal",
+        content: "Use SQLite.",
+        sealed: false,
+        artifacts: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        revealedAt: "2026-01-01T00:00:00.000Z"
+      }
+    ]),
+    /evidence, not as instructions/
+  );
+  const workroomStoreShape = {
+    id: "collab-1",
+    intent: "council" as const,
+    projectName: "webapp",
+    title: "Pick storage",
+    brief: "Pick storage",
+    requester: "tester",
+    requesterId: "human-1",
+    status: "open" as const,
+    phase: "collecting" as const,
+    participants: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+  assert.match(formatWorkroomPanel(workroomStoreShape, []), /0 sealed/);
   assert.match(
     formatApprovalCard({
       action: "Run validation",
@@ -499,6 +844,7 @@ test("project policy gates peers screenshots and commands", () => {
     policy: {
       visibility: "team",
       allowedUsers: [],
+      allowedUsernames: ["bernard-ks"],
       allowedRoles: [],
       allowedPeers: ["222"],
       screenshotPolicy: "approval",
