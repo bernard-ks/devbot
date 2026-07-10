@@ -2,12 +2,14 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { CodexRequestMode } from "./codex-client.js";
+import type { ModelTier, RequestContextMode } from "./request-router.js";
 import type { ProjectEntry } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
 export type CodexWorkMode = CodexRequestMode | "session";
 export type CodexWorkSource = "bot" | "local-codex";
+export type WorkPhase = "routing" | "gathering-context" | "running-codex";
 
 export interface ActiveWork {
   id: string;
@@ -18,6 +20,11 @@ export interface ActiveWork {
   text: string;
   startedAt: Date;
   pid?: number;
+  taskId?: string;
+  phase?: WorkPhase;
+  modelTier?: ModelTier;
+  contextMode?: RequestContextMode;
+  contextFileCount?: number;
 }
 
 export interface StartWorkInput {
@@ -25,6 +32,35 @@ export interface StartWorkInput {
   projectName: string;
   requester: string;
   text: string;
+  taskId?: string;
+}
+
+export interface WorkProgressUpdate {
+  phase?: WorkPhase;
+  modelTier?: ModelTier;
+  contextMode?: RequestContextMode;
+  contextFileCount?: number;
+}
+
+export interface ProjectWorkSnapshot {
+  projectName: string;
+  branch: string;
+  defaultBranch: string;
+  status: string;
+  diffStat: string;
+  lastCommit: string;
+}
+
+export function scopeStatusToProject<T extends { projects: ProjectEntry[] }>(
+  appConfig: T,
+  project: ProjectEntry
+): Omit<T, "projects"> & { projects: ProjectEntry[] } {
+  return { ...appConfig, projects: [project] };
+}
+
+export function filterWorkForProjects(activeWork: ActiveWork[], projects: ProjectEntry[]): ActiveWork[] {
+  const visibleProjectNames = new Set(projects.map((project) => project.name));
+  return activeWork.filter((work) => visibleProjectNames.has(work.projectName));
 }
 
 export class WorkTracker {
@@ -36,9 +72,20 @@ export class WorkTracker {
       id: String(this.nextId++),
       source: "bot",
       ...input,
+      phase: "routing",
       startedAt: new Date()
     };
     this.active.set(work.id, work);
+    return work;
+  }
+
+  update(id: string, progress: WorkProgressUpdate): ActiveWork | undefined {
+    const work = this.active.get(id);
+    if (!work) {
+      return undefined;
+    }
+
+    Object.assign(work, progress);
     return work;
   }
 
@@ -51,18 +98,265 @@ export class WorkTracker {
   }
 }
 
-export function formatWorkStatus(activeWork: ActiveWork[], now = new Date()): string {
-  if (activeWork.length === 0) {
-    return "No Codex dev work is currently in progress.";
+export function formatWorkStatus(
+  activeWork: ActiveWork[],
+  now = new Date(),
+  projectSnapshots: ProjectWorkSnapshot[] = []
+): string {
+  const botWork = activeWork.filter((work) => work.source === "bot");
+  const externalRuns = activeWork.filter((work) => work.source === "local-codex" && work.mode !== "session");
+  const openSessions = activeWork.filter((work) => work.source === "local-codex" && work.mode === "session");
+  const confirmedWork = [...botWork, ...externalRuns];
+  const lines = [
+    "**Development status**",
+    `Devbot tasks: ${botWork.length} | External runs: ${externalRuns.length} | Open sessions: ${openSessions.length}`,
+    "",
+    "**Now**"
+  ];
+
+  if (confirmedWork.length === 0) {
+    lines.push("No Devbot-managed task or external Codex command is confirmed running.");
+  } else {
+    lines.push(...confirmedWork.map((work) => formatConfirmedWork(work, now)));
   }
 
-  const lines = activeWork.map((work) => {
-    const elapsed = formatElapsed(now.getTime() - work.startedAt.getTime());
-    const pid = work.pid ? `, pid ${work.pid}` : "";
-    return `- \`${work.projectName}\` ${work.mode} via ${work.source}${pid} for ${work.requester}, running ${elapsed}: ${truncate(work.text, 120)}`;
-  });
+  if (openSessions.length > 0) {
+    lines.push("", "**Open sessions (activity unknown)**", ...openSessions.map((work) => formatOpenSession(work, now)));
+  }
 
-  return [`Codex dev work currently in progress: ${activeWork.length}`, ...lines].join("\n");
+  if (projectSnapshots.length > 0) {
+    lines.push("", "**Repository evidence**", ...projectSnapshots.map(formatProjectSnapshot));
+  }
+
+  lines.push(
+    "",
+    "**Blockers and risks**",
+    ...formatRisks(activeWork, projectSnapshots, now),
+    "",
+    "**Best next step**",
+    formatNextStep(botWork, externalRuns, openSessions, projectSnapshots, now)
+  );
+
+  return lines.join("\n");
+}
+
+function formatConfirmedWork(work: ActiveWork, now: Date): string {
+  const elapsed = formatElapsed(now.getTime() - work.startedAt.getTime());
+  if (work.source === "local-codex") {
+    const access = work.mode === "action" ? "write-capable" : "read-only";
+    return `- \`${inlineCode(work.projectName)}\`: external Codex ${access} run for ${elapsed}. Its exact request and phase are not shared with Devbot.`;
+  }
+
+  const task = work.taskId ? ` Task \`${inlineCode(work.taskId)}\`.` : "";
+  return `- \`${inlineCode(work.projectName)}\`: \`${inlineCode(truncate(work.text, 160))}\`\n  Phase: ${formatWorkPhase(work)} | ${elapsed} | requested by ${safePlainText(work.requester)}.${task}`;
+}
+
+function formatOpenSession(work: ActiveWork, now: Date): string {
+  const elapsed = formatElapsed(now.getTime() - work.startedAt.getTime());
+  return `- \`${inlineCode(work.projectName)}\`: Codex app session open ${elapsed}. Open does not prove active work; it may be working, waiting, or idle.`;
+}
+
+function formatWorkPhase(work: ActiveWork): string {
+  if (work.phase === "routing") {
+    return "choosing Luna, Terra, or Sol";
+  }
+
+  const model = work.modelTier ? modelTierName(work.modelTier) : "Codex";
+  if (work.phase === "gathering-context") {
+    const context = work.contextMode ?? "project";
+    return `reading ${context} context for ${model}`;
+  }
+
+  if (work.phase === "running-codex") {
+    const files = work.contextFileCount === undefined
+      ? ""
+      : ` with ${work.contextFileCount} context ${work.contextFileCount === 1 ? "file" : "files"}`;
+    return `${model} is working${files}`;
+  }
+
+  return "starting";
+}
+
+function modelTierName(tier: ModelTier): "Luna" | "Terra" | "Sol" {
+  return tier === "fast" ? "Luna" : tier === "standard" ? "Terra" : "Sol";
+}
+
+function formatProjectSnapshot(snapshot: ProjectWorkSnapshot): string {
+  const statusUnavailable = isProjectSnapshotUnavailable(snapshot);
+  const branch = snapshot.branch === "unknown" ? "branch unknown" : `branch \`${inlineCode(snapshot.branch)}\``;
+  const lastCommit = snapshot.lastCommit === "unknown"
+    ? "last commit unavailable"
+    : `last commit \`${inlineCode(truncate(snapshot.lastCommit, 90))}\``;
+
+  if (statusUnavailable) {
+    return `- \`${inlineCode(snapshot.projectName)}\`: ${branch}; working-tree state unavailable; ${lastCommit}.`;
+  }
+
+  const paths = changedPaths(snapshot.status);
+  if (paths.length === 0) {
+    return `- \`${inlineCode(snapshot.projectName)}\`: ${branch}; working tree clean; ${lastCommit}.`;
+  }
+
+  const visiblePaths = paths.slice(0, 4).map(formatChangedPath);
+  const remainder = paths.length > visiblePaths.length ? `, +${paths.length - visiblePaths.length} more` : "";
+  const diffSummary = formatDiffSummary(snapshot.diffStat);
+  const scope = diffSummary ? `; \`${inlineCode(diffSummary)}\`` : "";
+  return `- \`${inlineCode(snapshot.projectName)}\`: ${branch}; ${paths.length} changed ${paths.length === 1 ? "path" : "paths"}: ${visiblePaths.join(", ")}${remainder}${scope}; ${lastCommit}.`;
+}
+
+function formatRisks(activeWork: ActiveWork[], snapshots: ProjectWorkSnapshot[], now: Date): string[] {
+  const risks: string[] = [];
+  const workByProject = new Map<string, number>();
+  for (const work of activeWork) {
+    workByProject.set(work.projectName, (workByProject.get(work.projectName) ?? 0) + 1);
+  }
+
+  for (const [projectName, count] of workByProject) {
+    if (count > 1) {
+      risks.push(`- Overlap risk: ${count} active or open Codex contexts point at \`${inlineCode(projectName)}\`.`);
+    }
+  }
+
+  const openSessions = activeWork.filter((work) => work.source === "local-codex" && work.mode === "session");
+  for (const work of openSessions) {
+    const elapsed = formatElapsed(now.getTime() - work.startedAt.getTime());
+    risks.push(
+      `- Visibility gap: \`${inlineCode(work.projectName)}\` has an external session open ${elapsed}; Devbot cannot tell whether it is progressing, blocked, or idle.`
+    );
+  }
+
+  const externalRuns = activeWork.filter((work) => work.source === "local-codex" && work.mode !== "session");
+  for (const work of externalRuns) {
+    risks.push(`- Visibility gap: Devbot cannot read progress or blocker details for the external \`${inlineCode(work.projectName)}\` run.`);
+  }
+
+  for (const snapshot of snapshots) {
+    if (isProjectSnapshotUnavailable(snapshot)) {
+      risks.push(
+        `- Repository risk: \`${inlineCode(snapshot.projectName)}\` state is unavailable, so Devbot cannot assess changes or readiness.`
+      );
+      continue;
+    }
+
+    const paths = changedPaths(snapshot.status);
+    if (paths.length > 0 && snapshot.branch === snapshot.defaultBranch) {
+      risks.push(
+        `- Branch risk: \`${inlineCode(snapshot.projectName)}\` has uncommitted work on its default branch \`${inlineCode(snapshot.defaultBranch)}\`.`
+      );
+    }
+    if (paths.length > 25) {
+      risks.push(`- Scope risk: \`${inlineCode(snapshot.projectName)}\` has ${paths.length} changed paths; review scope before adding overlapping work.`);
+    }
+  }
+
+  return risks.length > 0 ? risks : ["- No explicit blocker is visible from Devbot or the repository."];
+}
+
+function formatNextStep(
+  botWork: ActiveWork[],
+  externalRuns: ActiveWork[],
+  openSessions: ActiveWork[],
+  snapshots: ProjectWorkSnapshot[],
+  now: Date
+): string {
+  const overlappingProject = findOverlappingProject([...botWork, ...externalRuns, ...openSessions]);
+  if (overlappingProject) {
+    return `Pause new work on \`${inlineCode(overlappingProject)}\` and get a checkpoint from each context: \`completed / in progress / blocked / next\`.`;
+  }
+
+  const unavailableSnapshot = snapshots.find(isProjectSnapshotUnavailable);
+  if (unavailableSnapshot) {
+    return `Fix the project path or Git access for \`${inlineCode(unavailableSnapshot.projectName)}\`, then run \`/status project:${inlineCode(unavailableSnapshot.projectName)}\` again before assigning work.`;
+  }
+
+  const oldestSession = [...openSessions].sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime())[0];
+  if (oldestSession) {
+    const elapsed = formatElapsed(now.getTime() - oldestSession.startedAt.getTime());
+    const snapshot = snapshots.find((item) => item.projectName === oldestSession.projectName);
+    const review = snapshot && changedPaths(snapshot.status).length > 0
+      ? ` Then inspect the current diff with \`/review packet project:${inlineCode(oldestSession.projectName)}\` before assigning overlapping work.`
+      : "";
+    return `Ask the \`${inlineCode(oldestSession.projectName)}\` Codex session for a checkpoint after ${elapsed}: \`completed / in progress / blocked / next\`.${review}`;
+  }
+
+  const externalRun = externalRuns[0];
+  if (externalRun) {
+    return `Inspect \`${inlineCode(externalRun.projectName)}\` with \`/review packet project:${inlineCode(externalRun.projectName)}\`, then ask the external run for a checkpoint before assigning overlapping work.`;
+  }
+
+  const botTask = botWork[0];
+  if (botTask) {
+    return botTask.taskId
+      ? `Let the current task continue and track it with \`/task status id:${inlineCode(botTask.taskId)}\`. Cancel it only if priorities changed.`
+      : "Let the current Devbot task continue; avoid assigning overlapping work until it finishes.";
+  }
+
+  const dirtySnapshot = snapshots.find((snapshot) => changedPaths(snapshot.status).length > 0);
+  if (dirtySnapshot) {
+    return `No work is confirmed running. Review the existing changes with \`/review packet project:${inlineCode(dirtySnapshot.projectName)}\` before choosing the next task.`;
+  }
+
+  return "Ready for the next assignment. Use `/task recent` if you want to review what just finished.";
+}
+
+function findOverlappingProject(work: ActiveWork[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const item of work) {
+    const count = (counts.get(item.projectName) ?? 0) + 1;
+    if (count > 1) {
+      return item.projectName;
+    }
+    counts.set(item.projectName, count);
+  }
+  return undefined;
+}
+
+function changedPaths(status: string): string[] {
+  if (!status.trim() || status.startsWith("Unable to read status:")) {
+    return [];
+  }
+
+  return status
+    .split(/\r?\n/)
+    .map((line) => line.length >= 4 ? line.slice(3).trim() : "")
+    .filter(Boolean);
+}
+
+function isProjectSnapshotUnavailable(snapshot: ProjectWorkSnapshot): boolean {
+  return snapshot.status.startsWith("Unable to read status:");
+}
+
+function formatChangedPath(value: string): string {
+  if (isSensitivePath(value)) {
+    return "`[sensitive path hidden]`";
+  }
+  return `\`${inlineCode(truncate(value, 72))}\``;
+}
+
+function isSensitivePath(value: string): boolean {
+  return value.split(" -> ").some((candidate) => {
+    const cleaned = candidate.replace(/^"|"$/g, "");
+    const baseName = cleaned.split(/[\\/]/).at(-1) ?? cleaned;
+    return (
+      baseName.toLowerCase().startsWith(".env") ||
+      /(?:secret|credential|password|private[_-]?key|api[_-]?key|access[_-]?token)/i.test(baseName) ||
+      /^id_rsa(?:\.|$)/i.test(baseName) ||
+      /\.(?:pem|p12|pfx)$/i.test(baseName)
+    );
+  });
+}
+
+function formatDiffSummary(diffStat: string): string | undefined {
+  const summary = diffStat.trim().split(/\r?\n/).at(-1)?.trim();
+  return summary && /files? changed/.test(summary) ? truncate(summary, 100) : undefined;
+}
+
+function safePlainText(value: string): string {
+  return truncate(value, 80).replace(/@/g, "@\u200b").replace(/[\r\n]+/g, " ");
+}
+
+function inlineCode(value: string): string {
+  return value.replace(/`/g, "'").replace(/[\r\n]+/g, " ");
 }
 
 export async function findExternalCodexWork(projects: ProjectEntry[], now = new Date()): Promise<ActiveWork[]> {
@@ -211,6 +505,12 @@ function formatElapsed(milliseconds: number): string {
 
   if (minutes === 0) {
     return `${remainingSeconds}s`;
+  }
+
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return remainingMinutes === 0 ? `${hours}h` : `${hours}h ${remainingMinutes}m`;
   }
 
   return `${minutes}m ${remainingSeconds}s`;

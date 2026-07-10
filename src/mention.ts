@@ -15,6 +15,8 @@ export interface ParsedStatusRequest {
   wantsImage: boolean;
 }
 
+const DETAILED_STATUS_SIGNAL = /\b(why|error|errors|failed|failing|failure|broken|stuck|blocking|root cause|diff|changed|changes|remaining|ready|merge|pull request)\b/;
+
 export function parseMentionRequest(
   content: string,
   botUserId: string,
@@ -70,20 +72,13 @@ export function parseStatusRequest(text: string): ParsedStatusRequest {
   }
 
   const wantsImage = wantsStatusImage(text);
-  const question = isSimpleStatusRequest(normalized) ? undefined : text.trim();
+  const question = statusDetailQuestion(text);
   return { isStatus: true, question, wantsImage };
 }
 
-function isSimpleStatusRequest(normalized: string): boolean {
-  return (
-    normalized === "status" ||
-    normalized === "wip" ||
-    normalized === "what are you working on" ||
-    normalized === "what is currently in progress" ||
-    normalized === "whats currently in progress" ||
-    normalized === "what's currently in progress" ||
-    normalized === "current dev work"
-  );
+export function statusDetailQuestion(text: string): string | undefined {
+  const normalized = text.toLowerCase().replace(/[?!.]/g, "").replace(/\s+/g, " ").trim();
+  return DETAILED_STATUS_SIGNAL.test(normalized) ? text.trim() : undefined;
 }
 
 function wantsStatusImage(text: string): boolean {
