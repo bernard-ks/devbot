@@ -49,6 +49,7 @@ export interface TaskRecord {
   diffStat?: string;
   commitSha?: string;
   verification?: string[];
+  memoryIds?: string[];
   contextFileCount?: number;
   model?: string;
   modelTier?: string;
@@ -102,6 +103,7 @@ export interface TaskEvidenceUpdate {
   diffStat?: string;
   commitSha?: string;
   verification?: string[];
+  memoryIds?: string[];
 }
 
 interface TaskStateFile {
@@ -255,6 +257,7 @@ export class TaskStore {
       if (input.diffStat !== undefined) task.diffStat = redactSensitiveText(input.diffStat);
       if (input.commitSha !== undefined) task.commitSha = redactSensitiveText(input.commitSha);
       if (input.verification) task.verification = normalizedStrings(input.verification).map((value) => redactSensitiveText(value));
+      if (input.memoryIds) task.memoryIds = normalizedStrings(input.memoryIds);
       updated = cloneTask(task);
     });
     return updated;
@@ -560,6 +563,7 @@ export function formatTaskDetail(task: TaskRecord): string {
     task.diffStat ? `Diff: ${task.diffStat}` : undefined,
     task.verification?.length ? ["", "Verification:", ...task.verification.map((item) => `- ${item}`)].join("\n") : undefined,
     task.captureNote ? `Visual proof: ${task.captureNote}` : undefined,
+    task.memoryIds?.length ? `Memory cited: ${task.memoryIds.map((id) => `\`${id}\``).join(", ")}` : undefined,
     "",
     "Request:",
     neutralizeMentions(truncate(task.text, 800)),
@@ -596,13 +600,14 @@ function createTaskRecord(input: StartTaskInput, status: TaskStatus, now: string
 }
 
 function cloneTask(task: TaskRecord): TaskRecord {
-  const { agentRoles, changedFiles, verification, ...base } = task;
+  const { agentRoles, changedFiles, verification, memoryIds, ...base } = task;
   return {
     ...base,
     includePatterns: [...task.includePatterns],
     ...(agentRoles ? { agentRoles: [...agentRoles] } : {}),
     ...(changedFiles ? { changedFiles: [...changedFiles] } : {}),
-    ...(verification ? { verification: [...verification] } : {})
+    ...(verification ? { verification: [...verification] } : {}),
+    ...(memoryIds ? { memoryIds: [...memoryIds] } : {})
   };
 }
 
@@ -631,6 +636,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
   const normalizedAgentRoles = Array.isArray(task.agentRoles) ? normalizedStrings(task.agentRoles) : [];
   const normalizedChangedFiles = Array.isArray(task.changedFiles) ? normalizedStrings(task.changedFiles) : [];
   const normalizedVerification = Array.isArray(task.verification) ? normalizedStrings(task.verification) : [];
+  const normalizedMemoryIds = Array.isArray(task.memoryIds) ? normalizedStrings(task.memoryIds) : [];
   const attention = oneOf(task.attention, ["approval", "blocked", "review"] as const);
   const approvalStatus = oneOf(task.approvalStatus, ["pending", "approved", "read-only", "denied"] as const);
   const proposalRevision = positiveInteger(task.proposalRevision) ?? (status === "awaiting-approval" ? 1 : undefined);
@@ -668,6 +674,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
     ...(stringValue(task.diffStat) ? { diffStat: stringValue(task.diffStat)! } : {}),
     ...(stringValue(task.commitSha) ? { commitSha: stringValue(task.commitSha)! } : {}),
     ...(normalizedVerification.length > 0 ? { verification: normalizedVerification } : {}),
+    ...(normalizedMemoryIds.length > 0 ? { memoryIds: normalizedMemoryIds } : {}),
     ...(typeof task.contextFileCount === "number" && Number.isInteger(task.contextFileCount) && task.contextFileCount >= 0
       ? { contextFileCount: task.contextFileCount }
       : {}),
