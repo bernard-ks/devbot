@@ -416,11 +416,11 @@ test("intake store correlates a reporter's reply to its own incomplete-report pr
     followupPromptMessageId: "prompt-msg-1"
   });
 
-  const found = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "author-1", channelId: "channel-1" });
+  const found = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "author-1", channelId: "channel-1", projectName: "web-app" });
   assert.equal(found?.id, record.id);
 
   await store.updateRecord(record.id, { status: "confirmed", clearFollowupPrompt: true });
-  const goneAfterResolved = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "author-1", channelId: "channel-1" });
+  const goneAfterResolved = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "author-1", channelId: "channel-1", projectName: "web-app" });
   assert.equal(goneAfterResolved, undefined);
 });
 
@@ -440,16 +440,87 @@ test("intake follow-up correlation is bound to the original reporter and channel
   });
 
   // Same prompt, different author: another user cannot answer a victim's prompt.
-  const wrongAuthor = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "attacker-9", channelId: "channel-1" });
+  const wrongAuthor = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "attacker-9", channelId: "channel-1", projectName: "web-app" });
   assert.equal(wrongAuthor, undefined);
 
   // Same prompt and author, different channel: cross-channel correlation is refused.
-  const wrongChannel = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "author-1", channelId: "channel-2" });
+  const wrongChannel = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "author-1", channelId: "channel-2", projectName: "web-app" });
   assert.equal(wrongChannel, undefined);
 
-  // The original reporter in the original channel still correlates.
-  const owner = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "author-1", channelId: "channel-1" });
+  // Same prompt, author, and channel, but the channel is now bound to a different project:
+  // a reply cannot resume a prompt that was opened for the old project.
+  const wrongProject = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "author-1", channelId: "channel-1", projectName: "other-app" });
+  assert.equal(wrongProject, undefined);
+
+  // The original reporter in the original channel with the original project still correlates.
+  const owner = await store.findByFollowupPrompt("prompt-msg-1", { authorId: "author-1", channelId: "channel-1", projectName: "web-app" });
   assert.equal(owner?.id, record.id);
+});
+
+test("rebinding an intake channel from project A to project B closes A's open prompts and stops a reply from reaching B", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-intake-rebind-"));
+  const store = new IntakeStore(path.join(root, "intake.json"));
+
+  // Channel is bound to project A (`private-a`) and a reporter has an open,
+  // incomplete report there with a pending "need more detail" prompt.
+  await store.setChannel("channel-1", "private-a");
+  const aRecord = await store.addRecord({
+    channelId: "channel-1",
+    messageId: "msg-a",
+    authorId: "reporter-1",
+    authorTag: "reporter#0001",
+    projectName: "private-a",
+    text: "the dashboard is broken",
+    signature: "text:the dashboard is broken",
+    status: "incomplete",
+    followupPromptMessageId: "prompt-a"
+  });
+
+  // The owner rebinds the same channel to project B (`private-b`).
+  await store.setChannel("channel-1", "private-b");
+
+  // handleIntakeMessage resolves the current channel project (B) and looks the
+  // reply up under it: A's prompt cannot be consumed as a B follow-up, so the
+  // reply never packs, screenshots, or delivers B's context onto A's record.
+  const asProjectB = await store.findByFollowupPrompt("prompt-a", {
+    authorId: "reporter-1",
+    channelId: "channel-1",
+    projectName: "private-b"
+  });
+  assert.equal(asProjectB, undefined);
+
+  // The rebind also invalidated A's pending prompt outright: it is dismissed and
+  // its follow-up prompt is cleared, so it can never be resumed again — not even
+  // under A's own project name.
+  const closed = await store.get(aRecord.id);
+  assert.equal(closed?.status, "dismissed");
+  assert.equal(closed?.followupPromptMessageId, undefined);
+  const asProjectA = await store.findByFollowupPrompt("prompt-a", {
+    authorId: "reporter-1",
+    channelId: "channel-1",
+    projectName: "private-a"
+  });
+  assert.equal(asProjectA, undefined);
+
+  // A fresh report on the rebound channel correlates normally against project B,
+  // proving the rebind closed only the incompatible prompts, not the pipeline.
+  const bRecord = await store.addRecord({
+    channelId: "channel-1",
+    messageId: "msg-b",
+    authorId: "reporter-2",
+    authorTag: "reporter#0002",
+    projectName: "private-b",
+    text: "checkout returns a 500",
+    signature: "text:checkout returns a 500",
+    status: "incomplete",
+    followupPromptMessageId: "prompt-b"
+  });
+  const bFollowup = await store.findByFollowupPrompt("prompt-b", {
+    authorId: "reporter-2",
+    channelId: "channel-1",
+    projectName: "private-b"
+  });
+  assert.equal(bFollowup?.id, bRecord.id);
 });
 
 test("intake reserveRateLimitSlot is atomic: concurrent reports each consume a distinct slot", async () => {

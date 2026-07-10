@@ -123,9 +123,31 @@ export class IntakeStore {
     private readonly maxRecords = 500
   ) {}
 
+  /**
+   * Binds `channelId` to `projectName` as the intake channel. Reassigning a
+   * channel to a different project also closes every still-open follow-up in
+   * that channel that belongs to another project: those prompts were issued
+   * for the old project, so a later reply to one of them must not be able to
+   * resume against the newly-bound project. They are dismissed and their
+   * follow-up prompt is cleared inside the same serialized mutation as the
+   * rebind, so no reply can race the reassignment and slip through.
+   */
   async setChannel(channelId: string, projectName: string): Promise<IntakeStateFile> {
     return this.mutate((state) => {
       state.channel = { channelId, projectName };
+      const now = new Date().toISOString();
+      for (const record of state.records) {
+        if (
+          record.status === "incomplete" &&
+          record.channelId === channelId &&
+          record.projectName !== projectName &&
+          record.followupPromptMessageId !== undefined
+        ) {
+          record.status = "dismissed";
+          delete record.followupPromptMessageId;
+          record.updatedAt = now;
+        }
+      }
       return cloneState(state);
     });
   }
@@ -220,13 +242,18 @@ export class IntakeStore {
   /**
    * Finds the open "incomplete" record whose follow-up prompt is
    * `promptMessageId`, but only when the reply comes from the same reporter in
-   * the same channel that opened the report. Binding to reporter + channel +
-   * prompt stops another user from answering a victim's prompt to bypass quota
-   * or overwrite the report under the victim's identity.
+   * the same channel that opened the report AND that record still belongs to
+   * the project the channel is currently bound to. Binding to reporter +
+   * channel + prompt stops another user from answering a victim's prompt to
+   * bypass quota or overwrite the report under the victim's identity; binding
+   * to `projectName` stops a reply from consuming a prompt that was opened while
+   * the channel pointed at a *different* project (an `/intake set` rebind), which
+   * would otherwise pack, screenshot, and deliver the newly-bound project's
+   * context onto the old project's record and into the old project's room.
    */
   async findByFollowupPrompt(
     promptMessageId: string,
-    binding: { authorId: string; channelId: string }
+    binding: { authorId: string; channelId: string; projectName: string }
   ): Promise<IntakeRecord | undefined> {
     const state = await this.readState();
     const match = state.records.find(
@@ -234,7 +261,8 @@ export class IntakeStore {
         item.status === "incomplete" &&
         item.followupPromptMessageId === promptMessageId &&
         item.authorId === binding.authorId &&
-        item.channelId === binding.channelId
+        item.channelId === binding.channelId &&
+        item.projectName === binding.projectName
     );
     return match ? cloneRecord(match) : undefined;
   }

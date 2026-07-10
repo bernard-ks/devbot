@@ -5838,14 +5838,17 @@ async function handleIntakeMessage(message: Message, appConfig: AppConfig, chann
 
   // A reply to Devbot's own "need more detail" prompt continues the same report instead of
   // spending another rate-limit slot on what is really one bug report split across messages.
-  // The follow-up is bound to the original reporter and channel (and its still-authorized
-  // intake channel here), so another user cannot answer a victim's prompt to skip quota or
-  // overwrite the report under the victim's identity.
+  // The follow-up is bound to the original reporter, channel, and the channel's currently
+  // bound project, so another user cannot answer a victim's prompt to skip quota or overwrite
+  // the report under the victim's identity, and a reply cannot resume a prompt opened while
+  // the channel pointed at a different project (an `/intake set` rebind) — which would pack,
+  // screenshot, and deliver this project's context onto the old project's record and room.
   const referencedMessageId = message.reference?.messageId;
   const followupOf = referencedMessageId
     ? await intakeStore.findByFollowupPrompt(referencedMessageId, {
         authorId: message.author.id,
-        channelId: message.channelId
+        channelId: message.channelId,
+        projectName: project.name
       })
     : undefined;
 
