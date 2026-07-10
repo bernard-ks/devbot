@@ -42,7 +42,7 @@ import {
 } from "./lab.js";
 import { renderStatusImage } from "./status-image.js";
 import { formatTaskDetail, TaskStore } from "./task-store.js";
-import { parseTaskControl, taskActionMatchesState, taskActionRows, taskControlRow } from "./task-controls.js";
+import { parseTaskControl, taskActionMatchesState, taskActionRows, taskControlRow, taskHasRestorableCheckpoint } from "./task-controls.js";
 import type { ProjectEntry } from "./types.js";
 import { filterWorkForProjects, formatWorkStatus, parseExternalCodexWork, scopeStatusToProject, WorkTracker } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
@@ -522,7 +522,12 @@ test("task store migration filters malformed optional fields", async () => {
       workspaceIsolated: "true",
       attention: "unknown",
       startedAt: "invalid",
-      updatedAt: "2026-07-10T00:00:00.000Z"
+      updatedAt: "2026-07-10T00:00:00.000Z",
+      checkpointRef: "refs/devbot/checkpoints/task-other",
+      checkpointHeadSha: "abc123",
+      checkpointBranch: "main",
+      checkpointCreatedAt: "2026-07-10T00:00:00.000Z",
+      reverted: "true"
     }]
   }));
 
@@ -533,6 +538,86 @@ test("task store migration filters malformed optional fields", async () => {
   assert.equal(task?.workspaceIsolated, undefined);
   assert.equal(task?.attention, undefined);
   assert.equal(task?.startedAt, new Date(0).toISOString());
+  // The ref doesn't match refs/devbot/checkpoints/task-migrated (spoofed/foreign
+  // ref, or a corrupted record), so the whole checkpoint must be dropped rather
+  // than partially trusted.
+  assert.equal(task?.checkpointRef, undefined);
+  assert.equal(task?.checkpointHeadSha, undefined);
+  assert.equal(task?.checkpointBranch, undefined);
+  assert.equal(task?.checkpointCreatedAt, undefined);
+  assert.equal(task?.reverted, undefined);
+});
+
+test("task store restart migration keeps a well-formed checkpoint restorable and rejects malformed variants", async () => {
+  const validRecord = {
+    id: "task-checkpoint-valid",
+    status: "succeeded",
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    text: "write a file",
+    includePatterns: [],
+    startedAt: "2026-07-10T00:00:00.000Z",
+    updatedAt: "2026-07-10T00:05:00.000Z",
+    finishedAt: "2026-07-10T00:05:00.000Z",
+    checkpointRef: "refs/devbot/checkpoints/task-checkpoint-valid",
+    checkpointHeadSha: "a".repeat(40),
+    checkpointBranch: "main",
+    checkpointCreatedAt: "2026-07-10T00:00:00.000Z",
+    checkpointPostTaskTree: "b".repeat(40),
+    reverted: false
+  };
+
+  async function loadWith(overrides: Record<string, unknown>) {
+    const root = await mkdtemp(path.join(tmpdir(), "devbot-task-checkpoint-migration-"));
+    const stateFile = path.join(root, "tasks.json");
+    await writeFile(stateFile, JSON.stringify({
+      version: 1,
+      tasks: [{ ...validRecord, ...overrides }]
+    }));
+    return new TaskStore(stateFile).get(validRecord.id);
+  }
+
+  const valid = await loadWith({});
+  assert.equal(valid?.checkpointRef, validRecord.checkpointRef);
+  assert.equal(valid?.checkpointHeadSha, validRecord.checkpointHeadSha);
+  assert.equal(valid?.checkpointBranch, validRecord.checkpointBranch);
+  assert.equal(valid?.checkpointCreatedAt, validRecord.checkpointCreatedAt);
+  assert.equal(valid?.checkpointPostTaskTree, validRecord.checkpointPostTaskTree);
+  assert.equal(valid?.reverted, false);
+  assert.equal(taskHasRestorableCheckpoint(valid!), true);
+
+  const wrongRef = await loadWith({ checkpointRef: "refs/devbot/checkpoints/task-someone-else" });
+  assert.equal(wrongRef?.checkpointRef, undefined);
+  assert.equal(taskHasRestorableCheckpoint(wrongRef!), false);
+
+  const badHeadSha = await loadWith({ checkpointHeadSha: "not-a-sha" });
+  assert.equal(badHeadSha?.checkpointRef, undefined);
+
+  const badTimestamp = await loadWith({ checkpointCreatedAt: "not-a-date" });
+  assert.equal(badTimestamp?.checkpointRef, undefined);
+
+  const badPostTaskTree = await loadWith({ checkpointPostTaskTree: "not-a-tree-hash" });
+  assert.equal(badPostTaskTree?.checkpointRef, validRecord.checkpointRef);
+  assert.equal(badPostTaskTree?.checkpointPostTaskTree, undefined);
+
+  const missingBranch = await loadWith({ checkpointBranch: "" });
+  assert.equal(missingBranch?.checkpointRef, undefined);
+
+  const revertedTrue = await loadWith({ reverted: true, revertedAt: "2026-07-10T00:10:00.000Z" });
+  assert.equal(revertedTrue?.reverted, true);
+  assert.equal(revertedTrue?.revertedAt, "2026-07-10T00:10:00.000Z");
+  assert.equal(taskHasRestorableCheckpoint(revertedTrue!), false);
+
+  const revertedBadTimestamp = await loadWith({ reverted: true, revertedAt: "not-a-date" });
+  assert.equal(revertedBadTimestamp?.reverted, true);
+  assert.equal(revertedBadTimestamp?.revertedAt, undefined);
+
+  // Unborn-branch checkpoints legitimately have an empty headSha.
+  const unbornHeadSha = await loadWith({ checkpointHeadSha: "" });
+  assert.equal(unbornHeadSha?.checkpointHeadSha, "");
+  assert.equal(taskHasRestorableCheckpoint(unbornHeadSha!), true);
 });
 
 test("task store rejects unknown state versions", async () => {
@@ -837,6 +922,11 @@ test("task controls keep task IDs behind state-aware public and private actions"
     .flatMap((row) => row.toJSON().components)
     .map((component) => ("label" in component ? component.label : undefined));
   assert.equal(viewerLabels.includes("Undo"), false);
+
+  const safeModeLabels = taskActionRows(checkpointedAction, { canControl: true, safeMode: true, hasChecks: false })
+    .flatMap((row) => row.toJSON().components)
+    .map((component) => ("label" in component ? component.label : undefined));
+  assert.equal(safeModeLabels.includes("Undo"), false);
 
   assert.equal(taskActionMatchesState("undo", checkpointedAction), true);
   assert.equal(taskActionMatchesState("undo-confirm", checkpointedAction), true);

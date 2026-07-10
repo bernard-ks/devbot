@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,9 +10,14 @@ import {
   RollbackRefusedError,
   createCheckpoint,
   diffSinceCheckpoint,
+  hashWorkingTree,
   pruneCheckpoints,
   restoreCheckpoint
 } from "./checkpoint.js";
+import { createTaskWorktree, inspectTaskWorktree } from "./task-worktree.js";
+import { TaskStore } from "./task-store.js";
+import { taskHasRestorableCheckpoint } from "./task-controls.js";
+import { hardenedGitEnvironment } from "./security.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -187,31 +192,91 @@ test("restore refuses when the branch changed since the checkpoint", async () =>
   }
 });
 
-test("restore refuses when a covered file changed after the task finished", async () => {
+test("restore refuses when a file the task changed was later deleted by a human", async () => {
+  // Reproduces the exact gap an mtime heuristic misses: the guard used to skip
+  // deleted paths entirely, so a post-task deletion would silently restore
+  // the pre-task file instead of refusing. An exact tree-hash comparison
+  // catches it because the deletion changes the tree.
   const repo = await makeRepo();
   try {
     await write(repo, "a.txt", "one\n");
     await git(repo, ["add", "-A"]);
     await git(repo, ["commit", "-qm", "seed"]);
 
-    const checkpoint = await createCheckpoint(repo, "task-cp-newer");
+    const checkpoint = await createCheckpoint(repo, "task-cp-later-delete");
     await write(repo, "a.txt", "agent change\n");
-    const taskFinishedMs = Date.now();
+    const postTaskTree = await hashWorkingTree(repo);
 
-    const future = new Date(taskFinishedMs + 60_000);
-    await utimes(path.join(repo, "a.txt"), future, future);
+    await rm(path.join(repo, "a.txt"));
 
     await assert.rejects(
       restoreCheckpoint(repo, checkpoint.ref, {
         expectedHeadSha: checkpoint.headSha,
         expectedBranch: checkpoint.branch,
-        guardMs: taskFinishedMs
+        expectedPostTaskTree: postTaskTree
       }),
       (error: unknown) =>
         error instanceof RollbackRefusedError &&
-        error.reason === "newer-changes" &&
+        error.reason === "workspace-changed" &&
         error.details.includes("a.txt")
     );
+    assert.equal(existsSync(path.join(repo, "a.txt")), false, "a refused Undo must not touch the file");
+  } finally {
+    await rm(repo, { force: true, recursive: true });
+  }
+});
+
+test("restore refuses on an edit that lands within the same second as the recorded post-task state", async () => {
+  // An mtime-with-tolerance guard can miss an edit that happens within its
+  // tolerance window. Comparing exact tree content has no such window.
+  const repo = await makeRepo();
+  try {
+    await write(repo, "a.txt", "one\n");
+    await git(repo, ["add", "-A"]);
+    await git(repo, ["commit", "-qm", "seed"]);
+
+    const checkpoint = await createCheckpoint(repo, "task-cp-rapid-edit");
+    await write(repo, "a.txt", "agent change\n");
+    const postTaskTree = await hashWorkingTree(repo);
+
+    await write(repo, "a.txt", "human edit moments later\n");
+
+    await assert.rejects(
+      restoreCheckpoint(repo, checkpoint.ref, {
+        expectedHeadSha: checkpoint.headSha,
+        expectedBranch: checkpoint.branch,
+        expectedPostTaskTree: postTaskTree
+      }),
+      (error: unknown) =>
+        error instanceof RollbackRefusedError &&
+        error.reason === "workspace-changed" &&
+        error.details.includes("a.txt")
+    );
+    assert.equal(await readFile(path.join(repo, "a.txt"), "utf8"), "human edit moments later\n");
+  } finally {
+    await rm(repo, { force: true, recursive: true });
+  }
+});
+
+test("restore proceeds when the workspace exactly matches the recorded post-task tree", async () => {
+  const repo = await makeRepo();
+  try {
+    await write(repo, "a.txt", "one\n");
+    await git(repo, ["add", "-A"]);
+    await git(repo, ["commit", "-qm", "seed"]);
+
+    const checkpoint = await createCheckpoint(repo, "task-cp-unchanged");
+    await write(repo, "a.txt", "agent change\n");
+    const postTaskTree = await hashWorkingTree(repo);
+
+    const summary = await restoreCheckpoint(repo, checkpoint.ref, {
+      expectedHeadSha: checkpoint.headSha,
+      expectedBranch: checkpoint.branch,
+      expectedPostTaskTree: postTaskTree
+    });
+
+    assert.equal(await readFile(path.join(repo, "a.txt"), "utf8"), "one\n");
+    assert.deepEqual(summary.restored, ["a.txt"]);
   } finally {
     await rm(repo, { force: true, recursive: true });
   }
@@ -256,5 +321,197 @@ test("pruneCheckpoints keeps the most recent refs", async () => {
     assert.equal(after.length, 2);
   } finally {
     await rm(repo, { force: true, recursive: true });
+  }
+});
+
+test("checkpoint git calls never inherit secret env vars or execute ambient global hooks", async () => {
+  // Unit-level guarantee: the hardened environment builder strips secret-shaped vars outright.
+  const dirtyEnv = { ...process.env, DEVBOT_TEST_API_KEY: "super-secret-value-should-not-leak" };
+  assert.equal(hardenedGitEnvironment(dirtyEnv).DEVBOT_TEST_API_KEY, undefined);
+
+  // Integration-level guarantee: an ambient hook configured on the *host* (a global
+  // ~/.gitconfig outside the project repo, simulating a machine-level helper Devbot
+  // does not control) must never fire. `update-ref` — used by both createCheckpoint
+  // and pruneCheckpoints — invokes Git's `reference-transaction` hook by default;
+  // confirmed empirically that an unhardened `update-ref` runs it and that
+  // `GIT_CONFIG_GLOBAL`+`core.hooksPath` overrides suppress it.
+  const repo = await makeRepo();
+  const fakeHome = await mkdtemp(path.join(tmpdir(), "devbot-cp-home-"));
+  const hooksDir = path.join(fakeHome, "ambient-hooks");
+  const marker = path.join(fakeHome, "hook-ran.marker");
+  await mkdir(hooksDir, { recursive: true });
+  const hookScript = path.join(hooksDir, "reference-transaction");
+  await writeFile(hookScript, `#!/bin/sh\nenv > "${marker}"\nexit 0\n`);
+  await chmod(hookScript, 0o755);
+  await writeFile(path.join(fakeHome, ".gitconfig"), `[core]\n\thooksPath = ${hooksDir}\n`);
+
+  const previousHome = process.env.HOME;
+  const previousSecret = process.env.DEVBOT_TEST_API_KEY;
+  process.env.HOME = fakeHome;
+  process.env.DEVBOT_TEST_API_KEY = "super-secret-value-should-not-leak";
+  try {
+    await write(repo, "a.txt", "one\n");
+    await git(repo, ["add", "-A"]);
+    await git(repo, ["commit", "-qm", "seed"]);
+
+    await createCheckpoint(repo, "task-cp-hook-guard");
+    await pruneCheckpoints(repo, 0);
+
+    assert.equal(existsSync(marker), false, "the ambient global hook must never execute");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousSecret === undefined) delete process.env.DEVBOT_TEST_API_KEY;
+    else process.env.DEVBOT_TEST_API_KEY = previousSecret;
+    await rm(fakeHome, { force: true, recursive: true });
+    await rm(repo, { force: true, recursive: true });
+  }
+});
+
+test("checkpoint metadata round-trips through a TaskStore restart and stays undo-eligible", async () => {
+  const repo = await makeRepo();
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-cp-taskstore-"));
+  try {
+    await write(repo, "a.txt", "one\n");
+    await git(repo, ["add", "-A"]);
+    await git(repo, ["commit", "-qm", "seed"]);
+
+    const stateFile = path.join(root, "tasks.json");
+    const store = new TaskStore(stateFile);
+    const task = await store.start({
+      source: "test",
+      mode: "action",
+      projectName: "demo",
+      requester: "tester",
+      text: "make a change"
+    });
+
+    const checkpoint = await createCheckpoint(repo, task.id);
+    await store.attachCheckpoint(task.id, {
+      ref: checkpoint.ref,
+      headSha: checkpoint.headSha,
+      branch: checkpoint.branch,
+      createdAt: checkpoint.createdAt
+    });
+    await write(repo, "a.txt", "agent change\n");
+    const postTaskTree = await hashWorkingTree(repo);
+    await store.recordPostTaskTree(task.id, postTaskTree);
+    await store.succeed(task.id, { resultPreview: "done" });
+
+    // Simulate a bot restart: a brand-new TaskStore instance backed by the same file.
+    const reloaded = new TaskStore(stateFile);
+    const reloadedTask = await reloaded.get(task.id);
+
+    assert.ok(reloadedTask);
+    assert.equal(reloadedTask?.checkpointRef, checkpoint.ref);
+    assert.equal(reloadedTask?.checkpointHeadSha, checkpoint.headSha);
+    assert.equal(reloadedTask?.checkpointBranch, checkpoint.branch);
+    assert.equal(reloadedTask?.checkpointCreatedAt, checkpoint.createdAt);
+    assert.equal(reloadedTask?.checkpointPostTaskTree, postTaskTree);
+    assert.equal(reloadedTask?.reverted, false);
+    assert.equal(taskHasRestorableCheckpoint(reloadedTask!), true);
+
+    const summary = await restoreCheckpoint(repo, reloadedTask!.checkpointRef!, {
+      expectedHeadSha: reloadedTask!.checkpointHeadSha ?? "",
+      expectedBranch: reloadedTask!.checkpointBranch ?? "HEAD",
+      expectedPostTaskTree: reloadedTask!.checkpointPostTaskTree!
+    });
+    assert.deepEqual(summary.restored, ["a.txt"]);
+    assert.equal(await readFile(path.join(repo, "a.txt"), "utf8"), "one\n");
+
+    await reloaded.markReverted(task.id);
+    assert.equal(taskHasRestorableCheckpoint((await reloaded.get(task.id))!), false);
+  } finally {
+    await rm(repo, { force: true, recursive: true });
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("end-to-end: checkpoint, mutate, and Undo an isolated task worktree without touching the source checkout", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-cp-worktree-"));
+  const sourceRepo = path.join(root, "source");
+  try {
+    await git(root, ["init", "-q", "-b", "main", "source"]);
+    await git(sourceRepo, ["config", "user.name", "Devbot Test"]);
+    await git(sourceRepo, ["config", "user.email", "devbot-test@example.invalid"]);
+    await write(sourceRepo, "tracked.txt", "original\n");
+    await git(sourceRepo, ["add", "-A"]);
+    await git(sourceRepo, ["commit", "-qm", "seed"]);
+    const sourceHeadBefore = await git(sourceRepo, ["rev-parse", "HEAD"]);
+
+    const created = await createTaskWorktree({
+      sourcePath: sourceRepo,
+      taskName: "task-e2e-undo",
+      worktreeRoot: path.join(root, "worktrees")
+    });
+    assert.equal(created.available, true);
+    if (!created.available) return;
+    const worktree = created.worktree;
+
+    const stateFile = path.join(root, "tasks.json");
+    const store = new TaskStore(stateFile);
+    const task = await store.start({
+      source: "test",
+      mode: "action",
+      projectName: "demo",
+      requester: "tester",
+      text: "isolated write"
+    });
+    await store.setWorkspace(task.id, {
+      workspacePath: worktree.path,
+      branchName: worktree.branch,
+      baseBranch: worktree.baseRevision,
+      isolated: true
+    });
+
+    // Checkpoint targets the isolated worktree, not the source checkout.
+    const checkpoint = await createCheckpoint(worktree.path, task.id);
+    await store.attachCheckpoint(task.id, {
+      ref: checkpoint.ref,
+      headSha: checkpoint.headSha,
+      branch: checkpoint.branch,
+      createdAt: checkpoint.createdAt
+    });
+
+    // The task mutates a file only inside its isolated worktree.
+    await write(worktree.path, "tracked.txt", "agent rewrote this\n");
+    await write(worktree.path, "new-file.txt", "created by the task\n");
+    const postTaskTree = await hashWorkingTree(worktree.path);
+    await store.recordPostTaskTree(task.id, postTaskTree);
+    await store.succeed(task.id, { resultPreview: "done" });
+
+    // Resolve the task's actual workspace root through its stored metadata,
+    // the same way the bot does before acting on Undo.
+    const savedTask = await store.get(task.id);
+    assert.ok(savedTask?.workspaceIsolated);
+    assert.equal(savedTask?.workspacePath, worktree.path);
+    const inspection = await inspectTaskWorktree({
+      sourcePath: sourceRepo,
+      path: savedTask!.workspacePath!,
+      branch: savedTask!.branchName!,
+      baseRevision: savedTask!.baseBranch!
+    });
+    assert.equal(inspection.available, true);
+    const workspaceRoot = savedTask!.workspacePath!;
+
+    assert.equal(taskHasRestorableCheckpoint(savedTask!), true);
+    const summary = await restoreCheckpoint(workspaceRoot, savedTask!.checkpointRef!, {
+      expectedHeadSha: savedTask!.checkpointHeadSha ?? "",
+      expectedBranch: savedTask!.checkpointBranch ?? "HEAD",
+      expectedPostTaskTree: savedTask!.checkpointPostTaskTree!
+    });
+    await store.markReverted(task.id);
+
+    assert.deepEqual(summary.restored.sort(), ["tracked.txt"]);
+    assert.deepEqual(summary.deleted.sort(), ["new-file.txt"]);
+    assert.equal(await readFile(path.join(workspaceRoot, "tracked.txt"), "utf8"), "original\n");
+    assert.equal(existsSync(path.join(workspaceRoot, "new-file.txt")), false);
+
+    // The source checkout must never have been touched by any of this.
+    assert.equal(await git(sourceRepo, ["rev-parse", "HEAD"]), sourceHeadBefore);
+    assert.equal(await git(sourceRepo, ["status", "--porcelain"]), "");
+    assert.equal(await readFile(path.join(sourceRepo, "tracked.txt"), "utf8"), "original\n");
+  } finally {
+    await rm(root, { force: true, recursive: true });
   }
 });
