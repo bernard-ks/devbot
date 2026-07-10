@@ -12,7 +12,7 @@ import {
 import { renderSetupPage } from "./setup-page.js";
 
 test("setup page uses the dark theme and exposes the guided controls", () => {
-  const html = renderSetupPage("session-token", "test-nonce");
+  const html = renderSetupPage("test-nonce");
   assert.match(html, /<meta name="color-scheme" content="dark">/);
   assert.match(html, /--canvas: #0d0f13/);
   assert.match(html, /id="choose-folder"/);
@@ -21,6 +21,12 @@ test("setup page uses the dark theme and exposes the guided controls", () => {
   assert.doesNotMatch(html, /content="light"/);
   assert.match(html, /<style nonce="test-nonce">/);
   assert.match(html, /<script nonce="test-nonce">/);
+});
+
+test("setup page contains no API credential", () => {
+  const html = renderSetupPage("test-nonce");
+  assert.doesNotMatch(html, /X-Devbot-Setup/i);
+  assert.doesNotMatch(html, /sessionToken/);
 });
 
 test("Discord install URL requests the bot command scope and private-room permissions", () => {

@@ -134,6 +134,17 @@ test("completion card puts bounded proof before result", () => {
   assertDiscordBounds(json);
 });
 
+test("completion card with task-derived text cannot expand mentions at the transport level", () => {
+  const payload = proofFirstCompletionCard({
+    taskId: "task-3",
+    project: "devbot",
+    title: "Notify @everyone about <@123>",
+    proof: [{ label: "Check", detail: "Result mentions <@&456> and @here.", status: "info" }],
+    summary: "Summary pinging @everyone, <@123>, and <@&456>."
+  });
+  assert.deepEqual(payload.allowedMentions, { parse: [] });
+});
+
 test("Needs Me inbox caps visible decisions and keeps every control routable", () => {
   const payload = needsMeInbox({
     inboxId: "inbox-main",

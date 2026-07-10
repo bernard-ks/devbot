@@ -17,7 +17,6 @@ import {
 import { renderSetupPage } from "./setup-page.js";
 
 const host = "127.0.0.1";
-const sessionToken = randomBytes(24).toString("base64url");
 const sessionExpiresAt = Date.now() + 10 * 60_000;
 const pageCookieName = "devbot_setup";
 const cwd = process.cwd();
@@ -89,12 +88,12 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
       return;
     }
     if (!pageClaim) {
-      pageClaim = randomBytes(18).toString("base64url");
+      pageClaim = randomBytes(24).toString("base64url");
       response.setHeader("Set-Cookie", `${pageCookieName}=${pageClaim}; Path=/; HttpOnly; SameSite=Strict`);
     }
     response.statusCode = 200;
     response.setHeader("Content-Type", "text/html; charset=utf-8");
-    response.end(renderSetupPage(sessionToken, cspNonce));
+    response.end(renderSetupPage(cspNonce));
     return;
   }
   if (request.method === "GET" && url.pathname === "/favicon.ico") {
@@ -102,10 +101,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     response.end();
     return;
   }
-  if (
-    !url.pathname.startsWith("/api/") ||
-    !safeEqual(request.headers["x-devbot-setup"], sessionToken)
-  ) {
+  if (!url.pathname.startsWith("/api/") || !hasClaimedSession(request)) {
     sendJson(response, 404, { error: "Not found." });
     return;
   }
@@ -295,6 +291,11 @@ function stringField(body: Record<string, unknown>, name: string): string {
     throw new Error(`Missing setup value: ${name}.`);
   }
   return value.trim();
+}
+
+function hasClaimedSession(request: IncomingMessage): boolean {
+  if (!pageClaim) return false;
+  return safeEqual(readCookie(request.headers.cookie, pageCookieName), pageClaim);
 }
 
 function safeEqual(provided: string | string[] | undefined, expected: string): boolean {

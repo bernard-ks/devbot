@@ -23,7 +23,7 @@ import type {
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { isApprovedDiscordUsername } from "./access.js";
+import { isAccessSubjectAllowed, isApprovedDiscordUsername } from "./access.js";
 import {
   confirmToActProposalCard,
   needsMeInbox,
@@ -1805,17 +1805,19 @@ async function resolveAmbientThreadAudience(
 }
 
 function isAllowedGuildMember(member: GuildMember, appConfig: AppConfig): boolean {
-  if (isOwner(member.id, appConfig)) return true;
-  const hasAllowList = appConfig.allowedUserIds.size > 0 || appConfig.allowedUsernames.size > 0 || appConfig.allowedRoleIds.size > 0;
-  if (!hasAllowList) return true;
-  return appConfig.allowedUserIds.has(member.id)
-    || isApprovedDiscordUsername({
-      username: member.user.username,
-      globalName: member.user.globalName,
-      tag: member.user.tag,
-      displayName: member.displayName
-    }, appConfig.allowedUsernames)
-    || member.roles.cache.some((role) => appConfig.allowedRoleIds.has(role.id));
+  return isAccessSubjectAllowed(
+    {
+      userId: member.id,
+      nameSource: {
+        username: member.user.username,
+        globalName: member.user.globalName,
+        tag: member.user.tag,
+        displayName: member.displayName
+      },
+      roleIds: [...member.roles.cache.keys()]
+    },
+    appConfig
+  );
 }
 
 function isAllowedGuildMemberForProject(member: GuildMember, project: ProjectEntry): boolean {
@@ -4994,31 +4996,30 @@ function isAllowed(
     | ModalSubmitInteraction,
   appConfig: AppConfig
 ): boolean {
-  if (!appConfig.ownerUserId) {
-    return false;
-  }
-  if (isOwner(interaction.user.id, appConfig)) {
-    return true;
-  }
+  return isAccessSubjectAllowed(
+    {
+      userId: interaction.user.id,
+      nameSource: interactionNameSource(interaction),
+      roleIds: interactionRoleIds(interaction)
+    },
+    appConfig
+  );
+}
 
-  if (appConfig.allowedUserIds.has(interaction.user.id)) {
-    return true;
-  }
-
-  if (isApprovedDiscordUsername(interactionNameSource(interaction), appConfig.allowedUsernames)) {
-    return true;
-  }
-
+function interactionRoleIds(
+  interaction:
+    | ChatInputCommandInteraction
+    | MessageContextMenuCommandInteraction
+    | ButtonInteraction
+    | AutocompleteInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction
+): string[] {
   if (interaction.member instanceof GuildMember) {
-    return interaction.member.roles.cache.some((role) => appConfig.allowedRoleIds.has(role.id));
+    return [...interaction.member.roles.cache.keys()];
   }
-
   const memberRoles = interaction.member?.roles;
-  if (Array.isArray(memberRoles)) {
-    return memberRoles.some((roleId) => appConfig.allowedRoleIds.has(roleId));
-  }
-
-  return false;
+  return Array.isArray(memberRoles) ? memberRoles : [];
 }
 
 function isAllowedForProject(
@@ -5082,22 +5083,14 @@ function canAccessTask(
 }
 
 function isAllowedMessage(message: Message, appConfig: AppConfig): boolean {
-  if (!appConfig.ownerUserId) {
-    return false;
-  }
-  if (isOwner(message.author.id, appConfig)) {
-    return true;
-  }
-
-  if (appConfig.allowedUserIds.has(message.author.id)) {
-    return true;
-  }
-
-  if (isApprovedDiscordUsername(messageNameSource(message), appConfig.allowedUsernames)) {
-    return true;
-  }
-
-  return message.member?.roles.cache.some((role) => appConfig.allowedRoleIds.has(role.id)) ?? false;
+  return isAccessSubjectAllowed(
+    {
+      userId: message.author.id,
+      nameSource: messageNameSource(message),
+      roleIds: message.member ? [...message.member.roles.cache.keys()] : []
+    },
+    appConfig
+  );
 }
 
 function isOwner(userId: string, appConfig: Pick<AppConfig, "ownerUserId">): boolean {
