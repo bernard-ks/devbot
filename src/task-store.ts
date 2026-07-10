@@ -1,11 +1,13 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import type { AuditEventType, AuditRecorder } from "./audit-ledger.js";
 import {
   hardenPrivateDirectoryPermissions,
   hardenPrivateFilePermissions,
   PRIVATE_DIRECTORY_MODE,
   PRIVATE_FILE_MODE,
+  publicErrorMessage,
   redactSensitiveText
 } from "./security.js";
 import { neutralizeMentions } from "./messages.js";
@@ -112,14 +114,19 @@ interface TaskStateFile {
 export class TaskStore {
   private state: TaskStateFile | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
+  private auditor: AuditRecorder | undefined;
 
   constructor(
     private readonly stateFile = path.resolve(".devbot", "tasks.json"),
     private readonly maxRecords = 500
   ) {}
 
+  setAuditor(auditor: AuditRecorder): void {
+    this.auditor = auditor;
+  }
+
   async start(input: StartTaskInput): Promise<TaskRecord> {
-    return this.mutate((state) => {
+    const task = await this.mutate((state) => {
       assertTaskCapacity(state.tasks, this.maxRecords);
       if (input.dedupeKey && state.tasks.some((task) => task.dedupeKey === input.dedupeKey)) {
         throw new Error("That task action has already started. Open its child task for the latest state.");
@@ -131,10 +138,12 @@ export class TaskStore {
       state.tasks = retainOpenTasks(state.tasks, this.maxRecords);
       return cloneTask(task);
     });
+    await this.audit("task.started", task, task.requester, `${task.mode} via ${task.source}`);
+    return task;
   }
 
   async propose(input: StartTaskInput): Promise<TaskRecord> {
-    return this.mutate((state) => {
+    const task = await this.mutate((state) => {
       assertTaskCapacity(state.tasks, this.maxRecords);
       if (input.dedupeKey && state.tasks.some((task) => task.dedupeKey === input.dedupeKey)) {
         throw new Error("That task proposal already exists.");
@@ -148,6 +157,8 @@ export class TaskStore {
       state.tasks = retainOpenTasks(state.tasks, this.maxRecords);
       return cloneTask(task);
     });
+    await this.audit("task.proposed", task, task.requester, `${task.mode} via ${task.source}`);
+    return task;
   }
 
   async begin(id: string, options: { mode?: string; actor?: string; expectedRevision?: number } = {}): Promise<TaskRecord | undefined> {
@@ -163,6 +174,14 @@ export class TaskStore {
       delete task.attention;
       started = cloneTask(task);
     });
+    if (started) {
+      await this.audit(
+        "task.approved",
+        started,
+        options.actor ?? "devbot",
+        `${started.approvalStatus ?? "approved"} as ${started.mode}${started.approvedRevision ? ` at revision ${started.approvedRevision}` : ""}`
+      );
+    }
     return started;
   }
 
@@ -179,6 +198,9 @@ export class TaskStore {
       delete task.attention;
       denied = cloneTask(task);
     });
+    if (denied) {
+      await this.audit("approval.denied", denied, actor, `proposal declined at revision ${denied.proposalRevision ?? 1}`);
+    }
     return denied;
   }
 
@@ -279,6 +301,7 @@ export class TaskStore {
     routeSource?: string;
   }): Promise<boolean> {
     let transitioned = false;
+    let completed: TaskRecord | undefined;
     await this.update(id, (task, now) => {
       if (task.status !== "running") {
         return;
@@ -302,12 +325,17 @@ export class TaskStore {
         delete task.attention;
       }
       task.finishedAt = now;
+      completed = cloneTask(task);
     });
+    if (completed) {
+      await this.audit("task.completed", completed, "devbot", `${completed.mode} via ${completed.source}`);
+    }
     return transitioned;
   }
 
   async fail(id: string, error: unknown): Promise<boolean> {
     let transitioned = false;
+    let failed: TaskRecord | undefined;
     await this.update(id, (task, now) => {
       if (task.status !== "running") {
         return;
@@ -317,7 +345,11 @@ export class TaskStore {
       task.error = redactSensitiveText(error instanceof Error ? error.message : String(error));
       task.attention = "blocked";
       task.finishedAt = now;
+      failed = cloneTask(task);
     });
+    if (failed) {
+      await this.audit("task.failed", failed, "devbot", failed.error ?? "failed");
+    }
     return transitioned;
   }
 
@@ -329,6 +361,7 @@ export class TaskStore {
 
   async cancel(id: string, reason = "Canceled by user request."): Promise<TaskRecord | undefined> {
     let canceled: TaskRecord | undefined;
+    let transitioned = false;
     await this.update(id, (task, now) => {
       if (task.status !== "running") {
         canceled = cloneTask(task);
@@ -339,13 +372,17 @@ export class TaskStore {
       task.error = redactSensitiveText(reason);
       task.attention = "blocked";
       task.finishedAt = now;
+      transitioned = true;
       canceled = cloneTask(task);
     });
+    if (transitioned && canceled) {
+      await this.audit("task.canceled", canceled, "devbot", canceled.error ?? "canceled");
+    }
     return canceled;
   }
 
   async interruptRunning(reason = "Interrupted when Devbot restarted."): Promise<number> {
-    return this.mutate((state) => {
+    const interrupted = await this.mutate((state) => {
       const now = new Date().toISOString();
       let interrupted = 0;
       for (const task of state.tasks) {
@@ -361,6 +398,15 @@ export class TaskStore {
       }
       return interrupted;
     });
+    if (interrupted > 0) {
+      await this.audit(
+        "task.canceled",
+        { id: "runtime", projectName: "" },
+        "devbot",
+        `${interrupted} running task(s) marked canceled: ${reason}`
+      );
+    }
+    return interrupted;
   }
 
   async get(id: string): Promise<TaskRecord | undefined> {
@@ -394,6 +440,22 @@ export class TaskStore {
       .filter((task) => !options.status || task.status === options.status)
       .slice(0, limit)
       .map(cloneTask);
+  }
+
+  private async audit(
+    type: AuditEventType,
+    task: Pick<TaskRecord, "id" | "projectName">,
+    actor: string,
+    summary: string
+  ): Promise<void> {
+    if (!this.auditor) {
+      return;
+    }
+    try {
+      await this.auditor.record({ type, actor, subject: task.id, project: task.projectName, summary });
+    } catch (error) {
+      console.warn(`Audit ledger append failed for ${task.id}: ${publicErrorMessage(error)}`);
+    }
   }
 
   private async update(id: string, apply: (task: TaskRecord, now: string) => void): Promise<void> {

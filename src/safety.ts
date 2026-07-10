@@ -13,6 +13,19 @@ export function safeModeActionMessage(surface: string): string {
   ].join("\n");
 }
 
+export function commandRequiresController(commandName: string, subcommand: string | null | undefined): boolean {
+  if (commandName === "do" || commandName === "run" || commandName === "ship" || commandName === "audit") {
+    return true;
+  }
+  if (commandName === "review") {
+    return subcommand === "validate" || subcommand === "gates";
+  }
+  if (commandName === "task") {
+    return subcommand === "cancel" || subcommand === "retry";
+  }
+  return commandName === "lab" && (subcommand === "approve" || subcommand === "bossfight");
+}
+
 export function isPeerAllowedForProject(project: ProjectEntry, peerBotId: string): boolean {
   return project.metadata.policy.allowedPeers.length === 0 || project.metadata.policy.allowedPeers.includes(peerBotId);
 }

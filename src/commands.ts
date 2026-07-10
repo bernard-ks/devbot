@@ -225,6 +225,31 @@ const commandBuilders = [
         )
     ),
   new SlashCommandBuilder()
+    .setName("audit")
+    .setDescription("Inspect and verify the tamper-evident local audit ledger.")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("recent")
+        .setDescription("List recent audit ledger records.")
+        .addStringOption((option) =>
+          option.setName("project").setDescription("Filter by configured project name.").setRequired(false).setAutocomplete(true)
+        )
+        .addIntegerOption((option) =>
+          option.setName("limit").setDescription("Number of records to show, 1-25.").setRequired(false).setMinValue(1).setMaxValue(25)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("show")
+        .setDescription("Show one audit ledger record by sequence number.")
+        .addIntegerOption((option) =>
+          option.setName("seq").setDescription("Record sequence number.").setRequired(true).setMinValue(1)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand.setName("verify").setDescription("Verify the audit ledger hash chain across rotations.")
+    ),
+  new SlashCommandBuilder()
     .setName("dashboard")
     .setDescription("Open your interactive project workspace.")
     .addStringOption((option) =>
