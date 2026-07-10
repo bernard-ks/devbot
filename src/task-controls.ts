@@ -10,7 +10,8 @@ export type TaskControlAction =
   | "cancel"
   | "promote"
   | "validate"
-  | "adjust";
+  | "adjust"
+  | "ship";
 
 interface PublicTaskControlOptions {
   status?: TaskStatus;
@@ -58,6 +59,9 @@ export function taskActionRows(
     }
     if (mode === "action") {
       buttons.push(button("review", task.id, "Review changes", ButtonStyle.Secondary));
+      if (options.canControl) {
+        buttons.push(button("ship", task.id, "Ship it", ButtonStyle.Success));
+      }
       if (options.canControl && options.hasChecks && !options.safeMode) {
         buttons.push(button("validate", task.id, "Run checks", ButtonStyle.Success));
       }
@@ -98,7 +102,7 @@ export function taskActionMatchesState(action: TaskControlAction, task: TaskReco
 }
 
 export function parseTaskControl(customId: string): { action: TaskControlAction; taskId: string } | undefined {
-  const match = /^devbot:task-control:(details|actions|followup|review|retry|cancel|promote|validate|adjust):(.+)$/i.exec(customId);
+  const match = /^devbot:task-control:(details|actions|followup|review|retry|cancel|promote|validate|adjust|ship):(.+)$/i.exec(customId);
   if (!match?.[1] || !match[2] || !isTaskId(match[2])) {
     return undefined;
   }

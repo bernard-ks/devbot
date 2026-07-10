@@ -107,6 +107,8 @@ import {
   taskControlRow,
   type TaskControlAction
 } from "./task-controls.js";
+import { beginVisualCapture, finishVisualCapture, resolveShipImage, type VisualCaptureSession } from "./visual-capture.js";
+import { composeShipCard } from "./ship-card.js";
 import {
   continuationPrompt,
   formatTaskProgress,
@@ -818,6 +820,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction, appConfig
     });
     return;
   }
+
+  if (interaction.commandName === "ship") {
+    await handleShipCommand(interaction, appConfig);
+    return;
+  }
 }
 
 async function handleSetupCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
@@ -1365,6 +1372,7 @@ interface ProjectRequestResult {
   context: PackedProjectContext;
   taskId: string;
   route: RequestRoute;
+  visualDiff?: { changedPercent: number; cardBuffer: Buffer; cardFileName: string };
 }
 
 async function runProjectRequest(options: ProjectRequestOptions): Promise<ProjectRequestResult> {
@@ -1493,6 +1501,7 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       executionProject.metadata.policy.maxContextChars,
       options.contextCharLimit
     );
+    const visualCapturePromise = beginVisualCaptureForRequest(options, task.id);
     const context = contextCharLimit === 0
       ? { project: executionProject, files: [], packedText: "" }
       : await contextService.pack(executionProject, options.text, options.includePatterns, contextCharLimit);
@@ -1506,9 +1515,35 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       route,
       contextFileCount: context.files.length
     });
+    const captureSession = await visualCapturePromise;
     const answer = await runCodex(options.appConfig, options.text, context, options.mode, route, controller.signal);
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree);
+    }
+    const visualDiff = captureSession
+      ? await finishVisualCapture(captureSession, options.project, task.id).catch(async (error) => {
+          console.warn(`Visual diff after-capture failed for task ${task.id}: ${(error as Error).message}`);
+          await taskStore.recordCapture(task.id, { captureNote: "Before screenshot captured, but the after screenshot failed." });
+          return undefined;
+        })
+      : undefined;
+    if (visualDiff) {
+      // Action tasks now execute in an isolated git worktree (see task-worktree.ts): Codex's edits
+      // land on a review branch, never in options.project.root. The dev server this capture just
+      // hit only serves the source checkout, so it cannot have picked up those edits yet — a 0%
+      // (or noise-level) diff here does NOT mean the task had no visual effect, only that it hasn't
+      // been merged. Keep recording the comparison (it still catches capture/server health issues
+      // and the rare case of a real difference), but always flag the caveat on isolated tasks so
+      // nobody mistakes "no diff shown" for "no change made".
+      await taskStore.recordCapture(task.id, {
+        ...visualDiff.metadata,
+        ...(isolatedWorktree
+          ? {
+              captureNote:
+                `Captured against the source checkout's dev server, not the isolated review branch (${isolatedWorktree.branch}) where this task's file changes landed; this comparison won't reflect them until that branch is merged.`
+            }
+          : {})
+      });
     }
     const completed = await taskStore.succeed(task.id, {
       contextFileCount: context.files.length,
@@ -1526,7 +1561,15 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
       }
       throw new Error(current?.error ?? `Task stopped while ${current?.status ?? "unavailable"}.`);
     }
-    return { answer, context, taskId: task.id, route };
+    return {
+      answer,
+      context,
+      taskId: task.id,
+      route,
+      ...(visualDiff?.cardBuffer
+        ? { visualDiff: { changedPercent: visualDiff.changedPercent, cardBuffer: visualDiff.cardBuffer, cardFileName: visualDiff.cardFileName ?? "devbot-visual-diff.png" } }
+        : {})
+    };
   } catch (error) {
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree, false).catch(() => undefined);
@@ -1608,6 +1651,19 @@ async function recordTaskWorktreeEvidence(
   });
 }
 
+async function beginVisualCaptureForRequest(options: ProjectRequestOptions, taskId: string): Promise<VisualCaptureSession | undefined> {
+  if (options.mode !== "action") {
+    return undefined;
+  }
+  try {
+    return await beginVisualCapture(options.project, options.text);
+  } catch (error) {
+    console.warn(`Visual diff before-capture failed for ${options.project.name}: ${(error as Error).message}`);
+    await taskStore.recordCapture(taskId, { captureNote: "Visual diff capture failed before the task started; continuing without it." });
+    return undefined;
+  }
+}
+
 async function reportTaskProgress(options: ProjectRequestOptions, progress: TaskProgressEvent): Promise<void> {
   if (!options.onProgress) {
     return;
@@ -1641,10 +1697,13 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
         progressRendered = true;
       }
     });
-    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`);
+    const chunks = splitDiscordMessage(
+      `${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}${visualDiffNote(result)}`
+    );
     await interaction.editReply({
       content: chunks.shift() ?? "Task completed without a response.",
-      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })]
+      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })],
+      files: visualDiffFiles(result)
     });
     for (const chunk of chunks) {
       await interaction.followUp({
@@ -1658,6 +1717,14 @@ async function executeInteractionRequest(options: InteractionRequestOptions): Pr
     }
     console.error(publicErrorMessage(error));
   }
+}
+
+function visualDiffNote(result: ProjectRequestResult): string {
+  return result.visualDiff ? `\n\nVisual diff: ${result.visualDiff.changedPercent.toFixed(1)}% of the page changed.` : "";
+}
+
+function visualDiffFiles(result: ProjectRequestResult): AttachmentBuilder[] {
+  return result.visualDiff ? [new AttachmentBuilder(result.visualDiff.cardBuffer, { name: result.visualDiff.cardFileName })] : [];
 }
 
 interface MessageRequestOptions extends Omit<ProjectRequestOptions, "onProgress"> {
@@ -1679,10 +1746,13 @@ async function executeMessageRequest(options: MessageRequestOptions): Promise<vo
         progressRendered = true;
       }
     });
-    const chunks = splitDiscordMessage(`${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}`);
+    const chunks = splitDiscordMessage(
+      `${result.answer}\n\n${formatResultFooter(requestOptions.project, result.route, requestOptions.mode)}${visualDiffNote(result)}`
+    );
     await pending.edit({
       content: chunks.shift() ?? "Task completed without a response.",
-      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })]
+      components: [taskControlRow(result.taskId, { status: "succeeded", mode: requestOptions.mode })],
+      files: visualDiffFiles(result)
     });
     for (const chunk of chunks) {
       await message.reply(chunk);
@@ -2945,6 +3015,20 @@ async function handleTaskControl(
     return;
   }
 
+  if (action === "ship") {
+    if (!canControl) {
+      await interaction.reply({ content: "Only the owner or an approved controller can compose a ship card.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const { card, hasScreenshot } = await buildShipCard(project, task);
+    await interaction.editReply({
+      content: shipCardCaption(project, task, hasScreenshot),
+      files: [new AttachmentBuilder(card, { name: `devbot-ship-${task.id}.png` })]
+    });
+    return;
+  }
+
   if (action === "cancel") {
     if (!canControl) {
       await interaction.reply({ content: "Only the owner or an approved controller can cancel work.", flags: MessageFlags.Ephemeral });
@@ -3365,6 +3449,52 @@ async function handleReviewCommand(interaction: ChatInputCommandInteraction, app
     const result = await evaluateMergeGates(project, commandNames);
     await editInteractionWithChunks(interaction, { content: formatMergeGateResult(project, result) }, privateReply);
   }
+}
+
+async function handleShipCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  const taskId = interaction.options.getString("task", true);
+  const task = await taskStore.get(taskId);
+  if (!task) {
+    await interaction.reply({ content: "That saved task is no longer available.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const project = findProject(appConfig.projects, task.projectName);
+  if (!project || !isAllowedForProject(interaction, project)) {
+    await interaction.reply({ content: "That task's project is unavailable to you.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (task.status !== "succeeded") {
+    await interaction.reply({
+      content: `Task \`${task.id}\` is ${task.status}, not completed. \`/ship\` needs a succeeded task.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  const privateReply = hasProjectAudienceRestriction(project);
+  await interaction.deferReply(privateReply ? { flags: MessageFlags.Ephemeral } : undefined);
+  const { card, hasScreenshot } = await buildShipCard(project, task);
+  await interaction.editReply({
+    content: shipCardCaption(project, task, hasScreenshot),
+    files: [new AttachmentBuilder(card, { name: `devbot-ship-${task.id}.png` })]
+  });
+}
+
+async function buildShipCard(project: ProjectEntry, task: TaskRecord): Promise<{ card: Buffer; hasScreenshot: boolean }> {
+  const source = await resolveShipImage(task, project);
+  const card = await composeShipCard({
+    projectName: project.name,
+    summary: task.text,
+    ...(source ? { image: source.image } : {}),
+    ...(source?.changedPercent !== undefined ? { changedPercent: source.changedPercent } : {})
+  });
+  return { card, hasScreenshot: Boolean(source) };
+}
+
+function shipCardCaption(project: ProjectEntry, task: TaskRecord, hasScreenshot: boolean): string {
+  return hasScreenshot
+    ? `Ship card for \`${project.name}\` task \`${task.id}\`. Attach and post anywhere.`
+    : `Ship card for \`${project.name}\` task \`${task.id}\`. No screenshot was available for this task, so the card is text-only.`;
 }
 
 async function handleDevbotCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
@@ -5494,7 +5624,7 @@ function isControllerUser(userId: string, appConfig: AppConfig): boolean {
 }
 
 function commandRequiresController(interaction: ChatInputCommandInteraction): boolean {
-  if (interaction.commandName === "do" || interaction.commandName === "run") {
+  if (interaction.commandName === "do" || interaction.commandName === "run" || interaction.commandName === "ship") {
     return true;
   }
   const subcommand = interaction.options.getSubcommand(false);

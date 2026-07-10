@@ -521,6 +521,10 @@ const commandBuilders = [
         .setDescription("Optional comma-separated path patterns, e.g. src/*,README.md,*.json.")
         .setRequired(false)
     ),
+  new SlashCommandBuilder()
+    .setName("ship")
+    .setDescription("Compose a shareable before/after card for a completed action task.")
+    .addStringOption((option) => option.setName("task").setDescription("Completed task ID.").setRequired(true).setAutocomplete(true)),
   new ContextMenuCommandBuilder()
     .setName("Start Devbot workroom")
     .setType(ApplicationCommandType.Message)
