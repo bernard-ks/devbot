@@ -133,6 +133,7 @@ import {
   findRunningProjectOrigin,
   previewOwnerGateReason,
   projectPreviewGateReason,
+  revalidateProjectOrigin,
   TunnelManager,
   type ActiveTunnel,
   type PendingExpireReason,
@@ -1361,9 +1362,18 @@ async function handlePreviewConfirmButton(
 
   await interaction.deferUpdate();
   try {
-    const tunnel = await tunnelManager.launch(id, (expiredTunnel, reason) => {
-      void editTunnelMessageExpired(expiredTunnel, reason);
-    });
+    const tunnel = await tunnelManager.launch(
+      id,
+      (expiredTunnel, reason) => {
+        void editTunnelMessageExpired(expiredTunnel, reason);
+      },
+      // Atomically re-prove, immediately before cloudflared is spawned, that the
+      // reserved origin is still served by this project's own listener. A
+      // listener swap during the confirmation window (project server exits, a
+      // foreign process binds the port) makes this refuse instead of exposing
+      // the foreign service.
+      (pendingInfo) => revalidateProjectOrigin(project, pendingInfo.origin, pendingInfo.port)
+    );
 
     // Recheck the tunnel is still the live one before publishing: a concurrent
     // stop/disable/shutdown could have raced launch() to completion.

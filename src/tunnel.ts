@@ -327,6 +327,34 @@ export async function findRunningProjectOrigin(
   return undefined;
 }
 
+/**
+ * Launch-time counterpart to `findRunningProjectOrigin`: re-proves that the one
+ * exact origin reserved at `/preview share` time is STILL (1) a valid loopback
+ * origin, (2) reachable, and (3) served by a listener inside this project's
+ * process tree — the same three gates, re-run atomically just before spawning.
+ * This is what defeats a listener swap during the confirmation window: if the
+ * project server exited and a foreign process bound the port, the reachability
+ * probe may still answer, but the listener-identity check fails and the origin
+ * is refused. Purely a decision; it never signals or touches the foreign
+ * listener.
+ */
+export async function revalidateProjectOrigin(
+  project: ProjectEntry,
+  origin: string,
+  port: number,
+  probeUrl: (origin: string) => Promise<boolean> = defaultProbeUrl,
+  verifyListener: (project: ProjectEntry, port: number) => Promise<boolean> = defaultVerifyProjectListener
+): Promise<boolean> {
+  const validated = validateLoopbackOrigin(origin);
+  if (!validated || validated.origin !== origin || validated.port !== port) {
+    return false;
+  }
+  if (!(await probeUrl(origin))) {
+    return false;
+  }
+  return verifyListener(project, port);
+}
+
 export interface ProcessInfo {
   pid: number;
   ppid: number;
@@ -472,6 +500,35 @@ async function defaultSnapshotProcesses(): Promise<ProcessInfo[]> {
   }
 }
 
+/** Parses one `ps -o pgid=,lstart=` row into the durable identity (process group + fixed five-field start time). */
+export function parseProcessIdentity(psOutput: string): DurableProcessIdentity {
+  const line = psOutput.split("\n").find((entry) => entry.trim().length > 0);
+  if (!line) {
+    return {};
+  }
+  const match = /^\s*(\d+)\s+(\S.*\S|\S)\s*$/.exec(line);
+  if (!match?.[2]) {
+    return {};
+  }
+  return { pgid: Number(match[1]), startTime: match[2] };
+}
+
+async function defaultCaptureProcessIdentity(pid: number): Promise<DurableProcessIdentity> {
+  if (process.platform === "win32") {
+    return {};
+  }
+  try {
+    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "pgid=,lstart="], {
+      env: minimalChildEnvironment(),
+      timeout: 5_000,
+      maxBuffer: 10_000
+    });
+    return parseProcessIdentity(stdout);
+  } catch {
+    return {};
+  }
+}
+
 async function defaultProbeUrl(url: string): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3_000);
@@ -559,9 +616,30 @@ export interface ReserveTunnelInput {
   onPendingExpire: (pending: PendingTunnel, reason: PendingExpireReason) => void;
 }
 
+export interface TunnelProcessRecordInput {
+  id: string;
+  pid: number;
+  origin: string;
+  createdAt: string;
+  pgid?: number;
+  startTime?: string;
+  argvSignature?: string;
+}
+
 export interface TunnelProcessLedgerLike {
-  record(entry: { id: string; pid: number; origin: string; createdAt: string }): Promise<void>;
+  record(entry: TunnelProcessRecordInput): Promise<void>;
   release(id: string): Promise<void>;
+}
+
+/** Durable, recycle-resistant identity of a spawned child, captured at record time. */
+export interface DurableProcessIdentity {
+  pgid?: number;
+  startTime?: string;
+}
+
+/** The cloudflared argv, as a signature the ledger can later re-match against `ps` output. */
+export function tunnelInvocationSignature(origin: string): string {
+  return `tunnel --url ${origin}`;
 }
 
 export interface TunnelManagerDeps {
@@ -577,7 +655,21 @@ export interface TunnelManagerDeps {
   createTunnelHome?: () => Promise<string>;
   removeTunnelHome?: (directory: string) => Promise<void>;
   processLedger?: TunnelProcessLedgerLike;
+  captureProcessIdentity?: (pid: number) => Promise<DurableProcessIdentity>;
 }
+
+export interface RevalidateReservationInput {
+  origin: string;
+  port: number;
+  projectName: string;
+}
+
+/**
+ * Launch-time re-proof that the reserved origin is still served by this
+ * project's own listener. Returns false to refuse the launch (listener changed
+ * or can no longer be proven); it must never signal or touch any process.
+ */
+export type RevalidateReservation = (pending: RevalidateReservationInput) => Promise<boolean>;
 
 /**
  * Tracks preview tunnels through pending (reserved, not yet spawned) -> active
@@ -679,7 +771,11 @@ export class TunnelManager {
   }
 
   /** Spawns cloudflared for a confirmed reservation. Aborts cleanly if cancelled mid-flight. */
-  async launch(id: string, onExpire: (tunnel: ActiveTunnel, reason: TunnelExpireReason) => void): Promise<ActiveTunnel> {
+  async launch(
+    id: string,
+    onExpire: (tunnel: ActiveTunnel, reason: TunnelExpireReason) => void,
+    revalidate?: RevalidateReservation
+  ): Promise<ActiveTunnel> {
     const tracked = this.tunnels.get(id);
     if (!tracked || tracked.state !== "pending") {
       throw new Error("This preview tunnel confirmation has expired. Run `/preview share` again.");
@@ -690,6 +786,41 @@ export class TunnelManager {
     if (!cloudflaredPath) {
       this.tunnels.delete(id);
       throw new Error("cloudflared is not installed. Install it with `brew install cloudflared` and try again.");
+    }
+
+    // Re-prove, atomically at launch and immediately before anything is
+    // spawned, that the exact reserved origin is still reachable AND still
+    // served by a listener inside this project's process tree. The project
+    // server verified at `/preview share` time may have exited during the
+    // up-to-120s confirmation window, letting a foreign process bind the port;
+    // reachability alone would then expose that foreign service. Fail closed:
+    // refuse without spawning cloudflared or signalling anything, so the
+    // foreign listener is never touched.
+    if (revalidate) {
+      let stillProjectOwned: boolean;
+      try {
+        stillProjectOwned = await revalidate({
+          origin: tracked.origin,
+          port: tracked.port,
+          projectName: tracked.projectName
+        });
+      } catch (error) {
+        this.tunnels.delete(id);
+        throw new Error(
+          `Could not re-verify the local listener for \`${tracked.projectName}\` before launch; refusing to expose it. (${(error as Error).message})`
+        );
+      }
+      // A cancel/disable/shutdown that raced the async revalidation wins.
+      if (this.tunnels.get(id) !== tracked || tracked.aborted) {
+        throw new Error("The preview tunnel was cancelled before it finished starting.");
+      }
+      if (!stillProjectOwned) {
+        this.tunnels.delete(id);
+        throw new Error(
+          "The local server for this project can no longer be verified as the one that would be exposed " +
+            "(its listener changed since `/preview share`); refusing to launch. Run `/preview share` again."
+        );
+      }
     }
 
     const createHome = this.deps.createTunnelHome ?? defaultCreateTunnelHome;
@@ -1006,7 +1137,20 @@ export class TunnelManager {
       throw new Error("cloudflared did not report a process id");
     }
     const createdAt = (this.deps.now?.() ?? new Date()).toISOString();
-    await ledger.record({ id, pid: child.pid, origin, createdAt });
+    // Capture a recycle-resistant identity (process group + kernel start time)
+    // alongside the pid and the invocation signature, so a later reconcile can
+    // prove the pid is still this exact cloudflared before ever signalling it.
+    const capture = this.deps.captureProcessIdentity ?? defaultCaptureProcessIdentity;
+    const identity = await capture(child.pid).catch(() => ({}) as DurableProcessIdentity);
+    await ledger.record({
+      id,
+      pid: child.pid,
+      origin,
+      createdAt,
+      argvSignature: tunnelInvocationSignature(origin),
+      ...(typeof identity.pgid === "number" ? { pgid: identity.pgid } : {}),
+      ...(identity.startTime ? { startTime: identity.startTime } : {})
+    });
     void observation.exited.then(() => {
       void ledger
         .release(id)

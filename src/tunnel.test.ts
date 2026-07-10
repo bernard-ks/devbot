@@ -13,8 +13,11 @@ import {
   describeProjectRevision,
   findCloudflaredPath,
   findRunningProjectOrigin,
+  parseProcessIdentity,
   parseProcessTree,
   parseTunnelUrl,
+  revalidateProjectOrigin,
+  tunnelInvocationSignature,
   verifyProjectListener,
   previewGateReason,
   previewOwnerGateReason,
@@ -27,6 +30,7 @@ import {
   type TunnelChildProcess,
   type TunnelExpireReason,
   type TunnelManagerDeps,
+  type TunnelProcessRecordInput,
   type TunnelSpawnFn
 } from "./tunnel.js";
 import type { ProjectEntry } from "./types.js";
@@ -220,6 +224,36 @@ test("verifyProjectListener confirms only when every listener pid belongs to the
     await verifyProjectListener(project, 3000, { listListenerPids: async () => [], snapshotProcesses }),
     false
   );
+});
+
+test("revalidateProjectOrigin re-proves reachability and a project-owned listener for the exact reserved origin", async () => {
+  const project = fakeProject("web", "/repos/web");
+  // Still reachable and still project-owned -> accepted.
+  assert.equal(await revalidateProjectOrigin(project, "http://127.0.0.1:3000", 3000, async () => true, async () => true), true);
+  // Reachable, but the listener is no longer this project's (swapped) -> refused.
+  assert.equal(await revalidateProjectOrigin(project, "http://127.0.0.1:3000", 3000, async () => true, async () => false), false);
+  // Not reachable at all -> refused without even consulting the listener check.
+  let listenerChecked = false;
+  assert.equal(
+    await revalidateProjectOrigin(project, "http://127.0.0.1:3000", 3000, async () => false, async () => {
+      listenerChecked = true;
+      return true;
+    }),
+    false
+  );
+  assert.equal(listenerChecked, false);
+  // Any drift from the exact reserved origin/port is refused (defense in depth).
+  assert.equal(await revalidateProjectOrigin(project, "http://127.0.0.1:3000", 3001, async () => true, async () => true), false);
+  assert.equal(await revalidateProjectOrigin(project, "https://example.com", 443, async () => true, async () => true), false);
+});
+
+test("parseProcessIdentity extracts pgid and the lstart timestamp from a ps row", () => {
+  assert.deepEqual(parseProcessIdentity("  40123 Fri Jul 10 12:34:56 2026\n"), {
+    pgid: 40123,
+    startTime: "Fri Jul 10 12:34:56 2026"
+  });
+  assert.deepEqual(parseProcessIdentity(""), {});
+  assert.equal(tunnelInvocationSignature("http://127.0.0.1:3000"), "tunnel --url http://127.0.0.1:3000");
 });
 
 test("findRunningProjectOrigin returns undefined when nothing validated is reachable", async () => {
@@ -727,6 +761,108 @@ test("TunnelManager fails closed and tears down when the process ledger cannot r
   assert.deepEqual(released, []);
 });
 
+test("TunnelManager launch refuses when the listener was swapped during confirmation, never spawning or touching the foreign process", async () => {
+  const project = fakeProject("web", "/repos/web");
+  let spawnCount = 0;
+  const spawnFn: TunnelSpawnFn = () => {
+    spawnCount += 1;
+    return fakeChild();
+  };
+  const { manager, homesCreated } = makeManager({}, spawnFn);
+  const pending = manager.reserve(reserveInput({ projectName: "web", origin: "http://127.0.0.1:3000" }));
+
+  // The project server verified at /preview share has exited; during the
+  // confirmation window a foreign process (pid 999, outside the project tree)
+  // bound the same port. A reachability probe still answers (the foreign
+  // service responds), so ONLY the listener-identity re-check can catch this.
+  const foreignProcesses = [{ pid: 999, ppid: 1, command: "/usr/bin/some-other-server --listen 3000" }];
+  const verifiedPorts: number[] = [];
+  const revalidate = (info: { origin: string; port: number; projectName: string }) =>
+    revalidateProjectOrigin(
+      project,
+      info.origin,
+      info.port,
+      async () => true,
+      (proj, port) => {
+        verifiedPorts.push(port);
+        return verifyProjectListener(proj, port, {
+          listListenerPids: async () => [999],
+          snapshotProcesses: async () => foreignProcesses
+        });
+      }
+    );
+
+  await assert.rejects(manager.launch(pending.id, () => {}, revalidate), /refusing to launch/);
+
+  // The listener-identity re-check ran for the reserved port, cloudflared was
+  // never spawned, no isolated home was created, and the reservation is gone.
+  // The foreign listener is untouched: the manager never obtains a handle to
+  // it, so there is nothing it could signal (spawnCount stays 0).
+  assert.deepEqual(verifiedPorts, [3000]);
+  assert.equal(spawnCount, 0);
+  assert.equal(homesCreated.length, 0);
+  assert.equal(manager.hasActiveForProject("web"), false);
+});
+
+test("TunnelManager launch proceeds when launch-time revalidation still proves the project's own listener", async () => {
+  const project = fakeProject("web", "/repos/web");
+  const { manager } = makeManager();
+  const pending = manager.reserve(reserveInput({ projectName: "web", origin: "http://127.0.0.1:3000" }));
+
+  const projectProcesses = [{ pid: 100, ppid: 1, command: "node /repos/web/node_modules/.bin/next dev" }];
+  const revalidate = (info: { origin: string; port: number; projectName: string }) =>
+    revalidateProjectOrigin(project, info.origin, info.port, async () => true, (proj, port) =>
+      verifyProjectListener(proj, port, {
+        listListenerPids: async () => [100],
+        snapshotProcesses: async () => projectProcesses
+      })
+    );
+
+  const launchPromise = manager.launch(pending.id, () => {}, revalidate);
+  await sleep(0);
+  lastSpawnedChild?.emitStdout("https://web.trycloudflare.com\n");
+  const tunnel = await launchPromise;
+
+  assert.equal(tunnel.url, "https://web.trycloudflare.com");
+  assert.equal(manager.hasActiveForProject("web"), true);
+  await manager.stop(tunnel.id, "stop");
+});
+
+test("TunnelManager launch fails closed when launch-time revalidation itself throws", async () => {
+  const { manager, homesCreated } = makeManager();
+  const pending = manager.reserve(reserveInput({ projectName: "web" }));
+  await assert.rejects(
+    manager.launch(pending.id, () => {}, async () => {
+      throw new Error("lsof unavailable");
+    }),
+    /refusing to expose it/
+  );
+  assert.equal(homesCreated.length, 0);
+  assert.equal(manager.hasActiveForProject("web"), false);
+});
+
+test("TunnelManager records a durable process identity (pgid, start time, argv signature) alongside the pid", async () => {
+  const recorded: TunnelProcessRecordInput[] = [];
+  const ledger = {
+    record: async (entry: TunnelProcessRecordInput) => {
+      recorded.push(entry);
+    },
+    release: async () => {}
+  };
+  const { manager } = makeManager({
+    processLedger: ledger,
+    captureProcessIdentity: async (pid) => ({ pgid: pid, startTime: "Fri Jul 10 12:00:00 2026" })
+  });
+  const pending = manager.reserve(reserveInput({ projectName: "web", origin: "http://127.0.0.1:3000" }));
+  const tunnel = await launchAndReportUrl(manager, pending.id, () => {}, "https://web.trycloudflare.com");
+
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0]?.id, tunnel.id);
+  assert.equal(recorded[0]?.argvSignature, "tunnel --url http://127.0.0.1:3000");
+  assert.equal(recorded[0]?.startTime, "Fri Jul 10 12:00:00 2026");
+  assert.ok((recorded[0]?.pgid ?? 0) > 0);
+});
+
 let lastSpawnedChild: FakeChild | undefined;
 let nextFakePid = 40_000;
 
@@ -808,6 +944,8 @@ function makeManager(
     removeTunnelHome: async (dir) => {
       homesRemoved.push(dir);
     },
+    // Keep tests hermetic: never spawn a real `ps` to capture identity.
+    captureProcessIdentity: async (pid) => ({ pgid: pid, startTime: "Fri Jul 10 00:00:00 2026" }),
     ...overrides
   });
   return { manager, homesCreated, homesRemoved };
