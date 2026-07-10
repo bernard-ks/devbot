@@ -147,6 +147,7 @@ import {
   tunnelConfirmExpiredMessage,
   tunnelConfirmMessage,
   tunnelControlExpiredMessage,
+  tunnelStopUnconfirmedMessage,
   tunnelDisabledMessage,
   tunnelExpiredMessage,
   tunnelNoOwnerMessage,
@@ -1167,7 +1168,13 @@ async function stopOrCancelPreviewForProject(projectName: string, reason: Tunnel
   const stopped = await tunnelManager.stopByProject(projectName, reason);
   if (!stopped) return;
   if (stopped.kind === "active") {
-    await editTunnelMessageExpired(stopped.tunnel, reason);
+    // Only mark the share message expired once the child's exit is confirmed;
+    // an unconfirmed kill leaves the tunnel tracked and still exposed.
+    if (stopped.exitConfirmed) {
+      await editTunnelMessageExpired(stopped.tunnel, reason);
+    } else {
+      console.warn(`Preview tunnel for ${projectName} could not confirm cloudflared exited during ${reason}; still tracked.`);
+    }
   } else {
     await editPendingMessageExpired(stopped.tunnel, "cancel");
   }
@@ -1196,6 +1203,11 @@ async function handlePreviewCommand(interaction: ChatInputCommandInteraction, ap
     const stopped = await tunnelManager.stopByProject(project.name, "stop");
     if (!stopped) {
       await interaction.reply({ content: `No active or pending preview tunnel for \`${project.name}\`.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (stopped.kind === "active" && !stopped.exitConfirmed) {
+      await interaction.reply({ content: tunnelStopUnconfirmedMessage(project.name), flags: MessageFlags.Ephemeral });
+      console.warn(`Preview tunnel stop for ${project.name} by ${interaction.user.tag} could not confirm cloudflared exited; still tracked.`);
       return;
     }
     await interaction.reply({ content: `Stopped the preview tunnel for \`${project.name}\`.`, flags: MessageFlags.Ephemeral });
@@ -1294,8 +1306,14 @@ async function handlePreviewStopButton(interaction: ButtonInteraction, id: strin
     await interaction.editReply({ content: tunnelControlExpiredMessage(), components: [] });
     return;
   }
-  await interaction.editReply(tunnelStoppedButtonUpdate(stopped, "stop"));
-  console.log(`Preview tunnel stopped for ${stopped.projectName} (${id}) by ${interaction.user.tag}.`);
+  if (!stopped.exitConfirmed) {
+    // Keep the Stop button so the owner can retry; the tunnel is still tracked.
+    await interaction.followUp({ content: tunnelStopUnconfirmedMessage(stopped.tunnel.projectName), flags: MessageFlags.Ephemeral });
+    console.warn(`Preview tunnel stop for ${stopped.tunnel.projectName} (${id}) by ${interaction.user.tag} could not confirm cloudflared exited; still tracked.`);
+    return;
+  }
+  await interaction.editReply(tunnelStoppedButtonUpdate(stopped.tunnel, "stop"));
+  console.log(`Preview tunnel stopped for ${stopped.tunnel.projectName} (${id}) by ${interaction.user.tag}.`);
 }
 
 async function handlePreviewConfirmButton(

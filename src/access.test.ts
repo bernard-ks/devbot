@@ -31,6 +31,8 @@ function setupState(overrides: Partial<SetupState> = {}): SetupState {
     peerBotIds: [],
     repositories: {},
     projectRoomIds: {},
+    previewTunnelsEnabled: false,
+    previewEnabledProjects: [],
     ...overrides
   };
 }

@@ -49,6 +49,18 @@ export interface ActiveTunnel {
   messageId?: string;
 }
 
+/**
+ * Result of a stop/expire attempt. `exitConfirmed` is false when SIGTERM and
+ * SIGKILL both went unanswered: the tunnel is intentionally still tracked and
+ * must be reported as *not* stopped, because a cloudflared process may still be
+ * serving the exposed origin. Cleanup (untracking, home removal, expiry) is
+ * deferred until the child's exit is actually observed.
+ */
+export interface TunnelStopOutcome {
+  tunnel: ActiveTunnel;
+  exitConfirmed: boolean;
+}
+
 export interface TunnelReadableLike {
   on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
 }
@@ -260,20 +272,174 @@ export function projectPreviewGateReason(projectPreviewAllowed: boolean): "proje
   return projectPreviewAllowed ? undefined : "project-disabled";
 }
 
+/**
+ * Resolves the exact loopback origin to expose for a project. A candidate URL
+ * is only accepted once it is (1) a valid loopback origin, (2) actually
+ * reachable, and (3) served by a process that provably belongs to this
+ * project's process tree. The third check is what stops a configured or global
+ * screenshot URL (or any other candidate) from publicly exposing an unrelated
+ * local service that merely happens to answer on the same loopback port.
+ */
 export async function findRunningProjectOrigin(
   project: ProjectEntry,
   probeUrl: (origin: string) => Promise<boolean> = defaultProbeUrl,
-  listUrls: (project: ProjectEntry) => Promise<string[]> = findProjectWebUrls
+  listUrls: (project: ProjectEntry) => Promise<string[]> = findProjectWebUrls,
+  verifyListener: (project: ProjectEntry, port: number) => Promise<boolean> = defaultVerifyProjectListener
 ): Promise<ValidatedLoopbackOrigin | undefined> {
   const urls = await listUrls(project);
   for (const url of urls) {
     const validated = validateLoopbackOrigin(url);
     if (!validated) continue;
-    if (await probeUrl(validated.origin)) {
-      return validated;
-    }
+    if (!(await probeUrl(validated.origin))) continue;
+    if (!(await verifyListener(project, validated.port))) continue;
+    return validated;
   }
   return undefined;
+}
+
+export interface ProcessInfo {
+  pid: number;
+  ppid: number;
+  command: string;
+}
+
+export type ListenerPidLookup = (port: number) => Promise<number[]>;
+export type ProcessSnapshot = () => Promise<ProcessInfo[]>;
+
+export interface VerifyProjectListenerDeps {
+  listListenerPids?: ListenerPidLookup;
+  snapshotProcesses?: ProcessSnapshot;
+}
+
+/**
+ * Proves that whoever is listening on `port` belongs to the managed project's
+ * process tree before its origin can be exposed. Fails closed: if no listener
+ * pid can be identified (no `lsof`, nothing bound, permission denied), or any
+ * listener on that port is outside the project tree, the port is refused. A
+ * configured screenshot URL alone is never sufficient.
+ */
+export async function verifyProjectListener(
+  project: ProjectEntry,
+  port: number,
+  deps: VerifyProjectListenerDeps = {}
+): Promise<boolean> {
+  const listListenerPids = deps.listListenerPids ?? defaultListenerPidsForPort;
+  const snapshotProcesses = deps.snapshotProcesses ?? defaultSnapshotProcesses;
+  const listeners = await listListenerPids(port);
+  if (listeners.length === 0) {
+    return false;
+  }
+  const processes = await snapshotProcesses();
+  const projectPids = collectProjectPids(processes, project.root);
+  return listeners.every((pid) => projectPids.has(pid));
+}
+
+async function defaultVerifyProjectListener(project: ProjectEntry, port: number): Promise<boolean> {
+  return verifyProjectListener(project, port);
+}
+
+/** Parses `ps -axo pid=,ppid=,command=` output into a process table. */
+export function parseProcessTree(psOutput: string): ProcessInfo[] {
+  const infos: ProcessInfo[] = [];
+  for (const line of psOutput.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*\S)\s*$/.exec(line);
+    if (!match?.[3]) continue;
+    const pid = Number(match[1]);
+    const ppid = Number(match[2]);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+    infos.push({ pid, ppid, command: match[3] });
+  }
+  return infos;
+}
+
+/**
+ * Pids that belong to a project: any process whose command line references the
+ * project root as a path token, plus every descendant of such a process. The
+ * descendant walk matters because a dev server is frequently a child of
+ * `npm run dev`/`next dev`, and only the parent's argv carries the project
+ * path; the child that actually binds the socket may not.
+ */
+export function collectProjectPids(processes: ProcessInfo[], projectRoot: string): Set<number> {
+  const root = path.resolve(projectRoot);
+  const childrenByParent = new Map<number, number[]>();
+  for (const proc of processes) {
+    const siblings = childrenByParent.get(proc.ppid) ?? [];
+    siblings.push(proc.pid);
+    childrenByParent.set(proc.ppid, siblings);
+  }
+  const projectPids = new Set<number>();
+  const queue: number[] = [];
+  for (const proc of processes) {
+    if (commandReferencesRoot(proc.command, root)) {
+      if (!projectPids.has(proc.pid)) {
+        projectPids.add(proc.pid);
+        queue.push(proc.pid);
+      }
+    }
+  }
+  while (queue.length > 0) {
+    const pid = queue.shift() as number;
+    for (const child of childrenByParent.get(pid) ?? []) {
+      if (!projectPids.has(child)) {
+        projectPids.add(child);
+        queue.push(child);
+      }
+    }
+  }
+  return projectPids;
+}
+
+/**
+ * Treats the root as a whole path token: a sibling directory sharing a prefix
+ * (`.../web` vs `.../web-legacy`) must not be mistaken for the project.
+ */
+function commandReferencesRoot(command: string, root: string): boolean {
+  let from = 0;
+  for (;;) {
+    const index = command.indexOf(root, from);
+    if (index === -1) return false;
+    const after = command[index + root.length];
+    if (after === undefined || after === path.sep || after === "/" || after === " " || after === '"' || after === "'" || after === ":") {
+      return true;
+    }
+    from = index + root.length;
+  }
+}
+
+async function defaultListenerPidsForPort(port: number): Promise<number[]> {
+  try {
+    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], {
+      env: minimalChildEnvironment(),
+      timeout: 5_000,
+      maxBuffer: 100_000
+    });
+    return parseListenerPids(stdout);
+  } catch {
+    return [];
+  }
+}
+
+function parseListenerPids(output: string): number[] {
+  const pids = new Set<number>();
+  for (const line of output.split("\n")) {
+    const value = Number(line.trim());
+    if (Number.isInteger(value) && value > 0) {
+      pids.add(value);
+    }
+  }
+  return [...pids];
+}
+
+async function defaultSnapshotProcesses(): Promise<ProcessInfo[]> {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-axo", "pid=,ppid=,command="], {
+      env: minimalChildEnvironment(),
+      maxBuffer: 2_000_000
+    });
+    return parseProcessTree(stdout);
+  } catch {
+    return [];
+  }
 }
 
 async function defaultProbeUrl(url: string): Promise<boolean> {
@@ -346,6 +512,7 @@ interface TrackedActive extends TrackedBase {
   homeDir: string;
   ttlTimer: unknown;
   onExpire: (tunnel: ActiveTunnel, reason: TunnelExpireReason) => void;
+  deferredCleanupArmed?: boolean;
 }
 
 type Tracked = TrackedPending | TrackedActive;
@@ -570,14 +737,22 @@ export class TunnelManager {
     return toActiveTunnel(active);
   }
 
-  /** Stops an active tunnel by id. Waits for a confirmed exit (SIGTERM, then SIGKILL) before reporting stopped. */
-  async stop(id: string, reason: TunnelExpireReason = "stop"): Promise<ActiveTunnel | undefined> {
+  /**
+   * Stops an active tunnel by id. Waits for a confirmed exit (SIGTERM, then
+   * SIGKILL) before reporting it stopped. If neither signal produces an
+   * observed exit, the tunnel stays tracked and is reported with
+   * `exitConfirmed: false` rather than as a clean stop.
+   */
+  async stop(id: string, reason: TunnelExpireReason = "stop"): Promise<TunnelStopOutcome | undefined> {
     const tracked = this.tunnels.get(id);
     if (!tracked || tracked.state === "pending") {
       return undefined;
     }
     if (tracked.state === "stopping") {
-      return toActiveTunnel(tracked);
+      // A prior stop/expire could not confirm the child exited, so it is still
+      // tracked while we wait for a real exit. Re-report it as unconfirmed
+      // instead of pretending it stopped cleanly.
+      return { tunnel: toActiveTunnel(tracked), exitConfirmed: false };
     }
     return this.finalizeActive(tracked, reason, false);
   }
@@ -594,32 +769,67 @@ export class TunnelManager {
     await this.finalizeActive(tracked, reason, alreadyExited);
   }
 
-  private async finalizeActive(tracked: TrackedActive, reason: TunnelExpireReason, alreadyExited: boolean): Promise<ActiveTunnel> {
+  private async finalizeActive(
+    tracked: TrackedActive,
+    reason: TunnelExpireReason,
+    alreadyExited: boolean
+  ): Promise<TunnelStopOutcome> {
     tracked.state = "stopping";
     this.clearScheduled(tracked.ttlTimer);
     // If the child is already confirmed gone (a real "exit" event fired), it
     // will never emit another one — signalling and waiting here would just
     // stall for the full grace period for no reason.
-    if (!alreadyExited) {
-      const exited = await this.killWithEscalation(tracked.child);
-      if (!exited) {
-        console.warn(
-          `cloudflared for preview tunnel ${tracked.projectName} (${tracked.id}) did not confirm exit after SIGTERM/SIGKILL; check for an orphaned process manually.`
-        );
-      }
+    if (alreadyExited || (await this.killWithEscalation(tracked.child))) {
+      await this.completeCleanup(tracked, reason);
+      return { tunnel: toActiveTunnel(tracked), exitConfirmed: true };
+    }
+    // SIGTERM and SIGKILL both went unanswered. Do NOT free the project slot,
+    // remove the isolated home, or fire expiry: a cloudflared process may still
+    // be serving the public origin. Keep the tunnel tracked and finish cleanup
+    // only once its exit is actually observed, so it is never reported as
+    // stopped while the exposure could still be live. The persisted ledger
+    // record is likewise retained (released only on a real exit) so a restart
+    // can still reconcile the orphan.
+    console.warn(
+      `cloudflared for preview tunnel ${tracked.projectName} (${tracked.id}) did not confirm exit after SIGTERM/SIGKILL; it stays tracked and reported as not stopped until its process exit is observed.`
+    );
+    this.armDeferredCleanup(tracked, reason);
+    return { tunnel: toActiveTunnel(tracked), exitConfirmed: false };
+  }
+
+  /** Untracks a tunnel, removes its isolated home, and fires expiry. Used once a real exit is confirmed. */
+  private async completeCleanup(tracked: TrackedActive, reason: TunnelExpireReason): Promise<void> {
+    if (this.tunnels.get(tracked.id) !== tracked) {
+      return;
     }
     this.tunnels.delete(tracked.id);
     await this.removeHomeSafely(tracked.homeDir);
-    const result = toActiveTunnel(tracked);
-    tracked.onExpire(result, reason);
-    return result;
+    tracked.onExpire(toActiveTunnel(tracked), reason);
+  }
+
+  /**
+   * Waits for a resistant child's eventual exit and only then completes the
+   * deferred cleanup for a tunnel whose kill never confirmed.
+   */
+  private armDeferredCleanup(tracked: TrackedActive, reason: TunnelExpireReason): void {
+    if (tracked.deferredCleanupArmed) {
+      return;
+    }
+    tracked.deferredCleanupArmed = true;
+    tracked.child.on("exit", () => {
+      void this.completeCleanup(tracked, reason);
+    });
   }
 
   /** Stops or cancels whatever tunnel (pending or active) is tracked for a project. */
   async stopByProject(
     projectName: string,
     reason: TunnelExpireReason = "stop"
-  ): Promise<{ kind: "active"; tunnel: ActiveTunnel } | { kind: "pending"; tunnel: PendingTunnel } | undefined> {
+  ): Promise<
+    | { kind: "active"; tunnel: ActiveTunnel; exitConfirmed: boolean }
+    | { kind: "pending"; tunnel: PendingTunnel }
+    | undefined
+  > {
     const tracked = [...this.tunnels.values()].find((entry) => entry.projectName === projectName);
     if (!tracked) {
       return undefined;
@@ -628,11 +838,15 @@ export class TunnelManager {
       const pending = this.cancelPending(tracked.id);
       return pending ? { kind: "pending", tunnel: pending } : undefined;
     }
-    const active = await this.stop(tracked.id, reason);
-    return active ? { kind: "active", tunnel: active } : undefined;
+    const outcome = await this.stop(tracked.id, reason);
+    return outcome ? { kind: "active", tunnel: outcome.tunnel, exitConfirmed: outcome.exitConfirmed } : undefined;
   }
 
-  /** Stops/cancels every tracked tunnel (shutdown, or the owner disabling the feature). */
+  /**
+   * Stops/cancels every tracked tunnel (shutdown, or the owner disabling the
+   * feature). Returns only the tunnels whose exit was confirmed; a tunnel whose
+   * kill did not confirm stays tracked and is not reported as stopped here.
+   */
   async stopAll(reason: TunnelExpireReason = "shutdown"): Promise<ActiveTunnel[]> {
     const results: ActiveTunnel[] = [];
     for (const id of [...this.tunnels.keys()]) {
@@ -643,7 +857,7 @@ export class TunnelManager {
         continue;
       }
       const stopped = await this.stop(id, reason);
-      if (stopped) results.push(stopped);
+      if (stopped?.exitConfirmed) results.push(stopped.tunnel);
     }
     return results;
   }

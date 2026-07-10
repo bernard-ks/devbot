@@ -126,6 +126,13 @@ export function tunnelControlExpiredMessage(): string {
   return "This preview tunnel control has expired.";
 }
 
+export function tunnelStopUnconfirmedMessage(projectName: string): string {
+  return [
+    `Could not confirm the preview tunnel for \`${projectName}\` stopped: \`cloudflared\` did not exit after SIGTERM and SIGKILL.`,
+    "It stays tracked and is still treated as exposed. Check for an orphaned `cloudflared` process (\`pkill cloudflared\`); Devbot finishes cleanup once its exit is observed."
+  ].join("\n");
+}
+
 export function tunnelNoServerMessage(projectName: string): string {
   return `No running local dev server was detected for \`${projectName}\`. Start it, then try again.`;
 }

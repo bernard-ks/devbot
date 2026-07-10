@@ -9,10 +9,13 @@ import test from "node:test";
 import {
   clampTtlMinutes,
   cloudflaredVersion,
+  collectProjectPids,
   describeProjectRevision,
   findCloudflaredPath,
   findRunningProjectOrigin,
+  parseProcessTree,
   parseTunnelUrl,
+  verifyProjectListener,
   previewGateReason,
   previewOwnerGateReason,
   projectPreviewGateReason,
@@ -106,7 +109,8 @@ test("findRunningProjectOrigin keeps the validated origin even when the probe an
   const origin = await findRunningProjectOrigin(
     fakeProject("web"),
     async () => true, // defaultProbeUrl treats manual-redirect 3xx as reachable
-    async () => ["http://[::1]:8080"]
+    async () => ["http://[::1]:8080"],
+    async () => true // listener verified as project-owned
   );
   assert.deepEqual(origin, { origin: "http://[::1]:8080", port: 8080 });
 });
@@ -124,10 +128,98 @@ test("findRunningProjectOrigin independently re-validates candidates, ignoring a
       probed.push(candidate);
       return reachable.has(candidate);
     },
-    async () => urls
+    async () => urls,
+    async () => true // listener verified as project-owned
   );
   assert.deepEqual(origin, { origin: "https://127.0.0.1:8443", port: 8443 });
   assert.deepEqual(probed, ["http://127.0.0.1:3000", "https://127.0.0.1:8443"]);
+});
+
+test("findRunningProjectOrigin refuses a reachable loopback origin whose listener is not in the project process tree", async () => {
+  // The blocker-2 case: a configured/global screenshot URL points at a port
+  // that answers, but the process listening there is not this project's.
+  const verifiedPorts: number[] = [];
+  const origin = await findRunningProjectOrigin(
+    fakeProject("web", "/repos/web"),
+    async () => true,
+    async () => ["http://127.0.0.1:3000"],
+    async (_project, port) => {
+      verifiedPorts.push(port);
+      return false;
+    }
+  );
+  assert.equal(origin, undefined);
+  assert.deepEqual(verifiedPorts, [3000]);
+});
+
+test("findRunningProjectOrigin exposes a reachable loopback origin only after its listener is bound to the project", async () => {
+  const verifiedPorts: number[] = [];
+  const origin = await findRunningProjectOrigin(
+    fakeProject("web", "/repos/web"),
+    async () => true,
+    async () => ["http://127.0.0.1:3000"],
+    async (_project, port) => {
+      verifiedPorts.push(port);
+      return true;
+    }
+  );
+  assert.deepEqual(origin, { origin: "http://127.0.0.1:3000", port: 3000 });
+  assert.deepEqual(verifiedPorts, [3000]);
+});
+
+test("parseProcessTree extracts pid, ppid, and command and skips non-process lines", () => {
+  const output = [
+    "  100     1 node /repos/web/node_modules/.bin/next dev",
+    " 101   100 /usr/bin/esbuild --service",
+    "not a process row",
+    ""
+  ].join("\n");
+  assert.deepEqual(parseProcessTree(output), [
+    { pid: 100, ppid: 1, command: "node /repos/web/node_modules/.bin/next dev" },
+    { pid: 101, ppid: 100, command: "/usr/bin/esbuild --service" }
+  ]);
+});
+
+test("collectProjectPids includes project-root processes plus descendants and excludes unrelated or sibling-prefixed ones", () => {
+  const processes = [
+    { pid: 100, ppid: 1, command: "node /repos/web/node_modules/.bin/next dev" }, // project root process
+    { pid: 101, ppid: 100, command: "node /repos/web/node_modules/next/dist/server/worker.js" }, // descendant (has root)
+    { pid: 102, ppid: 100, command: "/opt/esbuild --service=0.0.0" }, // descendant WITHOUT root, kept via ppid
+    { pid: 200, ppid: 1, command: "node /repos/web-legacy/server.js" }, // sibling prefix, must be excluded
+    { pid: 201, ppid: 1, command: "node /repos/other/server.js" }, // unrelated
+    { pid: 202, ppid: 201, command: "child-of-unrelated" } // descendant of unrelated, excluded
+  ];
+  const pids = [...collectProjectPids(processes, "/repos/web")].sort((a, b) => a - b);
+  assert.deepEqual(pids, [100, 101, 102]);
+});
+
+test("verifyProjectListener confirms only when every listener pid belongs to the project tree, and fails closed otherwise", async () => {
+  const project = fakeProject("web", "/repos/web");
+  const processes = [
+    { pid: 100, ppid: 1, command: "node /repos/web/node_modules/.bin/next dev" },
+    { pid: 101, ppid: 100, command: "node worker" }
+  ];
+  const snapshotProcesses = async () => processes;
+
+  assert.equal(
+    await verifyProjectListener(project, 3000, { listListenerPids: async () => [101], snapshotProcesses }),
+    true
+  );
+  // An unrelated local service listening on the same port is refused.
+  assert.equal(
+    await verifyProjectListener(project, 3000, { listListenerPids: async () => [999], snapshotProcesses }),
+    false
+  );
+  // A mix that includes any foreign listener is refused.
+  assert.equal(
+    await verifyProjectListener(project, 3000, { listListenerPids: async () => [101, 999], snapshotProcesses }),
+    false
+  );
+  // No identifiable listener → refuse (default-deny), never expose blindly.
+  assert.equal(
+    await verifyProjectListener(project, 3000, { listListenerPids: async () => [], snapshotProcesses }),
+    false
+  );
 });
 
 test("findRunningProjectOrigin returns undefined when nothing validated is reachable", async () => {
@@ -312,7 +404,8 @@ test("TunnelManager stop kills the child with SIGTERM, waits for confirmed exit,
   const child = lastSpawnedChild;
 
   const stopped = await manager.stop(tunnel.id, "stop");
-  assert.equal(stopped?.url, "https://web.trycloudflare.com");
+  assert.equal(stopped?.exitConfirmed, true);
+  assert.equal(stopped?.tunnel.url, "https://web.trycloudflare.com");
   assert.deepEqual(child?.killSignals, ["SIGTERM"]);
   assert.equal(manager.get(tunnel.id), undefined);
 });
@@ -325,15 +418,21 @@ test("TunnelManager stop escalates to SIGKILL when cloudflared ignores SIGTERM",
   const child = lastSpawnedChild;
 
   const stopped = await manager.stop(tunnel.id, "stop");
-  assert.ok(stopped);
+  assert.equal(stopped?.exitConfirmed, true);
   assert.deepEqual(child?.killSignals, ["SIGTERM", "SIGKILL"]);
 });
 
-test("TunnelManager stop gives up after SIGTERM and SIGKILL both go unanswered, without hanging forever", async () => {
+test("TunnelManager stop reports failure and keeps the tunnel tracked when SIGTERM and SIGKILL both go unanswered", async () => {
   const spawnFn: TunnelSpawnFn = () => fakeChild({ killBehavior: "ignore-all" });
-  const { manager } = makeManager({ killGraceMs: 10 }, spawnFn);
+  const { manager, homesRemoved } = makeManager({ killGraceMs: 10 }, spawnFn);
+  const expireReasons: string[] = [];
   const pending = manager.reserve(reserveInput({ projectName: "web" }));
-  const tunnel = await launchAndReportUrl(manager, pending.id, () => {}, "https://web.trycloudflare.com");
+  const tunnel = await launchAndReportUrl(
+    manager,
+    pending.id,
+    (_tunnel, reason) => { expireReasons.push(reason); },
+    "https://web.trycloudflare.com"
+  );
   const child = lastSpawnedChild;
 
   const originalWarn = console.warn;
@@ -341,9 +440,30 @@ test("TunnelManager stop gives up after SIGTERM and SIGKILL both go unanswered, 
   console.warn = (message?: unknown) => { warnings.push(String(message)); };
   try {
     const stopped = await manager.stop(tunnel.id, "stop");
-    assert.ok(stopped);
+    // A resistant child must never be reported as a clean stop. The exposure
+    // stays tracked (still active for the project), its home is not removed,
+    // and expiry is not fired until a real exit is actually observed.
+    assert.equal(stopped?.exitConfirmed, false);
     assert.deepEqual(child?.killSignals, ["SIGTERM", "SIGKILL"]);
     assert.ok(warnings.some((message) => message.includes("did not confirm exit")));
+    assert.equal(manager.get(tunnel.id)?.id, tunnel.id);
+    assert.equal(manager.hasActiveForProject("web"), true);
+    assert.equal(homesRemoved.length, 0);
+    assert.deepEqual(expireReasons, []);
+
+    // A repeat stop while unconfirmed keeps reporting failure, not success.
+    const stoppedAgain = await manager.stop(tunnel.id, "stop");
+    assert.equal(stoppedAgain?.exitConfirmed, false);
+    assert.equal(manager.hasActiveForProject("web"), true);
+
+    // Only once the process exits does the deferred cleanup finish: untracked,
+    // home removed, and expiry fired with the original stop reason.
+    child?.emitExit(0);
+    await sleep(0);
+    assert.equal(manager.get(tunnel.id), undefined);
+    assert.equal(manager.hasActiveForProject("web"), false);
+    assert.equal(homesRemoved.length, 1);
+    assert.deepEqual(expireReasons, ["stop"]);
   } finally {
     console.warn = originalWarn;
   }
