@@ -285,6 +285,14 @@ const commandBuilders = [
         .addStringOption((option) =>
           option.setName("commands").setDescription("Optional comma-separated configured commands.").setRequired(false).setAutocomplete(true)
         )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("duel")
+        .setDescription("Have an independent agent adversarially review a completed task's change, with one rebuttal round.")
+        .addStringOption((option) =>
+          option.setName("task").setDescription("Completed action task ID.").setRequired(true).setAutocomplete(true)
+        )
     ),
   new SlashCommandBuilder()
     .setName("devbot")

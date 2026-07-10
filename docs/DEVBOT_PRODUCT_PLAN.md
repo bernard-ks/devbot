@@ -74,6 +74,11 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Updates one Discord task message through routing, context preparation, work, failure, cancellation, and completion.
   - Uses restart-stable task controls for follow-up, review, validation, adjustment, retry, and cancellation.
   - Tracks task branch freshness and merged state against the local default branch (`/task freshness`, `/task show`) and rebases stale task branches inside their isolated worktrees on request (`/task sync`) with a backup ref, conflict-abort safety, and honest reporting.
+- Agent-vs-agent duel review:
+  - `/review duel task:<task-id>` and a **Duel review** button on completed action tasks let a fresh, different-tier Codex session adversarially review the task's actual diff.
+  - The reviewer must return a structured verdict citing file:line evidence, or state plainly that a clean diff has no substantive issues rather than inventing nits.
+  - The original author gets one rebuttal round to concede, rebut, or withdraw each issue; there is no third round.
+  - Results post to a dedicated thread with a resolved issue list (conceded / disputed / withdrawn) and owner **Accept & fix** (pre-fills a `/do` task from conceded issues) / **Dismiss** controls, recorded in the local collaboration store.
 - External local Codex awareness:
   - Detects local Codex app/CLI sessions whose working directory belongs to a configured project.
   - Separates confirmed external runs from open app sessions whose activity cannot be known.

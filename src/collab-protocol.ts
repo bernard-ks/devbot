@@ -23,7 +23,8 @@ export type CollabIntent =
   | "campfire"
   | "roster"
   | "ritual"
-  | "approval";
+  | "approval"
+  | "duel";
 
 export interface CollabActor {
   botId: string;
@@ -89,7 +90,8 @@ const COLLAB_INTENTS: CollabIntent[] = [
   "campfire",
   "roster",
   "ritual",
-  "approval"
+  "approval",
+  "duel"
 ];
 const COLLAB_MODES: CollabMode[] = ["read", "think", "validate", "write"];
 

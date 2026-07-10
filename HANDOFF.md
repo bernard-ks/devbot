@@ -1,89 +1,103 @@
-# Lane A — Bring-your-own-agent backends
+# Lane J — Agent-vs-agent duel review
 
-## Rebase note (onto origin/main `45d8833` — PRs #10 security-hardening, #16 screenshot-to-fix, #30 branch-freshness)
-Rebased 2026-07-10. Conflicting files and resolutions:
-- **`src/codex-client.ts`** — main's screenshot-to-fix (#16) added image support (`imagePaths` on `CompleteCodexOptions`, `buildImageExecArgs`, and the `transcribeErrorImages`/`parseTranscription`/`locateErrorInProject`/`parseLocateResponse` helpers) to the same function the lane replaced with the backend abstraction. Kept the lane's `getActiveBackend` → `buildAnswerCommand`/`buildActionCommand` → `runBackend`/`runSpec` pipeline and threaded `imagePaths` through `BuildCommandOptions` so the image helpers still work; the screenshot helpers are preserved verbatim and call the abstracted `completeCodexPrompt`. `buildImageExecArgs` moved into `agent-backend.ts` (where codex argv is built) and is re-exported from `codex-client.ts` for the existing test/`index.ts` import paths.
-- **`src/agent-backend.ts`** — added `imagePaths?: string[]` to `BuildCommandOptions`, `buildImageExecArgs`, and an image-arg splice in `buildCodexArgs` (before the trailing `-`), coexisting with this lane's hardened argv/`BackendCapabilities`.
-- **`src/index.ts`** — merged the two import blocks (main's screenshot helpers + the lane's `agent-backend` wiring); handler bodies auto-merged.
-- **`HANDOFF.md`** — took the lane's copy (per-lane rolling doc).
+## What this adds
 
-## Review round 3 (head after this rebase)
-Addresses the remaining reliability blocker on head `9d019b9`: `completeCodexPrompt()` acquired a run slot and then awaited `mkdtemp()` before entering the protected `try`, so a temp-dir failure leaked the slot. Moved every post-acquisition operation (temp-dir creation included) inside a `try` whose outer `finally` always calls `releaseSlot()`; temp-dir cleanup stays in a nested `finally`. Added `src/agent-backend-smoke.test.ts` "repeated temp-dir creation failures release the run slot and do not reduce capacity", which forces >4 consecutive `mkdtemp` failures (ENOENT via a missing temp root) and then proves valid requests still run at full concurrency.
+A second, independent Codex session adversarially reviews a completed write-capable task's
+actual diff, the original author gets one rebuttal round, and the resolved outcome (conceded /
+disputed / withdrawn) surfaces to the owner in a dedicated Discord thread.
 
-## Prior rebase note (onto origin/main `85e2530`, which merges bernard's dd0af6b "Add ambient Discord workrooms and security hardening")
-Rebased 2026-07-09. Conflicting files and resolutions:
-- **`src/codex-client.ts`** — both sides rewrote `completeCodexPrompt` and the spawn runner. Kept the lane's backend-abstraction pipeline (`getActiveBackend` → `buildAnswerCommand`/`buildActionCommand` → `runBackend`/`runSpec`) and folded bernard's **generic** hardening into it: the concurrency limiter (`acquireCodexRunSlot`, 4 active / 8 queued), output-size capping (`appendProcessOutput`), graceful termination with a 5s SIGKILL fallback (`requestTermination`), stdin-error handling, and `redactSensitiveText` on both the final answer and error output. bernard's **codex-specific** hardening (the `--strict-config`/`--ignore-*`/`--disable *`/`--config …` security flags, the isolated `HOME`/`CODEX_HOME` env, and passing the prompt over stdin via `-`) moved into the codex backend builder so it routes through the same abstraction as every other backend.
-- **`src/agent-backend.ts`** — `buildCodexArgs` now emits bernard's hardened argv, sets `stdin: options.prompt` with `-` as the positional, and builds `env` via a new `isolatedCodexEnvironment` (uses `minimalChildEnvironment` from `security.ts`, derives the runtime `HOME` from the output-file dir). Other backends (claude/gemini/opencode) are unchanged.
-- **`src/agent-backend.test.ts`** — updated the three codex argv assertions to the hardened flag layout and asserted `spec.stdin === "explain this"`.
-- **`src/setup-store.test.ts`** — the setup-subcommand-order assertion collided with bernard's new `project-room` subcommand; merged to the union order `wizard, doctor, show, backend, user, devbot, repo, room, project-room`.
-- **`src/index.ts`, `src/commands.ts`, `src/setup-store.ts`** — auto-merged; verified the lane's backend wiring (bootstrap `setActiveBackendId`, `initActiveBackend` in `clientReady`, `/setup backend` dispatch, doctor section, `tier: route.tier`) landed intact inside bernard's restructured handlers.
-- **`README.md`, `docs/DEVBOT_PRODUCT_PLAN.md`** — auto-merged, no conflict.
-
-Net effect: **codex is no longer byte-for-byte the pre-lane argv** — it is byte-for-byte bernard's hardened argv, now built inside the abstraction. `npm test` → **129 pass / 0 fail**.
-
-## What this delivers
-Devbot's executor is now pluggable. Instead of only driving the local Codex CLI, Devbot can run on **Codex, Claude Code, Gemini CLI, or opencode** — whichever is installed on the host. Codex remains the default and reference backend, and (post-rebase) still carries bernard's full security hardening — that hardening now lives inside the codex backend builder rather than in `codex-client.ts`.
-
-## Design
-- **`src/agent-backend.ts`** (new) — the backend abstraction:
-  - `AgentBackend` interface: `id`, `displayName`, `binary`, `experimental`, `usesOutputFile`, `detect()`, `buildAnswerCommand()`, `buildActionCommand()`.
-  - `SpawnSpec` is pure data (`bin`, `args`, `cwd`, `env`, `timeoutMs`, optional `stdin`/`outputFile`), so command construction is unit-testable without spawning.
-  - Four backend factories:
-    - **codex** — emits bernard's hardened argv (`--ask-for-approval never exec --ephemeral --strict-config --sandbox … --ignore-user-config --ignore-rules --disable apps/plugins/hooks/… --config allow_login_shell=false/…`), pipes the prompt over stdin (`-`), and runs under an isolated `HOME`/`CODEX_HOME` env (`isolatedCodexEnvironment` + `minimalChildEnvironment`). Same `--model` / `--config model_reasoning_effort` / `--skip-git-repo-check` splice order. Reads its final answer from the output file. Not experimental.
-    - **claude** — `claude -p …`; answer mode = `--permission-mode plan` (read-only-safe), action mode = `--permission-mode acceptEdits --add-dir <project>`. Flags verified against `claude --help` on this machine (v2.1.197). Not experimental.
-    - **gemini** — `gemini -p …`; action mode adds `--yolo`. Marked **experimental** (gemini not installed here, flags unverified).
-    - **opencode** — `opencode run …`. Marked **experimental** (not installed here; no verified read-only vs write flag, so answer and action modes are identical).
-  - Detection: `detect()` spawns `<binary> --version`, caches per process, and parses the version (`parseVersionOutput`). `ENOENT` ⇒ not installed.
-  - Selection: `selectBackendId()` — explicit `DEVBOT_AGENT_BACKEND` env → setup-store setting → first detected in order codex, claude, gemini, opencode → codex fallback. Module-level active-id singleton with `setActiveBackendId` / `getActiveBackend` / `initActiveBackend`.
-  - Model tiers: non-codex backends map Luna/Terra/Sol to their own model via optional env (`DEVBOT_CLAUDE_MODEL`, `DEVBOT_CLAUDE_FAST_MODEL`/`_STANDARD_MODEL`/`_DEEP_MODEL`, and the same for `DEVBOT_GEMINI_*` / `DEVBOT_OPENCODE_*`). No configured model ⇒ the `--model` flag is omitted (tier ignored gracefully). Codex keeps using the routing model strings as before.
-- **`src/codex-client.ts`** — refactored to delegate to the active backend. `answerWithProjectContext` and `completeCodexPrompt` keep their exported signatures (added optional `tier`/`mode` fields only). The spawn runner is generalized to `runSpec`/`runBackend`: if the spec has an `outputFile` it reads the answer from there (codex), otherwise it uses captured stdout (claude/gemini/opencode). Post-rebase this generic runner also carries bernard's hardening for every backend: the concurrency limiter, output-size cap, graceful-termination-with-SIGKILL-fallback, stdin passing/error-handling, and `redactSensitiveText` on answers and error output.
-- **`src/setup-store.ts`** — `SetupState.agentBackendId` + `setAgentBackend()`, persisted in the existing atomic JSON store.
-- **`src/index.ts`** — resolves the active backend at bootstrap and re-detects in `clientReady` (logs active + detected). New owner-only `/setup backend` subcommand (list detected backends with versions / select one). `/setup doctor` gains a "Coding-agent backends" section and an active-backend readiness check.
-- **`src/commands.ts`** — registers `/setup backend` with a fixed-choice `id` option (codex/claude/gemini/opencode).
+- `/review duel task:<task-id>` — owner/controller-only slash command.
+- A **Duel review** button on completed action-mode task cards (owner/controller-gated), next to
+  Follow up / Review changes / Run checks.
+- Reviewer round: a fresh read-only Codex session, always on a *different* Luna/Terra/Sol tier than
+  the author used (fast/standard → reviewer runs deep; deep → reviewer runs standard), given the
+  task's actual `git diff HEAD` (budgeted/truncated per file and in total) and asked to return a
+  structured `VERDICT:` + `ISSUE severity=... file=... line=... claim=...` block, or approve plainly
+  when the diff is clean.
+- Rebuttal round: only runs if the reviewer raised at least one issue. The original author's tier
+  gets the same diff plus the reviewer's issues and must respond with one `RESPONSE id=... stance=
+  concede|rebut|withdraw reasoning=...` line per issue. No third round.
+- Each issue resolves to a final status: `concede` → conceded (real), `rebut` → disputed,
+  `withdraw` → withdrawn, no rebuttal recorded → disputed (left open, not silently dropped).
+- The duel is recorded as a `CollabStore` conversation (new `"duel"` intent alongside the existing
+  lab intents) with a dedicated audit thread — reusing the same `startLabConversation` /
+  `createLabThread` machinery every other `/lab` command uses, so `/lab recent`-style history and
+  the thread pattern both work for duels without new infrastructure.
+- Thread message: summary (verdict, tiers, N issues: X conceded / Y disputed / Z withdrawn) +
+  the issue list with severities, file:line, reviewer claim, and author response.
+- If any issue was conceded, an **Accept & fix** button (owner/controller only) opens a modal
+  pre-filled with a `/do`-style fix task built from the conceded issues (editable before submit,
+  respects safe mode); **Dismiss** records a `deny` decision. Both are one-shot — decisions can't
+  be re-recorded once made (guarded by `CollabStore.decide`'s existing single-decision rule).
 
 ## Files touched
-- New: `src/agent-backend.ts`, `src/agent-backend.test.ts`
-- Modified: `src/codex-client.ts`, `src/setup-store.ts`, `src/commands.ts`, `src/index.ts`, `src/setup-store.test.ts`, `README.md`, `docs/DEVBOT_PRODUCT_PLAN.md`
 
-## Tests
-`npm test` → **129 pass / 0 fail** (post-rebase, incl. bernard's new security/ambient suites + 11 in `agent-backend.test.ts`). New coverage: codex answer/action/router-preflight argv (byte-for-byte), claude plan/acceptEdits + tier-model mapping, gemini yolo + experimental, opencode run + experimental, selection precedence, id normalization, version parsing, and the active-id singleton. Updated the setup-command-order assertion for the added `backend` subcommand.
+- `src/duel.ts` (new) — engine + pure logic: diff budgeting/truncation, verdict/rebuttal tolerant
+  parsers, issue-status resolution matrix, reviewer-tier selection, prompt builders, Discord
+  summary/issue formatting, `gatherDuelChangeEvidence` (impure `git diff` + truncation), and
+  `runDuelReview` (the two-round engine, with an injectable `complete` fn for testing, mirroring
+  `request-router.ts`'s pattern).
+- `src/duel.test.ts` (new) — 16 unit tests covering diff truncation (empty/small/oversized-file/
+  budget-exhausted), verdict parsing (well-formed/malformed/empty/approve-with-stray-text),
+  rebuttal parsing (well-formed/empty/unknown-id), the issue-status resolution matrix, tier
+  selection, tier labels, fix-task prompt construction, and two engine-level tests (clean diff
+  skips rebuttal; issue found runs both rounds) using an injected fake `complete`.
+- `src/duel-ui.ts` (new) — Discord button/modal customId encoding and tolerant parsing:
+  `devbot:duel-control:review:<taskId>`, `devbot:duel-control:accept|dismiss:<conversationId>`,
+  `devbot:duel-fix-modal:<conversationId>`.
+- `src/task-controls.ts` — imports `duelReviewButton`; adds it to `taskActionRows` for
+  succeeded action-mode tasks when the viewer can control.
+- `src/collab-protocol.ts` — added `"duel"` to `CollabIntent` (type + runtime array); no other
+  protocol changes.
+- `src/commands.ts` — added `/review duel task:<task-id>` subcommand (autocomplete reuses the
+  existing generic `task`-named-option autocomplete handler, no new autocomplete wiring needed).
+- `src/index.ts` — `handleReviewDuelCommand`, `handleDuelControl`, `handleDuelFixModal`,
+  `runDuelForTask` (shared by the slash command and the button), `recordDuelResult`,
+  `duelResolvedIssuesFromConversation`; new customId dispatch branches for buttons and modal
+  submits; widened `startLabConversation`/`createLabThread` parameter types to also accept
+  `ButtonInteraction` (both already only used `.channel`/`.user`/`.channelId`, which both
+  interaction kinds have) so the button-triggered duel can reuse the exact same thread-creation
+  path as `/lab` commands.
+- `README.md`, `docs/DEVBOT_PRODUCT_PLAN.md` — feature bullets.
+- `formatDevbotHelp` in `src/index.ts` — one discovery line under `/devbot help`.
 
 ## How to verify manually in Discord
-1. Run `/setup doctor` — the new "Coding-agent backends" section lists every backend with its version or "not installed" and marks the active one with `*`.
-2. Run `/setup backend` with no argument — see the detected backends, active selection, and the selection-order note.
-3. Run `/setup backend id:claude` (with Claude Code installed) — persists the choice; subsequent `/ask` and `/do` runs go through `claude -p`. Switch back with `/setup backend id:codex`.
-4. With only codex installed and nothing configured, everything behaves exactly as before (codex is auto-selected).
+
+1. Run a `/do` task that touches at least one file and let it succeed.
+2. Click **Duel review** on the completed task card (or run `/review duel task:<id>`).
+3. Confirm a new thread appears (named like `duel Duel review: task-... <suffix>`) with the
+   posting bot's header, then the verdict/issue summary.
+4. If issues were raised, confirm the author's response lines appear per issue and the
+   conceded/disputed/withdrawn counts in the summary match.
+5. If ≥1 issue was conceded, click **Accept & fix**, confirm a modal opens pre-filled with the
+   conceded issues, edit if desired, submit, and confirm a new write-capable task starts.
+6. Click **Dismiss** on a different duel and confirm it records without starting a task, and that
+   clicking either decision button again says the duel was already decided.
+7. Confirm a non-owner/non-controller account cannot trigger `/review duel`, the button, or the
+   decision buttons.
 
 ## Known limitations / risks
-- **gemini and opencode are experimental** — their flags were not verifiable on this machine. Post-review they are **action-only**: neither can prove read-only, so `buildAnswerCommand` refuses (fail closed) and only `/do` is wired. gemini's `--yolo` and opencode's `run` follow the brief but should be smoke-tested against the real CLIs before promotion.
-- **Claude `plan` mode for answers**: `plan` is the read-only-safe permission mode, now reinforced with a `--disallowedTools` write/network denylist and `--strict-mcp-config`. In non-interactive `-p` runs Claude may present a plan rather than a discursive answer for some prompts; acceptable for the deny-by-default posture, but worth watching in real use.
-- **Prompt passing**: all backends now deliver the prompt over **stdin** (codex via `-`; claude/gemini/opencode via `spec.stdin`), so no request text reaches argv/process listings.
-- **`DEVBOT_AGENT_BACKEND` env overrides `/setup backend`.** When both disagree, `/setup backend` saves the choice but reports that the env var wins until cleared.
-- No instruction-shaped / agent-directed text was found in the repo files touched.
 
-## Review round 1 (maintainer: bernard) — blocking issues addressed
-Appended as new commits on top of the reviewed branch; existing commits were not rewritten. Each blocking issue → fix + test:
-
-1. **Non-Codex agents inherited the full bot environment (`env: process.env`).**
-   - Fix: added `scopedChildEnvironment(env, allowList)` to `src/security.ts`. It starts from `minimalChildEnvironment` (which already drops the bot token / sensitive-named vars) and re-admits only a per-backend allow list of that CLI's own documented auth/config vars (claude: `ANTHROPIC_*` / `CLAUDE_CODE_*`; gemini: `GEMINI_*` / `GOOGLE_*`; opencode: `OPENCODE_*` + provider keys). `DISCORD_*` and `DEVBOT_*` prefixes are dropped unconditionally even if an allow list matched. claude/gemini/opencode backends now build `env` via this helper instead of `process.env`. The version probe also switched to `minimalChildEnvironment`.
-   - Test: `non-codex backends never forward Devbot secrets but do forward their own documented auth` (asserts `DISCORD_TOKEN`/`APPLICATION_SECRET`/`DEVBOT_*` absent, provider key present, `PATH` present) and `codex backend uses an isolated environment without Devbot secrets`.
-
-2. **Prompts were placed in argv.** claude/gemini/opencode passed the full request as an argv positional.
-   - Fix: all backends now set `spec.stdin = options.prompt` and carry no prompt token in `args` (the runner already pipes `stdin`). Matches how the hardened codex path uses `-` + stdin.
-   - Test: `no backend places the prompt in argv; every backend delivers it off-argv` (iterates all backends: asserts the secret prompt is not in any argv token and equals `spec.stdin`).
-
-3. **Read-only was not a guaranteed capability.** opencode's answer/action were identical; gemini answer safety was assumed.
-   - Fix: added a `BackendCapabilities` contract with `enforcesAnswerReadOnly`. Backends that can't guarantee it (gemini — unproven; opencode — no read-only mode) now **throw `ReadOnlyUnsupportedError` from `buildAnswerCommand`** (fail closed) instead of returning an action-equivalent spec. codex (sandbox `read-only`) and claude (`plan` mode + `--disallowedTools` write/network tools) keep answer mode. The router preflight and task runner surface the refusal cleanly (router falls back to heuristic routing; `/ask` returns the clear "switch backend" message).
-   - Test: `gemini backend ... refuses read-only answers` and `opencode backend ... refuses read-only answers` (assert `throws(/read-only/i)` and `capabilities.enforcesAnswerReadOnly === false`); claude/codex capability tests assert `true`.
-
-4. **Backend user config / extensions / network not constrained; no capability fields.**
-   - Fix: `BackendCapabilities` now carries explicit, tested fields for `minimalEnvironment`, `isolatesUserConfig`, `constrainsNetwork`, `enforcesAnswerReadOnly`, `confinesActionWorkspace`, `supportsCancellation`, `promptTransport`, `outputTransport` on every backend. claude gained `--strict-mcp-config` (no ambient MCP servers/plugins/tool extensions) on both modes and a read-only write-tool denylist on answer mode; action mode stays confined via `acceptEdits` + `--add-dir <project>`. gemini/opencode declare the unproven fields as `false` (consistent with their fail-closed answer refusal + experimental flag).
-   - Test: `claude backend declares a read-only-capable, minimal-env, confined capability contract` (full `capabilities` deepEqual) and the hardened-args test asserting `--strict-mcp-config` + `--disallowedTools`.
-
-5. **`/setup doctor` had an unconditional Codex executable check.**
-   - Fix: removed the codex-specific "Codex executable" readiness line from `formatSetupDoctor` in `src/index.ts`. Readiness is now generalized around the active backend (`Agent backend (<id>)`) plus a new `Read-only answers (<id>)` capability check driven by `capabilities.enforcesAnswerReadOnly`. The backend summary and `/setup backend` report annotate any backend that cannot serve read-only `/ask`.
-
-### Residual notes for the maintainer
-- gemini and opencode remain **experimental** and are only wired for `/do` (action) after the fail-closed answer refusal; they still need a real-CLI smoke test for action/cancellation/timeout/output parsing before promotion. No real third-party CLI is spawned in tests.
-- claude `--strict-mcp-config` blocks ambient MCP/plugin extensions, but the CLI has no flag to fully ignore `~/.claude/settings.json`; in `plan`/read-only answer mode this cannot grant writes, and action mode stays scoped to the project dir. Documented rather than assumed.
-- `npm test` → **133 pass / 0 fail** (rerun once: the first run's single failure was the known flaky child-process timeout in `security.test.ts`, green on rerun).
+- Diff evidence is `git diff HEAD` against the working tree at duel time, not a snapshot pinned to
+  when the task actually ran; if further changes land on the project between the task finishing
+  and the duel running, the reviewer sees the current working tree, not strictly "that task's"
+  diff. This matches the only diff source `review.ts` already offers elsewhere in devbot (task
+  records don't track a changed-file list), so it's consistent with existing behavior, not a new
+  gap — but worth knowing if multiple tasks land back-to-back before a duel is requested.
+- The reviewer/rebuttal prompts ask the model to follow an exact line format; the parsers are
+  tolerant (regex-based, warn-and-degrade on drift) but a badly-misbehaving model could still
+  produce zero parsed issues on a genuinely dirty diff. This fails toward "approve" rather than
+  toward inventing false positives, which matches the acceptance criterion but means a false
+  "clean" review is possible if the reviewer ignores the format entirely. Nothing in this codebase
+  today validates model output against ground truth beyond structural parsing (the same trust
+  boundary `request-router.ts`'s router-response parsing already accepts elsewhere in devbot).
+- `duelResolvedIssuesFromConversation` reconstructs conceded issues for **Accept & fix** by reading
+  back a JSON-stringified contribution from `CollabStore` rather than a dedicated typed store. This
+  keeps the durable-state footprint small and reuses existing infrastructure per the lane brief's
+  instruction to follow `collab-store.ts` patterns, but it means duel history isn't independently
+  queryable outside that one conversation's contributions today.
+- No repo file contained instruction-shaped text directed at AI agents; nothing to flag there.
+- Two full Codex read-only invocations per duel (reviewer + optional rebuttal) can take a while
+  back-to-back for a `deep`/Sol-tier reviewer; the slash command and button both defer the reply
+  immediately and the thread/summary land once both rounds finish, so Discord's interaction timeout
+  should not be hit, but this is slower than every other single-round command in devbot today.
