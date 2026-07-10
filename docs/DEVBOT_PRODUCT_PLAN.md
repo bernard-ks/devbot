@@ -90,9 +90,13 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
 - Opt-in preview tunnels:
-  - `/preview share` turns a detected running local dev server into a public `cloudflared` preview link, owner-only and off by default until enabled with `/setup preview`.
-  - Tunnels auto-expire (default 15, max 60 minutes), can be stopped early with `/preview stop` or a message button, and are always killed on Devbot shutdown.
-  - Refuses to start without the owner, the feature flag, the `cloudflared` binary, or a detected local dev server.
+  - `/preview share` turns a detected running local dev server into a public `cloudflared` Quick Tunnel link. Quick Tunnels are Cloudflare's anonymous, unauthenticated, testing-only tunnels: anyone with the URL reaches the exact local origin for as long as it is live, with no Discord allowlist in front of it.
+  - Owner-only and off by default at two independent gates: the global `/setup preview action:<enable|disable>` kill-switch, and a default-deny per-project allow-list set with `/setup preview action:enable project:<name>` (owner-controlled runtime state, never read from checked-in `.devbot/project.json`).
+  - Starting one always goes through a pre-spawn confirmation showing the exact local origin (scheme/host/port), project, git branch/revision, TTL, and the anonymous-public disclosure, with Confirm/Cancel buttons; nothing is spawned until the owner confirms, and an unconfirmed request auto-cancels after two minutes.
+  - The exact loopback origin is independently re-validated (scheme and port preserved, remote hosts and default-port confusion rejected) rather than trusting only upstream detection.
+  - Tunnels auto-expire (default 15, max 60 minutes), can be stopped early with `/preview stop` or a message button, and are always stopped (SIGTERM, escalating to SIGKILL if needed) on disable or Devbot shutdown. Owner `/preview stop`/`status` keep working even while the feature is disabled.
+  - `cloudflared` runs with an isolated, single-use `HOME` (removed after it exits) so it cannot pick up ambient Cloudflare account state, plus the bot's usual token/secret-stripped environment.
+  - Refuses to start without the owner, both enablement gates, the `cloudflared` binary, or a detected local dev server.
 
 ## Current Constraints
 
