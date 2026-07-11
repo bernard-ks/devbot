@@ -129,6 +129,7 @@ import { composeShipCard } from "./ship-card.js";
 import {
   authorizeTaskPreview,
   formatPreviewInstance,
+  previewPublicationChannel,
   resolvePreviewCommand,
   TaskPreviewManager,
   type PreviewControlAction,
@@ -1775,12 +1776,11 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree, true, workspaceNotes);
       // Every action task runs in an isolated Git worktree (task-worktree.ts); Codex's edits land
-      // on a review branch, never in options.project.root. Devbot has no managed preview of that
-      // isolated workspace, so there is no server it could honestly screenshot "after" against —
-      // the source checkout's dev server never reflects this task's changes. Per review, automatic
-      // before/after capture is skipped entirely rather than attaching a diff that would silently
-      // misrepresent someone else's (or no) change as this task's result. `/ship` remains available
-      // as an explicit, on-demand, honestly-captioned surface (visual-capture.ts).
+      // on a review branch, never in options.project.root. Automatic completion does not start or
+      // attach to the separate managed-preview lifecycle, so there is no server it could honestly
+      // screenshot "after" against — the source checkout's dev server never reflects this task's
+      // changes. Automatic before/after capture is skipped rather than attaching a misleading diff;
+      // `/task preview` remains an explicit controller action and `/ship` stays honestly text-only.
       await taskStore.recordCapture(task.id, {
         captureNote: isolatedVisualProofNote(task.id, isolatedWorktree.branch)
       });
@@ -3533,14 +3533,11 @@ function previewAccessContext(
 }
 
 function latestOpenPreview(taskId: string): PreviewInstance | undefined {
-  return previewManager
-    .list(taskId)
-    .filter((instance) => instance.state === "pending" || instance.state === "active" || instance.state === "stopping")
-    .at(-1);
+  return previewManager.latestUnresolved(taskId);
 }
 
 async function publishPreviewCard(task: TaskRecord, project: ProjectEntry, instance: PreviewInstance): Promise<string | undefined> {
-  const channelId = task.threadId ?? setupStore.snapshot().projectRoomIds[project.name];
+  const channelId = previewPublicationChannel(task, setupStore.snapshot().projectRoomIds[project.name]);
   if (!channelId) {
     return "No task workroom or bound project room exists, so the preview details stay in this private reply.";
   }
@@ -4221,7 +4218,7 @@ async function buildShipCard(project: ProjectEntry, task: TaskRecord): Promise<S
 function shipCardCaption(project: ProjectEntry, task: TaskRecord, build: ShipCardBuild): string {
   const header = `Ship card for \`${project.name}\` task \`${task.id}\`.`;
   if (build.isolatedBranch) {
-    return `${header} Visual proof unavailable for isolated branch \`${build.isolatedBranch}\`: Devbot has no managed preview of that isolated workspace, so no screenshot was attempted. The card is text-only; review the branch directly.`;
+    return `${header} Visual proof unavailable for isolated branch \`${build.isolatedBranch}\`: /ship does not start or attach to a managed task preview, so no screenshot was attempted. The card is text-only; use /task preview for live local inspection or review the branch directly.`;
   }
   return build.hasScreenshot
     ? `${header} Attach and post anywhere.`

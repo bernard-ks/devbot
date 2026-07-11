@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   authorizeTaskPreview,
   isPreviewId,
+  previewPublicationChannel,
   resolvePreviewCommand,
   TaskPreviewManager,
   type PreviewCommand,
@@ -40,7 +41,13 @@ async function createFixture(): Promise<Fixture> {
 
 async function writeFakeServer(
   fixture: Fixture,
-  options: { ignoreSigterm?: boolean; listenDelayMs?: number } = {}
+  options: {
+    ignoreSigterm?: boolean;
+    listenDelayMs?: number;
+    bindHost?: string;
+    ignorePort?: boolean;
+    latePublicListenerMs?: number;
+  } = {}
 ): Promise<string> {
   const script = path.join(fixture.workspace, "fake-server.cjs");
   await writeFile(
@@ -48,10 +55,18 @@ async function writeFakeServer(
     [
       'const http = require("node:http");',
       'const fs = require("node:fs");',
-      "const port = Number(process.env.PORT);",
-      'const host = process.env.HOST || "127.0.0.1";',
+      options.ignorePort ? "const port = 0;" : "const port = Number(process.env.PORT);",
+      options.bindHost
+        ? `const host = ${JSON.stringify(options.bindHost)};`
+        : 'const host = process.env.HOST || "127.0.0.1";',
       options.ignoreSigterm ? 'process.on("SIGTERM", () => {});' : "",
       'const server = http.createServer((request, response) => { response.statusCode = 200; response.end("ok"); });',
+      options.latePublicListenerMs !== undefined
+        ? [
+            'const publicServer = http.createServer((_request, response) => { response.statusCode = 200; response.end("unsafe"); });',
+            `setTimeout(() => publicServer.listen(0, "0.0.0.0"), ${options.latePublicListenerMs});`
+          ].join("\n")
+        : "",
       "setTimeout(() => {",
       "  let ledgerReady = false;",
       "  try {",
@@ -222,6 +237,12 @@ test("starts a preview on a loopback origin with an isolated child environment",
     assert.equal(entry.childIdentity?.pid, instance.pid);
     assert.equal(entry.childIdentity?.groupId, instance.pid);
     assert.equal(entry.tempHome, report.home);
+    const liveIdentity = await captureChildIdentity(instance.pid!);
+    assert.deepEqual(
+      liveIdentity,
+      entry.childIdentity,
+      "the foreground command must not replace the durable shell identity after the start gate opens"
+    );
     const tempHome = entry.tempHome!;
 
     const stopped = await manager.stop(instance.id, "requested");
@@ -257,7 +278,7 @@ test("fails closed when the preview command exits before serving", async () => {
   if (result.ok) return;
   assert.equal(result.instance?.state, "failed");
   assert.match(result.message, /exited before it started serving/);
-  assert.equal((await readLedger(fixture)).previews.length, 0);
+  assert.equal((await readLedger(fixture)).previews.length, 0, JSON.stringify(result));
 });
 
 test("handles a child spawn error without crashing", async () => {
@@ -287,6 +308,40 @@ test("enforces the global limit and one preview per task", async () => {
     if (!second.ok) assert.match(second.message, /preview limit \(1\)/);
   } finally {
     await manager.stopAll("requested");
+  }
+});
+
+test("concurrent starts reserve same-task and global capacity before awaiting the workspace", async () => {
+  const fixture = await createFixture();
+  const script = await writeFakeServer(fixture);
+  const sameTaskManager = makeManager(fixture, { maxPreviews: 3 });
+  try {
+    const sameTask = await Promise.all([
+      sameTaskManager.start(startInput(fixture, nodeCommand(script), "task-concurrent-same")),
+      sameTaskManager.start(startInput(fixture, nodeCommand(script), "task-concurrent-same"))
+    ]);
+    assert.equal(sameTask.filter((result) => result.ok).length, 1);
+    const duplicate = sameTask.find((result) => !result.ok);
+    assert.ok(duplicate && !duplicate.ok);
+    if (duplicate && !duplicate.ok) assert.match(duplicate.message, /already has an open preview/);
+  } finally {
+    await sameTaskManager.stopAll("requested");
+  }
+
+  const globalFixture = await createFixture();
+  const globalScript = await writeFakeServer(globalFixture);
+  const globalManager = makeManager(globalFixture, { maxPreviews: 1 });
+  try {
+    const global = await Promise.all([
+      globalManager.start(startInput(globalFixture, nodeCommand(globalScript), "task-concurrent-a")),
+      globalManager.start(startInput(globalFixture, nodeCommand(globalScript), "task-concurrent-b"))
+    ]);
+    assert.equal(global.filter((result) => result.ok).length, 1);
+    const limited = global.find((result) => !result.ok);
+    assert.ok(limited && !limited.ok);
+    if (limited && !limited.ok) assert.match(limited.message, /preview limit \(1\)/);
+  } finally {
+    await globalManager.stopAll("requested");
   }
 });
 
@@ -418,6 +473,37 @@ test("restart reconciliation kills identifiable orphans and never signals other 
   assert.equal(await pathExists(foreignHome), false);
 });
 
+test("restart reconciliation stops an ordinary foreground preview after its start gate opens", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX process reconciliation");
+    return;
+  }
+  const fixture = await createFixture();
+  const script = await writeFakeServer(fixture);
+  const original = makeManager(fixture);
+  const started = await original.start(
+    startInput(
+      fixture,
+      { source: "preset", name: "dev", command: `exec node ${script}` },
+      "task-restart-foreground"
+    )
+  );
+  assert.equal(started.ok, true);
+  if (!started.ok) return;
+  const persisted = (await readLedger(fixture)).previews[0] as { childIdentity?: ExecutionChildIdentity };
+  assert.ok(persisted.childIdentity);
+  assert.deepEqual(await captureChildIdentity(started.instance.pid!), persisted.childIdentity);
+
+  const restarted = makeManager(fixture, { sigkillDelayMs: 300 });
+  const notes = await restarted.reconcile();
+  assert.ok(notes.some((note) => note.includes(`Reconciled preview ${started.instance.id}`)), notes.join("\n"));
+  assert.ok(!notes.some((note) => note.includes("no longer belongs")), notes.join("\n"));
+  await waitFor(() => processGone(started.instance.pid!));
+  await waitFor(async () => !(await respondsOnPort(started.instance.origin)));
+  assert.equal((await readLedger(fixture)).previews.length, 0);
+  await original.stopAll("requested");
+});
+
 test("restart reconciliation clears gated pre-start state but retains an unverifiable bare pid", async (t) => {
   if (process.platform === "win32") {
     t.skip("POSIX process reconciliation");
@@ -460,7 +546,52 @@ test("restart reconciliation clears gated pre-start state but retains an unverif
   assert.deepEqual(remaining.map((entry) => entry.id), [barePidId]);
   assert.equal(await pathExists(prestartHome), false);
   assert.equal(await pathExists(barePidHome), true);
+  const blocked = await manager.start(
+    startInput(fixture, { source: "preset", name: "dev", command: "node should-never-run.cjs" }, "task-blocked-by-orphan")
+  );
+  assert.equal(blocked.ok, false);
+  if (!blocked.ok) assert.match(blocked.message, /previous runtime still has unconfirmed cleanup/);
   await rm(barePidHome, { force: true, recursive: true });
+});
+
+test("unconfirmed live cleanup blocks same-task and global restart until a retry succeeds", async () => {
+  const fixture = await createFixture();
+  const script = await writeFakeServer(fixture);
+  let failCleanup = true;
+  const manager = makeManager(fixture, {
+    maxPreviews: 1,
+    removeTempHome: async (candidate) => {
+      if (failCleanup) {
+        failCleanup = false;
+        throw new Error("simulated temporary-home cleanup failure");
+      }
+      await rm(candidate, { force: true, recursive: true });
+    }
+  });
+  const started = await manager.start(startInput(fixture, nodeCommand(script), "task-cleanup-pending"));
+  assert.equal(started.ok, true);
+  if (!started.ok) return;
+
+  const firstStop = await manager.stop(started.instance.id, "requested");
+  assert.equal(firstStop.ok, false);
+  assert.equal(firstStop.instance?.cleanupPending, true);
+  if (!firstStop.ok) assert.match(firstStop.message, /isolated home could not be removed/);
+
+  const sameTask = await manager.start(startInput(fixture, nodeCommand(script), "task-cleanup-pending"));
+  assert.equal(sameTask.ok, false);
+  if (!sameTask.ok) assert.match(sameTask.message, /already has an open preview/);
+  const global = await manager.start(startInput(fixture, nodeCommand(script), "task-cleanup-other"));
+  assert.equal(global.ok, false);
+  if (!global.ok) assert.match(global.message, /preview limit \(1\)/);
+
+  const retriedStop = await manager.stop(started.instance.id, "requested");
+  assert.equal(retriedStop.ok, true);
+  assert.equal(retriedStop.instance?.cleanupPending, undefined);
+  assert.equal((await readLedger(fixture)).previews.length, 0);
+
+  const afterCleanup = await manager.start(startInput(fixture, nodeCommand(script), "task-cleanup-other"));
+  assert.equal(afterCleanup.ok, true);
+  if (afterCleanup.ok) await manager.stop(afterCleanup.instance.id, "requested");
 });
 
 test("reaps a same-group child that outlives its exiting leader before clearing state", async (t) => {
@@ -539,7 +670,9 @@ test("never accepts a foreign server that races for the selected port", async (t
   }
   const fixture = await createFixture();
   // A foreign server owns the selected port before and after the preview runs.
+  let foreignRequests = 0;
   const foreign = createHttpServer((_request, response) => {
+    foreignRequests += 1;
     response.statusCode = 200;
     response.end("foreign-service");
   });
@@ -565,6 +698,7 @@ test("never accepts a foreign server that races for the selected port", async (t
   try {
     // Sanity: the foreign server is genuinely responsive on the raced port.
     assert.equal(await (await fetch(`http://127.0.0.1:${foreignPort}/`)).text(), "foreign-service");
+    foreignRequests = 0;
 
     const result = await manager.start(startInput(fixture, nodeCommand(script), "task-foreign-race"));
 
@@ -577,6 +711,7 @@ test("never accepts a foreign server that races for the selected port", async (t
     assert.equal((await readLedger(fixture)).previews.length, 0);
     assert.ok(result.instance?.pid);
     await waitFor(() => processGone(result.instance!.pid!));
+    assert.equal(foreignRequests, 0, "ownership must be proven before Devbot sends any request to the selected port");
 
     // The manager only stops its own child; the foreign listener is untouched.
     assert.equal(await (await fetch(`http://127.0.0.1:${foreignPort}/`)).text(), "foreign-service");
@@ -584,6 +719,44 @@ test("never accepts a foreign server that races for the selected port", async (t
     await manager.stopAll("requested");
     await new Promise<void>((resolve) => foreign.close(() => resolve()));
   }
+});
+
+test("stops a managed command that ignores HOST and opens a non-loopback listener", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX listener ownership");
+    return;
+  }
+  const fixture = await createFixture();
+  const script = await writeFakeServer(fixture, { bindHost: "0.0.0.0", ignorePort: true });
+  const manager = makeManager(fixture, { readyTimeoutMs: 4_000 });
+  const result = await manager.start(startInput(fixture, nodeCommand(script), "task-public-bind"));
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.match(result.message, /non-loopback listener/);
+  assert.equal(result.instance?.state, "failed");
+  assert.ok(result.instance?.pid);
+  await waitFor(() => processGone(result.instance!.pid!));
+  assert.equal((await readLedger(fixture)).previews.length, 0);
+});
+
+test("lifetime monitoring stops a preview that opens a second non-loopback listener after readiness", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX listener ownership");
+    return;
+  }
+  const fixture = await createFixture();
+  const script = await writeFakeServer(fixture, { latePublicListenerMs: 800 });
+  const manager = makeManager(fixture, { safetyIntervalMs: 100 });
+  const result = await manager.start(startInput(fixture, nodeCommand(script), "task-late-public-bind"));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  await waitFor(() => manager.status(result.instance.id)?.state === "failed", 5_000);
+  const failed = manager.status(result.instance.id);
+  assert.equal(failed?.state, "failed");
+  assert.match(failed?.message ?? "", /non-loopback listener after startup/);
+  await waitFor(() => processGone(result.instance.pid!));
+  assert.equal((await readLedger(fixture)).previews.length, 0);
 });
 
 test("resolves only configured presets or allow-listed package scripts", async () => {
@@ -655,6 +828,13 @@ test("authorization requires a controller to start while the requester may stop 
   const anonymousRequester = { id: "task-anon" } as { id: string; requesterId?: string };
   assert.equal(authorizeTaskPreview("stop", anonymousRequester, base).allowed, false);
   assert.equal(authorizeTaskPreview("stop", anonymousRequester, { ...base, controller: true }).allowed, true);
+});
+
+test("workroom and internal preview origins never fall back to a broader project room", () => {
+  assert.equal(previewPublicationChannel({ threadId: "private-thread", accessScope: "workroom" }, "project-room"), "private-thread");
+  assert.equal(previewPublicationChannel({ accessScope: "workroom" }, "project-room"), undefined);
+  assert.equal(previewPublicationChannel({ internal: true, threadId: "internal-thread" }, "project-room"), undefined);
+  assert.equal(previewPublicationChannel({ accessScope: "project" }, "project-room"), "project-room");
 });
 
 test("preview start fails closed when listener ownership is unavailable on Windows", async () => {
