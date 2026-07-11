@@ -46,6 +46,7 @@ Prerequisites: Node.js 20 or newer, a signed-in Codex CLI or app, and a Discord 
    - registers the local repository with a native folder picker
    - creates a deny-by-default `devbot-private` room
    - deploys slash commands and posts a reusable Discord workspace launcher
+   - optionally enables the Discord-native Studio board without opening any additional Studio or runtime listener
    - writes the ignored local `.env` and `.devbot/setup.json` with owner-only file permissions
    - starts Devbot in the same terminal, or reuses an already-running local process
 
@@ -73,7 +74,7 @@ Then use it:
 
 *The completion screen opens the private room and leaves users with the three everyday actions.*
 
-The launcher opens a personal, ephemeral workspace with project selection and native **Ask**, **Make change**, **Status**, **Recent**, and **Refresh** controls. Tasks update one shared message through routing, context preparation, work, completion, failure, or cancellation. Safe public controls open role-aware private actions for follow-up, review, validation, retry, adjustment, and cancellation. Internal task and model IDs remain in task details instead of normal conversation.
+The launcher opens a personal, ephemeral workspace with project selection and native **Ask**, **Make change**, **Status**, **Recent**, **Open Studio**, and **Refresh** controls. Tasks update one shared message through routing, context preparation, work, completion, failure, or cancellation. Safe public controls open role-aware private actions for follow-up, review, validation, retry, adjustment, and cancellation. Internal task and model IDs remain in task details instead of normal conversation.
 
 For production, run:
 
@@ -85,13 +86,14 @@ npm start
 ## Everyday Use
 
 - **Workspace:** open the shared Devbot launcher or run `/dashboard`; choose a project and use its native controls.
+- **Studio:** optionally enable it during setup, then run `/studio` or choose **Open Studio** for a Components V2 board covering tasks, agents, branches, approvals, and proof.
 - **Ask:** `@devbot <question>` or `/ask question:<text>` keeps the request read-only.
 - **Do:** `/do task:<text>` is the intentional write-capable path for the owner and controllers.
 - **Check:** `/status` reports current work, blockers, repository evidence, and the next action.
 - **Snap-to-fix:** mention `@devbot` with a screenshot of a stack trace, console error, or broken UI attached; Devbot transcribes the visible error, locates the likely spot in the project, and offers a one-tap **Fix it** button that starts a `/do` task pre-filled with the finding.
 - **Set up:** `/setup wizard` is owner-only and resumable; `/setup doctor` diagnoses the full path.
 
-The workspace remembers each approved user's selected project locally. Mentions, `/ask`, `/do`, `/status`, and `/dashboard` use that project when no explicit project is supplied. Every interaction rechecks current project access, controller authority, safe mode, and task state.
+The workspace remembers each approved user's intentional project choice locally. Explicit slash-command project options, `project:<name>` mentions, natural status scopes such as `status on devbot?`, and concrete Workspace/Studio project selections update it; merely falling back to a default does not. Mentions, `/ask`, `/do`, `/status`, and `/dashboard` use that choice when no project is supplied, then fall back to the setup default. Changing the setup default clears the setup actor's personal override. `/projects` labels the global default and your current selection separately. Every interaction rechecks current project access, controller authority, safe mode, and task state.
 
 ## Ambient Workrooms
 
@@ -104,7 +106,7 @@ Ideas 1-8 are implemented as the ambient workroom flow:
 5. **Proof-first completion:** completion cards show recorded proof before the result, including isolation evidence, changed files, and the route used. **Open proof** reveals the saved task detail; **Mark reviewed** clears the item from Needs Me for the requester and controllers.
 6. **Project rooms:** the owner can bind a private channel or private thread to one project with `/setup project-room action:bind project:webapp channel:#webapp-room`. Mentions in that room are restricted to the bound project; remove the binding with `action:remove`.
 7. **Workroom roles:** proposals default to **Builder**, **Reviewer**, and **Verifier**. The selector can change the team before approval: Builder proposes the smallest implementation, Reviewer checks scope and regressions, and Verifier defines completion evidence. These seats produce a read-only preflight brief before an approved action runs.
-8. **Components V2:** proposal, progress, proof, and Needs Me surfaces use bounded Discord Components V2 containers with stable, allow-listed custom IDs and disabled controls when state changes. Content is sanitized and mentions are not expanded by these cards.
+8. **Components V2:** proposal, ordinary task progress/completion, task detail, review packet/validation/gates, proof, and Needs Me surfaces use bounded Discord Components V2 containers with stable, allow-listed custom IDs and disabled controls when state changes. Content is sanitized and mentions are not expanded by these cards.
 
 Example:
 
@@ -113,6 +115,12 @@ Example:
 ```
 
 Review the private proposal, choose the roles, then select **Approve and start**. During execution, the workroom reports progress. On completion, inspect proof and the isolated branch before taking any repository action. For a read-only path, choose **Answer only** or write `/ask question:... project:webapp`.
+
+## Devbot Studio
+
+Studio is an optional Discord-native Components V2 workroom. It shows task lanes, Needs Me decisions, agent roles, branch state, changed files, verification, and the selected task's result or blocker in one private interactive card. Project and task selectors update the same message; **Open full task** hands off to the existing revision-checked task controls.
+
+Choose **Enable Studio** in `npm run setup`, toggle **Enable Studio** in `/setup wizard`, or set `DEVBOT_STUDIO_ENABLED=true` in the ignored local `.env` and restart Devbot. Then run `/studio` in the configured private room. Only the owner and approved controllers can open it. The feature creates no Activity, public URL, tunnel, web server, OAuth client secret, redirect, or loopback listener; all data travels through the bot's existing Discord connection and is filtered by current project and task access policy.
 
 Safety and fallback behavior are intentional. Only the requester or an approved controller can edit or decline a proposal; only the owner or an approved controller can approve write work or cancel it. `DEVBOT_SAFE_MODE=true` blocks approval and write execution. A project with a scoped audience declines channel-mention results and directs the user to the private workspace or `/ask`. If Discord cannot create a private task thread, an unrestricted proposal may remain in the configured private room; a scoped proposal is closed without publishing. If the target is not a Git repository, the worktree path is unsafe, or Git isolation is unavailable, the action stops before Codex receives write access and records the blocker in task evidence.
 
@@ -138,6 +146,7 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/task preview task:<task-id> action:<start|stop|status>`: Start, stop, or inspect a managed dev server for the task's isolated worktree. The server runs only the project's configured `dev`/`preview`/`serve`/`start` preset or an allow-listed package.json script, binds to a loopback origin (`http://127.0.0.1:<ephemeral port>`) on the machine running Devbot, and stops automatically after its TTL. It is not a public tunnel and is reachable only from that machine. Only the owner or an approved controller can start one; the task requester may inspect or stop it. Safe mode blocks starting one but never stopping it. Missing dependencies fail closed; Devbot does not install them.
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
 - `/dashboard project:<optional>`: Open the personal interactive workspace with project selection, current status, recent work, and native Ask / Change controls.
+- `/studio`: Open the optional Discord-native Components V2 Studio in the configured private room. Owner/controller-only; no web listener or Activity configuration is required.
 - `/inbox project:<optional> limit:<optional>`: Open the ephemeral **Needs Me** inbox for pending proposals and decisions, with review controls and refresh.
 - `/run command:<name> project:<optional>`: Run a configured command from `<project>/.devbot/project.json`, using the selected default project when omitted.
 - `/review packet project:<name> task:<optional>`: Create a provider-neutral review handoff packet from git status, diff stat, last commit, and optional task context.

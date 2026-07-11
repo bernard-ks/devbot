@@ -12,6 +12,7 @@ import {
   TextInputBuilder,
   TextInputStyle
 } from "discord.js";
+import { sanitizeDiscordOutput } from "./security.js";
 
 const CUSTOM_ID_PREFIX = "devbot:ambient:v1:";
 const SAFE_ENTITY_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -114,6 +115,65 @@ export interface NeedsMeInboxInput {
   items: readonly NeedsMeItem[];
   selectedRoles?: readonly AmbientRole[];
   title?: string;
+}
+
+export interface TaskProgressCardInput {
+  project: string;
+  title: string;
+  phase: string;
+  detail: string;
+  meta: string;
+  percent?: number;
+  blocker?: string;
+  controlRows?: readonly ActionRowBuilder<ButtonBuilder>[];
+}
+
+export interface TaskCompletionCardInput {
+  project: string;
+  title: string;
+  summary: string;
+  proof: readonly CompletionProof[];
+  meta?: string;
+  changedFiles?: readonly string[];
+  controlRows?: readonly ActionRowBuilder<ButtonBuilder>[];
+}
+
+export interface TaskDetailCardInput {
+  taskId: string;
+  project: string;
+  status: string;
+  detail: string;
+  workroom?: string;
+}
+
+export interface ReviewPacketCardInput {
+  project: string;
+  branch: string;
+  defaultBranch: string;
+  lastCommit: string;
+  repoUrl?: string;
+  taskId?: string;
+  taskStatus?: string;
+  taskRequest?: string;
+  changedFiles: string;
+  diffStat: string;
+  suggestedVerification: readonly string[];
+}
+
+export interface ReviewEvidenceCheck {
+  name: string;
+  command: string;
+  ok: boolean;
+  exitCode?: number;
+  output: string;
+}
+
+export interface ReviewEvidenceCardInput {
+  title: string;
+  project: string;
+  passed: boolean;
+  summary?: readonly string[];
+  checks: readonly ReviewEvidenceCheck[];
 }
 
 export function ambientCustomId(action: AmbientAction, entityId: string): string {
@@ -286,11 +346,11 @@ export function proofFirstCompletionCard(input: ProofFirstCompletionInput): Ambi
     ? "No verification evidence was recorded."
     : input.proof.slice(0, 6).map((item) => {
       const status = item.status === "failed" ? "FAIL" : item.status === "info" ? "INFO" : "PASS";
-      return `- **[${status}] ${inline(item.label, 80)}:** ${block(item.detail, 280)}`;
+      return `- **[${status}] ${inline(sanitizeDiscordOutput(item.label), 80)}:** ${block(sanitizeDiscordOutput(item.detail), 280)}`;
     }).join("\n");
   const result = [
     "**Result**",
-    block(input.summary, 650),
+    block(sanitizeDiscordOutput(input.summary), 650),
     input.roles?.length ? `\n**Team**\n${formatRoles(input.roles)}` : undefined,
     input.changedFiles?.length ? `\n**Changed files**\n${bullets(input.changedFiles, 5, 120, true)}` : undefined
   ].filter(isDefined).join("\n");
@@ -361,12 +421,137 @@ export function needsMeInbox(input: NeedsMeInboxInput): AmbientComponentsV2Paylo
   return componentsV2Payload(container);
 }
 
+export function taskProgressCard(input: TaskProgressCardInput): AmbientComponentsV2Payload {
+  const percent = input.percent === undefined ? undefined : Math.max(0, Math.min(100, Math.round(input.percent)));
+  const heading = [
+    `## ${input.blocker ? "Needs attention" : "In progress"}`,
+    `**${inline(input.title, 140)}**`,
+    `${inline(input.project, 80)} | ${inline(input.phase, 80)}${percent === undefined ? "" : ` | ${percent}%`}`
+  ].join("\n");
+  const body = [
+    block(input.detail, 1_500),
+    `\n_${inline(input.meta, 220)}_`,
+    input.blocker ? `\n**Blocker**\n${block(sanitizeDiscordOutput(input.blocker), 650)}` : undefined
+  ].filter(isDefined).join("\n");
+  const container = new ContainerBuilder()
+    .setAccentColor(input.blocker ? 0xdc2626 : 0x2563eb)
+    .addTextDisplayComponents(text(heading))
+    .addSeparatorComponents(new SeparatorBuilder().setDivider(true))
+    .addTextDisplayComponents(text(body));
+  addControlRows(container, input.controlRows);
+  return componentsV2Payload(container);
+}
+
+export function taskCompletionCard(input: TaskCompletionCardInput): AmbientComponentsV2Payload {
+  const failed = input.proof.some((item) => item.status === "failed");
+  const proof = formatProof(input.proof, 6, 160);
+  const result = [
+    "**Result**",
+    block(sanitizeDiscordOutput(input.summary), 1_250),
+    input.changedFiles?.length ? `\n**Changed files**\n${bullets(input.changedFiles, 5, 110, true)}` : undefined
+  ].filter(isDefined).join("\n");
+  const container = new ContainerBuilder()
+    .setAccentColor(failed ? 0xdc2626 : 0x16a34a)
+    .addTextDisplayComponents(text([
+      failed ? "## Complete with attention needed" : "## Complete",
+      `**${inline(input.title, 140)}**`,
+      `${inline(input.project, 80)}${input.meta ? ` | ${inline(input.meta, 120)}` : ""}`
+    ].join("\n")))
+    .addSeparatorComponents(new SeparatorBuilder().setDivider(true))
+    .addTextDisplayComponents(text(`**Proof**\n${proof}`))
+    .addSeparatorComponents(new SeparatorBuilder().setDivider(true))
+    .addTextDisplayComponents(text(result));
+  addControlRows(container, input.controlRows);
+  return componentsV2Payload(container);
+}
+
+export function taskDetailCard(input: TaskDetailCardInput): AmbientComponentsV2Payload {
+  const heading = [
+    "## Task detail",
+    `**${inline(input.taskId, 80)}**`,
+    `${inline(input.project, 80)} | ${inline(input.status, 60)}`
+  ].join("\n");
+  const body = [
+    input.workroom ? `**Workroom**\n${block(input.workroom, 120)}\n` : undefined,
+    block(sanitizeDiscordOutput(input.detail), 3_250)
+  ].filter(isDefined).join("\n");
+  const accent = input.status === "failed" || input.status === "interrupted" || input.status === "canceled"
+    ? 0xdc2626
+    : input.status === "awaiting-approval"
+      ? 0xd97706
+      : input.status === "succeeded"
+        ? 0x16a34a
+        : 0x2563eb;
+  return componentsV2Payload(
+    new ContainerBuilder()
+      .setAccentColor(accent)
+      .addTextDisplayComponents(text(heading))
+      .addSeparatorComponents(new SeparatorBuilder().setDivider(true))
+      .addTextDisplayComponents(text(body))
+  );
+}
+
+export function reviewPacketCard(input: ReviewPacketCardInput): AmbientComponentsV2Payload {
+  const metadata = [
+    `**Branch:** \`${inlineCode(input.branch, 160)}\` -> \`${inlineCode(input.defaultBranch, 120)}\``,
+    `**Last commit:** \`${inlineCode(sanitizeDiscordOutput(input.lastCommit), 220)}\``,
+    input.repoUrl ? `**Repository:** ${block(input.repoUrl, 300)}` : undefined,
+    input.taskId ? `**Task:** \`${inlineCode(input.taskId, 80)}\`${input.taskStatus ? ` | ${inline(input.taskStatus, 60)}` : ""}` : undefined,
+    input.taskRequest ? `**Request:** ${block(sanitizeDiscordOutput(input.taskRequest), 450)}` : undefined
+  ].filter(isDefined).join("\n");
+  const verification = input.suggestedVerification.length > 0
+    ? bullets(input.suggestedVerification, 8, 100, true)
+    : "- No project validation commands configured yet.";
+  const container = new ContainerBuilder()
+    .setAccentColor(input.changedFiles.trim() ? 0xd97706 : 0x16a34a)
+    .addTextDisplayComponents(text(`## Review packet\n**${inline(input.project, 100)}**`))
+    .addSeparatorComponents(new SeparatorBuilder().setDivider(true))
+    .addTextDisplayComponents(text(metadata))
+    .addTextDisplayComponents(text(`**Changed files**\n${fenced(sanitizeDiscordOutput(input.changedFiles) || "(working tree clean)", 850)}`))
+    .addTextDisplayComponents(text(`**Diff stat**\n${fenced(sanitizeDiscordOutput(input.diffStat) || "(no diff against HEAD)", 850)}`))
+    .addTextDisplayComponents(text(`**Suggested verification**\n${verification}`));
+  return componentsV2Payload(container);
+}
+
+export function reviewEvidenceCard(input: ReviewEvidenceCardInput): AmbientComponentsV2Payload {
+  const heading = [
+    `## ${inline(input.title, 120)}`,
+    `**${inline(input.project, 100)} | ${input.passed ? "PASSED" : "BLOCKED"}**`,
+    ...(input.summary ?? []).slice(0, 4).map((item) => `- ${block(sanitizeDiscordOutput(item), 180)}`)
+  ].join("\n");
+  const checks = input.checks.length === 0
+    ? "No validation checks were recorded."
+    : input.checks.slice(0, 4).map((check) => {
+      const exit = check.exitCode === undefined ? "" : ` | exit ${check.exitCode}`;
+      return [
+        `**[${check.ok ? "PASS" : "FAIL"}] ${inline(check.name, 80)}${exit}**`,
+        `Command: \`${inlineCode(sanitizeDiscordOutput(check.command), 180)}\``,
+        fencedTail(sanitizeDiscordOutput(check.output) || "(no output)", 500)
+      ].join("\n");
+    }).concat(
+      input.checks.length > 4 ? [`_${input.checks.length - 4} additional checks not shown._`] : []
+    ).join("\n\n");
+  return componentsV2Payload(
+    new ContainerBuilder()
+      .setAccentColor(input.passed ? 0x16a34a : 0xdc2626)
+      .addTextDisplayComponents(text(heading))
+      .addSeparatorComponents(new SeparatorBuilder().setDivider(true))
+      .addTextDisplayComponents(text(checks))
+  );
+}
+
 function componentsV2Payload(container: ContainerBuilder): AmbientComponentsV2Payload {
   return {
     flags: MessageFlags.IsComponentsV2,
     components: [container],
     allowedMentions: { parse: [] }
   };
+}
+
+function addControlRows(container: ContainerBuilder, rows: readonly ActionRowBuilder<ButtonBuilder>[] | undefined): void {
+  for (const row of (rows ?? []).slice(0, 3)) {
+    container.addActionRowComponents(row);
+  }
 }
 
 function text(content: string): TextDisplayBuilder {
@@ -381,14 +566,43 @@ function formatRoles(roles: readonly AmbientRole[]): string {
   return [...new Set(roles)].map((role) => role[0]?.toUpperCase() + role.slice(1)).join(" / ");
 }
 
+function formatProof(proof: readonly CompletionProof[], maxItems: number, maxDetailLength: number): string {
+  if (proof.length === 0) return "No verification evidence was recorded.";
+  return proof.slice(0, maxItems).map((item) => {
+    const status = item.status === "failed" ? "FAIL" : item.status === "info" ? "INFO" : "PASS";
+    return `- **[${status}] ${inline(sanitizeDiscordOutput(item.label), 70)}:** ${block(sanitizeDiscordOutput(item.detail), maxDetailLength)}`;
+  }).join("\n");
+}
+
+function fenced(value: string, maxLength: number): string {
+  return `\`\`\`\n${block(value.replace(/```/g, "'''"), maxLength)}\n\`\`\``;
+}
+
+function fencedTail(value: string, maxLength: number): string {
+  const normalized = value.replace(/```/g, "'''").replace(/\0/g, "").replace(/\r\n?/g, "\n").trim() || "Not provided";
+  const bounded = normalized.length <= maxLength
+    ? normalized
+    : `[earlier output omitted]\n${normalized.slice(-(maxLength - 27))}`;
+  return `\`\`\`\n${bounded}\n\`\`\``;
+}
+
 function bullets(values: readonly string[], maxItems: number, maxLength: number, code = false): string {
   return values.slice(0, maxItems).map((value) => {
-    const item = inline(value, maxLength);
+    const item = code ? inlineCode(value, maxLength) : inline(value, maxLength);
     return code ? `- \`${item.replace(/`/g, "'")}\`` : `- ${item}`;
   }).join("\n");
 }
 
 function inline(value: string, maxLength: number): string {
+  const normalized = value.replace(/[`\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+  const safe = normalized
+    .replace(/([\\_*~|>\[\]()<>])/g, "\\$1")
+    .replace(/@/g, "@\u200b")
+    .replace(/\bhttps?:\/\//gi, (url) => url.replace("://", "\u200b://"));
+  return truncate(safe, maxLength, "Not provided");
+}
+
+function inlineCode(value: string, maxLength: number): string {
   return truncate(value.replace(/[`\r\n]+/g, " ").replace(/\s+/g, " ").trim(), maxLength, "Not provided");
 }
 

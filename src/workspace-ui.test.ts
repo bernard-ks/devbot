@@ -50,6 +50,7 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
     projects: [pullprice, api],
     selectedProject: pullprice,
     canControl: false,
+    studioEnabled: true,
     safeMode: false,
     status,
     recentTasks: [task],
@@ -62,6 +63,8 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
   assert.match(viewer.content, /Done \| Answer/);
   assert.doesNotMatch(viewer.content, /task-abc/);
   assert.equal(makeChange && "disabled" in makeChange ? makeChange.disabled : undefined, true);
+  const openStudio = rows[1]?.components.find((component) => "custom_id" in component && component.custom_id.includes(":studio:"));
+  assert.equal(openStudio && "disabled" in openStudio ? openStudio.disabled : undefined, true);
   assert.equal(rows[2]?.components[0]?.type, 3);
   assert.match(JSON.stringify(rows[0]), /Needs Me \(2\)/);
 
@@ -69,6 +72,7 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
     projects: [pullprice],
     selectedProject: pullprice,
     canControl: true,
+    studioEnabled: true,
     safeMode: false,
     status,
     recentTasks: []
@@ -77,6 +81,25 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
     (component) => "custom_id" in component && component.custom_id.includes(":act:")
   );
   assert.equal(controllerMakeChange && "disabled" in controllerMakeChange ? controllerMakeChange.disabled : undefined, false);
+  const controllerStudio = controller.components[1]?.toJSON().components.find(
+    (component) => "custom_id" in component && component.custom_id.includes(":studio:")
+  );
+  assert.equal(controllerStudio && "disabled" in controllerStudio ? controllerStudio.disabled : undefined, false);
+
+  const studioOff = workspacePanelView({
+    projects: [pullprice],
+    selectedProject: pullprice,
+    canControl: true,
+    studioEnabled: false,
+    safeMode: false,
+    status,
+    recentTasks: []
+  });
+  const disabledStudio = studioOff.components[1]?.toJSON().components.find(
+    (component) => "custom_id" in component && component.custom_id.includes(":studio:")
+  );
+  assert.equal(disabledStudio && "disabled" in disabledStudio ? disabledStudio.disabled : undefined, true);
+  assert.match(JSON.stringify(disabledStudio), /Studio off/);
 });
 
 test("workspace status compaction preserves now risk and next", () => {

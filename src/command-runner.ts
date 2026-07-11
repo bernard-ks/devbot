@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { minimalChildEnvironment, redactSensitiveText } from "./security.js";
+import { minimalChildEnvironment, sanitizeDiscordOutput } from "./security.js";
 import type { ProjectEntry } from "./types.js";
 
 const execAsync = promisify(exec);
@@ -45,9 +45,7 @@ export async function runConfiguredProjectCommand(
 ): Promise<ProjectCommandResult> {
   const command = resolveProjectCommand(project, name);
   if (!command) {
-    throw new Error(
-      `No configured command named ${name} for ${project.name}. Add it to ${project.root}/.devbot/project.json.`
-    );
+    throw new Error(`No configured command named ${name} for ${project.name}. Add a command preset in that project's Devbot configuration.`);
   }
 
   const startedAt = new Date().toISOString();
@@ -65,10 +63,10 @@ export async function runConfiguredProjectCommand(
     return {
       projectName: project.name,
       kind: name,
-      command: redactSensitiveText(command),
+      command: sanitizeDiscordOutput(command),
       ok: true,
       exitCode: 0,
-      output: trimOutput(redactSensitiveText(`${stdout}${stderr ? `\n${stderr}` : ""}`)),
+      output: trimOutput(sanitizeDiscordOutput(`${stdout}${stderr ? `\n${stderr}` : ""}`)),
       startedAt,
       finishedAt: new Date().toISOString()
     };
@@ -77,10 +75,10 @@ export async function runConfiguredProjectCommand(
     return {
       projectName: project.name,
       kind: name,
-      command: redactSensitiveText(command),
+      command: sanitizeDiscordOutput(command),
       ok: false,
       exitCode: typeof err.code === "number" ? err.code : undefined,
-      output: trimOutput(redactSensitiveText(`${err.stdout ?? ""}${err.stderr ? `\n${err.stderr}` : ""}` || err.message)),
+      output: trimOutput(sanitizeDiscordOutput(`${err.stdout ?? ""}${err.stderr ? `\n${err.stderr}` : ""}` || err.message)),
       startedAt,
       finishedAt: new Date().toISOString()
     };

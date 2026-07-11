@@ -24,6 +24,7 @@ test("setup store persists access peers repositories defaults and room", async (
   await store.bindProjectRoom("Web App", "project-room-1");
   await store.setPrivateChannel("channel-1");
   await store.setWorkspaceMessage("message-1");
+  await store.setStudioEnabled(true);
 
   const reloaded = new SetupStore(filePath).snapshot();
   assert.deepEqual(reloaded.viewerUserIds, ["controller-1", "viewer-1"]);
@@ -34,6 +35,7 @@ test("setup store persists access peers repositories defaults and room", async (
   assert.equal(reloaded.projectRoomIds["web-app"], "project-room-1");
   assert.equal(reloaded.privateChannelId, "channel-1");
   assert.equal(reloaded.workspaceMessageId, "message-1");
+  assert.equal(reloaded.studioEnabled, true);
 });
 
 test("project room bindings are atomic, normalized, cloned, and removed with repositories", async () => {
@@ -169,17 +171,36 @@ test("setup wizard renders resumable readiness and native controls", () => {
   const incompleteRows = incomplete.components.map((row) => row.toJSON());
   assert.match(incomplete.content, /Required: 1\/2 ready/);
   assert.match(incomplete.content, /TODO  Private room/);
+  assert.match(incomplete.content, /Optional Studio: DISABLED/);
   assert.equal(incompleteRows.length, 4);
+  assert.equal(incompleteRows[0]?.components.length, 5);
+  const enableStudioButton = incompleteRows[0]?.components.find(
+    (component) => "custom_id" in component && component.custom_id.endsWith(":studio")
+  ) as { label?: string } | undefined;
+  assert.equal(enableStudioButton?.label, "Enable Studio");
   assert.equal(incompleteRows[0]?.components.find((component) => "custom_id" in component && component.custom_id.endsWith(":finish"))?.disabled, true);
 
-  const ready = setupWizardView(emptyState, config, "room-1", true);
+  const enabledByEnvironment = setupWizardView(emptyState, config, undefined, false, true);
+  assert.match(enabledByEnvironment.content, /Optional Studio: ENABLED/);
+  const environmentDisableButton = enabledByEnvironment.components[0]?.toJSON().components.find(
+    (component) => "custom_id" in component && component.custom_id.endsWith(":studio")
+  ) as { label?: string } | undefined;
+  assert.equal(environmentDisableButton?.label, "Disable Studio");
+
+  const ready = setupWizardView({ ...emptyState, studioEnabled: true }, config, "room-1", true);
   assert.match(ready.content, /Devbot is ready/);
   assert.match(ready.content, /workspace launcher is ready/);
+  assert.match(ready.content, /Studio: enabled/);
+  const disableStudioButton = ready.components[0]?.toJSON().components.find(
+    (component) => "custom_id" in component && component.custom_id.endsWith(":studio")
+  ) as { label?: string } | undefined;
+  assert.equal(disableStudioButton?.label, "Disable Studio");
   assert.equal(ready.components[0]?.toJSON().components.find((component) => "custom_id" in component && component.custom_id.endsWith(":finish"))?.disabled, false);
 });
 
 test("setup wizard parses stable component IDs and builds a repo modal", () => {
   assert.equal(parseSetupWizardAction("devbot:setup:viewer"), "viewer");
+  assert.equal(parseSetupWizardAction("devbot:setup:studio"), "studio");
   assert.equal(parseSetupWizardAction("devbot:workroom:close:x"), undefined);
   const modal = setupRepositoryModal().toJSON();
   assert.equal(modal.custom_id, "devbot:setup:repo-modal");

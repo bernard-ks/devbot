@@ -18,6 +18,7 @@ export interface SetupState {
   privateChannelId?: string;
   workspaceMessageId?: string;
   agentBackendId?: string;
+  studioEnabled?: boolean;
 }
 
 const EMPTY_SETUP: SetupState = {
@@ -141,6 +142,13 @@ export class SetupStore {
     });
   }
 
+  setStudioEnabled(enabled: boolean): Promise<SetupState> {
+    return this.mutate((state) => {
+      state.studioEnabled = enabled;
+      return cloneSetup(state);
+    });
+  }
+
   private mutate<T>(change: (draft: SetupState) => T): Promise<T> {
     const run = this.mutationQueue.then(async () => {
       const draft = cloneSetup(this.state);
@@ -189,7 +197,8 @@ function loadSetupState(filePath: string): SetupState {
       : {}),
     ...(typeof raw.agentBackendId === "string" && raw.agentBackendId.trim()
       ? { agentBackendId: raw.agentBackendId.trim().toLowerCase() }
-      : {})
+      : {}),
+    ...(typeof raw.studioEnabled === "boolean" ? { studioEnabled: raw.studioEnabled } : {})
   };
 }
 
@@ -250,6 +259,7 @@ function cloneSetup(state: SetupState): SetupState {
     ...(state.defaultProjectName ? { defaultProjectName: state.defaultProjectName } : {}),
     ...(state.privateChannelId ? { privateChannelId: state.privateChannelId } : {}),
     ...(state.workspaceMessageId ? { workspaceMessageId: state.workspaceMessageId } : {}),
-    ...(state.agentBackendId ? { agentBackendId: state.agentBackendId } : {})
+    ...(state.agentBackendId ? { agentBackendId: state.agentBackendId } : {}),
+    ...(typeof state.studioEnabled === "boolean" ? { studioEnabled: state.studioEnabled } : {})
   };
 }

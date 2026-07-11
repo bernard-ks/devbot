@@ -18,9 +18,9 @@ import { commandDefinitions } from "./commands.js";
 import { expandEnvPlaceholders, resolveCodexBin } from "./config.js";
 import { configuredCommandNames, resolveProjectCommand } from "./command-runner.js";
 import { ProjectContextService, parseIncludePatterns } from "./context.js";
-import { isWorkStatusQuestion, parseMentionRequest, parseStatusRequest } from "./mention.js";
+import { isWorkStatusQuestion, parseMentionRequest, parseOptionalProjectReference, parseStatusRequest } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
-import { createPeerEnvelope, formatPeerEnvelope, parsePeerEnvelope } from "./peer.js";
+import { createPeerEnvelope, formatCapabilities, formatPeerEnvelope, formatPeerList, parsePeerEnvelope } from "./peer.js";
 import { bestNavigationCandidate, detectLocalWebUrlsFromPs, extractScreenshotKeywords } from "./project-screenshot.js";
 import {
   commandRequiresApproval,
@@ -203,6 +203,7 @@ test("mentions remain read-only even when phrased as actions", () => {
   ]);
 
   assert.equal(request.project.name, "webapp");
+  assert.equal(request.projectWasExplicit, true);
   assert.deepEqual(request.includePatterns, ["src/*"]);
   assert.equal(request.text, "fix the failing tests");
   assert.equal(request.mode, "answer");
@@ -211,6 +212,7 @@ test("mentions remain read-only even when phrased as actions", () => {
 test("bare test mention is a read-only ping rather than a project action", () => {
   const request = parseMentionRequest("<@123> test", "123", [project("webapp", "/tmp/webapp")]);
   assert.equal(request.mode, "answer");
+  assert.equal(request.projectWasExplicit, false);
   assert.equal(request.text, "test");
 });
 
@@ -270,6 +272,38 @@ test("status requests preserve detail questions and image intent", () => {
     question: undefined,
     wantsImage: false
   });
+});
+
+test("status project references resolve strict natural wording without treating general build text as a project", () => {
+  const projects = [
+    project("pullprice", "/tmp/pullprice", { aliases: ["market"] }),
+    project("devbot", "/tmp/devbot", { canonicalName: "Dev Bot", aliases: ["bot"] })
+  ];
+
+  assert.equal(parseOptionalProjectReference("status on devbot?", projects).project?.name, "devbot");
+  assert.equal(parseOptionalProjectReference("what is the state of bot!", projects).project?.name, "devbot");
+  assert.equal(parseOptionalProjectReference("status for market.", projects).project?.name, "pullprice");
+  assert.equal(parseOptionalProjectReference("status on devbot and why is it stuck?", projects).project?.name, "devbot");
+  assert.equal(parseOptionalProjectReference("status for devbot please", projects).project?.name, "devbot");
+  assert.equal(parseOptionalProjectReference("what is devbot status?", projects).project?.name, "devbot");
+  assert.equal(parseOptionalProjectReference("how is devbot doing?", projects).project?.name, "devbot");
+  assert.equal(parseOptionalProjectReference("status on the web build", projects).project, undefined);
+  assert.equal(parseOptionalProjectReference("fix the status on devbot then run tests", projects).project, undefined);
+  assert.equal(parseOptionalProjectReference("fix the status on devbot and run tests", projects).project, undefined);
+  assert.equal(parseOptionalProjectReference("status for devbot please fix the tests", projects).project, undefined);
+});
+
+test("explicit project tokens win and unknown or ambiguous natural project scopes fail closed", () => {
+  const projects = [
+    project("pullprice", "/tmp/pullprice", { aliases: ["shared"] }),
+    project("devbot", "/tmp/devbot", { aliases: ["shared"] })
+  ];
+
+  const explicit = parseOptionalProjectReference("status on pullprice project:devbot", projects);
+  assert.equal(explicit.project?.name, "devbot");
+  assert.equal(explicit.text, "status on pullprice");
+  assert.throws(() => parseOptionalProjectReference("status on missing?", projects), /Unknown project: missing/);
+  assert.throws(() => parseOptionalProjectReference("status on shared?", projects), /Ambiguous project reference: shared/);
 });
 
 test("work status reports empty and active Codex work", () => {
@@ -678,6 +712,18 @@ test("autocomplete helpers suggest projects commands tasks and peers", () => {
   };
 
   assert.deepEqual(projectChoices([demo], "we"), [{ name: "demo", value: "demo" }]);
+  const api = project("api", "/tmp/api", { aliases: [] });
+  const docs = { ...project("docs", "/tmp/docs", { canonicalName: "Developer Handbook" }), isDefault: true };
+  assert.deepEqual(projectChoices([demo, docs, api], "", "api"), [
+    { name: "api (current)", value: "api" },
+    { name: "docs (default)", value: "docs" },
+    { name: "demo", value: "demo" }
+  ]);
+  assert.deepEqual(projectChoices([demo, docs, api], "developer"), [
+    { name: "docs (default)", value: "docs" }
+  ]);
+  const manyProjects = Array.from({ length: 25 }, (_, index) => project(`project-${index}`, `/tmp/project-${index}`));
+  assert.ok(projectChoices([...manyProjects, docs], "").some((choice) => choice.value === "docs"));
   assert.deepEqual(commandChoices(demo, "qui"), [{ name: "quick-check", value: "quick-check" }]);
   assert.deepEqual(commandChoices(demo, "test, bu"), [{ name: "build", value: "test, build" }]);
   assert.deepEqual(taskChoices([task], "abc"), [{ name: "task-abc | running action demo", value: "task-abc" }]);
@@ -942,6 +988,65 @@ test("peer envelopes round-trip through Discord-friendly fenced JSON", () => {
   assert.equal(parsed?.action, "snip");
   assert.equal(parsed?.project, "webapp");
   assert.equal(parsed?.target, "browse page");
+});
+
+test("legacy peer envelopes remain parseable inside Discord's transport limit", () => {
+  const envelope = createPeerEnvelope({
+    type: "devbot.peer.request",
+    from: "111",
+    owner: "alex",
+    action: "snip",
+    project: "webapp",
+    target: "inspect this very detailed target ".repeat(300)
+  });
+
+  const formatted = formatPeerEnvelope(envelope);
+  const parsed = parsePeerEnvelope(formatted);
+  assert.ok(formatted.length <= 1_950);
+  assert.equal(parsed?.requestId, envelope.requestId);
+  assert.equal(parsed?.action, "snip");
+  assert.match(parsed?.target ?? "", /\.\.\.$/);
+});
+
+test("an allow-listed peer without an announcement is not shown with an epoch timestamp", () => {
+  const output = formatPeerList([
+    {
+      botId: "123",
+      owner: "unknown",
+      botName: "123",
+      projects: [],
+      commands: [],
+      supportsScreenshots: false,
+      safeMode: true,
+      lastSeenAt: new Date(0).toISOString()
+    }
+  ]);
+  assert.match(output, /allow-listed, but has not announced/);
+  assert.doesNotMatch(output, /1969|1970|last seen/i);
+});
+
+test("peer capability and roster text stay within Discord's content limit", () => {
+  const peers = Array.from({ length: 30 }, (_, index) => ({
+    botId: String(10_000 + index),
+    owner: `owner-${index}`,
+    botName: `peer-${index}`,
+    projects: Array.from({ length: 8 }, (_value, projectIndex) => `project-${index}-${projectIndex}`),
+    commands: [],
+    supportsScreenshots: true,
+    safeMode: false,
+    lastSeenAt: new Date().toISOString()
+  }));
+  const capabilities = formatCapabilities({
+    botName: "devbot",
+    owner: "owner",
+    projects: Array.from({ length: 100 }, (_value, index) => `project-${index}`),
+    commands: Array.from({ length: 100 }, (_value, index) => `command-${index}`),
+    supportsScreenshots: true,
+    safeMode: false
+  });
+
+  assert.ok(formatPeerList(peers).length <= 1_900);
+  assert.ok(capabilities.length <= 1_900);
 });
 
 test("collab envelopes round-trip with v2 protocol fields", () => {
@@ -1221,6 +1326,24 @@ test("lab prompts and approval cards expose collaboration intent safely", () => 
     updatedAt: "2026-01-01T00:00:00.000Z"
   };
   assert.match(formatWorkroomPanel(workroomStoreShape, []), /0 sealed/);
+  assert.ok(formatWorkroomPanel({
+    ...workroomStoreShape,
+    phase: "decided",
+    participants: Array.from({ length: 50 }, (_value, index) => ({
+      id: `participant-${index}`,
+      kind: "bot" as const,
+      displayName: `Very long participant ${index} ${"x".repeat(80)}`,
+      state: "contributed" as const,
+      joinedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z"
+    })),
+    decision: {
+      outcome: "approve" as const,
+      actor: "tester",
+      note: "condition ".repeat(800),
+      createdAt: "2026-01-01T00:00:00.000Z"
+    }
+  }, []).length <= 1_900);
   assert.match(
     formatApprovalCard({
       action: "Run validation",

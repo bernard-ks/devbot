@@ -6,7 +6,8 @@ import {
   hardenPrivateFilePermissions,
   PRIVATE_DIRECTORY_MODE,
   PRIVATE_FILE_MODE,
-  redactSensitiveText
+  redactSensitiveText,
+  sanitizeDiscordOutput
 } from "./security.js";
 import { neutralizeMentions } from "./messages.js";
 
@@ -564,12 +565,12 @@ export function formatTaskLogs(task: TaskRecord): string {
     `Status: ${task.status}`,
     task.modelTier ? `Route: ${task.modelTier} / ${task.contextMode ?? "unknown"} via ${task.routeSource ?? "unknown"}` : undefined,
     task.model ? `Model: ${task.model}` : undefined,
-    task.routeReason ? `Reason: ${task.routeReason}` : undefined,
+    task.routeReason ? `Reason: ${sanitizeDiscordOutput(task.routeReason)}` : undefined,
     "",
     "Request:",
     neutralizeMentions(truncate(task.text, 1_500)),
-    task.resultPreview ? ["", "Result:", neutralizeMentions(truncate(task.resultPreview, 2_000))].join("\n") : undefined,
-    task.error ? ["", "Error:", neutralizeMentions(truncate(task.error, 2_000))].join("\n") : undefined
+    task.resultPreview ? ["", "Result:", neutralizeMentions(truncate(sanitizeDiscordOutput(task.resultPreview), 2_000))].join("\n") : undefined,
+    task.error ? ["", "Error:", neutralizeMentions(truncate(sanitizeDiscordOutput(task.error), 2_000))].join("\n") : undefined
   ]
     .filter((line) => line !== undefined)
     .join("\n");
@@ -583,7 +584,7 @@ export function formatTaskDetail(task: TaskRecord): string {
     `Mode: ${task.mode} via ${task.source}`,
     task.modelTier ? `Route: ${task.modelTier} / ${task.contextMode ?? "unknown"} via ${task.routeSource ?? "unknown"}` : undefined,
     task.model ? `Model: ${task.model}` : undefined,
-    task.routeReason ? `Route reason: ${task.routeReason}` : undefined,
+    task.routeReason ? `Route reason: ${sanitizeDiscordOutput(task.routeReason)}` : undefined,
     task.parentTaskId ? `Continues task: \`${task.parentTaskId}\`` : undefined,
     task.attention ? `Needs attention: ${task.attention}` : undefined,
     task.approvalStatus ? `Approval: ${task.approvalStatus}${task.approvalActor ? ` by ${neutralizeMentions(task.approvalActor)}` : ""}` : undefined,
@@ -598,16 +599,16 @@ export function formatTaskDetail(task: TaskRecord): string {
     task.finishedAt ? `Finished: ${formatTime(task.finishedAt)}` : undefined,
     task.contextFileCount !== undefined ? `Context files: ${task.contextFileCount}` : undefined,
     task.includePatterns.length > 0 ? `Include: \`${task.includePatterns.join(", ")}\`` : undefined,
-    task.changedFiles?.length ? `Changed files: ${task.changedFiles.map((file) => `\`${file}\``).join(", ")}` : undefined,
-    task.diffStat ? `Diff: ${task.diffStat}` : undefined,
-    task.verification?.length ? ["", "Verification:", ...task.verification.map((item) => `- ${item}`)].join("\n") : undefined,
-    task.captureNote ? `Visual proof: ${task.captureNote}` : undefined,
+    task.changedFiles?.length ? `Changed files: ${task.changedFiles.map((file) => `\`${sanitizeDiscordOutput(file)}\``).join(", ")}` : undefined,
+    task.diffStat ? `Diff: ${sanitizeDiscordOutput(task.diffStat)}` : undefined,
+    task.verification?.length ? ["", "Verification:", ...task.verification.map((item) => `- ${sanitizeDiscordOutput(item)}`)].join("\n") : undefined,
+    task.captureNote ? `Visual proof: ${sanitizeDiscordOutput(task.captureNote)}` : undefined,
     task.memoryIds?.length ? `Memory cited: ${task.memoryIds.map((id) => `\`${id}\``).join(", ")}` : undefined,
     "",
     "Request:",
     neutralizeMentions(truncate(task.text, 800)),
-    task.resultPreview ? ["", "Result preview:", neutralizeMentions(truncate(task.resultPreview, 1_200))].join("\n") : undefined,
-    task.error ? ["", "Error:", neutralizeMentions(truncate(task.error, 1_200))].join("\n") : undefined
+    task.resultPreview ? ["", "Result preview:", neutralizeMentions(truncate(sanitizeDiscordOutput(task.resultPreview), 1_200))].join("\n") : undefined,
+    task.error ? ["", "Error:", neutralizeMentions(truncate(sanitizeDiscordOutput(task.error), 1_200))].join("\n") : undefined
   ]
     .filter((line) => line !== undefined)
     .join("\n");

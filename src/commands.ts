@@ -77,6 +77,13 @@ const commandBuilders = [
         .addStringOption((option) =>
           option.setName("path").setDescription("Local absolute path; required when adding a repo.").setRequired(false)
         )
+        .addStringOption((option) =>
+          option
+            .setName("confirm")
+            .setDescription("For removal, type the project name to confirm room-binding and memory deletion.")
+            .setRequired(false)
+            .setMaxLength(100)
+        )
     )
     .addSubcommand((subcommand) =>
       subcommand
@@ -108,7 +115,7 @@ const commandBuilders = [
     .setName("status")
     .setDescription("Show current work, blockers, repository evidence, and the best next step.")
     .addStringOption((option) =>
-      option.setName("project").setDescription("Optional project for repository evidence or deeper inspection.").setRequired(false).setAutocomplete(true)
+      option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
     )
     .addStringOption((option) =>
       option
@@ -126,7 +133,7 @@ const commandBuilders = [
       option.setName("target").setDescription("Natural-language UI target or exact path/URL.").setRequired(true)
     )
     .addStringOption((option) =>
-      option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+      option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
     )
     .addStringOption((option) =>
       option
@@ -246,13 +253,16 @@ const commandBuilders = [
     .setName("dashboard")
     .setDescription("Open your interactive project workspace.")
     .addStringOption((option) =>
-      option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+      option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
     ),
+  new SlashCommandBuilder()
+    .setName("studio")
+    .setDescription("Open the optional Discord-native Devbot Studio workroom."),
   new SlashCommandBuilder()
     .setName("inbox")
     .setDescription("Show work that needs your attention across configured projects.")
     .addStringOption((option) =>
-      option.setName("project").setDescription("Optional configured project name.").setRequired(false).setAutocomplete(true)
+      option.setName("project").setDescription("Optional filter; omit to show every accessible project.").setRequired(false).setAutocomplete(true)
     )
     .addIntegerOption((option) =>
       option.setName("limit").setDescription("Number of items to show, 1-25.").setRequired(false).setMinValue(1).setMaxValue(25)
@@ -268,7 +278,7 @@ const commandBuilders = [
         .setAutocomplete(true)
     )
     .addStringOption((option) =>
-      option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+      option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
     ),
   new SlashCommandBuilder()
     .setName("review")
@@ -360,7 +370,7 @@ const commandBuilders = [
             .setMaxLength(500)
         )
         .addStringOption((option) =>
-          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+          option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
         )
         .addIntegerOption((option) =>
           option
@@ -386,7 +396,7 @@ const commandBuilders = [
         .setDescription("Collect local and peer screenshots for a target.")
         .addStringOption((option) => option.setName("target").setDescription("Natural-language target or route.").setRequired(true))
         .addStringOption((option) =>
-          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+          option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
         )
         .addStringOption((option) =>
           option
@@ -453,12 +463,12 @@ const commandBuilders = [
     .addSubcommand((subcommand) =>
       subcommand
         .setName("campfire")
-        .setDescription("Show stale running tasks and recovery options.")
+        .setDescription("Create a recorded stale-task recovery session.")
         .addIntegerOption((option) =>
           option.setName("minutes").setDescription("Age threshold in minutes.").setRequired(false).setMinValue(1).setMaxValue(1440)
         )
         .addStringOption((option) =>
-          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+          option.setName("project").setDescription("Optional filter; omit to inspect all accessible projects.").setRequired(false).setAutocomplete(true)
         )
     )
     .addSubcommand((subcommand) => subcommand.setName("roster").setDescription("Show peer devbot capability cards."))
@@ -517,7 +527,7 @@ const commandBuilders = [
         .setName("safety")
         .setDescription("Show active collaboration safety rules.")
         .addStringOption((option) =>
-          option.setName("project").setDescription("Configured project name.").setRequired(false).setAutocomplete(true)
+          option.setName("project").setDescription("Optional project; omit to show global collaboration rules.").setRequired(false).setAutocomplete(true)
         )
     ),
   new SlashCommandBuilder()
@@ -533,7 +543,7 @@ const commandBuilders = [
       option.setName("question").setDescription("What you want to know or inspect.").setRequired(true)
     )
     .addStringOption((option) =>
-      option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+      option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
     )
     .addStringOption((option) =>
       option
@@ -548,7 +558,7 @@ const commandBuilders = [
       option.setName("task").setDescription("The concrete change or command workflow to run.").setRequired(true)
     )
     .addStringOption((option) =>
-      option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+      option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
     )
     .addStringOption((option) =>
       option
@@ -568,7 +578,7 @@ const commandBuilders = [
     .setDescription("Record a project decision or note for Devbot to recall later.")
     .addStringOption((option) => option.setName("text").setDescription("What to remember.").setRequired(true).setMaxLength(500))
     .addStringOption((option) =>
-      option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+      option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
     )
     .addStringOption((option) =>
       option
@@ -585,7 +595,7 @@ const commandBuilders = [
         .setName("list")
         .setDescription("List recent memory entries.")
         .addStringOption((option) =>
-          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+          option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
         )
         .addStringOption((option) =>
           option
@@ -606,7 +616,7 @@ const commandBuilders = [
           option.setName("query").setDescription("What to search for.").setRequired(true).setMaxLength(200)
         )
         .addStringOption((option) =>
-          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+          option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
         )
     )
     .addSubcommand((subcommand) =>
@@ -615,7 +625,7 @@ const commandBuilders = [
         .setDescription("Owner/controller-only: mark an automatically captured outcome as approved for recall.")
         .addStringOption((option) => option.setName("id").setDescription("Memory entry ID.").setRequired(true).setAutocomplete(true))
         .addStringOption((option) =>
-          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+          option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
         )
     )
     .addSubcommand((subcommand) =>
@@ -624,7 +634,7 @@ const commandBuilders = [
         .setDescription("Owner-only: permanently delete a memory entry.")
         .addStringOption((option) => option.setName("id").setDescription("Memory entry ID.").setRequired(true).setAutocomplete(true))
         .addStringOption((option) =>
-          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+          option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
         )
     )
     .addSubcommand((subcommand) =>
@@ -635,7 +645,7 @@ const commandBuilders = [
           option.setName("confirm").setDescription("Type the project name to confirm the purge.").setRequired(true).setMaxLength(100)
         )
         .addStringOption((option) =>
-          option.setName("project").setDescription("Optional project; defaults to the selected setup repo.").setRequired(false).setAutocomplete(true)
+          option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
         )
     )
 ] satisfies Array<Pick<SlashCommandBuilder, "toJSON"> | Pick<ContextMenuCommandBuilder, "toJSON">>;

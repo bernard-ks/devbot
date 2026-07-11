@@ -192,6 +192,8 @@ export interface ScreenshotAnalysis {
   approach: string;
 }
 
+const DISCORD_SAFE_CONTENT_LENGTH = 1_900;
+
 export function buildFixTaskPrompt(analysis: ScreenshotAnalysis): string {
   return [
     "Fix the bug reported in a screenshot a developer attached to Discord.",
@@ -209,24 +211,25 @@ export function buildFixTaskPrompt(analysis: ScreenshotAnalysis): string {
 
 export function formatScreenshotAnalysisReply(analysis: ScreenshotAnalysis, imageCount: number): string {
   const plural = imageCount === 1 ? "image" : "images";
-  return [
+  const response = [
     `Analyzed ${imageCount} attached ${plural}.`,
     "",
     "Transcribed error:",
     "```",
-    truncateForDiscord(analysis.transcription, 1_200),
+    truncateForDiscord(analysis.transcription, 800),
     "```",
-    `Suspected location: ${analysis.location}`,
+    `Suspected location: ${truncateForDiscord(analysis.location.replace(/\s+/g, " "), 280)}`,
     "",
     "Suggested approach:",
-    truncateForDiscord(analysis.approach, 1_200)
+    truncateForDiscord(analysis.approach, 650)
   ].join("\n");
+  return truncateForDiscord(response, DISCORD_SAFE_CONTENT_LENGTH);
 }
 
 export function formatNoErrorFoundReply(reason: string, imageCount: number): string {
   const plural = imageCount === 1 ? "the image" : `the ${imageCount} images`;
   return [
-    `I can see ${plural}, but no error text — ${reason}`,
+    `I can see ${plural}, but no error text — ${truncateForDiscord(reason, 1_650)}`,
     "Tell me what's wrong and I will take another look."
   ].join(" ");
 }

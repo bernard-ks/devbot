@@ -25,7 +25,7 @@ function option(command: CommandJson | undefined, name: string): SchemaOption | 
   return command?.options?.find((entry) => entry.name === name);
 }
 
-test("ambient command schema exposes the workroom context menu and inbox", () => {
+test("ambient command schema exposes the workroom context menu, inbox, and Studio launcher", () => {
   const contextMenu = definitions.find((command) => command.name === "Start Devbot workroom");
   assert.equal(contextMenu?.type, ApplicationCommandType.Message);
 
@@ -36,6 +36,11 @@ test("ambient command schema exposes the workroom context menu and inbox", () =>
   assert.equal(project?.required, false);
   assert.equal(option(inbox, "limit")?.min_value, 1);
   assert.equal(option(inbox, "limit")?.max_value, 25);
+
+  const studio = definitions.find((command) => command.name === "studio");
+  assert.ok(studio);
+  assert.equal(studio.type ?? ApplicationCommandType.ChatInput, ApplicationCommandType.ChatInput);
+  assert.equal(studio.options?.length ?? 0, 0);
 });
 
 test("ambient setup schema binds project rooms and task recent includes approval", () => {

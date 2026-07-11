@@ -16,6 +16,10 @@ test("setup page uses the dark theme and exposes the guided controls", () => {
   assert.match(html, /<meta name="color-scheme" content="dark">/);
   assert.match(html, /--canvas: #0d0f13/);
   assert.match(html, /id="choose-folder"/);
+  assert.match(html, /id="enable-studio"/);
+  assert.match(html, /no public URL, tunnel, Activity, web server, or loopback listener/i);
+  assert.match(html, /enableStudio: state\.studioEnabled/);
+  assert.match(html, /enable-studio"\)\.addEventListener/);
   assert.match(html, /Open workspace/);
   assert.match(html, /Make change/);
   assert.doesNotMatch(html, /content="light"/);
@@ -84,7 +88,10 @@ test("initial setup provisions a private room, local repo, commands, and welcome
   const envFile = path.join(root, ".env");
   const envTemplateFile = path.join(root, ".env.example");
   const setupFile = path.join(root, ".devbot", "setup.json");
+  const preferencesFile = path.join(root, ".devbot", "preferences.json");
   await mkdir(repoRoot);
+  await mkdir(path.dirname(setupFile));
+  await writeFile(preferencesFile, JSON.stringify({ version: 1, selectedProjects: { "owner-1": "old-project" } }));
   await writeFile(
     envTemplateFile,
     [
@@ -93,6 +100,7 @@ test("initial setup provisions a private room, local repo, commands, and welcome
       "DISCORD_GUILD_ID=replace-me",
       "DEVBOT_OWNER_USER_ID=replace-me",
       "DEVBOT_AUTO_DEPLOY_COMMANDS=true",
+      "DEVBOT_STUDIO_ENABLED=false",
       ""
     ].join("\n")
   );
@@ -125,25 +133,31 @@ test("initial setup provisions a private room, local repo, commands, and welcome
     envFile,
     envTemplateFile,
     setupFile,
+    enableStudio: true,
     fetchImpl
   });
 
   assert.equal(result.ownerId, "owner-1");
   assert.equal(result.channelUrl, "https://discord.com/channels/guild-1/channel-1");
   assert.equal(result.repositoryName, "sample-app");
+  assert.equal(result.studioEnabled, true);
   assert.deepEqual(result.warnings, []);
 
   const setup = JSON.parse(await readFile(setupFile, "utf8")) as Record<string, unknown>;
   assert.equal(setup.privateChannelId, "channel-1");
   assert.equal(setup.workspaceMessageId, "message-1");
   assert.equal(setup.defaultProjectName, "sample-app");
+  assert.equal(setup.studioEnabled, true);
   assert.deepEqual(setup.repositories, { "sample-app": repoRoot });
+  const preferences = JSON.parse(await readFile(preferencesFile, "utf8")) as { selectedProjects: Record<string, string> };
+  assert.deepEqual(preferences.selectedProjects, {});
 
   const env = await readFile(envFile, "utf8");
   assert.match(env, /^DISCORD_TOKEN=bot.token.value$/m);
   assert.match(env, /^DISCORD_CLIENT_ID=app-1$/m);
   assert.match(env, /^DISCORD_GUILD_ID=guild-1$/m);
   assert.match(env, /^DEVBOT_OWNER_USER_ID=owner-1$/m);
+  assert.match(env, /^DEVBOT_STUDIO_ENABLED=true$/m);
 
   const channelCall = calls.find((call) => call.url.endsWith("/guilds/guild-1/channels"));
   const channelBody = channelCall?.body as { permission_overwrites?: Array<{ id: string; deny: string }> } | undefined;

@@ -75,6 +75,12 @@ export function renderSetupPage(nonce: string): string {
     .portal-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 16px; border: 1px solid var(--line); border-radius: 7px; background: #12151a; }
     .portal-row strong { display: block; font-size: 14px; }
     .portal-row p { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .optional-badge { display: inline-flex; margin-left: 7px; vertical-align: 2px; border: 1px solid #3a424d; border-radius: 999px; padding: 3px 7px; color: var(--muted); font-size: 9px; font-weight: 780; letter-spacing: 0.04em; text-transform: uppercase; }
+    .studio-opt-in { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px; border: 1px solid var(--line); border-radius: 7px; background: #12151a; }
+    .studio-opt-in strong { display: block; font-size: 14px; }
+    .studio-opt-in p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .studio-config { display: grid; gap: 16px; }
+    .studio-note { padding: 13px 15px; border-left: 3px solid var(--discord); background: rgba(116,128,255,0.1); color: #cbd0ff; font-size: 12px; line-height: 1.5; }
     .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 18px; }
     .field { min-width: 0; }
     .field.full { grid-column: 1 / -1; }
@@ -124,7 +130,7 @@ export function renderSetupPage(nonce: string): string {
       .checks, .fields, .quickstart { grid-template-columns: 1fr; }
       .check + .check { border-left: 0; border-top: 1px solid var(--line); }
       .field.full { grid-column: auto; }
-      .portal-row, .finish-row { align-items: stretch; flex-direction: column; }
+      .portal-row, .finish-row, .studio-opt-in { align-items: stretch; flex-direction: column; }
       .input-action { align-items: stretch; flex-direction: column; }
       .portal-row .button, .finish-row button { width: 100%; }
       footer { width: calc(100% - 30px); margin-top: -20px; text-align: center; }
@@ -225,8 +231,25 @@ export function renderSetupPage(nonce: string): string {
       </section>
 
       <section class="section">
+        <div class="section-heading">
+          <div><h2>Devbot Studio <span class="optional-badge">Optional</span></h2><p>A richer task board, agent map, branch state, approvals, and proof rendered directly in Discord.</p></div>
+          <span class="status waiting" id="studio-status">Skipped</span>
+        </div>
+        <div class="studio-opt-in" id="studio-opt-in">
+          <div><strong>Enable the Discord-native workroom</strong><p>Studio runs inside the bot process on this PC. It creates no public URL, tunnel, Activity, web server, or loopback listener.</p></div>
+          <button class="secondary" id="enable-studio" type="button" disabled>Enable Studio</button>
+        </div>
+        <div class="studio-config hidden" id="studio-config">
+          <div class="studio-note"><strong>Private by construction.</strong> \`/studio\` works only for the owner or approved controllers in Devbot's configured private room, and every task is filtered through its current project and requester policy.</div>
+          <div class="actions">
+            <button class="secondary" id="disable-studio" type="button">Disable Studio</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
         <div class="finish-row">
-          <div class="finish-copy"><strong>Finish local setup</strong><span>Creates the private room, deploys commands, saves local config, posts the workspace launcher, and starts Devbot.</span></div>
+          <div class="finish-copy"><strong>Finish local setup</strong><span>Creates the private room, deploys commands, saves local config, applies the optional Studio choice, posts the workspace launcher, and starts Devbot.</span></div>
           <button class="primary" id="finish-button" type="button" disabled>Finish setup</button>
         </div>
       </section>
@@ -238,7 +261,7 @@ export function renderSetupPage(nonce: string): string {
       <p id="success-copy"></p>
       <div class="quickstart">
         <div><span>Open</span><code>Open workspace</code></div>
-        <div><span>Explore</span><code>Ask or Status</code></div>
+        <div><span>Explore</span><code id="success-explore">Ask or Status</code></div>
         <div><span>Build</span><code>Make change</code></div>
       </div>
       <div class="actions">
@@ -249,7 +272,7 @@ export function renderSetupPage(nonce: string): string {
   <footer>Bound to 127.0.0.1 for this setup session.</footer>
 
   <script nonce="${nonce}">
-    const state = { identity: null, guilds: [], finished: false };
+    const state = { identity: null, guilds: [], finished: false, studioEnabled: false };
     const byId = (id) => document.getElementById(id);
 
     async function api(route, options) {
@@ -297,11 +320,19 @@ export function renderSetupPage(nonce: string): string {
       byId("install-link").href = payload.installUrl;
       byId("token-form").classList.add("hidden");
       byId("token").value = "";
+      byId("enable-studio").disabled = false;
       setStatus("discord-status", "Connected", true);
       setStep("step-system", true, false);
       setStep("step-discord", true, false);
       setStep("step-workspace", false, true);
       renderGuilds();
+    }
+
+    function renderStudio(enabled) {
+      state.studioEnabled = Boolean(enabled);
+      byId("studio-opt-in").classList.toggle("hidden", state.studioEnabled);
+      byId("studio-config").classList.toggle("hidden", !state.studioEnabled);
+      setStatus("studio-status", state.studioEnabled ? "Enabled" : "Skipped", state.studioEnabled);
     }
 
     function renderGuilds() {
@@ -368,6 +399,8 @@ export function renderSetupPage(nonce: string): string {
       updateFinishReadiness();
     });
     byId("repo-name").addEventListener("input", () => { byId("repo-name").dataset.edited = "true"; updateFinishReadiness(); });
+    byId("enable-studio").addEventListener("click", () => renderStudio(true));
+    byId("disable-studio").addEventListener("click", () => renderStudio(false));
     byId("choose-folder").addEventListener("click", async () => {
       showError("finish-error");
       const button = byId("choose-folder");
@@ -395,7 +428,8 @@ export function renderSetupPage(nonce: string): string {
           body: JSON.stringify({
             guildId: byId("guild").value,
             repositoryPath: byId("repo-path").value,
-            repositoryName: byId("repo-name").value
+            repositoryName: byId("repo-name").value,
+            enableStudio: state.studioEnabled
           })
         });
         state.finished = true;
@@ -403,7 +437,9 @@ export function renderSetupPage(nonce: string): string {
         byId("success").classList.add("visible");
         byId("room-link").href = result.channelUrl;
         byId("success-copy").textContent = "Private room and workspace launcher created in " + result.guildName + " with " + result.repositoryName + " selected. " +
-          (result.alreadyRunning ? "Your existing Devbot process is still running." : "Keep this terminal open while Devbot runs.");
+          (result.studioEnabled ? "Discord-native Studio is enabled. " : "Studio was skipped. ") +
+          (result.alreadyRunning ? "Restart the existing Devbot process to apply setup changes." : "Keep this terminal open while Devbot runs.");
+        byId("success-explore").textContent = result.studioEnabled ? "/studio" : "Ask or Status";
         setStep("step-system", true, false);
         setStep("step-discord", true, false);
         setStep("step-workspace", true, true);
@@ -422,6 +458,7 @@ export function renderSetupPage(nonce: string): string {
         byId("codex-check").textContent = payload.codex.label;
         byId("codex-check").className = payload.codex.ready ? "good" : "bad";
         setStatus("system-status", payload.node.ready && payload.codex.ready ? "Ready" : "Needs attention", payload.node.ready && payload.codex.ready);
+        renderStudio(payload.studioEnabled);
         if (payload.identity) renderIdentity(payload);
       } catch (error) {
         byId("codex-check").textContent = error.message || String(error);

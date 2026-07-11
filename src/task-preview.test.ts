@@ -8,6 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   authorizeTaskPreview,
+  formatPreviewInstance,
   isPreviewId,
   parsePreviewControlAction,
   previewPublicationChannel,
@@ -179,6 +180,32 @@ function processGone(pid: number): boolean {
     return true;
   }
 }
+
+test("preview status summaries stay within Discord's content limit", () => {
+  const output = formatPreviewInstance({
+    id: "preview-1234567890",
+    taskId: "task-1234567890",
+    projectName: "demo",
+    branch: "devbot/task/preview-overflow",
+    workspacePath: "/tmp/demo",
+    command: {
+      source: "preset",
+      name: "dev",
+      command: `node server.js ${"--very-long-argument ".repeat(300)}`
+    },
+    origin: "",
+    port: 0,
+    pid: undefined,
+    state: "failed",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: "2026-01-01T00:10:00.000Z",
+    message: "The preview could not start because the process reported a detailed failure. ".repeat(200)
+  });
+
+  assert.ok(output.length <= 900);
+  assert.match(output, /Preview/);
+  assert.match(output, /Command:/);
+});
 
 async function readLedger(fixture: Fixture): Promise<{ version: number; previews: unknown[] }> {
   return JSON.parse(await readFile(fixture.ledgerFile, "utf8")) as { version: number; previews: unknown[] };
@@ -910,4 +937,24 @@ test("preview controls parse strictly and expire when unknown", async () => {
   const stopped = await manager.stop("prv-0123456789ab", "requested");
   assert.equal(stopped.ok, false);
   if (!stopped.ok) assert.match(stopped.message, /expired/);
+});
+
+test("preview status hides paths from configured commands and failure messages", () => {
+  const output = formatPreviewInstance({
+    id: "prv-0123456789ab",
+    taskId: "task-paths",
+    projectName: "demo",
+    branch: "devbot/task/paths",
+    workspacePath: "/Users/bernard/private/worktree",
+    command: { source: "preset", name: "dev", command: "node /Users/bernard/private/server.mjs" },
+    origin: "",
+    port: 0,
+    pid: undefined,
+    state: "failed",
+    startedAt: new Date().toISOString(),
+    expiresAt: new Date().toISOString(),
+    message: "ENOENT at C:\\Users\\bernard\\private\\server.mjs"
+  });
+  assert.doesNotMatch(output, /\/Users\/bernard|C:\\Users/);
+  assert.match(output, /\[local path\]/);
 });

@@ -11,7 +11,8 @@ import {
   minimalChildEnvironment,
   PRIVATE_DIRECTORY_MODE,
   PRIVATE_FILE_MODE,
-  redactSensitiveText
+  redactSensitiveText,
+  sanitizeDiscordOutput
 } from "./security.js";
 import type { TaskRecord } from "./task-store.js";
 import { captureChildIdentity, terminateOrphanedChild, type ExecutionChildIdentity } from "./task-recovery.js";
@@ -30,6 +31,7 @@ const DEFAULT_EXIT_WAIT_MS = 12_000;
 const DEFAULT_SAFETY_INTERVAL_MS = 1_000;
 const MAX_OUTPUT_TAIL_CHARS = 1_500;
 const MAX_FINISHED_INSTANCES = 20;
+const DISCORD_PREVIEW_SUMMARY_LENGTH = 900;
 
 export type PreviewState = "pending" | "active" | "stopping" | "stopped" | "failed";
 export type PreviewStopReason = "requested" | "expired" | "shutdown";
@@ -1082,19 +1084,26 @@ export class TaskPreviewManager {
   }
 }
 
-export function formatPreviewInstance(instance: PreviewInstance): string {
-  return [
+export function formatPreviewInstance(instance: PreviewInstance, maxLength = DISCORD_PREVIEW_SUMMARY_LENGTH): string {
+  const command = sanitizeDiscordOutput(instance.command.command).replace(/`/g, "'");
+  const formatted = [
     `Preview \`${instance.id}\` for task \`${instance.taskId}\` on \`${instance.projectName}\`: ${instance.state}.`,
     instance.branch ? `Branch: \`${instance.branch}\` (isolated worktree)` : undefined,
     instance.state === "active" ? `Origin: <${instance.origin}> (loopback only, this machine)` : undefined,
     instance.state === "active" ? `Expires: ${new Date(instance.expiresAt).toLocaleString("en-US", { dateStyle: "short", timeStyle: "short" })}` : undefined,
-    `Command: \`${redactSensitiveText(instance.command.command).replace(/`/g, "'")}\` (${instance.command.source} \`${instance.command.name}\`)`,
+    `Command: \`${truncatePreviewText(command, 320)}\` (${instance.command.source} \`${instance.command.name}\`)`,
     instance.escalatedToSigkill ? "The process ignored SIGTERM and required SIGKILL." : undefined,
     instance.cleanupPending ? "Cleanup is still unconfirmed; Devbot will not start another preview." : undefined,
-    instance.message
+    instance.message ? truncatePreviewText(sanitizeDiscordOutput(instance.message), 420) : undefined
   ]
     .filter((line) => line !== undefined)
     .join("\n");
+  return truncatePreviewText(formatted, maxLength);
+}
+
+function truncatePreviewText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 function normalizeLedgerEntry(value: unknown): PreviewLedgerEntry | undefined {

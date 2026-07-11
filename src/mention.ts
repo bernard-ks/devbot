@@ -1,9 +1,11 @@
 import { parseIncludePatterns } from "./context.js";
 import type { CodexRequestMode } from "./codex-client.js";
+import { requireProjectReference } from "./project-routing.js";
 import type { ProjectEntry } from "./types.js";
 
 export interface ParsedMentionRequest {
   project: ProjectEntry;
+  projectWasExplicit: boolean;
   text: string;
   includePatterns: string[];
   mode: CodexRequestMode;
@@ -15,7 +17,32 @@ export interface ParsedStatusRequest {
   wantsImage: boolean;
 }
 
+export interface ParsedProjectReference {
+  project: ProjectEntry | undefined;
+  text: string;
+}
+
 const DETAILED_STATUS_SIGNAL = /\b(why|error|errors|failed|failing|failure|broken|stuck|blocking|root cause|diff|changed|changes|remaining|ready|merge|pull request)\b/;
+
+export function parseOptionalProjectReference(text: string, projects: ProjectEntry[]): ParsedProjectReference {
+  const explicitMatch = text.match(/\bproject:([a-z0-9_-]+)\b/i);
+  if (explicitMatch) {
+    return {
+      project: requireProjectReference(projects, explicitMatch[1] ?? ""),
+      text: text.replace(explicitMatch[0], "").trim()
+    };
+  }
+
+  const naturalMatch = [
+    /^\s*(?:please\s+)?(?:(?:what(?:'s| is)|show(?: me)?|give me|can you (?:show|give me))\s+(?:the\s+)?)?(?:status|state|progress|wip)\s+(?:on|of|for|about)\s+(?:the\s+)?([a-z0-9_-]+)(?=\s*(?:[?!.]*$|please\s*[?!.]*$|and\s+(?:why|what|where|when|how|is|are|was|were|did|does|do|has|have|can|could|should|would)\b))/i,
+    /^\s*(?:please\s+)?(?:what(?:'s| is)|show|give me)\s+(?:the\s+)?([a-z0-9_-]+)\s+(?:status|state|progress)\s*[?!.]*$/i,
+    /^\s*(?:please\s+)?how\s+is\s+([a-z0-9_-]+)\s+doing\s*[?!.]*$/i
+  ].map((pattern) => text.match(pattern)).find(Boolean);
+  if (!naturalMatch) {
+    return { project: undefined, text };
+  }
+  return { project: requireProjectReference(projects, naturalMatch[1] ?? ""), text };
+}
 
 export function parseMentionRequest(
   content: string,
@@ -27,7 +54,7 @@ export function parseMentionRequest(
   const projectMatch = text.match(/\bproject:([a-z0-9_-]+)\b/i);
   const includeMatch = text.match(/\binclude:([^\s]+)/i);
   const modeMatch = text.match(/\bmode:(ask|answer|act|action)\b/i);
-  const project = projectMatch ? mustFindProject(projects, projectMatch[1] ?? "") : defaultProject(projects);
+  const project = projectMatch ? requireProjectReference(projects, projectMatch[1] ?? "") : defaultProject(projects);
   const includePatterns = includeMatch ? parseIncludePatterns(includeMatch[1] ?? "") : [];
 
   if (projectMatch) {
@@ -43,7 +70,7 @@ export function parseMentionRequest(
   }
 
   const mode = modeMatch ? parseMentionMode(modeMatch[1] ?? "") : "answer";
-  return { project, text, includePatterns, mode };
+  return { project, projectWasExplicit: Boolean(projectMatch), text, includePatterns, mode };
 }
 
 export function stripBotMention(content: string, botUserId: string, botRoleIds: string[] = []): string {
@@ -87,21 +114,6 @@ function wantsStatusImage(text: string): boolean {
     /\b(snip|screenshot|screen shot|image|picture|pic)\b/.test(normalized) ||
     /\b(send|attach|include|show)\b.*\b(output|snip|screenshot|image|picture|pic)\b/.test(normalized)
   );
-}
-
-function mustFindProject(projects: ProjectEntry[], name: string): ProjectEntry {
-  const normalized = name.trim().toLowerCase();
-  const project = projects.find(
-    (entry) =>
-      entry.name === normalized ||
-      entry.metadata.aliases.includes(normalized) ||
-      entry.metadata.canonicalName?.toLowerCase() === normalized
-  );
-  if (!project) {
-    throw new Error(`Unknown project: ${name}`);
-  }
-
-  return project;
 }
 
 function defaultProject(projects: ProjectEntry[]): ProjectEntry {

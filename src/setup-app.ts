@@ -15,11 +15,14 @@ import {
   type DiscordBotIdentity
 } from "./setup-core.js";
 import { renderSetupPage } from "./setup-page.js";
+import { SetupStore } from "./setup-store.js";
 
 const host = "127.0.0.1";
 const sessionExpiresAt = Date.now() + 10 * 60_000;
 const pageCookieName = "devbot_setup";
 const cwd = process.cwd();
+const setupFile = path.resolve(process.env.DEVBOT_SETUP_STORE?.trim() || path.join(cwd, ".devbot/setup.json"));
+const setupStore = new SetupStore(setupFile);
 const session: { token?: string; identity?: DiscordBotIdentity; botProcess?: ChildProcess } = {
   ...(process.env.DISCORD_TOKEN?.trim() ? { token: process.env.DISCORD_TOKEN.trim() } : {})
 };
@@ -113,6 +116,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     sendJson(response, 200, {
       node,
       codex,
+      studioEnabled: setupStore.snapshot().studioEnabled ?? process.env.DEVBOT_STUDIO_ENABLED?.trim().toLowerCase() === "true",
       ...(session.identity
         ? { identity: session.identity, guilds, installUrl: buildDiscordInstallUrl(session.identity.applicationId) }
         : {})
@@ -154,14 +158,16 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
       guildId: stringField(body, "guildId"),
       repositoryName: stringField(body, "repositoryName"),
       repositoryPath: stringField(body, "repositoryPath"),
+      enableStudio: body.enableStudio === true,
       envFile: path.join(cwd, ".env"),
       envTemplateFile: path.join(cwd, ".env.example"),
-      setupFile: path.resolve(process.env.DEVBOT_SETUP_STORE?.trim() || path.join(cwd, ".devbot/setup.json"))
+      setupFile
     });
     process.env.DISCORD_TOKEN = session.token!;
     process.env.DISCORD_CLIENT_ID = result.applicationId;
     process.env.DISCORD_GUILD_ID = result.guildId;
     process.env.DEVBOT_OWNER_USER_ID = result.ownerId;
+    process.env.DEVBOT_STUDIO_ENABLED = result.studioEnabled ? "true" : "false";
     const alreadyRunning = isRuntimeRunning(runtimeLockPath(process.env.DEVBOT_RUNTIME_LOCK));
     sendJson(response, 200, { ...result, alreadyRunning });
     delete session.token;

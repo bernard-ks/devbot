@@ -11,7 +11,7 @@ import {
 import type { SetupState } from "./setup-store.js";
 import type { AppConfig } from "./types.js";
 
-export type SetupWizardAction = "room" | "repo" | "refresh" | "finish" | "viewer" | "controller" | "peer" | "default" | "repo-modal";
+export type SetupWizardAction = "room" | "repo" | "studio" | "refresh" | "finish" | "viewer" | "controller" | "peer" | "default" | "repo-modal";
 
 const PREFIX = "devbot:setup:";
 
@@ -24,7 +24,8 @@ export function setupWizardView(
   state: SetupState,
   config: AppConfig,
   effectiveRoomId: string | undefined,
-  finished = false
+  finished = false,
+  effectiveStudioEnabled = state.studioEnabled === true
 ) {
   const defaultProject = config.projects.find((project) => project.isDefault);
   const roomReady = Boolean(effectiveRoomId);
@@ -37,6 +38,7 @@ export function setupWizardView(
         "",
         `Room: <#${effectiveRoomId}>`,
         `Default repo: \`${defaultProject?.name}\``,
+        `Studio: ${effectiveStudioEnabled ? "enabled" : "disabled"}`,
         "",
         "Your workspace launcher is ready in the private room.",
         "Open it to ask, make changes, check status, or switch projects.",
@@ -50,6 +52,8 @@ export function setupWizardView(
         `${roomReady ? "READY" : "TODO"}  Private room${effectiveRoomId ? `: <#${effectiveRoomId}>` : ""}`,
         `${repoReady ? "READY" : "TODO"}  Default repo${defaultProject ? `: \`${defaultProject.name}\`` : ""}`,
         "",
+        `Optional Studio: ${effectiveStudioEnabled ? "ENABLED" : "DISABLED"}. Runs entirely through private Discord components.`,
+        "Room sync enforces the current Devbot allowlist on channel permissions or private-thread membership.",
         `Optional access: ${state.viewerUserIds.length} viewer(s), ${state.controllerUserIds.length} controller(s), ${state.peerBotIds.length} peer bot(s).`,
         ready
           ? "Setup is ready. Add people if needed, or choose Finish for the three-command quickstart."
@@ -64,9 +68,13 @@ export function setupWizardView(
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`${PREFIX}room`)
-        .setLabel(roomReady ? "Sync room" : "Use private room")
+        .setLabel(roomReady ? "Sync room access" : "Use private room")
         .setStyle(roomReady ? ButtonStyle.Secondary : ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(`${PREFIX}repo`).setLabel("Add repo").setStyle(repoReady ? ButtonStyle.Secondary : ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`${PREFIX}repo`).setLabel("Add or update repo").setStyle(repoReady ? ButtonStyle.Secondary : ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`${PREFIX}studio`)
+        .setLabel(effectiveStudioEnabled ? "Disable Studio" : "Enable Studio")
+        .setStyle(effectiveStudioEnabled ? ButtonStyle.Secondary : ButtonStyle.Primary),
       new ButtonBuilder().setCustomId(`${PREFIX}refresh`).setLabel("Refresh").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`${PREFIX}finish`).setLabel(ready ? "Finish" : "Not ready").setStyle(ButtonStyle.Success).setDisabled(!ready)
     ),
@@ -116,7 +124,7 @@ export function setupWizardView(
 export function setupRepositoryModal(): ModalBuilder {
   return new ModalBuilder()
     .setCustomId(`${PREFIX}repo-modal`)
-    .setTitle("Add a local repository")
+    .setTitle("Add or update a local repository")
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
@@ -150,6 +158,6 @@ function nextSetupStep(roomReady: boolean, repoReady: boolean): string {
 }
 
 function isSetupWizardAction(value: string): value is SetupWizardAction {
-  return value === "room" || value === "repo" || value === "refresh" || value === "finish" ||
+  return value === "room" || value === "repo" || value === "studio" || value === "refresh" || value === "finish" ||
     value === "viewer" || value === "controller" || value === "peer" || value === "default" || value === "repo-modal";
 }
