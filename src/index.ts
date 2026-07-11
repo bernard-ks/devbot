@@ -129,10 +129,10 @@ import { composeShipCard } from "./ship-card.js";
 import {
   authorizeTaskPreview,
   formatPreviewInstance,
+  parsePreviewControlAction,
   previewPublicationChannel,
   resolvePreviewCommand,
   TaskPreviewManager,
-  type PreviewControlAction,
   type PreviewInstance
 } from "./task-preview.js";
 import {
@@ -3415,7 +3415,11 @@ function shortSha(value: string): string {
 async function handleTaskPreviewCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const taskId = interaction.options.getString("task", true);
-  const action = (interaction.options.getString("action") ?? "start") as PreviewControlAction;
+  const action = parsePreviewControlAction(interaction.options.getString("action") ?? "start");
+  if (!action) {
+    await interaction.editReply("That preview action is invalid; choose start, stop, or status.");
+    return;
+  }
   const task = await taskStore.get(taskId);
   if (!task || !canAccessTask(interaction, task, appConfig)) {
     await interaction.editReply(`No accessible saved task found for \`${taskId}\`.`);

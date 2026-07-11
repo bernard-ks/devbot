@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   authorizeTaskPreview,
   isPreviewId,
+  parsePreviewControlAction,
   previewPublicationChannel,
   resolvePreviewCommand,
   TaskPreviewManager,
@@ -47,6 +48,7 @@ async function writeFakeServer(
     bindHost?: string;
     ignorePort?: boolean;
     latePublicListenerMs?: number;
+    closeSelectedListenerMs?: number;
   } = {}
 ): Promise<string> {
   const script = path.join(fixture.workspace, "fake-server.cjs");
@@ -61,6 +63,7 @@ async function writeFakeServer(
         : 'const host = process.env.HOST || "127.0.0.1";',
       options.ignoreSigterm ? 'process.on("SIGTERM", () => {});' : "",
       'const server = http.createServer((request, response) => { response.statusCode = 200; response.end("ok"); });',
+      options.closeSelectedListenerMs !== undefined ? "setInterval(() => {}, 60000);" : "",
       options.latePublicListenerMs !== undefined
         ? [
             'const publicServer = http.createServer((_request, response) => { response.statusCode = 200; response.end("unsafe"); });',
@@ -82,6 +85,9 @@ async function writeFakeServer(
       "      cwd: process.cwd(),",
       "      ledgerReady",
       "    }));",
+      options.closeSelectedListenerMs !== undefined
+        ? `    setTimeout(() => server.close(), ${options.closeSelectedListenerMs});`
+        : "",
       "  });",
       `}, ${options.listenDelayMs ?? 0});`
     ].join("\n"),
@@ -759,6 +765,41 @@ test("lifetime monitoring stops a preview that opens a second non-loopback liste
   assert.equal((await readLedger(fixture)).previews.length, 0);
 });
 
+test("lifetime monitoring retires a preview URL taken over by a foreign process without killing it", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX listener ownership");
+    return;
+  }
+  const fixture = await createFixture();
+  const script = await writeFakeServer(fixture, { closeSelectedListenerMs: 600 });
+  const manager = makeManager(fixture, { safetyIntervalMs: 200 });
+  const result = await manager.start(startInput(fixture, nodeCommand(script), "task-foreign-takeover"));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const foreign = createHttpServer((_request, response) => {
+    response.statusCode = 200;
+    response.end("foreign-after-takeover");
+  });
+  try {
+    await waitFor(async () => !(await respondsOnPort(result.instance.origin)), 4_000);
+    await new Promise<void>((resolve, reject) => {
+      foreign.once("error", reject);
+      foreign.listen(result.instance.port, "127.0.0.1", () => resolve());
+    });
+
+    await waitFor(() => manager.status(result.instance.id)?.state === "failed", 5_000);
+    const failed = manager.status(result.instance.id);
+    assert.match(failed?.message ?? "", /taken over by a different process/);
+    await waitFor(() => processGone(result.instance.pid!));
+    assert.equal(await (await fetch(result.instance.origin)).text(), "foreign-after-takeover");
+    assert.equal((await readLedger(fixture)).previews.length, 0);
+  } finally {
+    await manager.stopAll("requested");
+    await new Promise<void>((resolve) => foreign.close(() => resolve()));
+  }
+});
+
 test("resolves only configured presets or allow-listed package scripts", async () => {
   const fixture = await createFixture();
 
@@ -828,6 +869,14 @@ test("authorization requires a controller to start while the requester may stop 
   const anonymousRequester = { id: "task-anon" } as { id: string; requesterId?: string };
   assert.equal(authorizeTaskPreview("stop", anonymousRequester, base).allowed, false);
   assert.equal(authorizeTaskPreview("stop", anonymousRequester, { ...base, controller: true }).allowed, true);
+});
+
+test("preview actions reject unknown runtime values instead of falling through to start", () => {
+  assert.equal(parsePreviewControlAction("start"), "start");
+  assert.equal(parsePreviewControlAction("stop"), "stop");
+  assert.equal(parsePreviewControlAction("status"), "status");
+  assert.equal(parsePreviewControlAction("crafted-start"), undefined);
+  assert.equal(parsePreviewControlAction(undefined), undefined);
 });
 
 test("workroom and internal preview origins never fall back to a broader project room", () => {

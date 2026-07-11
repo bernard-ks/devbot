@@ -132,6 +132,7 @@ interface ManagedPreview {
   killTimer?: NodeJS.Timeout;
   safetyTimer?: NodeJS.Timeout;
   safetyCheckRunning?: boolean;
+  ownershipLossChecks?: number;
   /**
    * POSIX process-group id of the spawned child (equal to its pid because the
    * child is spawned detached as a group leader). Every descendant the dev
@@ -168,6 +169,10 @@ const execFileAsync = promisify(execFile);
 
 export function isPreviewId(value: string): boolean {
   return PREVIEW_ID_PATTERN.test(value);
+}
+
+export function parsePreviewControlAction(value: unknown): PreviewControlAction | undefined {
+  return value === "start" || value === "stop" || value === "status" ? value : undefined;
 }
 
 /** Workroom/internal preview origins never fall back into a broader project room. */
@@ -887,11 +892,24 @@ export class TaskPreviewManager {
     managed.safetyCheckRunning = true;
     try {
       const ownership = await classifyPortListener(managed.snapshot.port, managed.groupId);
-      if (ownership !== "unsafe" || managed.snapshot.state !== "active") return;
+      if (managed.snapshot.state !== "active") return;
+      if (ownership === "owned") {
+        managed.ownershipLossChecks = 0;
+        return;
+      }
+      if (ownership === "unknown") {
+        managed.ownershipLossChecks = (managed.ownershipLossChecks ?? 0) + 1;
+        if (managed.ownershipLossChecks < 3) return;
+      } else {
+        managed.ownershipLossChecks = 0;
+      }
       managed.aborted = true;
       managed.snapshot.state = "stopping";
-      managed.snapshot.message =
-        "The managed command opened a non-loopback listener after startup, so Devbot stopped the entire preview process group.";
+      managed.snapshot.message = ownership === "unsafe"
+        ? "The managed command opened a non-loopback listener after startup, so Devbot stopped the entire preview process group."
+        : ownership === "foreign"
+          ? "The selected preview port was taken over by a different process, so Devbot stopped only its managed process group and retired the preview URL."
+          : "The selected preview listener could no longer be verified after repeated checks, so Devbot stopped the managed process group.";
       this.terminate(managed);
       await this.awaitExit(managed);
       managed.snapshot.state = "failed";
