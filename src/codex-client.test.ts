@@ -164,14 +164,17 @@ if (outputIndex >= 0) await writeFile(args[outputIndex + 1], "finished before de
       model: undefined,
       sandbox: "read-only",
       actionSandbox: "workspace-write",
-      timeoutMs: 200
+      // Leave enough headroom for a separate Node process to start on a busy
+      // test runner; the assertion is about bookkeeping outliving the worker
+      // deadline, not about sub-200ms process startup.
+      timeoutMs: 1_000
     },
     prompt: "finish quickly",
     cwd: root,
     sandbox: "read-only",
     skipGitRepoCheck: true,
     onExit: async () => {
-      await new Promise((resolve) => setTimeout(resolve, 350));
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
     }
   });
   assert.equal(answer, "finished before deadline");

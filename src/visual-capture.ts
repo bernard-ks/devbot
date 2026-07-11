@@ -30,7 +30,7 @@ export function isSafeCaptureFileName(fileName: string): boolean {
 
 /** The honest completion note for isolated tasks; review round 2 requires it in the user-facing completion message, not only in task metadata. */
 export function isolatedVisualProofNote(taskId: string, branch: string): string {
-  return `Visual proof unavailable: this task ran on isolated branch \`${branch}\`, which the project's dev server does not serve. Run \`/ship task:${taskId}\` for details, or review the branch directly.`;
+  return `Visual proof unavailable: this task ran on isolated branch \`${branch}\`, which the project's source-checkout dev server does not serve. A controller can run \`/task preview task:${taskId} action:start\` for live local inspection; \`/ship task:${taskId}\` remains text-only, or review the branch directly.`;
 }
 
 export interface ShipCaptureLive {
@@ -48,11 +48,12 @@ export type ShipImageResult = ShipCaptureLive | ShipCaptureUnavailable;
 /**
  * `/ship` is the only remaining visual-evidence surface (see HANDOFF "Review
  * round 1"): action tasks always run in an isolated Git worktree
- * (task-worktree.ts), and Devbot has no managed preview of that isolated
- * workspace. The project's dev server only ever serves the source checkout,
- * so screenshotting it for an isolated task would misrepresent someone
- * else's (or no) change as this task's result. Isolated tasks therefore get
- * an explicit "unavailable" result instead of a screenshot attempt.
+ * (task-worktree.ts). Managed previews are explicit, separately authorized,
+ * TTL-bound commands; `/ship` never starts or silently attaches to one. The
+ * project's ordinary dev server serves the source checkout, so screenshotting
+ * it for an isolated task would misrepresent someone else's (or no) change as
+ * this task's result. Isolated tasks therefore get an explicit "unavailable"
+ * result instead of an automatic screenshot attempt.
  */
 export async function resolveShipImage(
   task: TaskRecord,

@@ -114,15 +114,27 @@ import {
   type TaskWorktree
 } from "./task-worktree.js";
 import {
+  parsePreviewControl,
   interruptedTaskNoticeRow,
   parseTaskControl,
+  previewControlRow,
   taskActionMatchesState,
   taskActionRows,
   taskControlRow,
+  type PreviewButtonAction,
   type TaskControlAction
 } from "./task-controls.js";
 import { isolatedVisualProofNote, resolveShipImage } from "./visual-capture.js";
 import { composeShipCard } from "./ship-card.js";
+import {
+  authorizeTaskPreview,
+  formatPreviewInstance,
+  parsePreviewControlAction,
+  previewPublicationChannel,
+  resolvePreviewCommand,
+  TaskPreviewManager,
+  type PreviewInstance
+} from "./task-preview.js";
 import {
   continuationPrompt,
   formatInterruptedTaskNotice,
@@ -204,6 +216,8 @@ setActiveBackendId(process.env.DEVBOT_AGENT_BACKEND?.trim() || setupStore.snapsh
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
+const previewLedgerFile = process.env.DEVBOT_PREVIEW_STORE?.trim();
+const previewManager = new TaskPreviewManager(previewLedgerFile ? { ledgerFile: previewLedgerFile } : {});
 const memoryStore = new MemoryStore(
   process.env.DEVBOT_MEMORY_STORE?.trim() || undefined,
   undefined,
@@ -252,6 +266,13 @@ client.once("clientReady", async () => {
     }
   } catch (error) {
     console.warn(`Unable to reconcile interrupted tasks: ${publicErrorMessage(error)}`);
+  }
+  try {
+    for (const note of await previewManager.reconcile()) {
+      console.log(`Preview reconciliation: ${note}`);
+    }
+  } catch (error) {
+    console.warn(`Unable to reconcile preview processes: ${publicErrorMessage(error)}`);
   }
   if (config.autoDeployCommands && client.application) {
     try {
@@ -310,6 +331,19 @@ client.once("clientReady", async () => {
 
 process.once("exit", () => clearRuntimeLock(runtimePidFile));
 
+for (const shutdownSignal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(shutdownSignal, () => {
+    void previewManager
+      .stopAll("shutdown")
+      .catch((error) => console.warn(`Unable to stop previews during shutdown: ${publicErrorMessage(error)}`))
+      .finally(() => {
+        void Promise.resolve(client.destroy())
+          .catch(() => undefined)
+          .finally(() => process.exit(shutdownSignal === "SIGINT" ? 130 : 143));
+      });
+  });
+}
+
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isAutocomplete()) {
@@ -355,6 +389,18 @@ client.on("interactionCreate", async (interaction) => {
           return;
         }
         await handleSetupWizardButton(interaction, config, setupAction);
+        return;
+      }
+      const previewControl = parsePreviewControl(interaction.customId);
+      if (previewControl) {
+        if (!isAllowed(interaction, config)) {
+          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!(await ensureConfiguredRoom(interaction))) {
+          return;
+        }
+        await handlePreviewControlButton(interaction, config, previewControl.action, previewControl.previewId);
         return;
       }
       const taskControl = parseTaskControl(interaction.customId);
@@ -1730,12 +1776,11 @@ async function runProjectRequest(options: ProjectRequestOptions): Promise<Projec
     if (isolatedWorktree) {
       await recordTaskWorktreeEvidence(task.id, isolatedWorktree, true, workspaceNotes);
       // Every action task runs in an isolated Git worktree (task-worktree.ts); Codex's edits land
-      // on a review branch, never in options.project.root. Devbot has no managed preview of that
-      // isolated workspace, so there is no server it could honestly screenshot "after" against —
-      // the source checkout's dev server never reflects this task's changes. Per review, automatic
-      // before/after capture is skipped entirely rather than attaching a diff that would silently
-      // misrepresent someone else's (or no) change as this task's result. `/ship` remains available
-      // as an explicit, on-demand, honestly-captioned surface (visual-capture.ts).
+      // on a review branch, never in options.project.root. Automatic completion does not start or
+      // attach to the separate managed-preview lifecycle, so there is no server it could honestly
+      // screenshot "after" against — the source checkout's dev server never reflects this task's
+      // changes. Automatic before/after capture is skipped rather than attaching a misleading diff;
+      // `/task preview` remains an explicit controller action and `/ship` stays honestly text-only.
       await taskStore.recordCapture(task.id, {
         captureNote: isolatedVisualProofNote(task.id, isolatedWorktree.branch)
       });
@@ -3223,6 +3268,11 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     return;
   }
 
+  if (subcommand === "preview") {
+    await handleTaskPreviewCommand(interaction, appConfig);
+    return;
+  }
+
   if (subcommand === "stale") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const minutes = interaction.options.getInteger("minutes") ?? 30;
@@ -3360,6 +3410,152 @@ async function appendTaskSyncEvidence(taskId: string, lines: string[]): Promise<
 
 function shortSha(value: string): string {
   return value.slice(0, 10);
+}
+
+async function handleTaskPreviewCommand(interaction: ChatInputCommandInteraction, appConfig: AppConfig): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const taskId = interaction.options.getString("task", true);
+  const action = parsePreviewControlAction(interaction.options.getString("action") ?? "start");
+  if (!action) {
+    await interaction.editReply("That preview action is invalid; choose start, stop, or status.");
+    return;
+  }
+  const task = await taskStore.get(taskId);
+  if (!task || !canAccessTask(interaction, task, appConfig)) {
+    await interaction.editReply(`No accessible saved task found for \`${taskId}\`.`);
+    return;
+  }
+  const project = findProject(appConfig.projects, task.projectName);
+  if (!project) {
+    await interaction.editReply(`The project for task \`${task.id}\` is no longer configured.`);
+    return;
+  }
+  const authorization = authorizeTaskPreview(action, task, previewAccessContext(interaction, project, appConfig));
+  if (!authorization.allowed) {
+    await interaction.editReply(authorization.message);
+    return;
+  }
+
+  if (action === "status") {
+    const instances = previewManager.list(task.id);
+    await interaction.editReply(
+      instances.length
+        ? instances.map(formatPreviewInstance).join("\n\n")
+        : `No preview has been started for task \`${task.id}\` since Devbot last started.`
+    );
+    return;
+  }
+
+  if (action === "stop") {
+    const open = latestOpenPreview(task.id);
+    if (!open) {
+      await interaction.editReply(`No running preview was found for task \`${task.id}\`.`);
+      return;
+    }
+    const stopped = await previewManager.stop(open.id, "requested");
+    await interaction.editReply(stopped.instance ? formatPreviewInstance(stopped.instance) : stopped.ok ? "Preview stopped." : stopped.message);
+    return;
+  }
+
+  if (!task.workspaceIsolated || !task.workspacePath || !task.branchName || !task.baseBranch) {
+    await interaction.editReply(`Task \`${task.id}\` has no recorded isolated workspace, so there is nothing to preview.`);
+    return;
+  }
+  const inspection = await inspectTaskWorktree(
+    { sourcePath: project.root, path: task.workspacePath, branch: task.branchName, baseRevision: task.baseBranch },
+    0
+  );
+  if (!inspection.available) {
+    await interaction.editReply(`Cannot preview task \`${task.id}\`: ${inspection.message}`);
+    return;
+  }
+  const resolved = await resolvePreviewCommand(project, task.workspacePath);
+  if (!resolved.ok) {
+    await interaction.editReply(resolved.message);
+    return;
+  }
+  const result = await previewManager.start({
+    taskId: task.id,
+    projectName: project.name,
+    branch: task.branchName,
+    workspacePath: task.workspacePath,
+    command: resolved.command
+  });
+  if (!result.ok) {
+    await interaction.editReply(result.instance ? `${result.message}\n\n${formatPreviewInstance(result.instance)}` : result.message);
+    return;
+  }
+  const publishNote = await publishPreviewCard(task, project, result.instance);
+  await interaction.editReply({
+    content: [formatPreviewInstance(result.instance), publishNote].filter(Boolean).join("\n\n"),
+    components: [previewControlRow(result.instance.id)]
+  });
+}
+
+async function handlePreviewControlButton(
+  interaction: ButtonInteraction,
+  appConfig: AppConfig,
+  action: PreviewButtonAction,
+  previewId: string
+): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const instance = previewManager.status(previewId);
+  if (!instance) {
+    await interaction.editReply("That preview control has expired.");
+    return;
+  }
+  const task = await taskStore.get(instance.taskId);
+  const project = task ? findProject(appConfig.projects, task.projectName) : undefined;
+  if (!task || !project || !canAccessTask(interaction, task, appConfig)) {
+    await interaction.editReply("That preview's task is unavailable to you.");
+    return;
+  }
+  const authorization = authorizeTaskPreview(action, task, previewAccessContext(interaction, project, appConfig));
+  if (!authorization.allowed) {
+    await interaction.editReply(authorization.message);
+    return;
+  }
+  if (action === "status") {
+    await interaction.editReply(formatPreviewInstance(instance));
+    return;
+  }
+  const stopped = await previewManager.stop(previewId, "requested");
+  await interaction.editReply(stopped.instance ? formatPreviewInstance(stopped.instance) : stopped.ok ? "Preview stopped." : stopped.message);
+}
+
+function previewAccessContext(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  project: ProjectEntry,
+  appConfig: AppConfig
+): { userId: string; controller: boolean; projectAllowed: boolean; safeMode: boolean } {
+  return {
+    userId: interaction.user.id,
+    controller: isControllerUser(interaction.user.id, appConfig),
+    projectAllowed: isAllowedForProject(interaction, project),
+    safeMode: appConfig.safeMode
+  };
+}
+
+function latestOpenPreview(taskId: string): PreviewInstance | undefined {
+  return previewManager.latestUnresolved(taskId);
+}
+
+async function publishPreviewCard(task: TaskRecord, project: ProjectEntry, instance: PreviewInstance): Promise<string | undefined> {
+  const channelId = previewPublicationChannel(task, setupStore.snapshot().projectRoomIds[project.name]);
+  if (!channelId) {
+    return "No task workroom or bound project room exists, so the preview details stay in this private reply.";
+  }
+  try {
+    const channel = await client.channels.fetch(channelId);
+    await sendToTextChannel(channel, {
+      content: formatPreviewInstance(instance),
+      components: [previewControlRow(instance.id)],
+      allowedMentions: { parse: [] }
+    });
+    return `Preview details were posted to <#${channelId}>.`;
+  } catch (error) {
+    return `The preview is running, but its card could not be posted to <#${channelId}>: ${publicErrorMessage(error)}. Use the controls in this reply.`;
+  }
 }
 
 async function handleTaskControl(
@@ -4026,7 +4222,7 @@ async function buildShipCard(project: ProjectEntry, task: TaskRecord): Promise<S
 function shipCardCaption(project: ProjectEntry, task: TaskRecord, build: ShipCardBuild): string {
   const header = `Ship card for \`${project.name}\` task \`${task.id}\`.`;
   if (build.isolatedBranch) {
-    return `${header} Visual proof unavailable for isolated branch \`${build.isolatedBranch}\`: Devbot has no managed preview of that isolated workspace, so no screenshot was attempted. The card is text-only; review the branch directly.`;
+    return `${header} Visual proof unavailable for isolated branch \`${build.isolatedBranch}\`: /ship does not start or attach to a managed task preview, so no screenshot was attempted. The card is text-only; use /task preview for live local inspection or review the branch directly.`;
   }
   return build.hasScreenshot
     ? `${header} Attach and post anywhere.`
