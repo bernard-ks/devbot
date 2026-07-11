@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { Page } from "playwright";
+import type { Page, Route } from "playwright";
 import { minimalChildEnvironment } from "./security.js";
 import type { ProjectEntry } from "./types.js";
 
@@ -78,13 +78,7 @@ export async function captureProjectScreenshot(
       const browser = await chromium.launch({ headless: true, env: definedEnvironment(minimalChildEnvironment()) });
       try {
         const page = await browser.newPage({ viewport });
-        await page.route("**/*", async (route) => {
-          if (isAllowedScreenshotResource(route.request().url(), allowedOrigins)) {
-            await route.continue();
-          } else {
-            await route.abort("blockedbyclient");
-          }
-        });
+        await page.route("**/*", approvedOriginRouteHandler(allowedOrigins));
         const diagnostics = collectScreenshotDiagnostics(page);
         await page.emulateMedia({ reducedMotion: "reduce" }).catch(() => undefined);
         await page.goto(startUrl, { waitUntil: "networkidle", timeout: 20_000 });
@@ -464,6 +458,33 @@ function projectScreenshotOrigins(project: ProjectEntry, projectUrls: readonly s
       .filter((value): value is string => Boolean(value))
       .map((value) => new URL(value).origin)
   );
+}
+
+/**
+ * `route.continue()` lets Chromium follow a server redirect without routing the
+ * redirected URL through this allowlist again. Re-issue approved HTTP requests
+ * without following redirects and fulfill that single response instead; any
+ * redirected request is then a new browser request and must pass this handler.
+ */
+export function approvedOriginRouteHandler(allowedOrigins: ReadonlySet<string>): (route: Route) => Promise<void> {
+  return async (route) => {
+    const requestUrl = route.request().url();
+    if (!isAllowedScreenshotResource(requestUrl, allowedOrigins)) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    const protocol = new URL(requestUrl).protocol;
+    if (protocol === "data:" || protocol === "blob:" || protocol === "about:") {
+      await route.continue();
+      return;
+    }
+    try {
+      const response = await route.fetch({ maxRedirects: 0 });
+      await route.fulfill({ response });
+    } catch {
+      await route.abort("failed").catch(() => undefined);
+    }
+  };
 }
 
 function isAllowedScreenshotResource(value: string, allowedOrigins: ReadonlySet<string>): boolean {
