@@ -193,7 +193,7 @@ export function labPrompt(kind: "roundtable" | "jam" | "argue" | "fix-from-snip"
 
 export function formatLabHeader(conversation: CollabConversation): string {
   const project = conversation.projectName ? ` on \`${conversation.projectName}\`` : "";
-  return `Lab session \`${conversation.id}\` (${conversation.intent}${project})\n${conversation.title}`;
+  return `Lab session \`${conversation.id}\` (${conversation.intent}${project})\n${truncateWorkroomText(conversation.title, 500)}`;
 }
 
 export function formatWorkroomPanel(conversation: CollabConversation, contributions: CollabContribution[]): string {
@@ -203,25 +203,28 @@ export function formatWorkroomPanel(conversation: CollabConversation, contributi
     .map((participant) => `${participant.displayName} (${participant.state})`)
     .join(", ");
   const decision = conversation.decision
-    ? `${conversation.decision.outcome} by ${conversation.decision.actor}${conversation.decision.note ? `: ${conversation.decision.note}` : ""}`
+    ? truncateWorkroomText(
+        `${conversation.decision.outcome} by ${conversation.decision.actor}${conversation.decision.note ? `: ${conversation.decision.note}` : ""}`,
+        320
+      )
     : "pending";
 
-  return [
+  return truncateWorkroomText([
     `Council workroom \`${conversation.id}\``,
     `Phase: **${conversation.phase}**`,
     `Project: ${conversation.projectName ? `\`${conversation.projectName}\`` : "(none)"}`,
     `Contributions: ${contributions.length} total, ${sealed} sealed, ${revealed} revealed`,
     `Decision: ${decision}`,
     "",
-    `Brief: ${truncateWorkroomText(conversation.brief ?? conversation.title, 700)}`,
+    `Brief: ${truncateWorkroomText(conversation.brief ?? conversation.title, 520)}`,
     "",
-    `Participants: ${participants || "none"}`,
+    `Participants: ${truncateWorkroomText(participants || "none", 520)}`,
     conversation.phase === "collecting"
       ? "Independent responses stay sealed until Reveal or Synthesize, preventing agents from anchoring on the first answer."
       : undefined
   ]
     .filter((line) => line !== undefined)
-    .join("\n");
+    .join("\n"), 1_900);
 }
 
 export function formatCouncilContributions(conversation: CollabConversation, contributions: CollabContribution[]): string {

@@ -52,7 +52,7 @@ It creates or adopts the private room, registers local repository paths, chooses
 /projects
 ```
 
-The Discord workspace stores a selected project per approved user. Mentions, `/ask`, `/do`, `/status`, and `/dashboard` use that selection when their optional project is omitted, then fall back to the setup default. Other project-aware commands retain autocomplete so an operator can choose a different root per request.
+The Discord workspace stores an intentional selected project per approved user. Explicit project options, `project:<name>` mentions, natural status scopes such as `status on devbot?`, and concrete Workspace/Studio project selections update it; fallback use does not. Mentions, `/ask`, `/do`, `/status`, and `/dashboard` use that selection when their optional project is omitted, then fall back to the setup default. Changing the setup default clears the setup actor's override, and `/projects` displays the global default separately from the user's current selection. Other project-aware commands retain autocomplete so an operator can choose a different root per request.
 
 Open the shared launcher or run `/dashboard` to get a personal ephemeral workspace. Its project selector only includes roots the user can access. Ask and Make change open Discord modals; task messages update in place and expose safe public controls plus a role-aware private Actions panel.
 
@@ -65,6 +65,14 @@ The ambient flow is the default for natural action-shaped mentions in a configur
 ```
 
 Devbot classifies the request, stores it as `awaiting-approval`, and posts a Components V2 proposal card. The card supports **Approve and start**, **Edit**, **Answer only**, and **Decline**. The requester or a controller can edit, answer-only, or decline; only the owner or an approved controller can approve write-capable work. Use `/inbox` to find pending decisions, or open the dashboard and choose **Needs Me**.
+
+## Devbot Studio
+
+Studio is optional and Discord-native. Toggle **Enable Studio** in `/setup wizard`, choose it in the local `npm run setup` wizard, or set `DEVBOT_STUDIO_ENABLED=true` in `.env` and restart Devbot. Then invoke `/studio` or choose **Open Studio** in the configured private room.
+
+The Components V2 card provides task lanes, Needs Me counts, agent roles, repository branch state, changed files, verification, and selected-task evidence. Its project and task selectors update the same private response. **Open full task** routes into the existing task detail and action controls; Studio itself does not create a second mutation path.
+
+There is no Studio HTTP process. Do not configure an Activity, OAuth client secret, public URL mapping, reverse proxy, tunnel, or loopback listener. Access remains owner/controller-only and every snapshot is rebuilt from current local state after applying the invoking user's project and task policy.
 
 When the proposal is created, Devbot opens a private task thread when the parent room supports private threads and membership management. Unrestricted projects inherit the configured Devbot audience; scoped projects use the requester and explicit project audience IDs. Devbot then stores the thread ID with the task. Approval starts the task inside that workroom. The task runs with Builder, Reviewer, and Verifier preflight seats by default; the proposal selector can reduce or change that team. The seats are read-only planning and review work, and do not authorize mutations.
 
@@ -167,6 +175,8 @@ If any global allow-list is configured, a Discord user must match at least one c
 - `control` includes view access and enables `/do`, action-task retries, `/run`, task cancel, review validation/gates, and `/lab approve`.
 - Only `DEVBOT_OWNER_USER_ID` can run `/setup`.
 - `/setup room` creates a text channel that denies visibility to `@everyone` when the bot has `Manage Channels`. Otherwise it adopts the current private thread or creates an invite-only one with `Create Private Threads`, then synchronizes member IDs directly.
+- Re-running room sync enforces the current Devbot allowlist by replacing the room's Devbot permission overwrites or private-thread membership set.
+- `/setup repo action:remove` also removes that project's room binding and permanently purges its Devbot memory, so it refuses unless `confirm:<project-name>` matches exactly.
 - Once a setup room exists, Devbot rejects normal commands and mentions outside it. `/setup` remains available to the owner from another channel for recovery.
 - Discord `/setup` commands only mutate the local setup store. The initial `npm run setup` tool writes the Discord bootstrap values to the ignored `.env` once.
 

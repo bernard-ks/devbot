@@ -14,8 +14,14 @@ import {
   proposalEditModal,
   proofFirstCompletionCard,
   proposalEntityId,
-  roleTeamSelector
+  reviewEvidenceCard,
+  reviewPacketCard,
+  roleTeamSelector,
+  taskCompletionCard,
+  taskDetailCard,
+  taskProgressCard
 } from "./ambient-ui.js";
+import { taskControlRow } from "./task-controls.js";
 
 test("ambient controls are stable, bounded, and strictly parsed", () => {
   const longestId = "x".repeat(AMBIENT_UI_LIMITS.entityId);
@@ -145,6 +151,18 @@ test("completion card with task-derived text cannot expand mentions at the trans
   assert.deepEqual(payload.allowedMentions, { parse: [] });
 });
 
+test("completion and review evidence cards hide absolute paths from generated output", () => {
+  const completion = serialize(proofFirstCompletionCard({
+    taskId: "task-paths",
+    project: "devbot",
+    title: "Path-safe result",
+    proof: [{ label: "Check", detail: "failed in /Users/bernard/private/check.ts", status: "failed" }],
+    summary: "Updated C:\\Users\\bernard\\private\\result.ts"
+  }));
+  assert.doesNotMatch(textContent(completion), /Users\/bernard|C:\\Users/);
+  assert.match(textContent(completion), /\[local path\]/);
+});
+
 test("completion card keeps six proof entries so an isolated-task visual-proof note is not evicted", () => {
   const payload = proofFirstCompletionCard({
     taskId: "task-3",
@@ -188,6 +206,114 @@ test("Needs Me inbox caps visible decisions and keeps every control routable", (
   assert.match(textContent(json), /3 more items not shown/);
   assert.ok((json.components?.length ?? 0) <= 10);
   assertDiscordBounds(json);
+});
+
+test("ordinary task cards keep legacy task controls inside bounded Components V2 containers", () => {
+  const controls = [taskControlRow("task-abc", { status: "succeeded", mode: "action" })];
+  const progress = taskProgressCard({
+    project: "devbot",
+    title: "Migrate ordinary task cards",
+    phase: "Working",
+    detail: "Building the bounded task lifecycle card.",
+    meta: "write-capable | 1m 5s",
+    percent: 60,
+    controlRows: controls
+  });
+  const progressJson = serialize(progress);
+  assert.equal(progress.flags, MessageFlags.IsComponentsV2);
+  assert.equal("content" in progress, false);
+  assert.match(textContent(progressJson), /In progress/);
+  assert.ok(controlIds(progressJson).includes("devbot:task-control:details:task-abc"));
+  assert.ok(controlIds(progressJson).includes("devbot:task-control:review:task-abc"));
+  assertDiscordBounds(progressJson);
+
+  const completion = taskCompletionCard({
+    project: "devbot",
+    title: "Migrate ordinary task cards",
+    summary: "x".repeat(5_000),
+    proof: Array.from({ length: 12 }, (_, index) => ({
+      label: `Evidence ${index}`,
+      detail: "y".repeat(1_000),
+      status: index === 0 ? "failed" as const : "passed" as const
+    })),
+    changedFiles: Array.from({ length: 20 }, (_, index) => `src/file-${index}.ts`),
+    controlRows: controls
+  });
+  const completionJson = serialize(completion);
+  assert.match(textContent(completionJson), /Complete with attention needed/);
+  assert.match(textContent(completionJson), /\[FAIL\] Evidence 0/);
+  assert.equal(textContent(completionJson).includes("Evidence 6"), false);
+  assert.ok(controlIds(completionJson).includes("devbot:task-control:actions:task-abc"));
+  assertDiscordBounds(completionJson);
+});
+
+test("card headings neutralize user Markdown, links, and mention-like labels", () => {
+  const payload = taskProgressCard({
+    project: "**trusted**",
+    title: "[Open proof](https://example.invalid) @everyone",
+    phase: "*working*",
+    detail: "Deliberate detail blocks may retain Markdown.",
+    meta: "read-only"
+  });
+  const content = textContent(serialize(payload));
+  assert.match(content, /\\\[Open proof\\\]\\\(/);
+  assert.doesNotMatch(content, /\]\(https:\/\//);
+  assert.doesNotMatch(content, /https:\/\//);
+  assert.doesNotMatch(content, /@everyone/);
+  assert.match(content, /@\u200beveryone/);
+  assert.deepEqual(payload.allowedMentions, { parse: [] });
+});
+
+test("task detail and review evidence cards are content-free, mention-safe, and bounded", () => {
+  const detail = taskDetailCard({
+    taskId: "task-abc",
+    project: "devbot",
+    status: "failed",
+    workroom: "<#123>",
+    detail: `Requester: @everyone <@123>\n${"z".repeat(6_000)}`
+  });
+  const detailJson = serialize(detail);
+  assert.deepEqual(detail.allowedMentions, { parse: [] });
+  assert.match(textContent(detailJson), /Task detail/);
+  assertDiscordBounds(detailJson);
+
+  const packet = reviewPacketCard({
+    project: "devbot",
+    branch: "feature/components-v2",
+    defaultBranch: "main",
+    lastCommit: "abc123 Add review cards",
+    taskId: "task-abc",
+    taskStatus: "succeeded",
+    taskRequest: "Show review proof in a rich card.",
+    changedFiles: `${"M src/file.ts\n".repeat(300)}\`\`\`spoof`,
+    diffStat: "src/file.ts | 10 +++++-----".repeat(100),
+    suggestedVerification: ["build", "test"]
+  });
+  const packetJson = serialize(packet);
+  assert.match(textContent(packetJson), /Review packet/);
+  assert.doesNotMatch(textContent(packetJson), /```spoof/);
+  assertDiscordBounds(packetJson);
+
+  const evidence = reviewEvidenceCard({
+    title: "Merge gate evidence",
+    project: "devbot",
+    passed: false,
+    summary: ["Working tree: clean.", "Validation: failed."],
+    checks: Array.from({ length: 8 }, (_, index) => ({
+      name: `check-${index}`,
+      command: `npm run check-${index}`,
+      ok: index !== 0,
+      exitCode: index === 0 ? 1 : 0,
+      output: index === 0 ? `early${"output".repeat(1_000)}late failure` : "output".repeat(1_000)
+    }))
+  });
+  const evidenceJson = serialize(evidence);
+  assert.match(textContent(evidenceJson), /BLOCKED/);
+  assert.match(textContent(evidenceJson), /\[FAIL\] check-0 \| exit 1/);
+  assert.match(textContent(evidenceJson), /late failure/);
+  assert.doesNotMatch(textContent(evidenceJson), /earlyoutput/);
+  assert.equal(textContent(evidenceJson).includes("check-4"), false);
+  assertDiscordBounds(evidenceJson);
 });
 
 type JsonComponent = {

@@ -256,6 +256,23 @@ test("formatScreenshotAnalysisReply renders a code block, location, and approach
   assert.match(reply, /Import foo before use/);
 });
 
+test("screenshot analysis replies stay within Discord's content limit", () => {
+  const reply = formatScreenshotAnalysisReply(
+    {
+      transcription: "TypeError ".repeat(800),
+      location: "src/generated/very-long-file.ts:42 ".repeat(300),
+      approach: "Add a focused guard and verify the affected route. ".repeat(400)
+    },
+    4
+  );
+  const noError = formatNoErrorFoundReply("No visible error. ".repeat(500), 4);
+
+  assert.ok(reply.length <= 1_900);
+  assert.ok(noError.length <= 1_900);
+  assert.match(reply, /Transcribed error:/);
+  assert.match(reply, /Suggested approach:/);
+});
+
 test("formatNoErrorFoundReply is honest about not finding an error", () => {
   const reply = formatNoErrorFoundReply("the screenshot shows a settings page with no visible errors.", 1);
   assert.match(reply, /I can see the image, but no error text/);

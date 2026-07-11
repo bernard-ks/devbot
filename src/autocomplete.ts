@@ -9,12 +9,30 @@ export interface AutocompleteChoice {
   value: string;
 }
 
-export function projectChoices(projects: ProjectEntry[], focused: string): AutocompleteChoice[] {
+export function projectChoices(projects: ProjectEntry[], focused: string, preferredName?: string): AutocompleteChoice[] {
   const query = normalize(focused);
   return projects
-    .filter((project) => project.name.includes(query) || project.metadata.aliases.some((alias) => alias.includes(query)))
+    .filter((project) => projectSearchText(project).includes(query))
+    .sort((left, right) => projectChoiceRank(left, preferredName) - projectChoiceRank(right, preferredName))
     .slice(0, 25)
-    .map((project) => ({ name: `${project.name}${project.isDefault ? " (default)" : ""}`, value: project.name }));
+    .map((project) => {
+      const current = project.name === preferredName;
+      const suffix = current && project.isDefault ? " (current, default)" : current ? " (current)" : project.isDefault ? " (default)" : "";
+      return { name: `${project.name}${suffix}`, value: project.name };
+    });
+}
+
+function projectSearchText(project: ProjectEntry): string {
+  return [project.name, project.metadata.canonicalName, ...project.metadata.aliases]
+    .filter((value): value is string => Boolean(value))
+    .join(" ")
+    .toLowerCase();
+}
+
+function projectChoiceRank(project: ProjectEntry, preferredName: string | undefined): number {
+  if (project.name === preferredName) return 0;
+  if (project.isDefault) return 1;
+  return 2;
 }
 
 export function commandChoices(project: ProjectEntry | undefined, focused: string): AutocompleteChoice[] {

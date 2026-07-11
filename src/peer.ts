@@ -53,6 +53,9 @@ interface PeerStateFile {
   peers: PeerRecord[];
 }
 
+const DISCORD_SAFE_CONTENT_LENGTH = 1_900;
+const DISCORD_PEER_ENVELOPE_LENGTH = 1_950;
+
 export class PeerStore {
   private state: PeerStateFile | undefined;
 
@@ -153,34 +156,62 @@ export function parsePeerEnvelope(content: string): PeerEnvelope | undefined {
   }
 }
 
-export function formatPeerEnvelope(envelope: PeerEnvelope): string {
-  return `\`\`\`json\n${JSON.stringify(envelope, null, 2)}\n\`\`\``;
+export function formatPeerEnvelope(envelope: PeerEnvelope, maxLength = DISCORD_PEER_ENVELOPE_LENGTH): string {
+  const fitted = fitPeerEnvelopeToDiscord(envelope, maxLength);
+  return `\`\`\`json\n${JSON.stringify(fitted)}\n\`\`\``;
 }
 
-export function formatCapabilities(capabilities: PeerCapabilities): string {
-  return [
+export function fitPeerEnvelopeToDiscord(envelope: PeerEnvelope, maxLength = DISCORD_PEER_ENVELOPE_LENGTH): PeerEnvelope {
+  const fitted = JSON.parse(JSON.stringify(envelope)) as PeerEnvelope;
+  if (formattedPeerEnvelopeLength(fitted) <= maxLength) return fitted;
+
+  const slots = peerEnvelopeStringSlots(fitted);
+  while (formattedPeerEnvelopeLength(fitted) > maxLength) {
+    const slot = slots.sort((left, right) => right.value().length - left.value().length)[0];
+    if (!slot || slot.value().length <= 24) break;
+    const overflow = formattedPeerEnvelopeLength(fitted) - maxLength;
+    const value = slot.value();
+    const nextLength = Math.max(21, value.length - overflow - 12);
+    slot.set(`${value.slice(0, nextLength - 3)}...`);
+  }
+
+  if (formattedPeerEnvelopeLength(fitted) > maxLength) {
+    delete fitted.capabilities;
+    delete fitted.prompt;
+    delete fitted.target;
+    delete fitted.task;
+    delete fitted.commands;
+    fitted.message = "Peer payload exceeded the Discord transport limit.";
+  }
+  return fitted;
+}
+
+export function formatCapabilities(capabilities: PeerCapabilities, maxLength = DISCORD_SAFE_CONTENT_LENGTH): string {
+  return truncateDiscordContent([
     `Devbot capabilities for \`${capabilities.botName}\``,
     `Owner: ${capabilities.owner}`,
     `Safe mode: ${capabilities.safeMode ? "on" : "off"}`,
     `Projects: ${capabilities.projects.map((project) => `\`${project}\``).join(", ") || "(none)"}`,
     `Commands: ${capabilities.commands.map((command) => `\`/${command}\``).join(", ")}`,
     `Screenshots: ${capabilities.supportsScreenshots ? "yes" : "no"}`
-  ].join("\n");
+  ].join("\n"), maxLength);
 }
 
-export function formatPeerList(peers: PeerRecord[]): string {
+export function formatPeerList(peers: PeerRecord[], maxLength = DISCORD_SAFE_CONTENT_LENGTH): string {
   if (peers.length === 0) {
     return "No peer devbots have announced themselves yet.";
   }
 
-  return peers
-    .map(
-      (peer) =>
-        `- <@${peer.botId}> \`${peer.botName}\` owned by ${peer.owner}, projects: ${
-          peer.projects.map((project) => `\`${project}\``).join(", ") || "(none)"
-        }, last seen ${new Date(peer.lastSeenAt).toLocaleString()}`
-    )
-    .join("\n");
+  return truncateDiscordContent(peers
+    .map((peer) => {
+      if (Date.parse(peer.lastSeenAt) <= 0) {
+        return `- <@${peer.botId}> is allow-listed, but has not announced its capabilities yet.`;
+      }
+      return `- <@${peer.botId}> \`${peer.botName}\` owned by ${peer.owner}, projects: ${
+        peer.projects.map((project) => `\`${project}\``).join(", ") || "(none)"
+      }, last seen ${new Date(peer.lastSeenAt).toLocaleString()}`;
+    })
+    .join("\n"), maxLength);
 }
 
 export function projectNames(projects: ProjectEntry[]): string[] {
@@ -200,6 +231,55 @@ function extractJson(content: string): string | undefined {
   }
 
   return undefined;
+}
+
+interface PeerStringSlot {
+  value: () => string;
+  set: (value: string) => void;
+}
+
+function peerEnvelopeStringSlots(envelope: PeerEnvelope): PeerStringSlot[] {
+  const slots: PeerStringSlot[] = [];
+  for (const key of ["message", "prompt", "target", "task", "commands", "project", "owner"] as const) {
+    if (typeof envelope[key] !== "string") continue;
+    slots.push({
+      value: () => String(envelope[key] ?? ""),
+      set: (value) => {
+        envelope[key] = value;
+      }
+    });
+  }
+  const capabilities = envelope.capabilities;
+  if (capabilities) {
+    for (const key of ["botName", "owner"] as const) {
+      slots.push({
+        value: () => capabilities[key],
+        set: (value) => {
+          capabilities[key] = value;
+        }
+      });
+    }
+    for (const values of [capabilities.projects, capabilities.commands]) {
+      for (let index = 0; index < values.length; index += 1) {
+        slots.push({
+          value: () => values[index] ?? "",
+          set: (value) => {
+            values[index] = value;
+          }
+        });
+      }
+    }
+  }
+  return slots;
+}
+
+function formattedPeerEnvelopeLength(envelope: PeerEnvelope): number {
+  return `\`\`\`json\n${JSON.stringify(envelope)}\n\`\`\``.length;
+}
+
+function truncateDiscordContent(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 20)).trimEnd()}\n[output truncated]`;
 }
 
 function newRequestId(): string {

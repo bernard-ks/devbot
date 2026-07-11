@@ -163,8 +163,41 @@ export function redactSensitiveText(value: string, environment: NodeJS.ProcessEn
     );
 }
 
+export interface DiscordOutputSanitizerOptions {
+  environment?: NodeJS.ProcessEnv;
+  privatePaths?: readonly string[];
+}
+
+/**
+ * Sanitizes untrusted or tool-generated text immediately before it is exposed
+ * in Discord. Deliberate operator surfaces should opt out so `/projects` and
+ * setup diagnostics can continue to show the machine paths they manage.
+ */
+export function sanitizeDiscordOutput(value: string, options: DiscordOutputSanitizerOptions = {}): string {
+  let sanitized = redactSensitiveText(value, options.environment ?? process.env).replace(/\0/g, "");
+  const privatePaths = [...new Set((options.privatePaths ?? []).map((entry) => entry.trim()).filter(Boolean))]
+    .sort((left, right) => right.length - left.length);
+  for (const privatePath of privatePaths) {
+    sanitized = sanitized.replaceAll(privatePath, "[local path]");
+  }
+
+  const posixRoot = "(?:Users|home|root|private|var|tmp|Volumes|Applications|Library|opt|etc|usr|mnt|srv|workspace|workspaces)";
+  const boundary = String.raw`(^|[\s\x60\"'(=\[])`;
+  const quotedPath = new RegExp(
+    String.raw`([\x60\"'])(?:file:\/\/\/(?:[^\x60\"'\r\n]+)|\/(?:${posixRoot})(?:\/[^\x60\"'\r\n]*)?|~\/(?:[^\x60\"'\r\n]+)|[A-Za-z]:[\\/](?:[^\x60\"'\r\n]+)|\\\\(?:[^\x60\"'\r\n]+))\1`,
+    "g"
+  );
+  sanitized = sanitized.replace(quotedPath, (match, quote: string) => `${quote}[local path]${quote}`);
+  sanitized = sanitized
+    .replace(new RegExp(`${boundary}file:\/\/\/[^\\s\\x60\\\"')\\]}>;,]+`, "gim"), "$1[local path]")
+    .replace(new RegExp(`${boundary}\/(?:${posixRoot})(?:\/[^\\s\\x60\\\"')\\]}>;,]*)?`, "gim"), "$1[local path]")
+    .replace(new RegExp(`${boundary}~\/(?:[^\\s\\x60\\\"')\\]}>;,]+)`, "gim"), "$1[local path]")
+    .replace(/(^|[\s`"'(=\[])(?:[A-Za-z]:[\\/]|\\\\)[^\s`"')\]}>;,]+/gim, "$1[local path]");
+  return sanitized;
+}
+
 export function publicErrorMessage(error: unknown, maxLength = 800): string {
-  const message = redactSensitiveText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim();
+  const message = sanitizeDiscordOutput(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim();
   if (!message) return "The operation failed without a safe error message.";
   return message.length <= maxLength ? message : `${message.slice(0, maxLength - 3)}...`;
 }

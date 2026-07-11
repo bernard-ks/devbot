@@ -8,7 +8,7 @@ Devbot is a local Discord interface for Codex-backed development work. It answer
 
 The small-team foundation now exists: owner-managed private setup, durable local tasks, peer discovery, sealed councils, approval records, and review handoffs. The next product step is to make those capabilities feel as natural as ordinary Discord conversation while deepening evidence-backed multi-agent work.
 
-## Ambient Workrooms: Ideas 1-8
+## Ambient Workrooms And Studio: Ideas 1-9
 
 The ambient workroom slice is now implemented:
 
@@ -20,8 +20,9 @@ The ambient workroom slice is now implemented:
 6. Owner-only `/setup project-room action:bind project:<name> channel:<channel>` binds a private channel or private thread to one project; `action:remove` removes the binding.
 7. Workroom roles are Builder, Reviewer, and Verifier. They provide read-only implementation, review, and evidence perspectives before approved work executes, and can be selected on the proposal card.
 8. Proposal, progress, proof, and inbox surfaces use bounded Discord Components V2 payloads, strict custom-ID parsing, sanitized text, and state-aware controls.
+9. `/studio` and the dashboard **Open Studio** control open an optional Discord-native Components V2 workroom. It shows task lanes, Needs Me decisions, workroom roles, branch state, changed files, diff stats, and verification without an HTTP server.
 
-The safety contract is explicit: only the requester or an approved controller can edit or decline; only the owner or approved controller can approve write work; safe mode blocks write execution; scoped-audience projects decline channel-mention output; scoped proposals close if a private task thread cannot be created; and unavailable Git isolation stops the action before write access. Activity idea 9 is deferred and is not represented as an implemented feature.
+The safety contract is explicit: only the requester or an approved controller can edit or decline; only the owner or approved controller can approve write work; safe mode blocks write execution; scoped-audience projects decline channel-mention output; scoped proposals close if a private task thread cannot be created; and unavailable Git isolation stops the action before write access. Studio is controller-only and read-only, reapplies current project and task access on every interaction, omits local paths and internal task records, and leaves task mutations on the existing revision-checked Discord controls.
 
 ## Current Features
 
@@ -30,13 +31,14 @@ The safety contract is explicit: only the requester or an approved controller ca
   - The wizard validates the Discord bot, opens installation, discovers servers, chooses the server owner, registers a local repository, creates the private room, deploys commands, and starts Devbot.
   - Discord application creation and bot-token retrieval remain the only required Developer Portal step.
 - Discord slash commands:
-  - `/setup wizard` provides resumable owner setup for viewers, controllers, peer bots, a private room, and runtime project roots.
+  - `/setup wizard` provides resumable owner setup for viewers, controllers, peer bots, a private room, runtime project roots, and the optional Discord-native Studio toggle.
   - `/setup doctor` diagnoses the complete local and Discord setup path, including detected coding-agent backends.
   - `/setup backend` lists detected coding agents with versions and selects the active one.
   - `/projects` lists configured local projects.
   - `/status` reports a decision-ready brief: confirmed bot work and phases, external runs, activity-unknown app sessions, repository evidence, risks, and a recommended next step.
   - `/status image:true` can attach a live local UI screenshot when a web dev server is detected.
   - `/dashboard` opens a personal Discord-native workspace with authorized project selection and modal Ask / Change flows.
+  - `/studio` opens the optional Discord-native visual workroom for controllers.
   - `/refresh` rebuilds the in-memory project file index.
   - `/ask` answers read-only project questions with local context.
   - `/do` asks local Codex to perform focused project work.
@@ -52,6 +54,11 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Private task threads, isolated task branches/worktrees, proof-first completion, and `/inbox` / dashboard Needs Me.
   - Owner-bound project rooms through `/setup project-room`.
   - Builder, Reviewer, and Verifier roles with bounded Components V2 cards.
+- Devbot Studio:
+  - Optional Components V2 task board rendered directly through the bot's Discord connection.
+  - Live read-only task lanes, approval queue, agent map, branch state, change evidence, and verification.
+  - Controller-only access in the configured private room, with current project/task policy applied on every refresh and selection.
+  - No Activity, browser bundle, OAuth client secret, tunnel, public URL, web server, or loopback listener.
 - Screenshot-to-fix:
   - Mentioning the bot with an image attachment (stack trace, console error, or broken UI) transcribes the visible error using an image-capable local Codex call, then locates the likely file/symbol using the existing project context ranking seeded by the transcribed text.
   - Treats all image content as untrusted error-report data; the analysis prompts explicitly instruct the model never to follow instructions that appear inside the screenshot.
@@ -116,7 +123,7 @@ The safety contract is explicit: only the requester or an approved controller ca
 - A setup-managed private room controls new message visibility, but it cannot retroactively hide messages previously posted in other channels.
 - The audit trail spans Discord messages, local task/collaboration stores, and git history; it is not yet centralized or tamper-evident.
 - The v2 collaboration protocol supports allow-listed discovery and coordination, but transport is still Discord-specific and peer writes remain human-gated.
-- Ambient workroom activity aggregation and the deferred Activity idea 9 are not implemented.
+- Studio does not mutate tasks, stream agent events, render full patch bodies, or aggregate the durable collaboration event log yet; those remain later Discord-native slices after shared mutation-domain checks are extracted.
 - Task previews assume an HTTP dev server that honors the provided `PORT`; readiness requires both an HTTP response and listener ownership by the exact managed process group on `127.0.0.1`, while non-loopback binds are stopped. One unresolved preview lifecycle runs per task and counts toward the global cap until cleanup is confirmed. Preview start and restart reconciliation are currently POSIX-only; Windows start fails closed.
 
 ## Improvement Themes

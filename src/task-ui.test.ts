@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { continuationPrompt, formatTaskProgress, parseTaskModal, taskRequestModal } from "./task-ui.js";
+import { continuationPrompt, formatTaskProgress, parseTaskModal, taskProgressPresentation, taskRequestModal } from "./task-ui.js";
 import type { TaskRecord } from "./task-store.js";
 
 test("task progress reports human phases without raw model IDs", () => {
@@ -28,6 +28,24 @@ test("task progress reports human phases without raw model IDs", () => {
   assert.match(output, /Terra is working with 4 context files/);
   assert.match(output, /1m 5s/);
   assert.doesNotMatch(output, /gpt-5\.6-terra|task-abc/);
+  assert.deepEqual(
+    taskProgressPresentation({
+      taskId: "task-abc",
+      projectName: "pullprice",
+      mode: "action",
+      text: "Fix the failing test",
+      requester: "tester",
+      startedAt: "2026-07-10T00:00:00.000Z",
+      phase: "running-codex",
+      contextFileCount: 4
+    }, new Date("2026-07-10T00:01:05.000Z")),
+    {
+      access: "write-capable",
+      elapsed: "1m 5s",
+      title: "Working",
+      detail: "Codex is working with 4 context files."
+    }
+  );
 
   const longFailure = formatTaskProgress({
     taskId: "task-abc",

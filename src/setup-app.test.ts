@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,10 +13,30 @@ interface SetupServer {
   baseUrl: string;
 }
 
-async function startSetupServer(): Promise<SetupServer> {
+async function startSetupServer(options: { studioEnabled?: boolean; envStudioEnabled?: boolean } = {}): Promise<SetupServer> {
   const cwd = await mkdtemp(path.join(tmpdir(), "devbot-setup-app-"));
+  if (typeof options.studioEnabled === "boolean") {
+    await mkdir(path.join(cwd, ".devbot"), { recursive: true });
+    await writeFile(
+      path.join(cwd, ".devbot/setup.json"),
+      JSON.stringify({
+        version: 1,
+        viewerUserIds: [],
+        controllerUserIds: [],
+        peerBotIds: [],
+        repositories: {},
+        projectRoomIds: {},
+        studioEnabled: options.studioEnabled
+      })
+    );
+  }
   const env = { ...process.env };
   delete env.DISCORD_TOKEN;
+  if (typeof options.envStudioEnabled === "boolean") {
+    env.DEVBOT_STUDIO_ENABLED = options.envStudioEnabled ? "true" : "false";
+  } else {
+    delete env.DEVBOT_STUDIO_ENABLED;
+  }
   env.DEVBOT_SETUP_NO_BROWSER = "true";
   env.DEVBOT_SETUP_NO_START = "true";
   env.CODEX_BIN = path.join(cwd, "missing-codex");
@@ -63,6 +83,7 @@ test("setup API is bound to the claiming browser session", async (t) => {
     claimCookie = setCookie.split(";")[0]!;
     const html = await response.text();
     assert.match(html, /id="choose-folder"/);
+    assert.match(html, /id="enable-studio"/);
     assert.doesNotMatch(html, /X-Devbot-Setup/i);
     assert.doesNotMatch(html, /sessionToken/);
   });
@@ -70,8 +91,9 @@ test("setup API is bound to the claiming browser session", async (t) => {
   await t.test("the claiming session can call the API", async () => {
     const response = await fetch(`${baseUrl}/api/state`, { headers: { Cookie: claimCookie } });
     assert.equal(response.status, 200);
-    const payload = (await response.json()) as { node?: { ready?: boolean } };
+    const payload = (await response.json()) as { node?: { ready?: boolean }; studioEnabled?: boolean };
     assert.equal(typeof payload.node?.ready, "boolean");
+    assert.equal(typeof payload.studioEnabled, "boolean");
   });
 
   await t.test("a second client cannot re-claim the page", async () => {
@@ -108,4 +130,17 @@ test("setup API is bound to the claiming browser session", async (t) => {
     const api = await fetch(`${baseUrl}/api/state`, { headers: { Cookie: claimCookie } });
     assert.equal(api.status, 200);
   });
+});
+
+test("setup API reports the persisted Studio choice before the environment fallback", async (t) => {
+  const server = await startSetupServer({ studioEnabled: false, envStudioEnabled: true });
+  t.after(async () => {
+    await stopSetupServer(server);
+  });
+  const page = await fetch(`${server.baseUrl}/`);
+  const cookie = (page.headers.get("set-cookie") ?? "").split(";")[0]!;
+  const response = await fetch(`${server.baseUrl}/api/state`, { headers: { Cookie: cookie } });
+  assert.equal(response.status, 200);
+  const payload = (await response.json()) as { studioEnabled?: boolean };
+  assert.equal(payload.studioEnabled, false);
 });

@@ -111,3 +111,15 @@ test("task detail output neutralizes stored mentions including approval actor, r
 test("task log output neutralizes stored mentions in request, result, and error", () => {
   assertMentionSafe(formatTaskLogs(hostileTask()));
 });
+
+test("task detail and logs hide paths from stored model results and failures", () => {
+  const task = {
+    ...hostileTask(),
+    resultPreview: "Changed /Users/bernard/private/result.ts",
+    error: "ENOENT C:\\Users\\bernard\\private\\missing.ts",
+    verification: ["failed at /tmp/devbot-check/output.log"]
+  };
+  const output = `${formatTaskDetail(task)}\n${formatTaskLogs(task)}`;
+  assert.doesNotMatch(output, /\/Users\/bernard|C:\\Users|\/tmp\/devbot-check/);
+  assert.match(output, /\[local path\]/);
+});

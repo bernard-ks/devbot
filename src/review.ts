@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { configuredCommandNames, formatProjectCommandResult, runConfiguredProjectCommand } from "./command-runner.js";
 import type { ProjectCommandResult } from "./command-runner.js";
-import { hardenedGitArguments, hardenedGitEnvironment, redactSensitiveText } from "./security.js";
+import { hardenedGitArguments, hardenedGitEnvironment, redactSensitiveText, sanitizeDiscordOutput } from "./security.js";
 import type { TaskRecord } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
 
@@ -28,7 +28,7 @@ export async function createReviewPacket(project: ProjectEntry, task?: TaskRecor
   const [branch, status, diffStat, lastCommit] = await Promise.all([
     git(project, ["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => "unknown"),
     git(project, ["status", "--short", "--untracked-files=all", "--ignore-submodules=all"])
-      .catch((error) => `Unable to read status: ${redactSensitiveText((error as Error).message)}`),
+      .catch((error) => `Unable to read status: ${sanitizeDiscordOutput((error as Error).message)}`),
     git(project, ["diff", "--stat", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "HEAD"]).catch(() => ""),
     git(project, ["log", "--no-show-signature", "-1", "--oneline"]).catch(() => "unknown")
   ]);
@@ -90,25 +90,25 @@ export function formatReviewPacket(packet: ReviewPacket): string {
       : "- No project validation commands configured yet."
   ];
 
-  return lines.filter((line) => line !== undefined).join("\n");
+  return sanitizeDiscordOutput(lines.filter((line) => line !== undefined).join("\n"));
 }
 
 export function formatValidationResults(project: ProjectEntry, results: ProjectCommandResult[]): string {
-  return [
+  return sanitizeDiscordOutput([
     `Validation for \`${project.name}\`: ${results.every((result) => result.ok) ? "passed" : "failed"}`,
     "",
     ...results.map(formatProjectCommandResult)
-  ].join("\n\n");
+  ].join("\n\n"));
 }
 
 export function formatMergeGateResult(project: ProjectEntry, result: MergeGateResult): string {
-  return [
+  return sanitizeDiscordOutput([
     `Merge gates for \`${project.name}\`: ${result.ok ? "passed" : "blocked"}`,
     `Clean working tree: ${result.cleanWorkingTree ? "yes" : "no"}`,
     `Validation: ${result.validation.every((item) => item.ok) ? "passed" : "failed"}`,
     "",
     ...result.validation.map(formatProjectCommandResult)
-  ].join("\n\n");
+  ].join("\n\n"));
 }
 
 function defaultValidationCommands(project: ProjectEntry): string[] {

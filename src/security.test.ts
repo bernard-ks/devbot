@@ -9,7 +9,7 @@ import { loadCodexConfig, loadProjectEntry } from "./config.js";
 import { ProjectContextService } from "./context.js";
 import { isApprovedProjectScreenshotUrl } from "./project-screenshot.js";
 import { commandRequiresApproval } from "./safety.js";
-import { minimalChildEnvironment, publicErrorMessage, redactSensitiveText } from "./security.js";
+import { minimalChildEnvironment, publicErrorMessage, redactSensitiveText, sanitizeDiscordOutput } from "./security.js";
 import { TaskStore } from "./task-store.js";
 import type { ProjectEntry, ScannerConfig } from "./types.js";
 
@@ -154,6 +154,29 @@ test("configured project commands receive an empty temporary home", async () => 
   await assert.rejects(stat(capture.HOME), /ENOENT/);
 });
 
+test("unknown project command errors do not disclose the local project path", async () => {
+  const root = "/Users/private/workspace/demo";
+  await assert.rejects(
+    runConfiguredProjectCommand(project("demo", root), "missing"),
+    (error: Error) => {
+      assert.match(error.message, /No configured command named missing for demo/);
+      assert.doesNotMatch(error.message, /\/Users\/private|\.devbot\/project\.json/);
+      return true;
+    }
+  );
+});
+
+test("configured command results sanitize command lines and tool output paths", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-command-paths-"));
+  await writeFile(path.join(root, "emit.mjs"), "console.log(process.cwd())\n");
+  const entry = project("demo", root);
+  entry.metadata.commands.presets.paths = `${process.execPath} emit.mjs`;
+  const result = await runConfiguredProjectCommand(entry, "paths", 5_000);
+  assert.equal(result.ok, true);
+  assert.doesNotMatch(`${result.command}\n${result.output}`, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(`${result.command}\n${result.output}`, /\[local path\]/);
+});
+
 test("Discord-facing text redacts known and patterned credentials", () => {
   const environment = { DISCORD_TOKEN: "known-discord-secret" };
   const redacted = redactSensitiveText(
@@ -163,6 +186,21 @@ test("Discord-facing text redacts known and patterned credentials", () => {
   assert.doesNotMatch(redacted, /known-discord-secret|bearer-secret|hunter2/);
   assert.match(redacted, /\[REDACTED\]/);
   assert.doesNotMatch(publicErrorMessage(new Error("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz")), /sk-abcdefghijklmnopqrstuvwxyz/);
+});
+
+test("unexpected Discord output hides local paths without hiding operator commands or web URLs", () => {
+  const sanitized = sanitizeDiscordOutput([
+    "failed at `/Users/bernard/My Project/src/index.ts`",
+    "then C:\\Users\\bernard\\secret\\config.json and file:///tmp/devbot/output.log",
+    "keep /projects, /setup show, src/index.ts, and https://example.com/docs/path"
+  ].join("\n"));
+  assert.doesNotMatch(sanitized, /bernard|My Project|config\.json|\/tmp\/devbot/);
+  assert.match(sanitized, /\[local path\]/);
+  assert.match(sanitized, /\/projects/);
+  assert.match(sanitized, /\/setup show/);
+  assert.match(sanitized, /src\/index\.ts/);
+  assert.match(sanitized, /https:\/\/example\.com\/docs\/path/);
+  assert.doesNotMatch(publicErrorMessage(new Error("ENOENT at /Users/bernard/private/file.ts")), /\/Users\/bernard/);
 });
 
 test("Discord Codex sandboxes reject danger-full-access", () => {

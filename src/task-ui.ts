@@ -26,19 +26,34 @@ export interface ParsedTaskModal {
   taskId: string;
 }
 
+export interface TaskProgressPresentation {
+  access: "write-capable" | "read-only";
+  elapsed: string;
+  title: string;
+  detail: string;
+}
+
 export function formatTaskProgress(progress: TaskProgressEvent, now = new Date()): string {
-  const access = progress.mode === "action" ? "write-capable" : "read-only";
-  const elapsed = formatElapsed(now.getTime() - new Date(progress.startedAt).getTime());
-  const phase = progressPhaseLabel(progress);
+  const presentation = taskProgressPresentation(progress, now);
   return [
     `**${progress.projectName} task**`,
-    `${access} | ${elapsed}`,
+    `${presentation.access} | ${presentation.elapsed}`,
     "",
-    `**${phase.title}**`,
-    truncate(phase.detail, 800),
+    `**${presentation.title}**`,
+    truncate(presentation.detail, 800),
     "",
     `Request: \`${inlineCode(truncate(progress.text, 240))}\``
   ].join("\n");
+}
+
+export function taskProgressPresentation(progress: TaskProgressEvent, now = new Date()): TaskProgressPresentation {
+  const phase = progressPhaseLabel(progress);
+  return {
+    access: progress.mode === "action" ? "write-capable" : "read-only",
+    elapsed: formatElapsed(now.getTime() - new Date(progress.startedAt).getTime()),
+    title: phase.title,
+    detail: phase.detail
+  };
 }
 
 export function formatInterruptedTaskNotice(task: TaskRecord): string {

@@ -5,6 +5,7 @@ import { PermissionFlagsBits, PermissionsBitField } from "discord.js";
 import { commandDefinitions } from "./commands.js";
 import { normalizeProjectName } from "./config.js";
 import { SetupStore } from "./setup-store.js";
+import { UserPreferenceStore } from "./user-preferences.js";
 import { workspaceLauncherView } from "./workspace-ui.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
@@ -31,6 +32,7 @@ export interface SetupFinishInput {
   envFile?: string;
   envTemplateFile?: string;
   setupFile?: string;
+  enableStudio?: boolean;
   fetchImpl?: FetchLike;
 }
 
@@ -45,6 +47,7 @@ export interface SetupFinishResult {
   channelUrl: string;
   repositoryName: string;
   repositoryPath: string;
+  studioEnabled: boolean;
   warnings: string[];
 }
 
@@ -149,6 +152,7 @@ export async function finishInitialSetup(input: SetupFinishInput): Promise<Setup
 
   const setupFile = path.resolve(input.setupFile ?? ".devbot/setup.json");
   const setupStore = new SetupStore(setupFile);
+  const userPreferences = new UserPreferenceStore(path.join(path.dirname(setupFile), "preferences.json"));
   const channel = await ensurePrivateChannel({
     token,
     guild,
@@ -159,7 +163,9 @@ export async function finishInitialSetup(input: SetupFinishInput): Promise<Setup
 
   await setupStore.setRepository(repositoryName, repositoryPath);
   await setupStore.setDefaultProject(repositoryName);
+  await userPreferences.clearSelectedProject(guild.owner_id);
   await setupStore.setPrivateChannel(channel.id);
+  await setupStore.setStudioEnabled(input.enableStudio === true);
 
   const envFile = path.resolve(input.envFile ?? ".env");
   const envTemplateFile = path.resolve(input.envTemplateFile ?? ".env.example");
@@ -170,7 +176,8 @@ export async function finishInitialSetup(input: SetupFinishInput): Promise<Setup
       DISCORD_CLIENT_ID: identity.applicationId,
       DISCORD_GUILD_ID: guild.id,
       DEVBOT_OWNER_USER_ID: guild.owner_id,
-      DEVBOT_AUTO_DEPLOY_COMMANDS: "true"
+      DEVBOT_AUTO_DEPLOY_COMMANDS: "true",
+      DEVBOT_STUDIO_ENABLED: input.enableStudio ? "true" : "false"
     },
     envTemplateFile
   );
@@ -221,6 +228,7 @@ export async function finishInitialSetup(input: SetupFinishInput): Promise<Setup
     channelUrl: `https://discord.com/channels/${guild.id}/${channel.id}`,
     repositoryName,
     repositoryPath,
+    studioEnabled: input.enableStudio === true,
     warnings
   };
 }

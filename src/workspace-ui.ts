@@ -13,7 +13,7 @@ import type { ProjectEntry } from "./types.js";
 const CONTROL_PREFIX = "devbot:workspace:";
 const MODAL_PREFIX = "devbot:workspace-modal:";
 
-export type WorkspaceAction = "open" | "ask" | "act" | "status" | "recent" | "inbox" | "refresh" | "project";
+export type WorkspaceAction = "open" | "ask" | "act" | "status" | "recent" | "inbox" | "studio" | "refresh" | "project";
 export type WorkspaceModalAction = "ask" | "act";
 
 export interface WorkspaceControl {
@@ -30,6 +30,7 @@ export interface WorkspacePanelInput {
   projects: ProjectEntry[];
   selectedProject: ProjectEntry;
   canControl: boolean;
+  studioEnabled: boolean;
   safeMode: boolean;
   status: string;
   recentTasks: TaskRecord[];
@@ -109,6 +110,11 @@ export function workspacePanelView(input: WorkspacePanelInput) {
       .setStyle(input.needsAttentionCount ? ButtonStyle.Danger : ButtonStyle.Secondary)
   );
   const utilityControls = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${CONTROL_PREFIX}studio:${input.selectedProject.name}`)
+      .setLabel(input.studioEnabled ? "Open Studio" : "Studio off")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(!input.canControl || !input.studioEnabled),
     new ButtonBuilder()
       .setCustomId(`${CONTROL_PREFIX}refresh:${input.selectedProject.name}`)
       .setLabel("Refresh")
@@ -226,7 +232,7 @@ function sectionLines(status: string, heading: string): string[] {
 }
 
 function isWorkspaceAction(value: string | undefined): value is WorkspaceAction {
-  return value === "open" || value === "ask" || value === "act" || value === "status" || value === "recent" || value === "inbox" || value === "refresh" || value === "project";
+  return value === "open" || value === "ask" || value === "act" || value === "status" || value === "recent" || value === "inbox" || value === "studio" || value === "refresh" || value === "project";
 }
 
 function isSafeProjectName(value: string): boolean {
