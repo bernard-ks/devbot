@@ -6,8 +6,11 @@ For a first installation:
 
 ```bash
 npm install
+npm run browsers:install
 npm run setup
 ```
+
+On a fresh Linux host, use `npx playwright install --with-deps chromium` so screenshot capture and its E2E check have the required system packages.
 
 The local browser tool requires Node.js 20+ and a signed-in Codex CLI, validates Discord, opens the bot install flow, discovers the selected server, registers a repository, creates the private room, posts the workspace launcher, writes protected local state, deploys commands, and requests a Devbot start. The setup session remains available for 30 minutes. You must explicitly confirm that Discord's owner of the selected server should become the immutable bootstrap owner; the person opening the local page is not assumed to be that owner. Setup also records whether screenshots for the first repository are allowed, approval-gated, or blocked.
 

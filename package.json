@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "tsc -p tsconfig.json --noEmit --noUnusedLocals --noUnusedParameters",
     "commands:deploy": "tsx src/deploy-commands.ts",
+    "browsers:install": "playwright install chromium",
     "setup": "tsx src/setup-app.ts",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",

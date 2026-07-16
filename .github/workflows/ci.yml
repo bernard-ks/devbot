@@ -23,5 +23,6 @@ jobs:
           cache: npm
       - run: npm install --global npm@11.13.0
       - run: npm ci
+      - run: npx playwright install --with-deps chromium
       - run: npm run check
       - run: npm audit --omit=dev

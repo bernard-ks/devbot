@@ -32,8 +32,11 @@ Prerequisites: Node.js 20 or newer, a signed-in Codex CLI or app, and a Discord 
 
    ```bash
    npm install
+   npm run browsers:install
    npm run setup
    ```
+
+   On Linux, use `npx playwright install --with-deps chromium` instead when Chromium system dependencies are not already installed.
 
 2. The setup page opens in your browser. Discord requires one manual platform step: create an application in the [Developer Portal](https://discord.com/developers/applications), open **Bot**, reset the token, and paste that token into the local setup page. Devbot then:
 
