@@ -15,8 +15,8 @@
     "setup": "tsx src/setup-app.ts",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "test": "npm run build && node --test \"dist/**/*.test.js\"",
-    "coverage": "npm run build && node --test --experimental-test-coverage \"dist/**/*.test.js\"",
+    "test": "npm run build && node scripts/run-tests.mjs",
+    "coverage": "npm run build && node scripts/run-tests.mjs --experimental-test-coverage",
     "check": "npm run lint && npm test"
   },
   "dependencies": {

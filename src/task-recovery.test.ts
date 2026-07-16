@@ -418,7 +418,6 @@ test("a child that survives the post-SIGKILL wait is reported unconfirmed, not k
     stdio: "ignore",
     detached: true
   });
-  child.unref();
   assert.ok(child.pid);
   const exited = new Promise((resolve) => child.once("exit", resolve));
   try {
