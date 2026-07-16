@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import {
@@ -7,6 +7,7 @@ import {
   PRIVATE_DIRECTORY_MODE,
   PRIVATE_FILE_MODE
 } from "./security.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 import type { AppConfig, ProjectEntry } from "./types.js";
 
 export type PeerAction = "capabilities" | "status" | "snip" | "plan" | "review" | "validate";
@@ -58,33 +59,43 @@ const DISCORD_PEER_ENVELOPE_LENGTH = 1_950;
 
 export class PeerStore {
   private state: PeerStateFile | undefined;
+  private mutationTail: Promise<void> = Promise.resolve();
 
-  constructor(private readonly stateFile = path.resolve(".devbot", "peers.json")) {}
+  constructor(private readonly stateFile = defaultRuntimeStatePath("peers.json")) {}
 
   async upsert(botId: string, capabilities: PeerCapabilities): Promise<void> {
-    const state = await this.load();
-    const existing = state.peers.find((peer) => peer.botId === botId);
-    const record: PeerRecord = {
-      botId,
-      owner: capabilities.owner,
-      botName: capabilities.botName,
-      projects: capabilities.projects,
-      commands: capabilities.commands,
-      supportsScreenshots: capabilities.supportsScreenshots,
-      safeMode: capabilities.safeMode,
-      lastSeenAt: new Date().toISOString()
+    const snapshot: PeerCapabilities = {
+      ...capabilities,
+      projects: [...capabilities.projects],
+      commands: [...capabilities.commands]
     };
+    return this.serializeMutation(async () => {
+      const state = clonePeerState(await this.load());
+      const existing = state.peers.find((peer) => peer.botId === botId);
+      const record: PeerRecord = {
+        botId,
+        owner: snapshot.owner,
+        botName: snapshot.botName,
+        projects: snapshot.projects,
+        commands: snapshot.commands,
+        supportsScreenshots: snapshot.supportsScreenshots,
+        safeMode: snapshot.safeMode,
+        lastSeenAt: new Date().toISOString()
+      };
 
-    if (existing) {
-      Object.assign(existing, record);
-    } else {
-      state.peers.unshift(record);
-    }
-    await this.save();
+      if (existing) {
+        Object.assign(existing, record);
+      } else {
+        state.peers.unshift(record);
+      }
+      await this.save(state);
+      this.state = state;
+    });
   }
 
   async list(): Promise<PeerRecord[]> {
-    return (await this.load()).peers;
+    await this.mutationTail;
+    return clonePeerState(await this.load()).peers;
   }
 
   private async load(): Promise<PeerStateFile> {
@@ -92,32 +103,90 @@ export class PeerStore {
       return this.state;
     }
 
+    let raw: string;
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, "utf8")) as PeerStateFile;
-      await hardenPrivateFilePermissions(this.stateFile);
-      this.state = { version: 1, peers: Array.isArray(parsed.peers) ? parsed.peers : [] };
-    } catch {
+      raw = await readFile(this.stateFile, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`Unable to read peer state at ${this.stateFile}: ${(error as Error).message}`, { cause: error });
+      }
       this.state = { version: 1, peers: [] };
+      return this.state;
     }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`Peer state at ${this.stateFile} contains invalid JSON and was left unchanged.`, { cause: error });
+    }
+    if (!isPeerStateFile(parsed)) {
+      throw new Error(`Peer state at ${this.stateFile} has an unsupported or invalid structure and was left unchanged.`);
+    }
+
+    await hardenPrivateFilePermissions(this.stateFile);
+    this.state = clonePeerState(parsed);
     return this.state;
   }
 
-  private async save(): Promise<void> {
-    if (!this.state) {
-      return;
-    }
-
+  private async save(state: PeerStateFile): Promise<void> {
     const directory = path.dirname(this.stateFile);
     await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
     await hardenPrivateDirectoryPermissions(directory);
     const tempFile = `${this.stateFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-    await writeFile(tempFile, `${JSON.stringify(this.state, null, 2)}\n`, {
-      encoding: "utf8",
-      flag: "wx",
-      mode: PRIVATE_FILE_MODE
-    });
-    await rename(tempFile, this.stateFile);
+    try {
+      await writeFile(tempFile, `${JSON.stringify(state, null, 2)}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: PRIVATE_FILE_MODE
+      });
+      await rename(tempFile, this.stateFile);
+      await hardenPrivateFilePermissions(this.stateFile);
+    } finally {
+      await rm(tempFile, { force: true }).catch(() => undefined);
+    }
   }
+
+  private serializeMutation(operation: () => Promise<void>): Promise<void> {
+    const result = this.mutationTail.then(operation);
+    this.mutationTail = result.catch(() => undefined);
+    return result;
+  }
+}
+
+function clonePeerState(state: PeerStateFile): PeerStateFile {
+  return {
+    version: 1,
+    peers: state.peers.map((peer) => ({
+      ...peer,
+      projects: [...peer.projects],
+      commands: [...peer.commands]
+    }))
+  };
+}
+
+function isPeerStateFile(value: unknown): value is PeerStateFile {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as { version?: unknown; peers?: unknown };
+  return candidate.version === 1 && Array.isArray(candidate.peers) && candidate.peers.every(isPeerRecord);
+}
+
+function isPeerRecord(value: unknown): value is PeerRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<Record<keyof PeerRecord, unknown>>;
+  return typeof candidate.botId === "string" && candidate.botId.length > 0
+    && typeof candidate.owner === "string"
+    && typeof candidate.botName === "string"
+    && isStringArray(candidate.projects)
+    && isStringArray(candidate.commands)
+    && typeof candidate.supportsScreenshots === "boolean"
+    && typeof candidate.safeMode === "boolean"
+    && typeof candidate.lastSeenAt === "string"
+    && Number.isFinite(Date.parse(candidate.lastSeenAt));
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
 export function buildCapabilities(appConfig: AppConfig, botUserId: string | undefined): PeerCapabilities {

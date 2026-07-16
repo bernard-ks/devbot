@@ -6,22 +6,28 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import path from "node:path";
 import { normalizeProjectName, resolveCodexBin } from "./config.js";
 import { isRuntimeRunning, runtimeLockPath } from "./runtime-lock.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
+import { acquireRuntimeStateLease } from "./runtime-state.js";
 import { minimalChildEnvironment, publicErrorMessage } from "./security.js";
 import {
   buildDiscordInstallUrl,
   finishInitialSetup,
   listDiscordBotGuilds,
   validateDiscordBotToken,
-  type DiscordBotIdentity
+  type DiscordBotIdentity,
+  type SetupScreenshotPolicy
 } from "./setup-core.js";
 import { renderSetupPage } from "./setup-page.js";
 import { SetupStore } from "./setup-store.js";
 
 const host = "127.0.0.1";
-const sessionExpiresAt = Date.now() + 10 * 60_000;
+const sessionExpiresAt = Date.now() + 30 * 60_000;
 const pageCookieName = "devbot_setup";
 const cwd = process.cwd();
-const setupFile = path.resolve(process.env.DEVBOT_SETUP_STORE?.trim() || path.join(cwd, ".devbot/setup.json"));
+const runtimeStateLease = acquireRuntimeStateLease({
+  primaryLock: runtimeLockPath(process.env.DEVBOT_RUNTIME_LOCK)
+});
+const setupFile = path.resolve(process.env.DEVBOT_SETUP_STORE?.trim() || defaultRuntimeStatePath("setup.json"));
 const setupStore = new SetupStore(setupFile);
 const session: { token?: string; identity?: DiscordBotIdentity; botProcess?: ChildProcess } = {
   ...(process.env.DISCORD_TOKEN?.trim() ? { token: process.env.DISCORD_TOKEN.trim() } : {})
@@ -60,6 +66,7 @@ server.listen(0, host, async () => {
 
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
+process.once("exit", () => runtimeStateLease.release());
 
 async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const cspNonce = randomBytes(16).toString("base64");
@@ -111,7 +118,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
 
   if (request.method === "GET" && url.pathname === "/api/state") {
     await hydrateExistingIdentity();
-    const [node, codex] = await Promise.all([checkNode(), checkCodex()]);
+    const { node, codex } = await checkPrerequisites();
     const guilds = session.token && session.identity ? await listDiscordBotGuilds(session.token).catch(() => []) : [];
     sendJson(response, 200, {
       node,
@@ -153,12 +160,20 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   if (request.method === "POST" && url.pathname === "/api/finish") {
     requireDiscordSession();
     const body = await readJsonBody(request);
+    const { node, codex } = await checkPrerequisites();
+    if (!node.ready || !codex.ready) {
+      throw new Error("Finish the System check before completing setup. Devbot requires Node.js 20+ and a signed-in Codex CLI.");
+    }
+    if (body.confirmGuildOwner !== true) {
+      throw new Error("Confirm that the selected Discord server owner should become Devbot's bootstrap owner.");
+    }
     const result = await finishInitialSetup({
       token: session.token!,
       guildId: stringField(body, "guildId"),
       repositoryName: stringField(body, "repositoryName"),
       repositoryPath: stringField(body, "repositoryPath"),
       enableStudio: body.enableStudio === true,
+      screenshotPolicy: screenshotPolicyField(body),
       envFile: path.join(cwd, ".env"),
       envTemplateFile: path.join(cwd, ".env.example"),
       setupFile
@@ -168,15 +183,24 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     process.env.DISCORD_GUILD_ID = result.guildId;
     process.env.DEVBOT_OWNER_USER_ID = result.ownerId;
     process.env.DEVBOT_STUDIO_ENABLED = result.studioEnabled ? "true" : "false";
+    runtimeStateLease.release();
     const alreadyRunning = isRuntimeRunning(runtimeLockPath(process.env.DEVBOT_RUNTIME_LOCK));
-    sendJson(response, 200, { ...result, alreadyRunning });
+    let runtimeStatus: "already-running" | "starting" | "manual-start" | "start-failed";
+    const warnings = [...result.warnings];
+    if (alreadyRunning) {
+      runtimeStatus = "already-running";
+    } else if (process.env.DEVBOT_SETUP_NO_START === "true") {
+      runtimeStatus = "manual-start";
+    } else {
+      const start = await startDevbot();
+      runtimeStatus = start.started ? "starting" : "start-failed";
+      if (start.warning) warnings.push(start.warning);
+    }
+    sendJson(response, 200, { ...result, warnings, alreadyRunning, runtimeStatus });
     delete session.token;
     delete session.identity;
     clearTimeout(sessionExpiryTimer);
     server.close();
-    if (!alreadyRunning && process.env.DEVBOT_SETUP_NO_START !== "true") {
-      setTimeout(startDevbot, 500);
-    }
     return;
   }
 
@@ -205,29 +229,73 @@ async function checkNode(): Promise<{ ready: boolean; version: string }> {
 
 async function checkCodex(): Promise<{ ready: boolean; label: string }> {
   const bin = resolveCodexBin(process.env.CODEX_BIN);
+  const version = await runCodexCheck(bin, ["--version"]);
+  if (!version.ok) return { ready: false, label: "Codex CLI not found" };
+  const login = await runCodexCheck(bin, ["login", "status"]);
+  if (!login.ok) return { ready: false, label: "Codex CLI found; sign in with codex login" };
+  const versionLabel = version.output.split(/\r?\n/)[0] || "Codex CLI";
+  return { ready: true, label: `${versionLabel} · signed in` };
+}
+
+async function checkPrerequisites(): Promise<{
+  node: { ready: boolean; version: string };
+  codex: { ready: boolean; label: string };
+}> {
+  const [node, codex] = await Promise.all([checkNode(), checkCodex()]);
+  return { node, codex };
+}
+
+function runCodexCheck(bin: string, args: string[]): Promise<{ ok: boolean; output: string }> {
   return new Promise((resolve) => {
-    execFile(bin, ["--version"], { env: minimalChildEnvironment(process.env, "codex"), timeout: 5_000 }, (error, stdout) => {
-      if (error) {
-        resolve({ ready: false, label: "Codex CLI not found" });
-        return;
-      }
-      resolve({ ready: true, label: stdout.trim().split(/\r?\n/)[0] || "Codex ready" });
+    execFile(bin, args, { env: minimalChildEnvironment(process.env, "codex"), timeout: 5_000 }, (error, stdout, stderr) => {
+      resolve({ ok: !error, output: `${stdout}\n${stderr}`.trim() });
     });
   });
 }
 
-function startDevbot(): void {
-  if (session.botProcess && session.botProcess.exitCode === null) return;
+function startDevbot(): Promise<{ started: boolean; warning?: string }> {
+  if (session.botProcess && session.botProcess.exitCode === null) return Promise.resolve({ started: true });
   const npm = process.platform === "win32" ? "npm.cmd" : "npm";
   console.log("");
-  console.log("Setup complete. Starting Devbot; keep this terminal open.");
-  session.botProcess = spawn(npm, ["run", "dev"], {
-    cwd,
-    env: process.env,
-    stdio: "inherit"
-  });
-  session.botProcess.once("exit", (code) => {
-    console.log(`Devbot stopped${code === null ? "." : ` with exit code ${code}.`}`);
+  console.log("Setup saved. Starting Devbot; keep this terminal open while it signs in.");
+  return new Promise((resolve) => {
+    const child = spawn(npm, ["run", "dev"], {
+      cwd,
+      env: process.env,
+      stdio: "inherit"
+    });
+    session.botProcess = child;
+    let settled = false;
+    let survivalTimer: NodeJS.Timeout | undefined;
+    child.once("spawn", () => {
+      survivalTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ started: true });
+      }, 750);
+    });
+    child.once("error", (error) => {
+      if (survivalTimer) clearTimeout(survivalTimer);
+      const message = `Devbot could not be started automatically: ${publicErrorMessage(error)}. Run npm run dev in this repository.`;
+      console.error(message);
+      delete session.botProcess;
+      if (!settled) {
+        settled = true;
+        resolve({ started: false, warning: message });
+      }
+    });
+    child.once("exit", (code) => {
+      console.log(`Devbot stopped${code === null ? "." : ` with exit code ${code}.`}`);
+      if (!settled) {
+        if (survivalTimer) clearTimeout(survivalTimer);
+        settled = true;
+        delete session.botProcess;
+        resolve({
+          started: false,
+          warning: `Devbot exited before startup completed${code === null ? "." : ` (exit code ${code}).`} Run npm run dev and review the terminal output.`
+        });
+      }
+    });
   });
 }
 
@@ -235,6 +303,9 @@ function openBrowser(url: string): void {
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
   const child = spawn(command, args, { detached: true, env: setupUtilityEnvironment(), stdio: "ignore" });
+  child.once("error", (error) => {
+    console.warn(`Unable to open the setup browser automatically: ${publicErrorMessage(error)}. Open ${url} manually.`);
+  });
   child.unref();
 }
 
@@ -299,6 +370,15 @@ function stringField(body: Record<string, unknown>, name: string): string {
   return value.trim();
 }
 
+function screenshotPolicyField(body: Record<string, unknown>): SetupScreenshotPolicy {
+  const value = body.screenshotPolicy;
+  if (value === undefined) return "approval";
+  if (value !== "allow" && value !== "approval" && value !== "deny") {
+    throw new Error("Screenshot policy must be allow, approval, or deny.");
+  }
+  return value;
+}
+
 function hasClaimedSession(request: IncomingMessage): boolean {
   if (!pageClaim) return false;
   return safeEqual(readCookie(request.headers.cookie, pageCookieName), pageClaim);
@@ -334,6 +414,7 @@ function friendlyError(error: unknown): string {
 
 function shutdown(): void {
   clearTimeout(sessionExpiryTimer);
+  runtimeStateLease.release();
   if (session.botProcess && session.botProcess.exitCode === null) {
     session.botProcess.kill("SIGTERM");
   }

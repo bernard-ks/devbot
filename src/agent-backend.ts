@@ -84,6 +84,9 @@ export interface BackendAvailability {
   /** The installed CLI passed this backend's required-flag/verification probe. */
   compatible: boolean;
   compatibilityError?: string;
+  /** Authentication was checked and is currently usable. Undefined means this backend has no auth probe. */
+  authenticated?: boolean;
+  authenticationError?: string;
   capabilities: BackendCapabilities;
   version?: string;
   error?: string;
@@ -172,6 +175,8 @@ export function parseVersionOutput(raw: string): string | undefined {
 interface DetectResult {
   installed: boolean;
   stdout: string;
+  /** Omitted by injected probes for backwards compatibility; only explicit false is a failed invocation. */
+  ok?: boolean;
   error?: string;
 }
 
@@ -191,7 +196,7 @@ function probeCli(bin: string, args: readonly string[], timeoutMs = 5_000): Prom
     let settled = false;
     const timer = setTimeout(() => {
       child?.kill("SIGKILL");
-      finish({ installed: true, stdout, error: "CLI probe timed out" });
+      finish({ installed: true, stdout, ok: false, error: "CLI probe timed out" });
     }, timeoutMs);
     const finish = (result: DetectResult): void => {
       if (settled) {
@@ -208,10 +213,16 @@ function probeCli(bin: string, args: readonly string[], timeoutMs = 5_000): Prom
       stderr += chunk.toString("utf8");
     });
     child.on("error", (error: NodeJS.ErrnoException) => {
-      finish({ installed: error.code !== "ENOENT", stdout, error: error.message });
+      finish({ installed: error.code !== "ENOENT", stdout, ok: false, error: error.message });
     });
-    child.on("close", () => {
-      finish({ installed: true, stdout: stdout || stderr });
+    child.on("close", (code) => {
+      const output = stdout || stderr;
+      finish({
+        installed: true,
+        stdout: output,
+        ok: code === 0,
+        ...(code === 0 ? {} : { error: output.trim() || `CLI exited with status ${code ?? "unknown"}` })
+      });
     });
   });
 }
@@ -226,6 +237,10 @@ function probeCli(bin: string, args: readonly string[], timeoutMs = 5_000): Prom
 interface BackendDefinition extends Omit<AgentBackend, "detect"> {
   requiredFlags?: readonly string[];
   verificationGap?: string;
+  authenticationProbe?: {
+    args: readonly string[];
+    failureMessage: string;
+  };
 }
 
 const detectionCache = new Map<string, Promise<BackendAvailability>>();
@@ -251,6 +266,19 @@ async function resolveCompatibility(
   return { compatible: true };
 }
 
+async function resolveAuthentication(
+  backend: BackendDefinition,
+  probe: CliProbe
+): Promise<{ authenticated?: boolean; authenticationError?: string }> {
+  if (!backend.authenticationProbe) return {};
+  const result = await probe(backend.binary, backend.authenticationProbe.args);
+  if (result.installed && result.ok !== false && !result.error) return { authenticated: true };
+  return {
+    authenticated: false,
+    authenticationError: backend.authenticationProbe.failureMessage
+  };
+}
+
 function detectBackend(backend: BackendDefinition, probe: CliProbe): Promise<BackendAvailability> {
   const cacheKey = `${backend.id}:${backend.binary}`;
   const cached = detectionCache.get(cacheKey);
@@ -262,6 +290,9 @@ function detectBackend(backend: BackendDefinition, probe: CliProbe): Promise<Bac
     const compatibility = result.installed
       ? await resolveCompatibility(backend, probe)
       : { compatible: false as const };
+    const authentication = result.installed && compatibility.compatible
+      ? await resolveAuthentication(backend, probe)
+      : {};
     return {
       id: backend.id,
       displayName: backend.displayName,
@@ -270,6 +301,7 @@ function detectBackend(backend: BackendDefinition, probe: CliProbe): Promise<Bac
       experimental: backend.experimental,
       compatible: compatibility.compatible,
       ...(compatibility.compatibilityError ? { compatibilityError: compatibility.compatibilityError } : {}),
+      ...authentication,
       capabilities: backend.capabilities,
       ...(version ? { version } : {}),
       ...(result.error && !result.installed ? { error: result.error } : {})
@@ -421,6 +453,10 @@ export function createCodexBackend(codex: CodexConfig, env: NodeJS.ProcessEnv = 
       experimental: false,
       usesOutputFile: true,
       usesRuntimeHome: false,
+      authenticationProbe: {
+        args: ["login", "status"],
+        failureMessage: "Codex CLI is installed but signed out. Run `codex login`, then retry."
+      },
       capabilities: CODEX_CAPABILITIES,
       buildAnswerCommand: (options) => buildCodexArgs(options, codex, codex.sandbox, env),
       buildActionCommand: (options) => buildCodexArgs(options, codex, codex.actionSandbox, env)

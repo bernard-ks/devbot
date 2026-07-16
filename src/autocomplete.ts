@@ -54,7 +54,7 @@ export function taskChoices(tasks: TaskRecord[], focused: string): AutocompleteC
     .filter((task) => searchableTaskText(task).includes(query))
     .slice(0, 25)
     .map((task) => ({
-      name: `${task.id} | ${task.status} ${task.mode} ${task.projectName}`,
+      name: truncateChoiceLabel(`${taskStatusLabel(task.status)} | ${task.projectName} | ${task.text || task.id}`, MAX_CHOICE_NAME_LENGTH),
       value: task.id
     }));
 }
@@ -82,7 +82,16 @@ export function memoryChoices(entries: MemoryEntry[], focused: string): Autocomp
 }
 
 function searchableTaskText(task: TaskRecord): string {
-  return `${task.id} ${task.status} ${task.mode} ${task.projectName} ${task.source}`.toLowerCase();
+  return `${task.id} ${task.status} ${task.mode} ${task.projectName} ${task.source} ${task.text}`.toLowerCase();
+}
+
+function taskStatusLabel(status: TaskRecord["status"]): string {
+  if (status === "awaiting-approval") return "Approval needed";
+  if (status === "succeeded") return "Done";
+  if (status === "failed") return "Needs attention";
+  if (status === "canceled") return "Canceled";
+  if (status === "interrupted") return "Interrupted";
+  return "Working";
 }
 
 function searchableMemoryText(entry: MemoryEntry): string {

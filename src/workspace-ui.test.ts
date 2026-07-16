@@ -50,6 +50,7 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
     projects: [pullprice, api],
     selectedProject: pullprice,
     canControl: false,
+    actionEnabled: true,
     studioEnabled: true,
     safeMode: false,
     status,
@@ -72,6 +73,7 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
     projects: [pullprice],
     selectedProject: pullprice,
     canControl: true,
+    actionEnabled: true,
     studioEnabled: true,
     safeMode: false,
     status,
@@ -90,6 +92,7 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
     projects: [pullprice],
     selectedProject: pullprice,
     canControl: true,
+    actionEnabled: false,
     studioEnabled: false,
     safeMode: false,
     status,
@@ -100,6 +103,11 @@ test("workspace panel is project-aware and keeps write controls role-aware", () 
   );
   assert.equal(disabledStudio && "disabled" in disabledStudio ? disabledStudio.disabled : undefined, true);
   assert.match(JSON.stringify(disabledStudio), /Studio off/);
+  const unavailableChange = studioOff.components[0]?.toJSON().components.find(
+    (component) => "custom_id" in component && component.custom_id.includes(":act:")
+  );
+  assert.equal(unavailableChange && "disabled" in unavailableChange ? unavailableChange.disabled : undefined, true);
+  assert.match(JSON.stringify(unavailableChange), /Changes unavailable/);
 });
 
 test("workspace status compaction preserves now risk and next", () => {

@@ -9,7 +9,9 @@ npm install
 npm run setup
 ```
 
-The local browser tool validates Discord, opens the bot install flow, discovers the selected server, chooses the server owner as the bootstrap owner, registers a repository, creates the private room, posts the workspace launcher, writes ignored local state, deploys commands, and starts Devbot.
+The local browser tool requires Node.js 20+ and a signed-in Codex CLI, validates Discord, opens the bot install flow, discovers the selected server, registers a repository, creates the private room, posts the workspace launcher, writes protected local state, deploys commands, and requests a Devbot start. The setup session remains available for 30 minutes. You must explicitly confirm that Discord's owner of the selected server should become the immutable bootstrap owner; the person opening the local page is not assumed to be that owner. Setup also records whether screenshots for the first repository are allowed, approval-gated, or blocked.
+
+The final page says **Setup saved** and reports the actual next state: starting, already running and requiring a restart, manual start required, or automatic start failed. It also displays provisioning warnings such as a workspace launcher that Discord refused to post. Treat the bot as ready only after the terminal confirms that it logged in to Discord.
 
 For an already-configured installation:
 
@@ -88,7 +90,7 @@ Safety and fallback rules:
 - A private task thread is preferred. If Discord cannot create it, an unrestricted proposal can remain in the configured private room; a scoped proposal is closed before it is published. If a project room is not private, `/setup project-room` refuses the binding.
 - If the target is not a Git repository, the worktree path would be unsafe, the branch/path already exists, or Git worktree support fails, Devbot stops before granting write access and records the isolation blocker.
 - Scoped project audiences do not receive channel-mention results; use the ephemeral dashboard or `/ask` path instead.
-- Completed, declined, failed, canceled, and interrupted tasks retain their state in `.devbot/tasks.json`; task controls become unavailable when the saved state no longer permits the requested action.
+- Completed, declined, failed, canceled, and interrupted tasks retain their state in the protected runtime store (`~/.devbot/state/tasks.json` by default); task controls become unavailable when the saved state no longer permits the requested action.
 
 Bind a project room as the owner:
 
@@ -97,9 +99,9 @@ Bind a project room as the owner:
 /setup project-room action:remove project:webapp
 ```
 
-The channel must be a private server text channel or private thread, and every visible member must satisfy both the Devbot and project allowlists. Devbot rechecks bound-room privacy and periodically revalidates its effective audience. In a bound room, the bound project is selected automatically and a mention naming another project is rejected with a pointer to that project's room.
+The channel must be a private server text channel or private thread, and every visible member must satisfy both the Devbot and project allowlists. Roles with `Administrator` (and, for private threads, `Manage Threads`) can bypass ordinary membership or channel denies, so Devbot refuses the binding unless those elevated roles are explicitly allowed at both scopes. Devbot rechecks bound-room privacy and periodically revalidates its effective audience. In a bound room, the bound project is selected automatically and a mention naming another project is rejected with a pointer to that project's room.
 
-When Devbot restarts, saved tasks that were still marked running are recovered as canceled with an interruption reason. This keeps the workspace from presenting orphaned work as active after a process restart.
+When Devbot restarts, saved tasks that were still marked running are recovered as `interrupted`, with their isolated workspace and evidence preserved. Retry and dismiss controls make the recovery decision explicit instead of presenting orphaned work as active.
 
 Configure project roots with `config/projects.json`:
 
@@ -197,25 +199,36 @@ npm run commands:deploy
 
 ## Runtime State
 
-By default, devbot writes local runtime state under `.devbot/` in this repo:
+By default, Devbot writes protected local runtime state under `~/.devbot/state`:
 
-- `.devbot/tasks.json`
-- `.devbot/peers.json`
-- `.devbot/collab.json`
-- `.devbot/setup.json`
-- `.devbot/preferences.json`
-- `.devbot/runtime.pid`
+- `~/.devbot/state/tasks.json`
+- `~/.devbot/state/executions.json`
+- `~/.devbot/state/previews.json`
+- `~/.devbot/state/peers.json`
+- `~/.devbot/state/collab.json`
+- `~/.devbot/state/setup.json`
+- `~/.devbot/state/preferences.json`
+- `~/.devbot/state/screenshot-fixes.json`
+- `~/.devbot/state/commands.sha256`
+- `~/.devbot/state/memory/`
+- `~/.devbot/state/captures/`
+- `~/.devbot/state/runtime.pid`
 
-Override these paths with:
+Set `DEVBOT_STATE_DIR` to move the whole runtime root. Override individual paths with:
 
 - `DEVBOT_TASK_STORE`
+- `DEVBOT_EXECUTION_STORE`
+- `DEVBOT_PREVIEW_STORE`
 - `DEVBOT_PEER_STORE`
 - `DEVBOT_COLLAB_STORE`
 - `DEVBOT_SETUP_STORE`
 - `DEVBOT_PREFERENCES_STORE`
+- `DEVBOT_MEMORY_STORE`
+- `DEVBOT_SNAPFIX_STORE`
 - `DEVBOT_RUNTIME_LOCK`
 
-Relative override paths are resolved from the devbot process working directory.
+Relative override paths are resolved from the Devbot process working directory. Recognized legacy runtime files under this repository's `.devbot/` directory migrate on first use; repository-owned `.devbot/project.json` metadata stays in place.
+During the transition from checkout-local state, a running Devbot also holds `.devbot/runtime.pid` as a compatibility fence so an older release cannot start against the legacy ledgers. It is removed on a clean shutdown and is never packed into agent context.
 Use absolute paths if you want state stored outside this repo.
 
 These files are intentionally not committed.
@@ -318,7 +331,7 @@ Use `/lab` for private devbot collaboration in Discord:
 /lab safety project:webapp
 ```
 
-Lab sessions persist workroom state to `.devbot/collab.json`. The store tracks lifecycle phase, stable participants, correlated peer invitations, sealed contributions, synthesis, decisions, and an event timeline. Existing version 1 files are migrated in memory and saved as version 2 after the next mutation. Malformed state fails loudly rather than being replaced.
+Lab sessions persist workroom state to `~/.devbot/state/collab.json` by default. The store tracks lifecycle phase, stable participants, correlated peer invitations, sealed contributions, synthesis, decisions, and an event timeline. Existing version 1 files are migrated in memory and saved as version 2 after the next mutation. Malformed state fails loudly rather than being replaced.
 
 Run only one Devbot process against a given collaboration state file. In-process mutations are serialized and written atomically, but the JSON backend is not a multi-process database. Give each bot its own `DEVBOT_COLLAB_STORE` path.
 
@@ -343,8 +356,9 @@ Recommended flow:
 1. Ask Devbot to implement with `/do`.
 2. Open the response's **Details** button or use `/task show <id>`.
 3. Generate `/review packet project:<name> task:<id>`.
-4. Run `/review validate project:<name>`.
-5. Run `/review gates project:<name>`.
-6. Commit, push, and merge outside devbot unless you have added a separate controlled merge integration.
+4. Have an owner/controller create the reviewed task commit with `/task commit task:<id>`.
+5. Run `/review validate project:<name> task:<id>` against that exact isolated checkout.
+6. Run `/review gates project:<name> task:<id>` against the same branch.
+7. Push and merge outside Devbot unless you have added a separate controlled provider integration.
 
-`/review gates` checks that the working tree is clean and configured validation commands pass. It does not merge.
+`/review gates` checks that the selected checkout is clean and its configured validation commands pass. Supplying `task:<id>` is what binds the evidence to the task worktree and branch; omitting it intentionally checks the source checkout. Devbot does not merge.

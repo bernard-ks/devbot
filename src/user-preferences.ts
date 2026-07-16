@@ -4,6 +4,7 @@ import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { normalizeProjectName } from "./config.js";
 import { hardenPrivateDirectoryPermissions, PRIVATE_DIRECTORY_MODE } from "./security.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 
 interface UserPreferenceState {
   version: 1;
@@ -20,7 +21,7 @@ export class UserPreferenceStore {
   private mutationQueue: Promise<void> = Promise.resolve();
   private readonly filePath: string;
 
-  constructor(filePath = ".devbot/preferences.json") {
+  constructor(filePath = defaultRuntimeStatePath("preferences.json")) {
     this.filePath = path.resolve(filePath);
     this.state = loadState(this.filePath);
   }

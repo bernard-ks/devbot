@@ -42,7 +42,7 @@ All fan-out requests share one `conversationId`, but each invited peer gets its 
 
 ## Workroom lifecycle
 
-Persistent workrooms are stored in `.devbot/collab.json` by default. A sealed council normally moves through these phases:
+Persistent workrooms are stored in `~/.devbot/state/collab.json` by default. A sealed council normally moves through these phases:
 
 1. `collecting`: Two to four role-based local agent seats run independently in parallel, invited peer proposals are accepted, and every answer remains sealed. One additional challenge may also be added without seeing other proposals.
 2. `deliberating`: Reveal makes all collected contributions visible and closes collection; late peer results are not accepted as council contributions.

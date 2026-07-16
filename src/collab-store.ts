@@ -9,6 +9,7 @@ import {
   PRIVATE_DIRECTORY_MODE,
   PRIVATE_FILE_MODE
 } from "./security.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 
 export type WorkroomPhase = "collecting" | "deliberating" | "synthesized" | "decided" | "closed";
 export type ParticipantState = "active" | "invited" | "contributed";
@@ -91,7 +92,7 @@ export class CollabStore {
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(
-    private readonly stateFile = path.resolve(".devbot", "collab.json"),
+    private readonly stateFile = defaultRuntimeStatePath("collab.json"),
     private readonly maxConversations = 200,
     private readonly maxEvents = 1_000,
     private readonly maxContributions = 1_000,

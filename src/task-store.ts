@@ -10,6 +10,7 @@ import {
   sanitizeDiscordOutput
 } from "./security.js";
 import { neutralizeMentions } from "./messages.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 
 export type TaskStatus = "awaiting-approval" | "running" | "succeeded" | "failed" | "canceled" | "interrupted";
 export type TaskAttention = "approval" | "blocked" | "review";
@@ -118,7 +119,7 @@ export class TaskStore {
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(
-    private readonly stateFile = path.resolve(".devbot", "tasks.json"),
+    private readonly stateFile = defaultRuntimeStatePath("tasks.json"),
     private readonly maxRecords = 500
   ) {}
 

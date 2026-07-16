@@ -11,6 +11,7 @@ import {
   PRIVATE_FILE_MODE,
   redactSensitiveText
 } from "./security.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 import type { ProjectEntry } from "./types.js";
 
 export type MemoryKind = "decision" | "outcome" | "note";
@@ -93,7 +94,7 @@ interface MemoryFileState {
   quarantined: string[];
 }
 
-export const DEFAULT_MEMORY_STORE_ROOT = path.resolve(".devbot", "memory");
+export const DEFAULT_MEMORY_STORE_ROOT = defaultRuntimeStatePath("memory");
 const DEFAULT_MAX_OUTCOMES = 500;
 export const MAX_ENTRY_TEXT_CHARS = 4_000;
 export const MAX_TAGS = 20;

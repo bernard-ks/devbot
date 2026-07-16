@@ -313,7 +313,9 @@ export async function commitTaskWorktree(
     };
   }
 
-  const changedPaths = new Set(inspection.changes.map((change) => change.path));
+  const changedPaths = new Set(
+    inspection.changes.flatMap((change) => [change.path, ...(change.previousPath ? [change.previousPath] : [])])
+  );
   const files = [...options.files];
   const invalidFile = files.find((file) => !isSafeChangedPath(file, worktree.path, changedPaths));
   if (invalidFile) {
@@ -335,15 +337,26 @@ export async function commitTaskWorktree(
     };
   }
 
-  const staged = await gitPath(worktree.path, ["add", "--", ...files]);
-  if (!staged.ok) {
-    return {
-      available: true,
-      committed: false,
-      worktree,
-      changes: inspection.changes,
-      message: errorMessage("Unable to stage task changes", staged)
-    };
+  // A staged rename's source no longer exists as an index path, so passing it
+  // back to `git add` produces a pathspec error. The rename deletion is already
+  // staged; add its destination (and every other reported path) normally.
+  const stagedRenameSources = new Set(
+    inspection.changes
+      .filter((change) => /[RC]/.test(change.indexStatus) && change.previousPath)
+      .map((change) => change.previousPath!)
+  );
+  const filesToStage = files.filter((file) => !stagedRenameSources.has(file));
+  if (filesToStage.length > 0) {
+    const staged = await gitPath(worktree.path, ["add", "--", ...filesToStage]);
+    if (!staged.ok) {
+      return {
+        available: true,
+        committed: false,
+        worktree,
+        changes: inspection.changes,
+        message: errorMessage("Unable to stage task changes", staged)
+      };
+    }
   }
 
   const commit = await gitPath(worktree.path, ["commit", "-m", options.message]);

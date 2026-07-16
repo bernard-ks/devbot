@@ -33,3 +33,12 @@ export function commandRequiresApproval(project: ProjectEntry, commandName: stri
 
   return !project.metadata.policy.readOnlyCommands.includes(normalized);
 }
+
+/** A role inherits project access only when the project is wholly unrestricted or names that role explicitly. */
+export function isRoleAllowedForProject(project: ProjectEntry, roleId: string): boolean {
+  const policy = project.metadata.policy;
+  const projectRestricted = policy.allowedUsers.length > 0
+    || policy.allowedUsernames.length > 0
+    || policy.allowedRoles.length > 0;
+  return !projectRestricted || policy.allowedRoles.includes(roleId);
+}

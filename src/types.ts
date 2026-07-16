@@ -87,9 +87,12 @@ export interface RoutingConfig {
 
 export interface ScannerConfig {
   maxIndexedFileBytes: number;
+  maxIndexedFiles: number;
+  maxIndexedTotalBytes: number;
   maxSnippetCharsPerFile: number;
   maxPackedContextChars: number;
   maxRankedFiles: number;
+  cacheTtlMs: number;
 }
 
 export interface IndexedFile {

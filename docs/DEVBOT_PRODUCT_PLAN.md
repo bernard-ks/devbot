@@ -1,6 +1,6 @@
 # Devbot Product Plan
 
-Updated: 2026-07-09
+Updated: 2026-07-15
 
 ## Purpose
 
@@ -14,8 +14,8 @@ The ambient workroom slice is now implemented:
 
 1. Natural `@devbot` requests are classified as answer requests or proposed actions. Action-shaped mentions receive a confirmation preview with **Approve and start**, **Edit**, **Answer only**, and **Decline**; no write begins from the mention alone.
 2. Each proposal is persisted as an approval-gated task and gets a private Discord task thread when the room supports private thread creation and membership management.
-3. Approved write tasks run in a separate `devbot/task/<task-name>` Git branch and worktree outside the source checkout. Completion records the branch, changed files, and bounded diff-status evidence while leaving changes uncommitted for human review. Devbot does not merge or push.
-4. `/inbox` and dashboard **Needs Me** show pending decisions for the current user, with private task detail and refresh controls.
+3. Approved write tasks run in a separate `devbot/task/<task-name>` Git branch and worktree outside the source checkout. Completion records the branch, changed files, and bounded diff-status evidence. An owner/controller can commit exactly those reviewed paths with `/task commit`; Devbot does not merge or push.
+4. `/inbox` and dashboard **Needs Me** show pending decisions for the current user, with private task detail, pagination, and refresh controls.
 5. Completion cards put recorded proof before the result and provide an **Open proof** action for the saved task record.
 6. Owner-only `/setup project-room action:bind project:<name> channel:<channel>` binds a private channel or private thread to one project; `action:remove` removes the binding.
 7. Workroom roles are Builder, Reviewer, and Verifier. They provide read-only implementation, review, and evidence perspectives before approved work executes, and can be selected on the proposal card.
@@ -28,7 +28,7 @@ The safety contract is explicit: only the requester or an approved controller ca
 
 - Initial setup:
   - `npm run setup` opens a loopback-only browser wizard.
-  - The wizard validates the Discord bot, opens installation, discovers servers, chooses the server owner, registers a local repository, creates the private room, deploys commands, and starts Devbot.
+  - The wizard validates the Discord bot, opens installation, discovers servers, explicitly confirms the server owner, registers a local repository and screenshot policy, creates the private room, deploys commands, and requests a Devbot start. Completion reports terminal login or restart work honestly instead of claiming immediate readiness.
   - Discord application creation and bot-token retrieval remain the only required Developer Portal step.
 - Discord slash commands:
   - `/setup wizard` provides resumable owner setup for viewers, controllers, peer bots, a private room, runtime project roots, and the optional Discord-native Studio toggle.
@@ -36,7 +36,7 @@ The safety contract is explicit: only the requester or an approved controller ca
   - `/setup backend` lists detected coding agents with versions and selects the active one.
   - `/projects` lists configured local projects.
   - `/status` reports a decision-ready brief: confirmed bot work and phases, external runs, activity-unknown app sessions, repository evidence, risks, and a recommended next step.
-  - `/status image:true` can attach a live local UI screenshot when a web dev server is detected.
+  - `/status image:true` can attach a live local UI screenshot when a web dev server is detected and policy already allows capture; approval-gated projects direct controllers to `/snip`.
   - `/dashboard` opens a personal Discord-native workspace with authorized project selection and modal Ask / Change flows.
   - `/studio` opens the optional Discord-native visual workroom for controllers.
   - `/refresh` rebuilds the in-memory project file index.
@@ -66,9 +66,10 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Honestly reports when no error-looking text is visible instead of inventing one; non-image attachments and unauthorized users are ignored per the deny-by-default access model.
 - Local project context:
   - Scans static or owner-registered project roots and supports a selected default on multi-project hosts.
-  - Ignores dependency/build folders and common secret files.
+  - Ignores dependency/build folders and common secret files; private `.devbot`/`.codex` runtime directories remain excluded even when an include pattern requests them.
   - Redacts secret-looking values from indexed text.
-  - Ranks local files against the user request before building the Codex prompt.
+  - Enforces per-file, aggregate-byte, file-count, ranked-file, and packed-context limits with bounded environment overrides, and automatically refreshes cached indexes after a short TTL.
+  - Ranks local files against the user request before building delimiter-safe JSON Lines prompt records, so repository content and filenames cannot forge context boundaries.
 - Bring-your-own coding-agent backends:
   - Pluggable executor abstraction with Codex CLI as the default and reference backend (unchanged flags) and Claude Code as an opt-in, answers-only alternative.
   - Selection is explicit: `DEVBOT_AGENT_BACKEND`, then the `/setup backend` choice; only Codex is ever auto-selected, so an incidentally installed CLI never becomes the executor.
@@ -91,11 +92,11 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Opens the running app and navigates through visible links/buttons based on request language.
   - Handles requests like "browse page" or "watchlist view" without reading framework routes from disk.
   - Supports explicit URLs and paths such as `/cards/op01-016` when the user wants an exact target.
-- Ship cards (`/ship`-only; see HANDOFF "Review round 1" for why this is narrower than automatic before/after capture):
+- Ship cards (`/ship`-only; deliberately narrower than automatic before/after capture so isolated-task evidence stays honest):
   - `/do` action tasks always run in an isolated Git worktree (see task-worktree.ts). Automatic completion and `/ship` do not start or silently attach to the separate managed-preview lifecycle, so they never screenshot the source checkout's dev server and call it "proof" of an isolated task's change. Completed action tasks instead get an explicit `captureNote` ("Visual proof unavailable...") on the task record, visible via `/task show`; a controller can start `/task preview` separately for live local inspection.
   - `/ship task:<task-id>` (also a "Ship it" button on completed action tasks, owner/controller-gated) composes a 1200x675 shareable card with the project name and task summary. For isolated tasks the card is text-only with a "visual proof unavailable for isolated branch" caption; for non-isolated tasks (e.g. answer-mode) it attempts one stabilized live screenshot of the project's detected dev server, when the project's screenshot policy allows it.
   - Screenshots wait for two consecutive identical frames (animations/transitions disabled, `prefers-reduced-motion` emulated) before being used, so loading spinners and blinking carets don't get misread as content.
-  - Any screenshot `/ship` does persist lands under `.devbot/captures` with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
+  - Any screenshot `/ship` does persist lands under `~/.devbot/state/captures` by default, with owner-only directory/file permissions (0700/0600), a validated basename-only filename, and pruning to the most recent 200 files.
   - The before/after pixel-diff engine (`visual-diff.ts`: grid-cell clustering, dimension-change-aware, no external image-diff dependency) is retained as tested, reusable primitives for a future managed-preview integration, but nothing wires it automatically today.
 - Managed task workspace previews:
   - `/task preview` serves a task's verified isolated worktree with the project's configured `dev`/`preview`/`serve`/`start` preset or an allow-listed package.json script; free-text commands are never accepted, and missing dependencies fail closed without installing.
@@ -104,7 +105,7 @@ The safety contract is explicit: only the requester or an approved controller ca
   - Access: only the owner or an approved controller may start a preview; the task requester may inspect or stop it. Project access is rechecked on every control, and safe mode blocks starting a preview but never stop or status.
   - This is the managed preview of `task.workspacePath` that isolated-task evidence work was blocked on; future visual diff, video proof, or authenticated sharing features can consume the exported `TaskPreviewManager` API instead of capturing the unchanged source checkout.
 - Project memory:
-  - Persists decisions, manual notes, and completed action-task outcomes in a central Devbot-owned store (`.devbot/memory/<project-key>.jsonl`, owner-only permissions) outside the managed project checkout, keyed by the project's canonical (resolved) root so it survives repository renames within setup.
+  - Persists decisions, manual notes, and completed action-task outcomes in a central Devbot-owned store (`~/.devbot/state/memory/<project-key>.jsonl` by default, owner-only permissions) outside the managed project checkout, keyed by the project's canonical (resolved) root so it survives repository renames within setup.
   - Carries the originating task's access scope, requester, and internal flag onto every automatically captured outcome, and applies the same access rule used for task records to every list/search/recall/autocomplete path, so workroom-private or internal task results stay restricted to their requester and controllers.
   - Automatically records a terse outcome (result, changed files, detail) when an action task succeeds or fails; automatic outcomes start `proposed`/`untrusted` and are excluded from automatic recall until a controller runs `/memory promote` to mark them `active`/`trusted`. Manual `/remember` decisions and notes are `active`/`trusted` immediately.
   - Redacts secrets from entry text, tags, and author at write time and again defensively on read/output/recall; validates and normalizes every entry against a versioned schema, quarantining (never silently destroying) corrupt or invalid lines.
@@ -138,7 +139,7 @@ The safety contract is explicit: only the requester or an approved controller ca
   - review links or branch references and merge state
   - screenshot URLs and capture metadata
 - Migrate durable local task state to SQLite while keeping task IDs out of normal conversation UI.
-- Persist recoverable active execution across bot restarts instead of closing interrupted tasks as canceled. Implemented with a durable execution ledger (`.devbot/executions.json`): running tasks are marked `interrupted` on startup, identity-verified orphan worker processes are stopped with an observed exit, the original task message gains Retry and Dismiss controls, and preserved isolated worktrees are reused on retry when they still verify. Model work itself is not resumed.
+- Persist recoverable active execution across bot restarts instead of closing interrupted tasks as canceled. Implemented with a durable execution ledger (`~/.devbot/state/executions.json` by default): running tasks are marked `interrupted` on startup, identity-verified orphan worker processes are stopped with an observed exit, the original task message gains Retry and Dismiss controls, and preserved isolated worktrees are reused on retry when they still verify. Model work itself is not resumed.
 - Add structured logs with request IDs.
 
 ### 2. Better Project Awareness
@@ -329,7 +330,7 @@ MVP multi-bot flow:
 - Add `BOT_OWNER`, `BOT_DISPLAY_NAME`, and `PEER_BOT_IDS` config. Done.
 - Add a coordination channel ID config. Done with `COORDINATION_CHANNEL_ID`.
 - Add structured result envelopes for bot-to-bot messages. Done.
-- Add collaboration event persistence. Done with `.devbot/collab.json`.
+- Add collaboration event persistence. Done with `~/.devbot/state/collab.json` by default.
 - Add tests for peer message parsing and permission enforcement. Peer parsing tests added; permission enforcement is handled by `PEER_BOT_IDS` and should get deeper integration tests when Discord handlers are split out.
 
 ## Open Questions

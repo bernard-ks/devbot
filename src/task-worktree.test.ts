@@ -66,6 +66,31 @@ test("inspects changed files and commits only changes in the isolated worktree",
   assert.equal(await git(fixture.repo, ["log", "-1", "--pretty=%s"]), "Initial commit");
 });
 
+test("task commits include both sides of a reported rename", async () => {
+  const fixture = await createGitFixture();
+  const created = await createTaskWorktree({
+    sourcePath: fixture.repo,
+    taskName: "Rename tracked file",
+    worktreeRoot: fixture.worktreeRoot
+  });
+  assert.equal(created.available, true);
+  if (!created.available) return;
+  await git(created.worktree.path, ["mv", "tracked.txt", "renamed.txt"]);
+  const inspection = await inspectTaskWorktree(created.worktree, 0);
+  assert.equal(inspection.available, true);
+  if (!inspection.available) return;
+  const renamed = inspection.changes.find((change) => change.previousPath);
+  assert.ok(renamed);
+
+  const commit = await commitTaskWorktree(created.worktree, {
+    message: "Rename tracked file",
+    files: [renamed.path, renamed.previousPath!]
+  });
+  assert.equal(commit.available && commit.committed, true);
+  assert.equal(await git(created.worktree.path, ["status", "--porcelain"]), "");
+  assert.equal(await git(created.worktree.path, ["ls-files"]), "renamed.txt");
+});
+
 test("reports unavailable isolation without creating paths or branches", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-task-worktree-unavailable-"));
   const result = await createTaskWorktree({

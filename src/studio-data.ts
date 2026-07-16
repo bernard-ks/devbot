@@ -88,10 +88,11 @@ const MAX_CHANGED_FILES = 8;
 const MAX_VERIFICATION_ITEMS = 6;
 
 export function buildStudioSnapshot(input: StudioSnapshotInput): StudioSnapshot {
-  const tasks = input.tasks
-    .filter(isStudioTaskVisible)
+  const visibleTasks = input.tasks.filter(isStudioTaskVisible);
+  const tasks = visibleTasks
     .slice(0, MAX_TASKS)
     .map((task) => studioTask(task, input.privatePaths ?? []));
+  const allLanes = visibleTasks.map(taskLane);
   const projects = input.reviews.map((review) => studioProject(review, input.privatePaths ?? []));
 
   return {
@@ -100,9 +101,9 @@ export function buildStudioSnapshot(input: StudioSnapshotInput): StudioSnapshot 
     generatedAt: (input.generatedAt ?? new Date()).toISOString(),
     bot: input.bot,
     totals: {
-      needsMe: tasks.filter((task) => task.lane === "needs-me").length,
-      inFlight: tasks.filter((task) => task.lane === "in-flight").length,
-      recent: tasks.filter((task) => task.lane === "recent").length,
+      needsMe: allLanes.filter((lane) => lane === "needs-me").length,
+      inFlight: allLanes.filter((lane) => lane === "in-flight").length,
+      recent: allLanes.filter((lane) => lane === "recent").length,
       projects: projects.length
     },
     projects,

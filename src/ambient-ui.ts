@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -35,6 +36,8 @@ export type AmbientAction =
   | "completion-proof"
   | "completion-reviewed"
   | "inbox-open"
+  | "inbox-prev"
+  | "inbox-next"
   | "inbox-refresh"
   | "team-select";
 
@@ -46,6 +49,18 @@ export interface ParsedAmbientControl {
 export interface ParsedProposalEntity {
   taskId: string;
   revision: number;
+}
+
+export interface InboxControlState {
+  projectName?: string;
+  limit: number;
+  page: number;
+}
+
+export interface ParsedInboxControlState {
+  projectKey?: string;
+  limit: number;
+  page: number;
 }
 
 export interface AmbientComponentsV2Payload {
@@ -112,6 +127,9 @@ export interface NeedsMeItem {
 
 export interface NeedsMeInboxInput {
   inboxId: string;
+  previousInboxId?: string;
+  nextInboxId?: string;
+  page?: number;
   items: readonly NeedsMeItem[];
   selectedRoles?: readonly AmbientRole[];
   title?: string;
@@ -210,6 +228,32 @@ export function parseProposalEntityId(entityId: string): ParsedProposalEntity | 
   if (!match?.[1]) return undefined;
   const revision = match[2] ? Number(match[2]) : 1;
   return Number.isSafeInteger(revision) ? { taskId: match[1], revision } : undefined;
+}
+
+export function inboxEntityId(state: InboxControlState): string {
+  const project = state.projectName ? `k${inboxProjectKey(state.projectName)}` : "a";
+  if (!Number.isInteger(state.limit) || state.limit < 1 || state.limit > 25
+    || !Number.isInteger(state.page) || state.page < 0 || state.page > 4) {
+    throw new RangeError("Inbox control state is outside supported bounds.");
+  }
+  return `inbox-${project}-l${state.limit}-p${state.page}`;
+}
+
+export function inboxProjectKey(projectName: string): string {
+  if (!/^[a-z0-9_-]+$/.test(projectName)) {
+    throw new RangeError("Inbox project names must be normalized project identifiers.");
+  }
+  return createHash("sha256").update(projectName).digest("hex").slice(0, 16);
+}
+
+export function parseInboxEntityId(value: string): ParsedInboxControlState | undefined {
+  const match = /^inbox-(a|k[a-f0-9]{16})-l([1-9]|1[0-9]|2[0-5])-p([0-4])$/.exec(value);
+  if (!match?.[1] || !match[2] || !match[3]) return undefined;
+  return {
+    ...(match[1] !== "a" ? { projectKey: match[1].slice(1) } : {}),
+    limit: Number(match[2]),
+    page: Number(match[3])
+  };
 }
 
 export function parseAmbientRole(value: string): AmbientRole | undefined {
@@ -380,11 +424,15 @@ export function proofFirstCompletionCard(input: ProofFirstCompletionInput): Ambi
 }
 
 export function needsMeInbox(input: NeedsMeInboxInput): AmbientComponentsV2Payload {
-  const visibleItems = input.items.slice(0, AMBIENT_UI_LIMITS.inboxItems);
-  const overflow = Math.max(0, input.items.length - visibleItems.length);
+  const pageCount = Math.max(1, Math.ceil(input.items.length / AMBIENT_UI_LIMITS.inboxItems));
+  const page = Math.max(0, Math.min(Math.floor(input.page ?? 0), pageCount - 1));
+  const start = page * AMBIENT_UI_LIMITS.inboxItems;
+  const visibleItems = input.items.slice(start, start + AMBIENT_UI_LIMITS.inboxItems);
   const heading = [
     `## ${inline(input.title ?? "Needs Me", 120)}`,
-    visibleItems.length === 0 ? "Nothing is waiting for your decision." : `${input.items.length} decision${input.items.length === 1 ? "" : "s"} waiting.`
+    visibleItems.length === 0
+      ? "Nothing is waiting for your decision."
+      : `${input.items.length} decision${input.items.length === 1 ? "" : "s"} waiting. Page ${page + 1} of ${pageCount}.`
   ].join("\n");
   const container = new ContainerBuilder().setAccentColor(visibleItems.some((item) => item.urgency === "high") ? 0xdc2626 : 0x7c3aed)
     .addTextDisplayComponents(text(heading));
@@ -406,16 +454,26 @@ export function needsMeInbox(input: NeedsMeInboxInput): AmbientComponentsV2Paylo
     );
   }
 
-  if (overflow > 0) {
-    container.addTextDisplayComponents(text(`_${overflow} more ${overflow === 1 ? "item" : "items"} not shown._`));
+  if (input.items.length > visibleItems.length) {
+    container.addTextDisplayComponents(text(`_Showing ${start + 1}-${start + visibleItems.length} of ${input.items.length}._`));
   }
   container
     .addActionRowComponents(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
+          .setCustomId(ambientCustomId("inbox-prev", input.previousInboxId ?? input.inboxId))
+          .setLabel("Previous")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(!input.previousInboxId),
+        new ButtonBuilder()
           .setCustomId(ambientCustomId("inbox-refresh", input.inboxId))
           .setLabel("Refresh")
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(ambientCustomId("inbox-next", input.nextInboxId ?? input.inboxId))
+          .setLabel("Next")
           .setStyle(ButtonStyle.Secondary)
+          .setDisabled(!input.nextInboxId)
       )
     );
   return componentsV2Payload(container);
@@ -624,6 +682,8 @@ function isAmbientAction(value: string | undefined): value is AmbientAction {
     || value === "completion-proof"
     || value === "completion-reviewed"
     || value === "inbox-open"
+    || value === "inbox-prev"
+    || value === "inbox-next"
     || value === "inbox-refresh"
     || value === "team-select";
 }

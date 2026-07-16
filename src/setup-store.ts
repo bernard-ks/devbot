@@ -4,6 +4,7 @@ import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { normalizeProjectName } from "./config.js";
 import { hardenPrivateDirectoryPermissions, PRIVATE_DIRECTORY_MODE } from "./security.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 
 export type SetupUserPermission = "view" | "control";
 
@@ -35,7 +36,7 @@ export class SetupStore {
   private mutationQueue: Promise<void> = Promise.resolve();
   private readonly filePath: string;
 
-  constructor(filePath = ".devbot/setup.json") {
+  constructor(filePath = defaultRuntimeStatePath("setup.json")) {
     this.filePath = path.resolve(filePath);
     this.state = loadSetupState(this.filePath);
   }

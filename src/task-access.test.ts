@@ -23,7 +23,7 @@ test("ordinary project tasks retain project-level access", () => {
   assert.equal(canAccessTaskRecord(task, { userId: "viewer", projectAllowed: false, controller: false }), false);
 });
 
-test("task branch sync is limited to the requester or a controller with project access", () => {
+test("task branch sync is limited to a controller with project access", () => {
   const task = record({
     requesterId: "requester",
     workspaceIsolated: true,
@@ -31,14 +31,14 @@ test("task branch sync is limited to the requester or a controller with project 
     branchName: "devbot/task/task-access",
     baseBranch: "abc123"
   });
-  assert.equal(taskSyncRefusal(task, { userId: "requester", projectAllowed: true, controller: false, safeMode: false }), undefined);
+  assert.equal(taskSyncRefusal(task, { userId: "requester", projectAllowed: true, controller: false, safeMode: false }), "needs-controller");
   assert.equal(taskSyncRefusal(task, { userId: "controller", projectAllowed: true, controller: true, safeMode: false }), undefined);
-  assert.equal(taskSyncRefusal(task, { userId: "viewer", projectAllowed: true, controller: false, safeMode: false }), "requester-or-controller");
+  assert.equal(taskSyncRefusal(task, { userId: "viewer", projectAllowed: true, controller: false, safeMode: false }), "needs-controller");
   assert.equal(taskSyncRefusal(task, { userId: "requester", projectAllowed: false, controller: false, safeMode: false }), "access");
 });
 
 test("safe mode, missing branch evidence, and open tasks refuse branch sync", () => {
-  const context = { userId: "requester", projectAllowed: true, controller: false, safeMode: false };
+  const context = { userId: "controller", projectAllowed: true, controller: true, safeMode: false };
   const task = record({
     requesterId: "requester",
     workspaceIsolated: true,

@@ -187,7 +187,7 @@ export function sanitizeDiscordOutput(value: string, options: DiscordOutputSanit
     String.raw`([\x60\"'])(?:file:\/\/\/(?:[^\x60\"'\r\n]+)|\/(?:${posixRoot})(?:\/[^\x60\"'\r\n]*)?|~\/(?:[^\x60\"'\r\n]+)|[A-Za-z]:[\\/](?:[^\x60\"'\r\n]+)|\\\\(?:[^\x60\"'\r\n]+))\1`,
     "g"
   );
-  sanitized = sanitized.replace(quotedPath, (match, quote: string) => `${quote}[local path]${quote}`);
+  sanitized = sanitized.replace(quotedPath, (_match, quote: string) => `${quote}[local path]${quote}`);
   sanitized = sanitized
     .replace(new RegExp(`${boundary}file:\/\/\/[^\\s\\x60\\\"')\\]}>;,]+`, "gim"), "$1[local path]")
     .replace(new RegExp(`${boundary}\/(?:${posixRoot})(?:\/[^\\s\\x60\\\"')\\]}>;,]*)?`, "gim"), "$1[local path]")

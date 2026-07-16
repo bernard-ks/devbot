@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,7 +13,11 @@ interface SetupServer {
   baseUrl: string;
 }
 
-async function startSetupServer(options: { studioEnabled?: boolean; envStudioEnabled?: boolean } = {}): Promise<SetupServer> {
+async function startSetupServer(options: {
+  studioEnabled?: boolean;
+  envStudioEnabled?: boolean;
+  codexStatus?: "missing" | "signed-out" | "ready";
+} = {}): Promise<SetupServer> {
   const cwd = await mkdtemp(path.join(tmpdir(), "devbot-setup-app-"));
   if (typeof options.studioEnabled === "boolean") {
     await mkdir(path.join(cwd, ".devbot"), { recursive: true });
@@ -39,7 +43,24 @@ async function startSetupServer(options: { studioEnabled?: boolean; envStudioEna
   }
   env.DEVBOT_SETUP_NO_BROWSER = "true";
   env.DEVBOT_SETUP_NO_START = "true";
-  env.CODEX_BIN = path.join(cwd, "missing-codex");
+  env.DEVBOT_STATE_DIR = path.join(cwd, ".state");
+  if (options.codexStatus && options.codexStatus !== "missing") {
+    const fakeCodex = path.join(cwd, "fake-codex");
+    await writeFile(
+      fakeCodex,
+      [
+        "#!/usr/bin/env node",
+        'if (process.argv[2] === "--version") { console.log("codex-cli test"); process.exit(0); }',
+        `if (process.argv[2] === "login" && process.argv[3] === "status") { process.exit(${options.codexStatus === "ready" ? 0 : 1}); }`,
+        "process.exit(1);",
+        ""
+      ].join("\n")
+    );
+    await chmod(fakeCodex, 0o755);
+    env.CODEX_BIN = fakeCodex;
+  } else {
+    env.CODEX_BIN = path.join(cwd, "missing-codex");
+  }
   const child = spawn(process.execPath, [appPath], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
   const baseUrl = await new Promise<string>((resolve, reject) => {
     let output = "";
@@ -143,4 +164,28 @@ test("setup API reports the persisted Studio choice before the environment fallb
   assert.equal(response.status, 200);
   const payload = (await response.json()) as { studioEnabled?: boolean };
   assert.equal(payload.studioEnabled, false);
+});
+
+test("setup API requires a signed-in Codex session, not only an installed CLI", { skip: process.platform === "win32" }, async (t) => {
+  const signedOut = await startSetupServer({ codexStatus: "signed-out" });
+  t.after(async () => {
+    await stopSetupServer(signedOut);
+  });
+  const signedOutPage = await fetch(`${signedOut.baseUrl}/`);
+  const signedOutCookie = (signedOutPage.headers.get("set-cookie") ?? "").split(";")[0]!;
+  const signedOutState = await fetch(`${signedOut.baseUrl}/api/state`, { headers: { Cookie: signedOutCookie } });
+  const signedOutPayload = (await signedOutState.json()) as { codex: { ready: boolean; label: string } };
+  assert.equal(signedOutPayload.codex.ready, false);
+  assert.match(signedOutPayload.codex.label, /sign in/i);
+
+  const ready = await startSetupServer({ codexStatus: "ready" });
+  t.after(async () => {
+    await stopSetupServer(ready);
+  });
+  const readyPage = await fetch(`${ready.baseUrl}/`);
+  const readyCookie = (readyPage.headers.get("set-cookie") ?? "").split(";")[0]!;
+  const readyState = await fetch(`${ready.baseUrl}/api/state`, { headers: { Cookie: readyCookie } });
+  const readyPayload = (await readyState.json()) as { codex: { ready: boolean; label: string } };
+  assert.equal(readyPayload.codex.ready, true);
+  assert.match(readyPayload.codex.label, /signed in/i);
 });

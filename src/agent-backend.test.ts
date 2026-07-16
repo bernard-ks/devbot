@@ -327,6 +327,30 @@ test("claude detection requires every safety flag before reporting compatible", 
   clearDetectionCache();
 });
 
+test("codex detection reports authentication readiness instead of treating a signed-out CLI as ready", async () => {
+  clearDetectionCache();
+  const calls: string[] = [];
+  const signedOut = await createCodexBackend(codex, {}, async (_bin, args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "--version") return { installed: true, stdout: "codex-cli 1.2.3", ok: true };
+    return { installed: true, stdout: "Not logged in", ok: false };
+  }).detect();
+  assert.equal(signedOut.installed, true);
+  assert.equal(signedOut.compatible, true);
+  assert.equal(signedOut.authenticated, false);
+  assert.match(signedOut.authenticationError ?? "", /codex login/i);
+  assert.deepEqual(calls, ["--version", "login status"]);
+
+  clearDetectionCache();
+  const ready = await createCodexBackend(codex, {}, async (_bin, args) => ({
+    installed: true,
+    stdout: args[0] === "--version" ? "codex-cli 1.2.3" : "Logged in",
+    ok: true
+  })).detect();
+  assert.equal(ready.authenticated, true);
+  clearDetectionCache();
+});
+
 test("unverified adapters detect as installed but never as compatible for execution", async () => {
   clearDetectionCache();
   const probe = async () => ({ installed: true, stdout: "0.5.0" });

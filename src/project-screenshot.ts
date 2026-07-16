@@ -10,6 +10,7 @@ const DEFAULT_VIEWPORT = { width: 1440, height: 1000 };
 const MAX_CONCURRENT_SCREENSHOTS = 2;
 const STABILITY_ATTEMPTS = 3;
 const STABILITY_INTERVAL_MS = 200;
+const MAX_DIAGNOSTICS_PER_KIND = 25;
 const DISABLE_MOTION_STYLE = [
   "*, *::before, *::after {",
   "  animation-play-state: paused !important;",
@@ -193,21 +194,25 @@ function collectScreenshotDiagnostics(page: Page): {
 
   page.on("console", (message) => {
     if (message.type() === "error") {
-      consoleErrors.push(truncateDiagnostic(message.text()));
+      pushDiagnostic(consoleErrors, message.text());
     }
   });
 
   page.on("requestfailed", (request) => {
-    failedRequests.push(truncateDiagnostic(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? ""}`.trim()));
+    pushDiagnostic(failedRequests, `${request.method()} ${request.url()} ${request.failure()?.errorText ?? ""}`.trim());
   });
 
   page.on("response", (response) => {
     if (response.status() >= 400) {
-      badResponses.push(truncateDiagnostic(`${response.status()} ${response.url()}`));
+      pushDiagnostic(badResponses, `${response.status()} ${response.url()}`);
     }
   });
 
   return { consoleErrors, failedRequests, badResponses };
+}
+
+function pushDiagnostic(target: string[], value: string): void {
+  if (target.length < MAX_DIAGNOSTICS_PER_KIND) target.push(truncateDiagnostic(value));
 }
 
 async function freezeDynamicUi(page: Page): Promise<void> {

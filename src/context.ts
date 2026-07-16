@@ -1,9 +1,14 @@
 import { constants } from "node:fs";
-import { lstat, open, readdir, realpath } from "node:fs/promises";
+import { lstat, open, readdir, realpath, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { scoreTextMatches, tokenizeQuery } from "./relevance.js";
 import { redactSensitiveText } from "./security.js";
 import type { IndexedFile, PackedProjectContext, ProjectEntry, ScannerConfig } from "./types.js";
+
+const PRIVATE_RUNTIME_PATH_PARTS = new Set([
+  ".codex",
+  ".devbot"
+]);
 
 const IGNORED_PATH_PARTS = new Set([
   ".cache",
@@ -26,7 +31,7 @@ const IGNORED_PATH_PARTS = new Set([
   "vendor"
 ]);
 
-const IGNORED_FILENAMES = new Set([
+const PROTECTED_FILENAMES = new Set([
   ".env",
   ".env.local",
   ".env.production",
@@ -45,6 +50,12 @@ const IGNORED_FILENAMES = new Set([
   "pnpm-lock.yaml",
   "yarn.lock"
 ]);
+
+const PROJECT_CONTEXT_HEADER = serializeJsonLine({
+  kind: "devbot.project-context",
+  version: 1,
+  encoding: "jsonl"
+});
 
 const TEXT_EXTENSIONS = new Set([
   "",
@@ -92,13 +103,16 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 export class ProjectContextService {
-  private readonly cache = new Map<string, IndexedFile[]>();
+  private readonly cache = new Map<string, { files: IndexedFile[]; indexedAtMs: number }>();
 
-  constructor(private readonly scanner: ScannerConfig) {}
+  constructor(
+    private readonly scanner: ScannerConfig,
+    private readonly now: () => number = Date.now
+  ) {}
 
   async refresh(project: ProjectEntry): Promise<number> {
     const files = await this.indexProject(project);
-    this.cache.set(cacheKey(project), files);
+    this.cache.set(cacheKey(project), { files, indexedAtMs: this.now() });
     return files.length;
   }
 
@@ -115,42 +129,56 @@ export class ProjectContextService {
     includePatterns: string[] = [],
     maxPackedContextChars = this.scanner.maxPackedContextChars
   ): Promise<PackedProjectContext> {
-    const indexed = this.cache.get(cacheKey(project)) ?? (await this.indexAndCache(project));
+    const indexed = await this.getFreshIndex(project);
     const filtered = includePatterns.length > 0 ? indexed.filter((file) => matchesAny(file.relativePath, includePatterns)) : indexed;
     const ranked = rankFiles(filtered, question).slice(0, this.scanner.maxRankedFiles);
     const files: IndexedFile[] = [];
-    const chunks: string[] = [];
-    let totalChars = 0;
+    const records: string[] = [];
+    let totalChars = PROJECT_CONTEXT_HEADER.length;
 
     for (const file of ranked) {
       const snippet = file.text.slice(0, this.scanner.maxSnippetCharsPerFile);
-      const chunk = `--- FILE: ${file.relativePath} (${file.sizeBytes} bytes) ---\n${snippet}\n`;
-      if (totalChars + chunk.length > maxPackedContextChars) {
+      const record = serializeJsonLine({
+        kind: "file",
+        path: file.relativePath.replaceAll("\\", "/"),
+        sizeBytes: file.sizeBytes,
+        truncated: snippet.length < file.text.length,
+        content: snippet
+      });
+      const recordChars = 1 + record.length;
+      if (totalChars + recordChars > maxPackedContextChars) {
         break;
       }
 
       files.push({ ...file, text: snippet });
-      chunks.push(chunk);
-      totalChars += chunk.length;
+      records.push(record);
+      totalChars += recordChars;
     }
 
     return {
       project,
       files,
-      packedText: chunks.join("\n")
+      packedText: records.length > 0 ? [PROJECT_CONTEXT_HEADER, ...records].join("\n") : ""
     };
   }
 
-  private async indexAndCache(project: ProjectEntry): Promise<IndexedFile[]> {
+  private async getFreshIndex(project: ProjectEntry): Promise<IndexedFile[]> {
+    const key = cacheKey(project);
+    const cached = this.cache.get(key);
+    const ageMs = cached ? this.now() - cached.indexedAtMs : Number.POSITIVE_INFINITY;
+    if (cached && ageMs >= 0 && ageMs < this.scanner.cacheTtlMs) {
+      return cached.files;
+    }
+
     const files = await this.indexProject(project);
-    this.cache.set(cacheKey(project), files);
+    this.cache.set(key, { files, indexedAtMs: this.now() });
     return files;
   }
 
   private async indexProject(project: ProjectEntry): Promise<IndexedFile[]> {
     const files: IndexedFile[] = [];
     const canonicalRoot = await realpath(project.root).catch(() => path.resolve(project.root));
-    await walk(project.root, project.root, canonicalRoot, this.scanner, files);
+    await walk(project.root, project.root, canonicalRoot, this.scanner, files, { totalBytes: 0 });
     return files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
   }
 }
@@ -160,8 +188,13 @@ async function walk(
   current: string,
   canonicalRoot: string,
   scanner: ScannerConfig,
-  output: IndexedFile[]
+  output: IndexedFile[],
+  budget: { totalBytes: number }
 ): Promise<void> {
+  if (indexIsFull(scanner, output, budget)) {
+    return;
+  }
+
   let entries;
   try {
     entries = await readdir(current, { withFileTypes: true });
@@ -169,16 +202,23 @@ async function walk(
     return;
   }
 
+  entries.sort((left, right) => {
+    return traversalPriority(left.name) - traversalPriority(right.name) || left.name.localeCompare(right.name);
+  });
   for (const entry of entries) {
+    if (indexIsFull(scanner, output, budget)) {
+      return;
+    }
+
     const absolutePath = path.join(current, entry.name);
     const relativePath = toRelative(root, absolutePath);
 
-    if (shouldIgnore(relativePath, entry.name)) {
+    if (shouldIgnore(relativePath)) {
       continue;
     }
 
     if (entry.isDirectory()) {
-      await walk(root, absolutePath, canonicalRoot, scanner, output);
+      await walk(root, absolutePath, canonicalRoot, scanner, output, budget);
       continue;
     }
 
@@ -191,7 +231,9 @@ async function walk(
       const handle = await open(absolutePath, constants.O_RDONLY | noFollow);
       try {
         const stats = await handle.stat();
-        if (!stats.isFile() || stats.size > scanner.maxIndexedFileBytes) continue;
+        const remainingBytes = scanner.maxIndexedTotalBytes - budget.totalBytes;
+        const maxReadableBytes = Math.min(scanner.maxIndexedFileBytes, remainingBytes);
+        if (!stats.isFile() || stats.size > maxReadableBytes) continue;
         const [resolvedPath, currentStats] = await Promise.all([realpath(absolutePath), lstat(absolutePath)]);
         if (
           !isWithinRoot(resolvedPath, canonicalRoot)
@@ -201,14 +243,17 @@ async function walk(
         ) {
           continue;
         }
-        const text = redactSecrets(await handle.readFile("utf8"));
+        const contents = await readFileBounded(handle, maxReadableBytes);
+        if (!contents) continue;
+        const text = redactSecrets(contents.toString("utf8"));
         if (looksBinary(text)) continue;
         output.push({
           relativePath,
           absolutePath,
-          sizeBytes: stats.size,
+          sizeBytes: contents.byteLength,
           text
         });
+        budget.totalBytes += contents.byteLength;
       } finally {
         await handle.close();
       }
@@ -218,13 +263,58 @@ async function walk(
   }
 }
 
-function shouldIgnore(relativePath: string, filename: string): boolean {
-  if (IGNORED_FILENAMES.has(filename)) {
+function indexIsFull(scanner: ScannerConfig, output: IndexedFile[], budget: { totalBytes: number }): boolean {
+  return output.length >= scanner.maxIndexedFiles || budget.totalBytes >= scanner.maxIndexedTotalBytes;
+}
+
+function traversalPriority(name: string): number {
+  const normalized = name.toLowerCase();
+  if (normalized === "readme.md") return 0;
+  if (normalized === "package.json") return 1;
+  if (normalized === "src" || normalized === "app") return 2;
+  if (normalized === "lib") return 3;
+  if (normalized === "test" || normalized === "tests") return 4;
+  if (normalized === "docs") return 5;
+  return 10;
+}
+
+async function readFileBounded(handle: FileHandle, maxBytes: number): Promise<Buffer | undefined> {
+  const buffer = Buffer.allocUnsafe(maxBytes + 1);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+
+  return offset > maxBytes ? undefined : buffer.subarray(0, offset);
+}
+
+function shouldIgnore(relativePath: string): boolean {
+  if (isProtectedProjectContextPath(relativePath)) {
     return true;
   }
 
-  const parts = relativePath.split(path.sep);
+  const parts = normalizePathParts(relativePath);
   return parts.some((part) => IGNORED_PATH_PARTS.has(part));
+}
+
+export function isProtectedProjectContextPath(relativePath: string): boolean {
+  const parts = normalizePathParts(relativePath);
+  if (parts.some((part) => PRIVATE_RUNTIME_PATH_PARTS.has(part))) {
+    return true;
+  }
+
+  const filename = parts.at(-1) ?? "";
+  return PROTECTED_FILENAMES.has(filename) || filename === ".env" || filename.startsWith(".env.");
+}
+
+function normalizePathParts(relativePath: string): string[] {
+  return relativePath
+    .replaceAll("\\", "/")
+    .split("/")
+    .map((part) => part.trim().toLowerCase())
+    .filter(Boolean);
 }
 
 function isLikelyTextFile(filename: string): boolean {
@@ -316,6 +406,12 @@ function escapeRegex(value: string): string {
 
 function toRelative(root: string, absolutePath: string): string {
   return path.relative(root, absolutePath) || ".";
+}
+
+function serializeJsonLine(value: Record<string, unknown>): string {
+  return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, (character) => {
+    return `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`;
+  });
 }
 
 export function parseIncludePatterns(value: string | null): string[] {
