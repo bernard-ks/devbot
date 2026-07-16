@@ -5,10 +5,13 @@ import {
   AMBIENT_UI_LIMITS,
   ambientCustomId,
   confirmToActProposalCard,
+  inboxEntityId,
+  inboxProjectKey,
   needsMeInbox,
   parseAmbientCustomId,
   parseAmbientRole,
   parseAmbientRoleSelection,
+  parseInboxEntityId,
   parseProposalEntityId,
   progressCard,
   proposalEditModal,
@@ -188,7 +191,8 @@ test("completion card keeps six proof entries so an isolated-task visual-proof n
 
 test("Needs Me inbox caps visible decisions and keeps every control routable", () => {
   const payload = needsMeInbox({
-    inboxId: "inbox-main",
+    inboxId: inboxEntityId({ limit: 8, page: 0 }),
+    nextInboxId: inboxEntityId({ limit: 8, page: 1 }),
     selectedRoles: ["reviewer"],
     items: Array.from({ length: 8 }, (_, index) => ({
       id: `decision-${index}`,
@@ -203,9 +207,21 @@ test("Needs Me inbox caps visible decisions and keeps every control routable", (
   assert.equal(actions.filter((action) => action === "inbox-open").length, AMBIENT_UI_LIMITS.inboxItems);
   assert.equal(actions.includes("team-select"), false);
   assert.ok(actions.includes("inbox-refresh"));
-  assert.match(textContent(json), /3 more items not shown/);
+  assert.ok(actions.includes("inbox-next"));
+  assert.match(textContent(json), /Showing 1-5 of 8/);
   assert.ok((json.components?.length ?? 0) <= 10);
   assertDiscordBounds(json);
+});
+
+test("Needs Me pagination state is compact and strictly parsed", () => {
+  const id = inboxEntityId({ projectName: "devbot", limit: 25, page: 4 });
+  assert.deepEqual(parseInboxEntityId(id), { projectKey: inboxProjectKey("devbot"), limit: 25, page: 4 });
+  assert.deepEqual(parseInboxEntityId(inboxEntityId({ limit: 10, page: 0 })), { limit: 10, page: 0 });
+  assert.equal(parseInboxEntityId("inbox-a-l26-p0"), undefined);
+  assert.throws(() => inboxEntityId({ projectName: "../../private", limit: 10, page: 0 }), RangeError);
+  const sentinelName = inboxEntityId({ projectName: "all", limit: 10, page: 0 });
+  assert.deepEqual(parseInboxEntityId(sentinelName), { projectKey: inboxProjectKey("all"), limit: 10, page: 0 });
+  assert.ok(inboxEntityId({ projectName: "project-" + "x".repeat(100), limit: 10, page: 0 }).length <= 64);
 });
 
 test("ordinary task cards keep legacy task controls inside bounded Components V2 containers", () => {

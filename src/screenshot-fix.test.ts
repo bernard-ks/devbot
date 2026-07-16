@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildFixTaskPrompt,
   canActOnScreenshotFix,
+  classifyImageRequest,
   detectImageExtension,
   downloadImageAttachment,
   filterImageAttachments,
@@ -22,6 +23,12 @@ import {
 } from "./screenshot-fix.js";
 
 const PNG_MAGIC_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+
+test("image requests distinguish error-to-fix from general visual questions", () => {
+  assert.equal(classifyImageRequest("fix this console error"), "error");
+  assert.equal(classifyImageRequest("why is this UI broken?"), "error");
+  assert.equal(classifyImageRequest("what do you think of this dashboard layout?"), "visual");
+});
 
 test("filterImageAttachments keeps only supported image types under the size cap", () => {
   const attachments: ImageAttachmentInput[] = [

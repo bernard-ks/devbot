@@ -180,6 +180,40 @@ if (outputIndex >= 0) await writeFile(args[outputIndex + 1], "finished before de
   assert.equal(answer, "finished before deadline");
 });
 
+test("agent output files are read with a bounded tail", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-bounded-output-"));
+  const fakeCodex = path.join(root, "fake-codex.mjs");
+  await writeFile(
+    fakeCodex,
+    `#!/usr/bin/env node
+import { writeFile } from "node:fs/promises";
+for await (const _chunk of process.stdin) {}
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("--output-last-message");
+if (outputIndex >= 0) await writeFile(args[outputIndex + 1], "HEAD_MARKER" + "x".repeat(70000) + "TAIL_MARKER");
+`
+  );
+  await chmod(fakeCodex, 0o700);
+
+  const answer = await completeCodexPrompt({
+    codex: {
+      bin: fakeCodex,
+      model: undefined,
+      sandbox: "read-only",
+      actionSandbox: "workspace-write",
+      timeoutMs: 5_000
+    },
+    prompt: "produce a deliberately oversized result",
+    cwd: root,
+    sandbox: "read-only",
+    skipGitRepoCheck: true
+  });
+
+  assert.equal(answer.length, 64_000);
+  assert.doesNotMatch(answer, /HEAD_MARKER/);
+  assert.match(answer, /TAIL_MARKER$/);
+});
+
 async function waitForExit(pid: number, timeoutMs = 4_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {

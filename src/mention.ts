@@ -103,6 +103,30 @@ export function parseStatusRequest(text: string): ParsedStatusRequest {
   return { isStatus: true, question, wantsImage };
 }
 
+/**
+ * Handles looser status phrasing without treating ordinary questions containing
+ * words such as "work" or "output" as status/screenshot requests.
+ */
+export function parseFallbackStatusRequest(text: string): ParsedStatusRequest {
+  const normalized = text.toLowerCase().replace(/[?!.]/g, "").replace(/\s+/g, " ").trim();
+  const visualRequest = /\b(snip|screenshot|screen shot)\b/.test(normalized);
+  const statusSignal = /\b(status|state|progress|wip)\b/.test(normalized);
+  const statusShaped = statusSignal && (
+    /^(status|state|progress|wip)\b/.test(normalized)
+    || /\b(any|current|latest|check|show|give|send|tell|whats|what is|hows|how is)\b.{0,60}\b(status|state|progress|wip)\b/.test(normalized)
+    || /\b(project|repo|repository|build|task|branch)\b.{0,40}\b(status|state|progress|wip)\b/.test(normalized)
+    || /\b(status|state|progress|wip)\b.{0,40}\b(project|repo|repository|build|task|branch|on|for|of)\b/.test(normalized)
+  );
+  if (!visualRequest && !statusShaped) {
+    return { isStatus: false, question: undefined, wantsImage: false };
+  }
+  return {
+    isStatus: true,
+    question: statusDetailQuestion(text),
+    wantsImage: visualRequest || wantsStatusImage(text)
+  };
+}
+
 export function statusDetailQuestion(text: string): string | undefined {
   const normalized = text.toLowerCase().replace(/[?!.]/g, "").replace(/\s+/g, " ").trim();
   return DETAILED_STATUS_SIGNAL.test(normalized) ? text.trim() : undefined;

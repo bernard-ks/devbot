@@ -12,6 +12,14 @@ export interface ImageAttachmentInput {
   size: number;
 }
 
+export function classifyImageRequest(text: string): "error" | "visual" {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return "error";
+  return /\b(error|exception|stack trace|traceback|console|failed|failing|failure|bug|broken|crash|fix|debug|issue|wrong)\b/.test(normalized)
+    ? "error"
+    : "visual";
+}
+
 export const MAX_IMAGE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 export const MAX_IMAGE_ATTACHMENTS_PER_MESSAGE = 4;
 export const MAX_TOTAL_ATTACHMENT_BYTES = 16 * 1024 * 1024;

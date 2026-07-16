@@ -44,23 +44,32 @@ export async function createReviewPacket(project: ProjectEntry, task?: TaskRecor
   };
 }
 
-export async function validateReview(project: ProjectEntry, commandNames?: string[]): Promise<ProjectCommandResult[]> {
-  const names = commandNames?.length ? commandNames : defaultValidationCommands(project);
+export async function validateReview(
+  project: ProjectEntry,
+  commandNames?: string[],
+  signal?: AbortSignal
+): Promise<ProjectCommandResult[]> {
+  const names = commandNames?.length ? commandNames : validationCommandNames(project);
   if (names.length === 0) {
     throw new Error(`No validation commands configured for ${project.name}. Add test/build/lint/verify to .devbot/project.json.`);
   }
 
   const results: ProjectCommandResult[] = [];
   for (const name of names) {
-    results.push(await runConfiguredProjectCommand(project, name));
+    results.push(await runConfiguredProjectCommand(project, name, signal ? { signal } : {}));
+    if (signal?.aborted) break;
   }
   return results;
 }
 
-export async function evaluateMergeGates(project: ProjectEntry, commandNames?: string[]): Promise<MergeGateResult> {
+export async function evaluateMergeGates(
+  project: ProjectEntry,
+  commandNames?: string[],
+  signal?: AbortSignal
+): Promise<MergeGateResult> {
   const status = await git(project, ["status", "--short", "--untracked-files=all", "--ignore-submodules=all"]).catch(() => "unknown");
   const cleanWorkingTree = status.trim().length === 0;
-  const validation = await validateReview(project, commandNames);
+  const validation = await validateReview(project, commandNames, signal);
   return {
     ok: cleanWorkingTree && validation.every((result) => result.ok),
     cleanWorkingTree,
@@ -111,7 +120,7 @@ export function formatMergeGateResult(project: ProjectEntry, result: MergeGateRe
   ].join("\n\n"));
 }
 
-function defaultValidationCommands(project: ProjectEntry): string[] {
+export function validationCommandNames(project: ProjectEntry): string[] {
   const commands = project.metadata.commands;
   if (commands.verify.length > 0) {
     return ["verify"];

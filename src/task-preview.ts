@@ -14,6 +14,7 @@ import {
   redactSensitiveText,
   sanitizeDiscordOutput
 } from "./security.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 import type { TaskRecord } from "./task-store.js";
 import { captureChildIdentity, terminateOrphanedChild, type ExecutionChildIdentity } from "./task-recovery.js";
 import type { ProjectEntry } from "./types.js";
@@ -21,7 +22,7 @@ import type { ProjectEntry } from "./types.js";
 const PREVIEW_ID_PATTERN = /^prv-[a-f0-9]{12}$/;
 const PREVIEW_COMMAND_NAMES = ["dev", "preview", "serve", "start"] as const;
 const PACKAGE_SCRIPT_NAME_PATTERN = /^[a-z0-9:_-]{1,64}$/i;
-const DEFAULT_LEDGER_FILE = path.resolve(".devbot", "previews.json");
+const DEFAULT_LEDGER_FILE = defaultRuntimeStatePath("previews.json");
 const DEFAULT_MAX_PREVIEWS = 3;
 const DEFAULT_TTL_MS = 30 * 60_000;
 const DEFAULT_READY_TIMEOUT_MS = 60_000;

@@ -30,6 +30,7 @@ export interface WorkspacePanelInput {
   projects: ProjectEntry[];
   selectedProject: ProjectEntry;
   canControl: boolean;
+  actionEnabled: boolean;
   studioEnabled: boolean;
   safeMode: boolean;
   status: string;
@@ -93,9 +94,9 @@ export function workspacePanelView(input: WorkspacePanelInput) {
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`${CONTROL_PREFIX}act:${input.selectedProject.name}`)
-      .setLabel("Make change")
+      .setLabel(input.actionEnabled ? "Make change" : "Changes unavailable")
       .setStyle(ButtonStyle.Success)
-      .setDisabled(!input.canControl || input.safeMode),
+      .setDisabled(!input.canControl || input.safeMode || !input.actionEnabled),
     new ButtonBuilder()
       .setCustomId(`${CONTROL_PREFIX}status:${input.selectedProject.name}`)
       .setLabel("Status")
@@ -210,6 +211,7 @@ function taskStatusLabel(task: TaskRecord): string {
   if (task.status === "succeeded") return "Done";
   if (task.status === "failed") return "Needs attention";
   if (task.status === "canceled") return "Canceled";
+  if (task.status === "interrupted") return "Interrupted";
   return "Working";
 }
 

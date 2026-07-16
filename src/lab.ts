@@ -361,7 +361,7 @@ export function formatSafetySummary(appConfig: Pick<AppConfig, "safeMode" | "pee
     `Read-only sandbox: \`${appConfig.codex.sandbox}\``,
     `Action sandbox: \`${appConfig.codex.actionSandbox}\``,
     `Allowed peers: ${peers}`,
-    project ? `Project scope: \`${project.name}\` at \`${project.root}\`` : "Project scope: select a project for root-specific rules.",
+    project ? `Project scope: \`${project.name}\` (local root hidden)` : "Project scope: select a project for project-specific rules.",
     "",
     "No peer request may execute writes, shell commands, pushes, merges, package installs, deploys, migrations, or secret/config changes without human approval.",
     "Peer bots may ask, observe, plan, review packets, and hand off freely inside allow-listed project scope."

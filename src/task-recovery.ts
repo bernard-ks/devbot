@@ -9,6 +9,7 @@ import {
   PRIVATE_FILE_MODE,
   redactSensitiveText
 } from "./security.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 import { isTaskId, type TaskAccessScope, type TaskRecord } from "./task-store.js";
 
 export type ExecutionPhase =
@@ -80,7 +81,7 @@ export class ExecutionLedger {
   private issues: ExecutionLoadIssues | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
 
-  constructor(private readonly stateFile = path.resolve(".devbot", "executions.json")) {}
+  constructor(private readonly stateFile = defaultRuntimeStatePath("executions.json")) {}
 
   async record(input: StartExecutionInput): Promise<void> {
     const now = new Date().toISOString();

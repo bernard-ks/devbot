@@ -3,10 +3,11 @@ import path from "node:path";
 import { captureProjectScreenshot } from "./project-screenshot.js";
 import { hardenPrivateDirectoryPermissions, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "./security.js";
 import { isScreenshotBlocked, screenshotRequiresApproval } from "./safety.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 import type { TaskRecord } from "./task-store.js";
 import type { ProjectEntry } from "./types.js";
 
-export const DEFAULT_CAPTURE_ROOT = path.resolve(".devbot", "captures");
+export const DEFAULT_CAPTURE_ROOT = defaultRuntimeStatePath("captures");
 const MAX_RETAINED_CAPTURES = 200;
 const CAPTURE_FILE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,78}\.png$/i;
 
@@ -46,8 +47,7 @@ export interface ShipCaptureUnavailable {
 export type ShipImageResult = ShipCaptureLive | ShipCaptureUnavailable;
 
 /**
- * `/ship` is the only remaining visual-evidence surface (see HANDOFF "Review
- * round 1"): action tasks always run in an isolated Git worktree
+ * `/ship` is the only automatic visual-evidence surface: action tasks always run in an isolated Git worktree
  * (task-worktree.ts). Managed previews are explicit, separately authorized,
  * TTL-bound commands; `/ship` never starts or silently attaches to one. The
  * project's ordinary dev server serves the source checkout, so screenshotting
@@ -94,7 +94,7 @@ async function persistShipCapture(taskId: string, image: Buffer, captureRoot = D
   await pruneCaptures(captureRoot);
 }
 
-/** Caps `.devbot/captures` to the most recently written files; captured UI can contain sensitive product data and must not accumulate forever. */
+/** Caps protected runtime captures to the most recently written files; captured UI can contain sensitive product data and must not accumulate forever. */
 export async function pruneCaptures(captureRoot = DEFAULT_CAPTURE_ROOT, maxRetained = MAX_RETAINED_CAPTURES): Promise<void> {
   let entries: string[];
   try {

@@ -8,6 +8,7 @@ import {
   PRIVATE_FILE_MODE,
   redactSensitiveText
 } from "./security.js";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 import { isScreenshotFixId, newScreenshotFixId, type ScreenshotAnalysis } from "./screenshot-fix.js";
 
 export interface ScreenshotFixRecord extends ScreenshotAnalysis {
@@ -33,7 +34,7 @@ export class ScreenshotFixStore {
   private state: ScreenshotFixStateFile | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
 
-  constructor(private readonly stateFile = path.resolve(".devbot", "screenshot-fixes.json")) {}
+  constructor(private readonly stateFile = defaultRuntimeStatePath("screenshot-fixes.json")) {}
 
   async create(input: CreateScreenshotFixInput): Promise<ScreenshotFixRecord> {
     return this.mutate((state) => {

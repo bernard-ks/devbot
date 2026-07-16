@@ -16,9 +16,11 @@ Devbot is the Discord front-end for whichever coding agent you already run local
 
 - **Codex CLI** (`codex`) — the default and reference backend, and the only one Devbot ever selects automatically; behavior is unchanged from earlier releases. This is currently the only backend that runs `/do` actions, because its sandbox confines writes to the task workspace.
 - **Claude Code** (`claude`) — answers only, after an explicit opt-in (`/setup backend id:claude` or `DEVBOT_AGENT_BACKEND=claude`). Read-only answers run with `--safe-mode` (the CLI's documented switch that disables CLAUDE.md, hooks, plugins, skills, MCP servers, and other user customization), `plan` permission mode, a read-only tool allow list plus a write/network tool denylist, `--strict-mcp-config`, `--no-session-persistence`, and an isolated empty `HOME` (credentials still resolve through the real `CLAUDE_CONFIG_DIR`). The Claude CLI has no supported flag that confines filesystem writes to a single directory (`--add-dir` only grants extra access), so `/do` actions fail closed on this backend. Detection probes `claude --help` for every safety flag above and refuses to run an older CLI that would silently ignore them.
-- **Gemini CLI** (`gemini`) and **opencode** (`opencode`) — experimental and detection-only. Devbot lists them in `/setup backend`, but neither has passed a real-CLI verification of read-only answers or workspace-confined actions, so both `/ask` and `/do` fail closed and no process is ever spawned for them.
+- **Gemini CLI** (`gemini`) and **opencode** (`opencode`) — experimental and detection-only. Devbot reports them in backend diagnostics but does not offer them as active setup choices; neither has passed real-CLI verification of read-only answers or workspace-confined actions, so no process is ever spawned for them.
 
 Every executable backend runs under the same hardening Devbot applies to Codex: a minimal child environment (never `process.env`, so `DISCORD_TOKEN` and other Devbot secrets can never reach a third-party CLI — only exact, individually named auth variables are forwarded, with no prefix-based admission), and the prompt delivered over stdin so it never appears in process listings. Both modes are fail-closed capabilities: a backend that cannot guarantee a read-only run refuses answer mode, and a backend that cannot confine writes to the task workspace refuses action mode.
+
+The browser setup flow bootstraps the reference Codex backend and therefore requires a signed-in Codex CLI. After setup, an owner can explicitly select compatible Claude for answer-only use; `/setup doctor` reports ask readiness separately from change capability.
 
 Devbot picks a backend in this order: the `DEVBOT_AGENT_BACKEND` environment variable, then the `/setup backend` choice. Nothing else is automatic — if neither is set, Devbot uses Codex, so an incidentally installed CLI can never become the executor by mere presence. The Luna / Terra / Sol tiers map to a backend's own fast / balanced / deep model whenever you configure one (for example `DEVBOT_CLAUDE_DEEP_MODEL`). Run `/setup backend` to see detected agents and versions, or `/setup doctor` for the full readiness view, which gates on answer and action readiness for the active backend.
 
@@ -30,31 +32,27 @@ Prerequisites: Node.js 20 or newer, a signed-in Codex CLI or app, and a Discord 
 
    ```bash
    npm install
+   npm run browsers:install
    npm run setup
    ```
 
+   On Linux, use `npx playwright install --with-deps chromium` instead when Chromium system dependencies are not already installed.
+
 2. The setup page opens in your browser. Discord requires one manual platform step: create an application in the [Developer Portal](https://discord.com/developers/applications), open **Bot**, reset the token, and paste that token into the local setup page. Devbot then:
-
-![Dark Devbot setup showing the local system check and Discord application connection](docs/images/setup-connect-dark.png)
-
-*Connect the Discord application without exposing the bot token in the repository.*
 
    - validates the bot directly with Discord
    - opens the correct server-install prompt with the required scopes and permissions
    - discovers the server after installation
-   - uses the Discord server owner as the initial Devbot owner
+   - requires an explicit confirmation before using the Discord server owner as the initial Devbot owner
    - registers the local repository with a native folder picker
+   - records whether that repository's screenshots are allowed, approval-gated, or blocked
    - creates a deny-by-default `devbot-private` room
    - deploys slash commands and posts a reusable Discord workspace launcher
    - optionally enables the Discord-native Studio board without opening any additional Studio or runtime listener
-   - writes the ignored local `.env` and `.devbot/setup.json` with owner-only file permissions
-   - starts Devbot in the same terminal, or reuses an already-running local process
+   - writes the ignored local `.env` and protected runtime setup state with owner-only file permissions
+   - requests a Devbot start in the same terminal, or reports that an existing process must be restarted
 
-![Dark Devbot setup showing server discovery, native repository selection, and the final setup action](docs/images/setup-workspace-dark.png)
-
-*Choose the Discord server and local repository; the remaining bootstrap work is automatic.*
-
-The setup page binds only to `127.0.0.1`, validates its loopback host, protects its API with a per-run session secret, clears the pasted token field after validation, and never returns the token in an API response.
+The setup page binds only to `127.0.0.1`, validates its loopback host, protects its API with a per-run 30-minute browser claim, clears the pasted token field after validation, and never returns the token in an API response. Completion stays locked until Node.js 20+ and a signed-in Codex CLI pass the system check. The result reports launcher/start warnings and does not claim Devbot is ready before the terminal confirms its Discord login.
 
 The Discord application itself cannot be created by Devbot: Discord's [application API](https://docs.discord.com/developers/resources/application) exposes read and edit operations for the current app, while creation and bot-token retrieval remain in the Developer Portal. Everything after that token is automated.
 
@@ -69,10 +67,6 @@ Then use it:
 /do task:fix the failing authentication test
 /status
 ```
-
-![Dark Devbot setup completion screen showing the Discord workspace launcher flow](docs/images/setup-ready-dark.png)
-
-*The completion screen opens the private room and leaves users with the three everyday actions.*
 
 The launcher opens a personal, ephemeral workspace with project selection and native **Ask**, **Make change**, **Status**, **Recent**, **Open Studio**, and **Refresh** controls. Tasks update one shared message through routing, context preparation, work, completion, failure, or cancellation. Safe public controls open role-aware private actions for follow-up, review, validation, retry, adjustment, and cancellation. Internal task and model IDs remain in task details instead of normal conversation.
 
@@ -101,7 +95,7 @@ Ideas 1-8 are implemented as the ambient workroom flow:
 
 1. **Natural intent preview:** `@devbot fix the failing auth test` is classified as a proposed action and shown as a confirmation card. `@devbot why is auth failing?` remains an immediate read-only answer. The proposal offers **Approve and start**, **Edit**, **Answer only**, and **Decline**. Editing opens a modal; answer-only runs without write access.
 2. **Private task threads:** an approved-room mention creates a private task thread and posts the proposal there. Unrestricted projects inherit the configured Devbot audience; scoped projects admit the requester and explicit project audience IDs. Eligible peers and the bot are added when project policy permits.
-3. **Isolated work:** an approved write action runs from a separate `devbot/task/<task-name>` branch and worktree under `~/.devbot/worktrees` by default. The source checkout is left untouched. Changed-file and bounded diff-status evidence are saved, while the changes remain uncommitted for human review; Devbot does not merge or push them. When the project's default branch moves on, `/task freshness` reports how far each task branch is behind, detects branches that are already fully merged, and `/task sync` can rebase a branch in the same isolated worktree.
+3. **Isolated work:** an approved write action runs from a separate `devbot/task/<task-name>` branch and worktree under `~/.devbot/worktrees` by default. The source checkout is left untouched. Changed-file and bounded diff-status evidence are saved for human review. A controller can commit the reviewed paths with `/task commit`, validate that exact worktree with task-scoped `/review validate` or `/review gates`, and rebase it with `/task sync`; Devbot still does not push or merge automatically.
 4. **Needs Me:** `/inbox` and the dashboard **Needs Me** control surface proposals and other decisions waiting for the current user. Open an item to see its private task detail, workroom, approval state, branch, changed files, and verification evidence.
 5. **Proof-first completion:** completion cards show recorded proof before the result, including isolation evidence, changed files, and the route used. **Open proof** reveals the saved task detail; **Mark reviewed** clears the item from Needs Me for the requester and controllers.
 6. **Project rooms:** the owner can bind a private channel or private thread to one project with `/setup project-room action:bind project:webapp channel:#webapp-room`. Mentions in that room are restricted to the bound project; remove the binding with `action:remove`.
@@ -130,11 +124,11 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/setup user action:<add|remove> user:<user> permission:<view|control>`: Manage private-room viewers. Controllers can also invoke write-capable commands; granting control automatically grants view access.
 - `/setup devbot action:<add|remove> bot:<bot>`: Manage peer Devbots and their private-room access.
 - `/setup repo action:<add|remove|default> name:<name> path:<required for add>`: Register a local project root or select the default used when a command omits `project`.
-- `/setup project-room action:<bind|remove> project:<name> channel:<optional>`: Bind or remove a private ambient room for one project. The selected channel must be private, and every visible member must satisfy both the Devbot and project allowlists.
+- `/setup project-room action:<bind|remove> project:<name> channel:<optional>`: Bind or remove a private ambient room for one project. The selected channel must be private, and every visible member or elevated role must satisfy both the Devbot and project allowlists; Administrator and private-thread manager bypasses fail closed unless explicitly allowed.
 - `/setup room name:<optional>`: Create or resync the private Devbot room. It uses a deny-by-default text channel when Devbot can manage channels, otherwise it adopts or creates an invite-only private thread.
 - `/projects`: List configured projects.
-- `/status project:<optional> question:<optional> image:<optional>`: Show a decision-ready brief with confirmed Devbot tasks, task phase, external Codex runs, activity-unknown app sessions, repository evidence, visible blockers or risks, and the best next step. Add a question for a deeper read-only inspection, and set `image:true` to attach a live project UI screenshot when a local web app is detected.
-- `/snip project:<optional> target:<text>`: Attach a live project UI screenshot by opening the running app and navigating visible UI controls from the target text. Explicit paths and local URLs are also supported.
+- `/status project:<optional> question:<optional> image:<optional>`: Show a decision-ready brief with confirmed Devbot tasks, task phase, external Codex runs, activity-unknown app sessions, repository evidence, visible blockers or risks, and the best next step. Add a question for a deeper read-only inspection. `image:true` attaches a live UI only when policy already allows capture; approval-gated projects point to `/snip` for controller consent.
+- `/snip project:<optional> target:<text>`: Attach a live project UI screenshot by opening the running app and navigating visible UI controls from the target text. Explicit paths and local URLs are also supported. Approval-gated projects show **Approve once**, **Always allow**, and **Cancel** controls to an owner/controller before capture.
 - `/task recent project:<optional> status:<optional> limit:<optional>`: List recent saved devbot tasks from local task history.
 - `/task show id:<task-id>`: Show one saved task with request, status, and result or error preview.
 - `/task status id:<task-id>`: Alias for showing one saved task.
@@ -142,16 +136,17 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/task cancel id:<task-id>`: Mark a running saved task as canceled in local history.
 - `/task retry id:<task-id>`: Retry a failed, canceled, or interrupted saved task with the same project, mode, text, and include patterns.
 - `/task freshness project:<name> limit:<optional>`: Show merged state and behind/ahead counts for saved task branches against the project's local default branch. Branches that are fully merged are marked durably on the task record and flagged as prune-eligible worktrees.
-- `/task sync task:<task-id>`: Rebase one task branch onto the current local default branch inside its isolated worktree. Available to the task requester, the owner, or an approved controller; blocked by safe mode and while the task is still open. The pre-sync tip is preserved under `refs/devbot/backup/<task-id>` first, conflicts abort with the branch restored and the conflicted files reported, and configured validation runs afterwards for controllers with results reported as-is.
+- `/task commit task:<task-id> message:<optional>`: Stage only the task worktree's reported changed paths and create a reviewable commit. Owner/controller-only and blocked by safe mode.
+- `/task sync task:<task-id>`: Rebase one task branch onto the current local default branch inside its isolated worktree. Owner/controller-only; blocked by safe mode and while the task is still open. The pre-sync tip is preserved under `refs/devbot/backup/<task-id>` first, conflicts abort with the branch restored and the conflicted files reported, and configured validation runs afterwards with results reported as-is.
 - `/task preview task:<task-id> action:<start|stop|status>`: Start, stop, or inspect a managed dev server for the task's isolated worktree. The server runs only the project's configured `dev`/`preview`/`serve`/`start` preset or an allow-listed package.json script, binds to a loopback origin (`http://127.0.0.1:<ephemeral port>`) on the machine running Devbot, and stops automatically after its TTL. It is not a public tunnel and is reachable only from that machine. Only the owner or an approved controller can start one; the task requester may inspect or stop it. Safe mode blocks starting one but never stopping it. Missing dependencies fail closed; Devbot does not install them.
 - `/task stale minutes:<optional> project:<optional>`: List running tasks older than a selected threshold.
 - `/dashboard project:<optional>`: Open the personal interactive workspace with project selection, current status, recent work, and native Ask / Change controls.
 - `/studio`: Open the optional Discord-native Components V2 Studio in the configured private room. Owner/controller-only; no web listener or Activity configuration is required.
-- `/inbox project:<optional> limit:<optional>`: Open the ephemeral **Needs Me** inbox for pending proposals and decisions, with review controls and refresh.
-- `/run command:<name> project:<optional>`: Run a configured command from `<project>/.devbot/project.json`, using the selected default project when omitted.
+- `/inbox project:<optional> limit:<optional>`: Open the paginated ephemeral **Needs Me** inbox for up to 25 pending proposals and decisions, with review and refresh controls.
+- `/run command:<name> project:<optional> confirm:<optional>`: Run every command configured under that preset from `<project>/.devbot/project.json`. Commands not classified as read-only require an explicit `confirm:true` rerun.
 - `/review packet project:<name> task:<optional>`: Create a provider-neutral review handoff packet from git status, diff stat, last commit, and optional task context.
-- `/review validate project:<name> commands:<optional>`: Run configured validation commands.
-- `/review gates project:<name> commands:<optional>`: Check merge gates without merging: clean working tree plus validation pass.
+- `/review validate project:<name> task:<optional> commands:<optional> confirm:<optional>`: Run configured validation commands in the task's verified isolated worktree when supplied, and report the exact branch tested.
+- `/review gates project:<name> task:<optional> commands:<optional> confirm:<optional>`: Check merge gates without merging in the exact selected checkout: clean working tree plus validation pass.
 - `/devbot capabilities`: Show this bot's owner, safe mode, projects, and command capabilities.
 - `/devbot announce`: Post a structured capability announcement for peer devbots.
 - `/devbot peers`: List peer devbots that have announced themselves.
@@ -159,12 +154,12 @@ Safety and fallback behavior are intentional. Only the requester or an approved 
 - `/peer snip bot:<id-or-mention> target:<text> project:<optional>`: Ask an allow-listed peer bot for a live UI screenshot.
 - `/lab council prompt:<text> project:<optional> seats:<optional 2-4>`: Open a persistent workroom on the selected default or explicit project with three independent local agent seats by default, plus invited peer bots, before the human reveals, challenges, synthesizes, approves, denies, or closes the room.
 - `/lab roundtable project:<name> prompt:<text>`: Start a private devbot strategy room with role-based product, frontend, backend, testing, and risk angles.
-- `/lab see target:<text> project:<optional>`: Collect a local screenshot plus peer screenshot requests for the same target.
+- `/lab see target:<text> project:<optional>`: Collect a local screenshot plus peer screenshot requests for the same target when local policy permits capture; use `/snip` first when controller approval is required.
 - `/lab handoff project:<name> target:<human-or-bot> task:<optional>`: Create a baton-pass review handoff card and send a peer review-packet request when the target is an allow-listed bot.
 - `/lab bossfight project:<name> task:<optional> commands:<optional>`: Build a merge-readiness boss bar from review packets, local gates, peer observers, and approval state.
 - `/lab jam project:<name> theme:<text>`: Brainstorm playful options and convert the best one into a concrete task.
 - `/lab argue project:<name> proposal:<text>`: Run a contrarian council against a proposal from speed, safety, UX, and maintenance angles.
-- `/lab fix-from-snip project:<name> target:<text> complaint:<text>`: Capture visual context and produce an approval-ready fix plan.
+- `/lab fix-from-snip project:<name> target:<text> complaint:<text>`: Use policy-allowed visual context and produce an approval-ready fix plan; approval-gated screenshots must be captured separately through `/snip`.
 - `/lab campfire minutes:<optional> project:<optional>`: Surface stale running tasks with recovery options.
 - `/lab roster`: Show peer capability cards.
 - `/lab ritual project:<name> task:<optional>`: Build a merge ritual card with review packet, recent tasks, and safety state.
@@ -198,7 +193,7 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
-Task history is stored locally in `.devbot/tasks.json` by default. In-flight execution records live in `.devbot/executions.json`, the managed-preview ledger in `.devbot/previews.json`, per-user project selection in `.devbot/preferences.json`, peer registry state in `.devbot/peers.json`, collaboration workrooms in `.devbot/collab.json`, owner-managed setup in `.devbot/setup.json`, and per-project memory in `.devbot/memory/<project-key>.jsonl` (one owner-only file per project identity, keyed by its resolved root plus full normalized project name, never inside the managed project's checkout). Set `DEVBOT_TASK_STORE`, `DEVBOT_EXECUTION_STORE`, `DEVBOT_PREVIEW_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, `DEVBOT_SETUP_STORE`, or `DEVBOT_MEMORY_STORE` to use different files or directories; relative paths resolve from the devbot process working directory.
+Task history, in-flight executions, managed previews, preferences, peers, collaboration workrooms, setup, screenshots, and project memory default to owner-only files under `~/.devbot/state`. Set `DEVBOT_STATE_DIR` to move that protected root, or use `DEVBOT_TASK_STORE`, `DEVBOT_EXECUTION_STORE`, `DEVBOT_PREVIEW_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, `DEVBOT_SETUP_STORE`, `DEVBOT_SNAPFIX_STORE`, or `DEVBOT_MEMORY_STORE` for an individual override; relative override paths resolve from the Devbot process working directory. On first use, Devbot migrates recognized legacy runtime files from this repository's `.devbot/` directory without moving project metadata such as `.devbot/project.json`.
 
 ## Restart Recovery
 
@@ -274,7 +269,7 @@ The safety boundary is deliberate: peer bots can ask, observe, plan, review, and
 - `/task sync` rewrites only the isolated task branch, never the source checkout. The pre-sync tip is preserved under an exact-format `refs/devbot/backup/<task-id>` ref before the rebase, conflicts are never auto-resolved, and a conflicted or failed sync restores the branch and reports honestly.
 - Screenshots are limited to configured or detected loopback origins. Redirects and browser subresources are restricted to those approved origins; arbitrary localhost ports, remote hosts, credentials in URLs, and link-local metadata addresses are rejected.
 - Task previews run only a configured project preset or an allow-listed package.json script from the verified isolated worktree, never free-text commands. Only controllers can start them. The child gets a minimal credential-free environment and empty temporary home; its command remains behind a private stdin gate until a stable pid, process-group id, kernel start time, command identity, and temporary-home path are durably recorded. Readiness requires an HTTP listener owned by that exact process group and bound specifically to loopback; a foreign or non-loopback listener is stopped without being accepted, and active previews keep checking the whole group for later non-loopback listeners. TTL, manual stop, shutdown, and restart recovery use SIGTERM then SIGKILL and clear state only after the whole group, listener, temporary home, and owner-only ledger are confirmed clean. A bare or recycled pid is never signaled, and previews are never exposed beyond the local machine.
-- Local task, setup, preference, peer, and collaboration state is written owner-only inside owner-only directories. Responses, stored results, errors, command output, and indexed context pass through credential redaction.
+- Local task, setup, preference, peer, capture, and collaboration state defaults to owner-only files under `~/.devbot/state` (or `DEVBOT_STATE_DIR`), outside managed checkouts; legacy checkout-local state migrates on first use. Responses, stored results, errors, command output, and indexed context pass through credential redaction.
 - These controls reduce exposure but do not make untrusted repositories harmless. Keep credentials out of project roots, review isolated changes before applying them, use ID-based Discord allowlists, and leave screenshot policy at `approval` unless a project UI is safe to post.
 
 ## Project Context Behavior
@@ -289,7 +284,7 @@ The friendly route is shown while Devbot works; concrete model IDs and routing d
 
 Configure the family with `CODEX_ROUTER_MODEL`, `CODEX_FAST_MODEL`, `CODEX_STANDARD_MODEL`, and `CODEX_DEEP_MODEL`. Reasoning effort and the focused context budget have separate environment controls; see `.env.example`.
 
-The scanner ranks files by path and content matches against your question or task, then passes a bounded set of relevant snippets to local Codex.
+The scanner ranks files by path and content matches against your question or task, then passes a bounded set of relevant snippets to local Codex as delimiter-safe JSON Lines records. Repository text remains data even when it contains prompt-like tags.
 
 By default:
 
@@ -301,11 +296,14 @@ By default:
 Defaults are conservative:
 
 - Maximum indexed file size: `80 KB`
+- Maximum index size: `2,000 files` and `8 MB` of file contents
 - Maximum context per file: `12 KB`
 - Maximum packed project context: `120,000 characters`
+- Cached indexes refresh automatically after `5 seconds`; `/refresh` still forces an immediate rebuild
 - Default ignored paths include `.git`, `node_modules`, `dist`, `build`, `coverage`, `.env`, private keys, logs, and common binary media files
+- Private `.devbot` and `.codex` directories are always excluded, including when an `include` pattern explicitly requests them
 
-Tune these in `src/config.ts` if you need a larger or smaller context window.
+Tune these with the bounded `DEVBOT_CONTEXT_*` settings documented in `.env.example`. Invalid or excessive values fail startup rather than silently removing a limit.
 
 ## License
 

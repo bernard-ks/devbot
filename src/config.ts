@@ -3,13 +3,16 @@ import "dotenv/config";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { normalizeDiscordUsernames } from "./access.js";
-import type { AppConfig, ProjectCommands, ProjectEntry, ProjectMap, ProjectMetadata } from "./types.js";
+import type { AppConfig, ProjectCommands, ProjectEntry, ProjectMap, ProjectMetadata, ScannerConfig } from "./types.js";
 
-const DEFAULT_SCANNER = {
+const DEFAULT_SCANNER: ScannerConfig = {
   maxIndexedFileBytes: 80_000,
+  maxIndexedFiles: 2_000,
+  maxIndexedTotalBytes: 8_000_000,
   maxSnippetCharsPerFile: 12_000,
   maxPackedContextChars: 120_000,
-  maxRankedFiles: 36
+  maxRankedFiles: 36,
+  cacheTtlMs: 5_000
 };
 
 export function loadConfig(): AppConfig {
@@ -19,13 +22,13 @@ export function loadConfig(): AppConfig {
   return {
     ...loadDiscordConfig(),
     ownerUserId: process.env.DEVBOT_OWNER_USER_ID?.trim() || undefined,
-    autoDeployCommands: parseBoolean(process.env.DEVBOT_AUTO_DEPLOY_COMMANDS, true),
+    autoDeployCommands: parseBooleanEnv(process.env.DEVBOT_AUTO_DEPLOY_COMMANDS, true, "DEVBOT_AUTO_DEPLOY_COMMANDS"),
     codex,
     routing: loadRoutingConfig(codex.model),
     allowedUserIds: csvSet(process.env.ALLOWED_USER_IDS),
     allowedUsernames: normalizedUsernameSet(process.env.ALLOWED_USERNAMES),
     allowedRoleIds: csvSet(process.env.ALLOWED_ROLE_IDS),
-    safeMode: parseBoolean(process.env.DEVBOT_SAFE_MODE, false),
+    safeMode: parseBooleanEnv(process.env.DEVBOT_SAFE_MODE, false, "DEVBOT_SAFE_MODE"),
     botIdentity: {
       owner: process.env.BOT_OWNER?.trim() || "local",
       displayName: process.env.BOT_DISPLAY_NAME?.trim() || process.env.DISCORD_BOT_NAME?.trim() || "devbot"
@@ -33,24 +36,45 @@ export function loadConfig(): AppConfig {
     peerBotIds: csvSet(process.env.PEER_BOT_IDS),
     coordinationChannelId: process.env.COORDINATION_CHANNEL_ID?.trim() || undefined,
     projects,
-    scanner: DEFAULT_SCANNER
+    scanner: loadScannerConfig()
   };
+}
+
+export function loadScannerConfig(environment: NodeJS.ProcessEnv = process.env): ScannerConfig {
+  const scanner: ScannerConfig = {
+    maxIndexedFileBytes: positiveIntegerEnv(environment, "DEVBOT_CONTEXT_MAX_INDEXED_FILE_BYTES", DEFAULT_SCANNER.maxIndexedFileBytes, 1_000_000),
+    maxIndexedFiles: positiveIntegerEnv(environment, "DEVBOT_CONTEXT_MAX_INDEXED_FILES", DEFAULT_SCANNER.maxIndexedFiles, 20_000),
+    maxIndexedTotalBytes: positiveIntegerEnv(environment, "DEVBOT_CONTEXT_MAX_INDEXED_TOTAL_BYTES", DEFAULT_SCANNER.maxIndexedTotalBytes, 100_000_000),
+    maxSnippetCharsPerFile: positiveIntegerEnv(environment, "DEVBOT_CONTEXT_MAX_SNIPPET_CHARS_PER_FILE", DEFAULT_SCANNER.maxSnippetCharsPerFile, 100_000),
+    maxPackedContextChars: positiveIntegerEnv(environment, "DEVBOT_CONTEXT_MAX_PACKED_CHARS", DEFAULT_SCANNER.maxPackedContextChars, 1_000_000),
+    maxRankedFiles: positiveIntegerEnv(environment, "DEVBOT_CONTEXT_MAX_RANKED_FILES", DEFAULT_SCANNER.maxRankedFiles, 200),
+    cacheTtlMs: positiveIntegerEnv(environment, "DEVBOT_CONTEXT_CACHE_TTL_MS", DEFAULT_SCANNER.cacheTtlMs, 3_600_000)
+  };
+
+  if (scanner.maxIndexedFileBytes > scanner.maxIndexedTotalBytes) {
+    throw new Error("DEVBOT_CONTEXT_MAX_INDEXED_FILE_BYTES cannot exceed DEVBOT_CONTEXT_MAX_INDEXED_TOTAL_BYTES.");
+  }
+  if (scanner.maxSnippetCharsPerFile > scanner.maxPackedContextChars) {
+    throw new Error("DEVBOT_CONTEXT_MAX_SNIPPET_CHARS_PER_FILE cannot exceed DEVBOT_CONTEXT_MAX_PACKED_CHARS.");
+  }
+
+  return scanner;
 }
 
 function loadRoutingConfig(defaultModel: string | undefined) {
   const routerModel = process.env.CODEX_ROUTER_MODEL?.trim() || undefined;
   return {
-    enabled: parseBoolean(process.env.CODEX_ROUTING_ENABLED, Boolean(routerModel)),
+    enabled: parseBooleanEnv(process.env.CODEX_ROUTING_ENABLED, Boolean(routerModel), "CODEX_ROUTING_ENABLED"),
     routerModel,
     routerReasoningEffort: process.env.CODEX_ROUTER_REASONING_EFFORT?.trim() || "low",
-    routerTimeoutMs: Number(process.env.CODEX_ROUTER_TIMEOUT_MS || 30_000),
+    routerTimeoutMs: positiveIntegerEnv(process.env, "CODEX_ROUTER_TIMEOUT_MS", 30_000, 600_000),
     fastModel: process.env.CODEX_FAST_MODEL?.trim() || defaultModel,
     fastReasoningEffort: process.env.CODEX_FAST_REASONING_EFFORT?.trim() || undefined,
     standardModel: process.env.CODEX_STANDARD_MODEL?.trim() || defaultModel,
     standardReasoningEffort: process.env.CODEX_STANDARD_REASONING_EFFORT?.trim() || undefined,
     deepModel: process.env.CODEX_DEEP_MODEL?.trim() || defaultModel,
     deepReasoningEffort: process.env.CODEX_DEEP_REASONING_EFFORT?.trim() || undefined,
-    focusedContextChars: Number(process.env.CODEX_FOCUSED_CONTEXT_CHARS || 24_000)
+    focusedContextChars: positiveIntegerEnv(process.env, "CODEX_FOCUSED_CONTEXT_CHARS", 24_000, 1_000_000)
   };
 }
 
@@ -70,7 +94,7 @@ export function loadCodexConfig(environment: NodeJS.ProcessEnv = process.env): A
     model: environment.CODEX_MODEL?.trim() || undefined,
     sandbox,
     actionSandbox,
-    timeoutMs: Number(environment.CODEX_TIMEOUT_MS || 180_000)
+    timeoutMs: positiveIntegerEnv(environment, "CODEX_TIMEOUT_MS", 180_000, 3_600_000)
   };
 }
 
@@ -173,7 +197,7 @@ export function loadProjectEntry(name: string, projectPath: string): ProjectEntr
   return {
     name: projectName,
     root,
-    metadata: loadProjectMetadata(root, projectName)
+    metadata: loadProjectMetadata(root)
   };
 }
 
@@ -188,7 +212,7 @@ export function expandEnvPlaceholders(value: string, label = "value"): string {
   });
 }
 
-function loadProjectMetadata(root: string, projectName: string): ProjectMetadata {
+function loadProjectMetadata(root: string): ProjectMetadata {
   const metadataFile = path.join(root, ".devbot", "project.json");
   const raw = existsSync(metadataFile) ? readJsonObject(metadataFile) : {};
   const commands = readCommands(raw.commands);
@@ -292,10 +316,29 @@ function numberValue(value: unknown): number | undefined {
   return undefined;
 }
 
-function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+function positiveIntegerEnv(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+  maximum: number
+): number {
+  const raw = environment[name]?.trim();
+  if (!raw) return fallback;
+
+  const parsed = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed) || parsed <= 0 || parsed > maximum) {
+    throw new Error(`${name} must be a positive integer no greater than ${maximum}.`);
+  }
+
+  return parsed;
+}
+
+export function parseBooleanEnv(value: string | undefined, fallback: boolean, name = "Boolean setting"): boolean {
   if (!value?.trim()) {
     return fallback;
   }
-
-  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  throw new Error(`${name} must be true or false (accepted: true/false, 1/0, yes/no, on/off).`);
 }

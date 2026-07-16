@@ -39,6 +39,7 @@ export function renderSetupPage(nonce: string): string {
     .secondary { color: var(--ink); background: var(--surface-raised); border-color: #3a424d; }
     .secondary:hover { border-color: #566171; background: #242932; }
     .quiet { color: var(--muted); background: transparent; border-color: var(--line); }
+    :focus-visible { outline: 3px solid rgba(116,128,255,0.55); outline-offset: 2px; }
     .topbar { height: 68px; display: flex; align-items: center; justify-content: space-between; padding: 0 30px; border-bottom: 1px solid var(--line); background: rgba(15,18,23,0.96); }
     .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
     .mark { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 7px; background: var(--discord); color: white; font: 700 15px/1 ui-monospace, SFMono-Regular, Menlo, monospace; box-shadow: 0 0 0 1px rgba(255,255,255,0.08) inset; }
@@ -89,6 +90,10 @@ export function renderSetupPage(nonce: string): string {
     input::placeholder { color: #697382; }
     input:focus, select:focus { border-color: var(--discord); box-shadow: 0 0 0 3px rgba(116,128,255,0.22); }
     .field-hint { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.4; }
+    .system-help { margin: 12px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .confirmation { display: flex; align-items: flex-start; gap: 10px; margin-top: 18px; padding: 14px; border: 1px solid var(--line); border-radius: 7px; background: #12151a; }
+    .confirmation input { width: 18px; height: 18px; flex: none; margin: 1px 0 0; accent-color: var(--discord); }
+    .confirmation label { margin: 0; color: var(--ink); font-size: 12px; line-height: 1.5; }
     .input-action { display: flex; align-items: center; gap: 8px; }
     .input-action input { flex: 1 1 auto; min-width: 0; }
     .input-action button { flex: none; }
@@ -107,6 +112,10 @@ export function renderSetupPage(nonce: string): string {
     .success-mark { width: 48px; height: 48px; display: grid; place-items: center; border-radius: 50%; background: var(--green-soft); color: var(--green); font-size: 24px; font-weight: 850; }
     .success h2 { margin: 18px 0 8px; font-size: 24px; letter-spacing: 0; }
     .success > p { margin: 0; color: var(--muted); line-height: 1.6; }
+    .warning-list { display: none; margin: 20px 0 0; padding: 14px 16px; border-left: 3px solid var(--amber); background: var(--amber-soft); color: #f8dca3; font-size: 12px; line-height: 1.5; }
+    .warning-list.visible { display: block; }
+    .warning-list strong { display: block; margin-bottom: 5px; }
+    .warning-list ul { margin: 0; padding-left: 18px; }
     .quickstart { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 26px 0; background: var(--line); border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
     .quickstart div { padding: 16px; background: var(--surface); min-width: 0; }
     .quickstart span { color: var(--muted); font-size: 11px; text-transform: uppercase; font-weight: 750; }
@@ -135,6 +144,9 @@ export function renderSetupPage(nonce: string): string {
       .portal-row .button, .finish-row button { width: 100%; }
       footer { width: calc(100% - 30px); margin-top: -20px; text-align: center; }
     }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+    }
   </style>
 </head>
 <body>
@@ -143,36 +155,38 @@ export function renderSetupPage(nonce: string): string {
       <div class="mark">&lt;/&gt;</div>
       <div class="brand-copy"><strong>Devbot setup</strong><span>Local Discord workspace</span></div>
     </div>
-    <div class="local-pill">Local only</div>
+    <div class="local-pill">Setup served locally</div>
   </header>
 
   <main class="shell">
     <aside class="rail">
       <h1>Ready in one pass.</h1>
       <p>Connect Discord, choose a server and repository, then open your private Devbot room.</p>
-      <ol class="steps">
-        <li class="step active" id="step-system"><span class="step-number">1</span><span>System</span></li>
+      <ol class="steps" aria-label="Setup progress">
+        <li class="step active" id="step-system" aria-current="step"><span class="step-number">1</span><span>System</span></li>
         <li class="step" id="step-discord"><span class="step-number">2</span><span>Discord</span></li>
         <li class="step" id="step-workspace"><span class="step-number">3</span><span>Workspace</span></li>
       </ol>
     </aside>
 
-    <div class="workspace" id="setup-workspace">
+    <div class="workspace" id="setup-workspace" aria-busy="false">
       <section class="section">
         <div class="section-heading">
           <div><h2>System check</h2><p>Devbot runs through the Codex session already on this machine.</p></div>
-          <span class="status waiting" id="system-status">Checking</span>
+          <span class="status waiting" id="system-status" role="status" aria-live="polite" aria-atomic="true">Checking</span>
         </div>
         <div class="checks">
           <div class="check"><span>Node.js</span><strong id="node-check">Checking...</strong></div>
           <div class="check"><span>Codex</span><strong id="codex-check">Checking...</strong></div>
         </div>
+        <p class="system-help" id="system-help" role="status" aria-live="polite">Setup completion stays locked until both checks pass.</p>
+        <div class="actions"><button class="quiet" id="recheck-system" type="button">Recheck system</button></div>
       </section>
 
       <section class="section">
         <div class="section-heading">
           <div><h2>Connect Discord</h2><p>Discord requires the application to be created in its Developer Portal. Devbot handles everything after the token.</p></div>
-          <span class="status waiting" id="discord-status">Not connected</span>
+          <span class="status waiting" id="discord-status" role="status" aria-live="polite" aria-atomic="true">Not connected</span>
         </div>
 
         <div class="portal-row">
@@ -184,7 +198,7 @@ export function renderSetupPage(nonce: string): string {
           <div class="fields">
             <div class="field full">
               <label for="token">Bot token</label>
-              <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the token once">
+              <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the token once" required>
               <p class="field-hint">Validated directly with Discord, then written only to this repo's ignored local .env file.</p>
             </div>
           </div>
@@ -202,13 +216,13 @@ export function renderSetupPage(nonce: string): string {
           <a class="button primary" id="install-link" target="_blank" rel="noreferrer">Add Devbot to Discord</a>
           <button class="secondary" id="refresh-guilds" type="button">Refresh servers</button>
         </div>
-        <div class="error" id="discord-error" role="alert"></div>
+        <div class="error" id="discord-error" role="alert" tabindex="-1"></div>
       </section>
 
       <section class="section">
         <div class="section-heading">
-          <div><h2>Choose the workspace</h2><p>The selected server owner becomes Devbot's initial owner. The repository remains on this machine.</p></div>
-          <span class="status waiting" id="workspace-status">Waiting</span>
+          <div><h2>Choose the workspace</h2><p>Discord's owner of the selected server becomes Devbot's bootstrap owner. The person opening this page may be someone else.</p></div>
+          <span class="status waiting" id="workspace-status" role="status" aria-live="polite" aria-atomic="true">Waiting</span>
         </div>
         <div class="fields">
           <div class="field full">
@@ -226,14 +240,27 @@ export function renderSetupPage(nonce: string): string {
             <label for="repo-name">Short name</label>
             <input id="repo-name" type="text" autocomplete="off" spellcheck="false" maxlength="40" placeholder="my-app">
           </div>
+          <div class="field full">
+            <label for="screenshot-policy">Screenshot access</label>
+            <select id="screenshot-policy">
+              <option value="approval" selected>Ask before capturing (recommended)</option>
+              <option value="allow">Allow screenshots for this repository</option>
+              <option value="deny">Block screenshots for this repository</option>
+            </select>
+            <p class="field-hint">Saved in this repository's .devbot/project.json policy. You can change it later.</p>
+          </div>
         </div>
-        <div class="error" id="finish-error" role="alert"></div>
+        <div class="confirmation">
+          <input id="confirm-owner" type="checkbox" aria-describedby="owner-confirmation-help">
+          <label for="confirm-owner" id="owner-confirmation-help">I confirm that the selected Discord server owner should have sole bootstrap control of Devbot. I will choose a server I own or coordinate with its owner.</label>
+        </div>
+        <div class="error" id="finish-error" role="alert" tabindex="-1"></div>
       </section>
 
       <section class="section">
         <div class="section-heading">
           <div><h2>Devbot Studio <span class="optional-badge">Optional</span></h2><p>A richer task board, agent map, branch state, approvals, and proof rendered directly in Discord.</p></div>
-          <span class="status waiting" id="studio-status">Skipped</span>
+          <span class="status waiting" id="studio-status" role="status" aria-live="polite" aria-atomic="true">Skipped</span>
         </div>
         <div class="studio-opt-in" id="studio-opt-in">
           <div><strong>Enable the Discord-native workroom</strong><p>Studio runs inside the bot process on this PC. It creates no public URL, tunnel, Activity, web server, or loopback listener.</p></div>
@@ -249,18 +276,19 @@ export function renderSetupPage(nonce: string): string {
 
       <section class="section">
         <div class="finish-row">
-          <div class="finish-copy"><strong>Finish local setup</strong><span>Creates the private room, deploys commands, saves local config, applies the optional Studio choice, posts the workspace launcher, and starts Devbot.</span></div>
+          <div class="finish-copy"><strong>Finish local setup</strong><span>Creates the private room, deploys commands, saves local config and policy choices, posts the workspace launcher, and requests a Devbot start. The result will report anything still needed.</span></div>
           <button class="primary" id="finish-button" type="button" disabled>Finish setup</button>
         </div>
       </section>
     </div>
 
-    <section class="workspace success" id="success">
+    <section class="workspace success" id="success" role="status" aria-live="polite" aria-atomic="false" tabindex="-1">
       <div class="success-mark">✓</div>
-      <h2>Devbot is ready.</h2>
+      <h2 id="success-title">Setup saved.</h2>
       <p id="success-copy"></p>
+      <div class="warning-list" id="success-warnings" role="alert"><strong>Needs attention</strong><ul id="warning-items"></ul></div>
       <div class="quickstart">
-        <div><span>Open</span><code>Open workspace</code></div>
+        <div><span>Open</span><code id="success-open">Private room</code></div>
         <div><span>Explore</span><code id="success-explore">Ask or Status</code></div>
         <div><span>Build</span><code>Make change</code></div>
       </div>
@@ -272,7 +300,7 @@ export function renderSetupPage(nonce: string): string {
   <footer>Bound to 127.0.0.1 for this setup session.</footer>
 
   <script nonce="${nonce}">
-    const state = { identity: null, guilds: [], finished: false, studioEnabled: false };
+    const state = { identity: null, guilds: [], finished: false, studioEnabled: false, systemReady: false };
     const byId = (id) => document.getElementById(id);
 
     async function api(route, options) {
@@ -294,18 +322,42 @@ export function renderSetupPage(nonce: string): string {
     function setStep(id, done, active) {
       const element = byId(id);
       element.className = "step" + (done ? " done" : "") + (active ? " active" : "");
-      if (done) element.querySelector(".step-number").textContent = "✓";
+      element.querySelector(".step-number").textContent = done ? "✓" : ({ "step-system": "1", "step-discord": "2", "step-workspace": "3" }[id] || "");
+      if (active) element.setAttribute("aria-current", "step");
+      else element.removeAttribute("aria-current");
+    }
+
+    function updateProgressSteps() {
+      if (state.finished) {
+        setStep("step-system", true, false);
+        setStep("step-discord", true, false);
+        setStep("step-workspace", true, false);
+        return;
+      }
+      if (!state.systemReady) {
+        setStep("step-system", false, true);
+        setStep("step-discord", Boolean(state.identity), false);
+        setStep("step-workspace", false, false);
+        return;
+      }
+      setStep("step-system", true, false);
+      setStep("step-discord", Boolean(state.identity), !state.identity);
+      setStep("step-workspace", false, Boolean(state.identity));
     }
 
     function showError(id, error) {
       const element = byId(id);
       element.textContent = error ? error.message || String(error) : "";
       element.classList.toggle("visible", Boolean(error));
+      if (error) element.focus();
     }
 
     function setBusy(button, busy, label) {
       button.disabled = busy;
-      button.innerHTML = busy ? '<span class="spinner"></span>' + label : label;
+      button.setAttribute("aria-busy", String(busy));
+      button.innerHTML = busy ? '<span class="spinner" aria-hidden="true"></span>' + label : label;
+      byId("setup-workspace").setAttribute("aria-busy", String(busy));
+      if (!busy && button.id === "finish-button") updateFinishReadiness();
     }
 
     function renderIdentity(payload) {
@@ -322,9 +374,7 @@ export function renderSetupPage(nonce: string): string {
       byId("token").value = "";
       byId("enable-studio").disabled = false;
       setStatus("discord-status", "Connected", true);
-      setStep("step-system", true, false);
-      setStep("step-discord", true, false);
-      setStep("step-workspace", false, true);
+      updateProgressSteps();
       renderGuilds();
     }
 
@@ -349,13 +399,33 @@ export function renderSetupPage(nonce: string): string {
         if (state.guilds.some((guild) => guild.id === previous)) select.value = previous;
         if (state.guilds.length === 1) select.value = state.guilds[0].id;
       }
+      if (previous && select.value !== previous) byId("confirm-owner").checked = false;
       updateFinishReadiness();
     }
 
     function updateFinishReadiness() {
-      const ready = Boolean(state.identity && byId("guild").value && byId("repo-path").value.trim());
+      const workspaceReady = Boolean(state.identity && byId("guild").value && byId("repo-path").value.trim() && byId("confirm-owner").checked);
+      const ready = state.systemReady && workspaceReady;
       byId("finish-button").disabled = !ready;
-      setStatus("workspace-status", ready ? "Ready" : "Waiting", ready);
+      byId("finish-button").title = !state.systemReady ? "Complete the system check first" : !workspaceReady ? "Choose a server and repository, then confirm the owner" : "";
+      setStatus("workspace-status", workspaceReady ? (state.systemReady ? "Ready" : "System needed") : "Waiting", ready);
+    }
+
+    async function loadSetupState() {
+      const payload = await api("/api/state");
+      byId("node-check").textContent = payload.node.version;
+      byId("node-check").className = payload.node.ready ? "good" : "bad";
+      byId("codex-check").textContent = payload.codex.label;
+      byId("codex-check").className = payload.codex.ready ? "good" : "bad";
+      state.systemReady = Boolean(payload.node.ready && payload.codex.ready);
+      setStatus("system-status", state.systemReady ? "Ready" : "Needs attention", state.systemReady);
+      byId("system-help").textContent = state.systemReady
+        ? "Node.js and the signed-in Codex session are ready."
+        : "Install Node.js 20+ and run codex login if needed, then choose Recheck system.";
+      renderStudio(payload.studioEnabled);
+      if (payload.identity) renderIdentity(payload);
+      else updateProgressSteps();
+      updateFinishReadiness();
     }
 
     async function refreshGuilds() {
@@ -390,7 +460,11 @@ export function renderSetupPage(nonce: string): string {
 
     byId("refresh-guilds").addEventListener("click", refreshGuilds);
     byId("install-link").addEventListener("click", () => setTimeout(refreshGuilds, 3500));
-    byId("guild").addEventListener("change", updateFinishReadiness);
+    byId("guild").addEventListener("change", () => {
+      byId("confirm-owner").checked = false;
+      updateFinishReadiness();
+    });
+    byId("confirm-owner").addEventListener("change", updateFinishReadiness);
     byId("repo-path").addEventListener("input", () => {
       const pathValue = byId("repo-path").value.trim().replace(/[\\/]+$/, "");
       if (!byId("repo-name").dataset.edited && pathValue) {
@@ -401,6 +475,21 @@ export function renderSetupPage(nonce: string): string {
     byId("repo-name").addEventListener("input", () => { byId("repo-name").dataset.edited = "true"; updateFinishReadiness(); });
     byId("enable-studio").addEventListener("click", () => renderStudio(true));
     byId("disable-studio").addEventListener("click", () => renderStudio(false));
+    byId("recheck-system").addEventListener("click", async () => {
+      const button = byId("recheck-system");
+      setBusy(button, true, "Checking");
+      try {
+        await loadSetupState();
+      } catch (error) {
+        state.systemReady = false;
+        byId("system-help").textContent = error.message || String(error);
+        setStatus("system-status", "Needs attention", false);
+        updateProgressSteps();
+        updateFinishReadiness();
+      } finally {
+        setBusy(button, false, "Recheck system");
+      }
+    });
     byId("choose-folder").addEventListener("click", async () => {
       showError("finish-error");
       const button = byId("choose-folder");
@@ -429,20 +518,39 @@ export function renderSetupPage(nonce: string): string {
             guildId: byId("guild").value,
             repositoryPath: byId("repo-path").value,
             repositoryName: byId("repo-name").value,
-            enableStudio: state.studioEnabled
+            enableStudio: state.studioEnabled,
+            screenshotPolicy: byId("screenshot-policy").value,
+            confirmGuildOwner: byId("confirm-owner").checked
           })
         });
         state.finished = true;
         byId("setup-workspace").classList.add("hidden");
         byId("success").classList.add("visible");
         byId("room-link").href = result.channelUrl;
-        byId("success-copy").textContent = "Private room and workspace launcher created in " + result.guildName + " with " + result.repositoryName + " selected. " +
-          (result.studioEnabled ? "Discord-native Studio is enabled. " : "Studio was skipped. ") +
-          (result.alreadyRunning ? "Restart the existing Devbot process to apply setup changes." : "Keep this terminal open while Devbot runs.");
+        const roomCopy = result.launcherPosted
+          ? "Private room and workspace launcher created in " + result.guildName + " with " + result.repositoryName + " selected. "
+          : "Private room created in " + result.guildName + " with " + result.repositoryName + " selected; the workspace launcher still needs attention. ";
+        const runtimeCopy = result.runtimeStatus === "starting"
+          ? "Devbot is starting and signing into Discord in the terminal. Open the room after the terminal confirms it is logged in."
+          : result.runtimeStatus === "already-running"
+            ? "Restart the existing Devbot process to load these setup changes."
+            : result.runtimeStatus === "manual-start"
+              ? "Start Devbot with npm run dev in this repository, then wait for the terminal to confirm it is logged in."
+              : "Automatic start failed. Follow the action below, then start Devbot with npm run dev.";
+        byId("success-title").textContent = result.warnings && result.warnings.length ? "Setup saved with action needed." : "Setup saved.";
+        byId("success-copy").textContent = roomCopy + (result.studioEnabled ? "Discord-native Studio is enabled. " : "Studio was skipped. ") + runtimeCopy;
+        byId("success-open").textContent = result.launcherPosted ? "Workspace launcher" : "Private room";
+        const warningItems = byId("warning-items");
+        warningItems.replaceChildren();
+        (result.warnings || []).forEach((warning) => {
+          const item = document.createElement("li");
+          item.textContent = warning;
+          warningItems.append(item);
+        });
+        byId("success-warnings").classList.toggle("visible", Boolean(result.warnings && result.warnings.length));
         byId("success-explore").textContent = result.studioEnabled ? "/studio" : "Ask or Status";
-        setStep("step-system", true, false);
-        setStep("step-discord", true, false);
-        setStep("step-workspace", true, true);
+        updateProgressSteps();
+        byId("success").focus();
       } catch (error) {
         showError("finish-error", error);
       } finally {
@@ -452,18 +560,15 @@ export function renderSetupPage(nonce: string): string {
 
     (async () => {
       try {
-        const payload = await api("/api/state");
-        byId("node-check").textContent = payload.node.version;
-        byId("node-check").className = payload.node.ready ? "good" : "bad";
-        byId("codex-check").textContent = payload.codex.label;
-        byId("codex-check").className = payload.codex.ready ? "good" : "bad";
-        setStatus("system-status", payload.node.ready && payload.codex.ready ? "Ready" : "Needs attention", payload.node.ready && payload.codex.ready);
-        renderStudio(payload.studioEnabled);
-        if (payload.identity) renderIdentity(payload);
+        await loadSetupState();
       } catch (error) {
+        state.systemReady = false;
         byId("codex-check").textContent = error.message || String(error);
         byId("codex-check").className = "bad";
         setStatus("system-status", "Needs attention", false);
+        byId("system-help").textContent = "Unable to complete the system check. Choose Recheck system to try again.";
+        updateProgressSteps();
+        updateFinishReadiness();
       }
     })();
   </script>

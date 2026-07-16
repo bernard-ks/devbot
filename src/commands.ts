@@ -19,9 +19,7 @@ const commandBuilders = [
             .setRequired(false)
             .addChoices(
               { name: "codex", value: "codex" },
-              { name: "claude", value: "claude" },
-              { name: "gemini", value: "gemini" },
-              { name: "opencode", value: "opencode" }
+              { name: "claude (read-only answers)", value: "claude" }
             )
         )
     )
@@ -223,6 +221,15 @@ const commandBuilders = [
     )
     .addSubcommand((subcommand) =>
       subcommand
+        .setName("commit")
+        .setDescription("Commit reviewed task changes in their isolated worktree.")
+        .addStringOption((option) => option.setName("task").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
+        .addStringOption((option) =>
+          option.setName("message").setDescription("Optional commit message; a safe task summary is used by default.").setRequired(false).setMaxLength(200)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
         .setName("preview")
         .setDescription("Start, stop, or inspect a loopback-only dev server for a task's isolated workspace.")
         .addStringOption((option) => option.setName("task").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
@@ -279,6 +286,9 @@ const commandBuilders = [
     )
     .addStringOption((option) =>
       option.setName("project").setDescription("Optional project; defaults to your current project, then the setup default.").setRequired(false).setAutocomplete(true)
+    )
+    .addBooleanOption((option) =>
+      option.setName("confirm").setDescription("Confirm a command that project policy does not mark read-only.").setRequired(false)
     ),
   new SlashCommandBuilder()
     .setName("review")
@@ -300,7 +310,13 @@ const commandBuilders = [
           option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
         )
         .addStringOption((option) =>
+          option.setName("task").setDescription("Optional task ID; validation runs in its isolated worktree.").setRequired(false).setAutocomplete(true)
+        )
+        .addStringOption((option) =>
           option.setName("commands").setDescription("Optional comma-separated configured commands.").setRequired(false).setAutocomplete(true)
+        )
+        .addBooleanOption((option) =>
+          option.setName("confirm").setDescription("Confirm commands that project policy does not mark read-only.").setRequired(false)
         )
     )
     .addSubcommand((subcommand) =>
@@ -311,7 +327,13 @@ const commandBuilders = [
           option.setName("project").setDescription("Configured project name.").setRequired(true).setAutocomplete(true)
         )
         .addStringOption((option) =>
+          option.setName("task").setDescription("Optional task ID; gates inspect its isolated worktree.").setRequired(false).setAutocomplete(true)
+        )
+        .addStringOption((option) =>
           option.setName("commands").setDescription("Optional comma-separated configured commands.").setRequired(false).setAutocomplete(true)
+        )
+        .addBooleanOption((option) =>
+          option.setName("confirm").setDescription("Confirm commands that project policy does not mark read-only.").setRequired(false)
         )
     ),
   new SlashCommandBuilder()

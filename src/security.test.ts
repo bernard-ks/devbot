@@ -5,19 +5,22 @@ import path from "node:path";
 import test from "node:test";
 import { completeCodexPrompt } from "./codex-client.js";
 import { runConfiguredProjectCommand } from "./command-runner.js";
-import { loadCodexConfig, loadProjectEntry } from "./config.js";
+import { loadCodexConfig, loadProjectEntry, parseBooleanEnv } from "./config.js";
 import { ProjectContextService } from "./context.js";
 import { isApprovedProjectScreenshotUrl } from "./project-screenshot.js";
-import { commandRequiresApproval } from "./safety.js";
+import { commandRequiresApproval, isRoleAllowedForProject } from "./safety.js";
 import { minimalChildEnvironment, publicErrorMessage, redactSensitiveText, sanitizeDiscordOutput } from "./security.js";
 import { TaskStore } from "./task-store.js";
 import type { ProjectEntry, ScannerConfig } from "./types.js";
 
 const scanner: ScannerConfig = {
   maxIndexedFileBytes: 10_000,
+  maxIndexedFiles: 100,
+  maxIndexedTotalBytes: 100_000,
   maxSnippetCharsPerFile: 10_000,
   maxPackedContextChars: 20_000,
-  maxRankedFiles: 10
+  maxRankedFiles: 10,
+  cacheTtlMs: 5_000
 };
 
 function project(name: string, root: string, overrides: Partial<ProjectEntry["metadata"]["policy"]> = {}): ProjectEntry {
@@ -218,6 +221,13 @@ test("Discord Codex sandboxes reject danger-full-access", () => {
   );
 });
 
+test("numeric and boolean environment settings fail closed on typos", () => {
+  assert.throws(() => loadCodexConfig({ CODEX_TIMEOUT_MS: "never" }), /CODEX_TIMEOUT_MS must be a positive integer/);
+  assert.throws(() => loadCodexConfig({ CODEX_TIMEOUT_MS: "0" }), /CODEX_TIMEOUT_MS must be a positive integer/);
+  assert.equal(parseBooleanEnv("off", true, "FEATURE"), false);
+  assert.throws(() => parseBooleanEnv("ture", false, "FEATURE"), /FEATURE must be true or false/);
+});
+
 test("malformed project metadata fails closed", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "devbot-invalid-policy-"));
   await mkdir(path.join(root, ".devbot"));
@@ -267,6 +277,15 @@ test("unclassified project commands require approval", () => {
   assert.equal(commandRequiresApproval(entry, "lint"), false);
   assert.equal(commandRequiresApproval(entry, "deploy"), true);
   assert.equal(commandRequiresApproval(entry, "unknown"), true);
+});
+
+test("a global role cannot inherit a user-restricted project's room audience", () => {
+  const entry = project("demo", process.cwd());
+  assert.equal(isRoleAllowedForProject(entry, "role-global"), true);
+  entry.metadata.policy.allowedUsers = ["user-one"];
+  assert.equal(isRoleAllowedForProject(entry, "role-global"), false);
+  entry.metadata.policy.allowedRoles = ["role-project"];
+  assert.equal(isRoleAllowedForProject(entry, "role-project"), true);
 });
 
 test("proposal approval is bound to the reviewed revision and state is private", async () => {

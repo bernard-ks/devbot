@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { defaultRuntimeStatePath } from "./runtime-paths.js";
 
 export interface CommandSyncInput<T = unknown> {
   definitions: T[];
@@ -10,7 +11,7 @@ export interface CommandSyncInput<T = unknown> {
 }
 
 export async function syncCommandsIfChanged<T>(input: CommandSyncInput<T>): Promise<boolean> {
-  const stateFile = path.resolve(input.stateFile ?? ".devbot/commands.sha256");
+  const stateFile = input.stateFile ? path.resolve(input.stateFile) : defaultRuntimeStatePath("commands.sha256");
   const hash = commandDefinitionsHash(input.definitions, input.guildId);
   const previous = await readFile(stateFile, "utf8").catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return "";

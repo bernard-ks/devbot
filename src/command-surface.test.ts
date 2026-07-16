@@ -36,7 +36,7 @@ test("complete Discord command surface is unique, bounded, and intentionally cou
   const slashPaths = commandDefinitions
     .filter((command) => command.type === ApplicationCommandType.ChatInput)
     .flatMap((command) => invocationPaths(command));
-  assert.equal(slashPaths.length, 61);
+  assert.equal(slashPaths.length, 62);
   assert.equal(commandDefinitions.filter((command) => command.type === ApplicationCommandType.Message).length, 1);
 
   for (const command of commandDefinitions) {
@@ -72,6 +72,51 @@ test("destructive repository removal exposes an explicit confirmation field", ()
   const confirm = repo && "options" in repo ? repo.options?.find((option) => option.name === "confirm") : undefined;
   assert.equal(confirm?.required, false);
   assert.match(confirm?.description ?? "", /confirm.*memory deletion/i);
+});
+
+test("configured command approval is exposed on run and not unrelated dashboard navigation", () => {
+  const run = commandDefinitions.find((command) => command.name === "run");
+  const dashboard = commandDefinitions.find((command) => command.name === "dashboard");
+  const runOptions = run && "options" in run ? run.options ?? [] : [];
+  const dashboardOptions = dashboard && "options" in dashboard ? dashboard.options ?? [] : [];
+  assert.ok(runOptions.some((option) => option.name === "confirm" && option.type === ApplicationCommandOptionType.Boolean));
+  assert.equal(dashboardOptions.some((option) => option.name === "confirm"), false);
+});
+
+test("configured command surfaces share shutdown-aware cancellation tracking", async () => {
+  const source = await readFile(path.resolve("src/index.ts"), "utf8");
+  assert.match(source, /for \(const controller of activeCommandControllers\)[\s\S]*?controller\.abort/);
+  assert.match(source, /runTrackedCommand\(\(signal\) => runConfiguredProjectCommand\(project, command, \{ signal \}\)\)/);
+  assert.match(source, /runTrackedValidation\(reviewProject, commandNames\)/);
+  assert.match(source, /runTrackedMergeGates\(reviewProject, commandNames\)/);
+});
+
+test("help distinguishes backend-confined agent changes from controller-run local validation", async () => {
+  const source = await readFile(path.resolve("src/index.ts"), "utf8");
+  const start = source.indexOf("function formatDevbotHelp");
+  const end = source.indexOf("function parseCommandNames", start);
+  assert.ok(start >= 0 && end > start);
+  const help = source.slice(start, end);
+  assert.match(help, /agentActionsEnabled = controller && actionAvailable && !appConfig\.safeMode/);
+  assert.match(help, /localCommandsEnabled = controller && !appConfig\.safeMode/);
+  assert.match(help, /Agent-authored project changes/);
+  assert.match(help, /Configured local commands/);
+});
+
+test("private channel and workroom audience checks include the permission-bypassing guild owner", async () => {
+  const source = await readFile(path.resolve("src/index.ts"), "utf8");
+  const roomStart = source.indexOf("async function projectRoomAudienceProblem");
+  const roomEnd = source.indexOf("async function createOrSyncPrivateRoom", roomStart);
+  assert.ok(roomStart >= 0 && roomEnd > roomStart);
+  assert.match(source.slice(roomStart, roomEnd), /visibleIds\.add\(channel\.guild\.ownerId\)/);
+
+  const workroomStart = source.indexOf("async function resolveAmbientThreadAudience");
+  const workroomEnd = source.indexOf("async function fetchGuildMembersById", workroomStart);
+  assert.ok(workroomStart >= 0 && workroomEnd > workroomStart);
+  const workroom = source.slice(workroomStart, workroomEnd);
+  assert.match(workroom, /candidateIds\.add\(guild\.ownerId\)/);
+  assert.match(workroom, /guildMembers\.get\(guild\.ownerId\)/);
+  assert.match(workroom, /server owner[\s\S]*outside the Devbot or project allowlist/);
 });
 
 test("potentially long task read responses use Discord-safe chunked delivery", async () => {
