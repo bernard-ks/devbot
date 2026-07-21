@@ -4,7 +4,7 @@ Devbot is a local-first Discord bot with privileged access to repositories, so c
 
 ## Local checks
 
-Use Node.js 20 or 22 and the npm version pinned in `package.json`.
+Use Node.js 22 or 24 and the npm version pinned in `package.json`.
 
 ```bash
 npm ci
@@ -15,7 +15,7 @@ npm audit --omit=dev
 
 On a fresh Linux environment, install Chromium and its system packages with `npx playwright install --with-deps chromium`.
 
-`npm run build` removes `dist` first so deleted compiled tests cannot survive between builds. `npm run coverage` is available for local gap analysis; coverage is evidence, not a substitute for behavior-focused tests.
+`npm run build` removes `dist` first so deleted compiled tests cannot survive between builds. `npm test` and `npm run coverage` compile into separate private temporary output directories, so concurrent invocations share no mutable build artifacts. Coverage enforces baseline floors of 85% lines, 75% branches, and 85% functions; those floors are regression guards, not a substitute for behavior-focused tests or live Discord validation.
 
 ## Change expectations
 

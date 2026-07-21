@@ -421,7 +421,7 @@ export function renderSetupPage(nonce: string): string {
       setStatus("system-status", state.systemReady ? "Ready" : "Needs attention", state.systemReady);
       byId("system-help").textContent = state.systemReady
         ? "Node.js and the signed-in Codex session are ready."
-        : "Install Node.js 20+ and run codex login if needed, then choose Recheck system.";
+        : "Install Node.js 22+ and run codex login if needed, then choose Recheck system.";
       renderStudio(payload.studioEnabled);
       if (payload.identity) renderIdentity(payload);
       else updateProgressSteps();

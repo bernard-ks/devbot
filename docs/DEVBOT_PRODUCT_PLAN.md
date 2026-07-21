@@ -1,12 +1,24 @@
 # Devbot Product Plan
 
-Updated: 2026-07-15
+Updated: 2026-07-20
 
 ## Purpose
 
 Devbot is a local Discord interface for Codex-backed development work. It answers project questions, runs focused local Codex tasks, reports active work, and attaches live UI screenshots without requiring an OpenAI API key.
 
 The small-team foundation now exists: owner-managed private setup, durable local tasks, peer discovery, sealed councils, approval records, and review handoffs. The next product step is to make those capabilities feel as natural as ordinary Discord conversation while deepening evidence-backed multi-agent work.
+
+## Current Hardening Priorities
+
+The active backlog is deliberately narrower than the historical idea inventory below:
+
+1. Keep setup/browser errors behind a fixed public-error boundary while retaining sanitized local diagnostics.
+2. Support maintained Node.js LTS releases, require pinned CI actions, and protect `main` with pull-request and check rules.
+3. Split the Discord gateway into testable interaction routers; `src/index.ts` remains the largest unisolated orchestration surface.
+4. Enforce a coverage floor and keep build-backed test suites safe when invoked concurrently.
+5. Extend request/task-correlated structured logs across background work and keep runtime-state backups integrity-verifiable.
+
+Items marked **Implemented** below describe shipped foundations, not pending work. SQLite, richer provider integration, and multiplayer automation remain conditional investments rather than prerequisites for the current single-host product.
 
 ## Ambient Workrooms And Studio: Ideas 1-9
 
@@ -127,7 +139,7 @@ The safety contract is explicit: only the requester or an approved controller ca
 - Studio does not mutate tasks, stream agent events, render full patch bodies, or aggregate the durable collaboration event log yet; those remain later Discord-native slices after shared mutation-domain checks are extracted.
 - Task previews assume an HTTP dev server that honors the provided `PORT`; readiness requires both an HTTP response and listener ownership by the exact managed process group on `127.0.0.1`, while non-loopback binds are stopped. One unresolved preview lifecycle runs per task and counts toward the global cap until cleanup is confirmed. Preview start and restart reconciliation are currently POSIX-only; Windows start fails closed.
 
-## Improvement Themes
+## Future Improvement Themes
 
 ### 1. Reliability And State
 
@@ -140,11 +152,12 @@ The safety contract is explicit: only the requester or an approved controller ca
   - screenshot URLs and capture metadata
 - Migrate durable local task state to SQLite while keeping task IDs out of normal conversation UI.
 - Persist recoverable active execution across bot restarts instead of closing interrupted tasks as canceled. Implemented with a durable execution ledger (`~/.devbot/state/executions.json` by default): running tasks are marked `interrupted` on startup, identity-verified orphan worker processes are stopped with an observed exit, the original task message gains Retry and Dismiss controls, and preserved isolated worktrees are reused on retry when they still verify. Model work itself is not resumed.
-- Add structured logs with request IDs.
+- **Implemented baseline:** Discord gateway events and failures use sanitized structured logs with request IDs. Extend the same correlation through task workers, previews, setup, and peer transport.
+- **Implemented:** offline runtime-state backups refuse live runtimes and symlinks, use owner-only copies, and include a SHA-256 manifest. Automatic restore remains intentionally unsupported.
 
 ### 2. Better Project Awareness
 
-- Add project metadata files, for example `.devbot/project.json`, to describe:
+- **Implemented:** project metadata files such as `.devbot/project.json` describe:
   - canonical project name
   - repo URL
   - default branch
@@ -153,8 +166,8 @@ The safety contract is explicit: only the requester or an approved controller ca
   - test commands
   - build commands
   - owner bot
-- Use package manager scripts and known framework files to infer common commands.
-- Add project-specific command presets, for example `/run test`, `/run build`, `/run lint`.
+- **Implemented baseline:** package scripts and project metadata supply bounded preview and validation commands.
+- **Implemented:** project-specific command presets support flows such as `/run test`, `/run build`, and `/run lint` when declared by the project.
 
 ### 3. Screenshot And UI Inspection
 
@@ -175,7 +188,7 @@ The safety contract is explicit: only the requester or an approved controller ca
 ### 4. Review And Merge Workflows
 
 - Keep review/merge support provider-neutral instead of coupling devbot to one hosting provider or CLI.
-- Make `/do` optionally produce a branch and review packet instead of editing main directly.
+- **Implemented:** `/do` write work always uses an isolated branch/worktree and can generate a review packet.
 - Add merge gates:
   - clean working tree
   - tests pass

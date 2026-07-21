@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const appPath = fileURLToPath(new URL("./setup-app.js", import.meta.url));
@@ -11,12 +12,15 @@ const appPath = fileURLToPath(new URL("./setup-app.js", import.meta.url));
 interface SetupServer {
   child: ChildProcess;
   baseUrl: string;
+  cwd: string;
+  stderr: () => string;
 }
 
 async function startSetupServer(options: {
   studioEnabled?: boolean;
   envStudioEnabled?: boolean;
   codexStatus?: "missing" | "signed-out" | "ready";
+  discordStatus?: "ready" | "internal-error" | "guild-refresh-error";
 } = {}): Promise<SetupServer> {
   const cwd = await mkdtemp(path.join(tmpdir(), "devbot-setup-app-"));
   if (typeof options.studioEnabled === "boolean") {
@@ -61,7 +65,43 @@ async function startSetupServer(options: {
   } else {
     env.CODEX_BIN = path.join(cwd, "missing-codex");
   }
-  const child = spawn(process.execPath, [appPath], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+  const nodeArgs: string[] = [];
+  if (options.discordStatus) {
+    const fakeDiscord = path.join(cwd, "fake-discord.mjs");
+    const fetchImplementation = options.discordStatus !== "internal-error"
+      ? [
+          "let guildRequests = 0;",
+          "globalThis.fetch = async (input) => {",
+          "  const pathname = new URL(String(input)).pathname;",
+          "  const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });",
+          "  if (pathname === '/api/v10/users/@me') return json({ id: 'bot-1', username: 'Testbot', bot: true });",
+          "  if (pathname === '/api/v10/oauth2/applications/@me') return json({ id: 'app-1' });",
+          "  if (pathname === '/api/v10/users/@me/guilds') {",
+          "    guildRequests += 1;",
+          ...(options.discordStatus === "guild-refresh-error"
+            ? ["    if (guildRequests > 1) throw new Error('private guild refresh diagnostic at /Users/operator/private/guilds.json');"]
+            : []),
+          "    return json([{ id: 'guild-1', name: 'Test guild' }]);",
+          "  }",
+          "  if (pathname === '/api/v10/guilds/guild-1') return json({ id: 'guild-1', name: 'Test guild', owner_id: 'owner-1' });",
+          "  return json({ message: 'Unexpected fake Discord route' }, 500);",
+          "};",
+          ""
+        ]
+      : [
+          "globalThis.fetch = async () => {",
+          "  throw new Error(\"private diagnostic at /Users/operator/private/setup-secrets.json\");",
+          "};",
+          ""
+        ];
+    await writeFile(fakeDiscord, fetchImplementation.join("\n"));
+    nodeArgs.push("--import", fakeDiscord);
+  }
+  const child = spawn(process.execPath, [...nodeArgs, appPath], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString("utf8");
+  });
   const baseUrl = await new Promise<string>((resolve, reject) => {
     let output = "";
     const timer = setTimeout(() => reject(new Error(`Setup app did not report a URL. Output: ${output}`)), 30_000);
@@ -79,13 +119,22 @@ async function startSetupServer(options: {
       reject(new Error(`Setup app exited early with code ${code}. Output: ${output}`));
     });
   });
-  return { child, baseUrl };
+  return { child, baseUrl, cwd, stderr: () => stderr };
 }
 
 async function stopSetupServer(server: SetupServer): Promise<void> {
   const exited = new Promise<void>((resolve) => server.child.once("exit", () => resolve()));
   server.child.kill("SIGTERM");
   await exited;
+}
+
+async function waitForStderr(server: SetupServer, pattern: RegExp): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const output = server.stderr();
+    if (pattern.test(output)) return output;
+    await delay(20);
+  }
+  throw new Error(`Setup app did not log ${pattern}. Stderr: ${server.stderr()}`);
 }
 
 test("setup API is bound to the claiming browser session", async (t) => {
@@ -188,4 +237,134 @@ test("setup API requires a signed-in Codex session, not only an installed CLI", 
   const readyPayload = (await readyState.json()) as { codex: { ready: boolean; label: string } };
   assert.equal(readyPayload.codex.ready, true);
   assert.match(readyPayload.codex.label, /signed in/i);
+});
+
+test("setup API returns actionable client errors with 4xx statuses", async (t) => {
+  const server = await startSetupServer();
+  t.after(async () => {
+    await stopSetupServer(server);
+  });
+  const page = await fetch(`${server.baseUrl}/`);
+  const cookie = (page.headers.get("set-cookie") ?? "").split(";")[0]!;
+
+  const invalidJson = await fetch(`${server.baseUrl}/api/connect`, {
+    method: "POST",
+    headers: { Cookie: cookie, "Content-Type": "application/json" },
+    body: "{"
+  });
+  assert.equal(invalidJson.status, 400);
+  assert.deepEqual(await invalidJson.json(), { error: "Setup request is not valid JSON." });
+
+  const missingToken = await fetch(`${server.baseUrl}/api/connect`, {
+    method: "POST",
+    headers: { Cookie: cookie, "Content-Type": "application/json" },
+    body: "{}"
+  });
+  assert.equal(missingToken.status, 400);
+  assert.deepEqual(await missingToken.json(), { error: "Paste the bot token from the Discord Developer Portal." });
+
+  const missingSession = await fetch(`${server.baseUrl}/api/guilds`, { headers: { Cookie: cookie } });
+  assert.equal(missingSession.status, 409);
+  assert.deepEqual(await missingSession.json(), { error: "Connect and validate the Discord application first." });
+});
+
+test("setup API keeps arbitrary upstream diagnostics out of client responses", async (t) => {
+  const server = await startSetupServer({ discordStatus: "internal-error" });
+  t.after(async () => {
+    await stopSetupServer(server);
+  });
+  const page = await fetch(`${server.baseUrl}/`);
+  const cookie = (page.headers.get("set-cookie") ?? "").split(";")[0]!;
+
+  const response = await fetch(`${server.baseUrl}/api/connect`, {
+    method: "POST",
+    headers: { Cookie: cookie, "Content-Type": "application/json" },
+    body: JSON.stringify({ token: "test-token" })
+  });
+  const responseText = await response.text();
+  assert.equal(response.status, 502);
+  assert.equal(
+    responseText,
+    JSON.stringify({ error: "Discord could not be reached to complete setup. Check your connection and try again." })
+  );
+  assert.doesNotMatch(responseText, /private diagnostic|\/Users\/operator|setup-secrets/);
+
+  const stderr = await waitForStderr(server, /Setup request failed \(POST \/api\/connect, HTTP 502\)/);
+  assert.match(stderr, /private diagnostic/);
+  assert.match(stderr, /\[local path\]/);
+  assert.doesNotMatch(stderr, /\/Users\/operator|setup-secrets\.json/);
+});
+
+test("setup guild refresh maps Discord failures without exposing diagnostics", async (t) => {
+  const server = await startSetupServer({ discordStatus: "guild-refresh-error" });
+  t.after(async () => {
+    await stopSetupServer(server);
+  });
+  const page = await fetch(`${server.baseUrl}/`);
+  const cookie = (page.headers.get("set-cookie") ?? "").split(";")[0]!;
+  const connect = await fetch(`${server.baseUrl}/api/connect`, {
+    method: "POST",
+    headers: { Cookie: cookie, "Content-Type": "application/json" },
+    body: JSON.stringify({ token: "test-token" })
+  });
+  assert.equal(connect.status, 200);
+
+  const response = await fetch(`${server.baseUrl}/api/guilds`, { headers: { Cookie: cookie } });
+  const responseText = await response.text();
+  assert.equal(response.status, 502);
+  assert.equal(
+    responseText,
+    JSON.stringify({ error: "Discord could not be reached to complete setup. Check your connection and try again." })
+  );
+  assert.doesNotMatch(responseText, /private guild refresh|\/Users\/operator|guilds\.json/);
+
+  const stderr = await waitForStderr(server, /Setup request failed \(GET \/api\/guilds, HTTP 502\)/);
+  assert.match(stderr, /private guild refresh diagnostic/);
+  assert.match(stderr, /\[local path\]/);
+  assert.doesNotMatch(stderr, /\/Users\/operator|guilds\.json/);
+});
+
+test("setup API returns a generic 500 while logging sanitized filesystem diagnostics", async (t) => {
+  const server = await startSetupServer({ codexStatus: "ready", discordStatus: "ready" });
+  t.after(async () => {
+    await stopSetupServer(server);
+  });
+  const repositoryPath = path.join(server.cwd, "private-repository-do-not-expose");
+  await mkdir(repositoryPath);
+  await writeFile(path.join(repositoryPath, ".devbot"), "blocks the setup metadata directory");
+
+  const page = await fetch(`${server.baseUrl}/`);
+  const cookie = (page.headers.get("set-cookie") ?? "").split(";")[0]!;
+  const connect = await fetch(`${server.baseUrl}/api/connect`, {
+    method: "POST",
+    headers: { Cookie: cookie, "Content-Type": "application/json" },
+    body: JSON.stringify({ token: "test-token" })
+  });
+  assert.equal(connect.status, 200);
+
+  const response = await fetch(`${server.baseUrl}/api/finish`, {
+    method: "POST",
+    headers: { Cookie: cookie, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      guildId: "guild-1",
+      repositoryName: "private-repository",
+      repositoryPath,
+      screenshotPolicy: "approval",
+      confirmGuildOwner: true
+    })
+  });
+  const responseText = await response.text();
+  assert.equal(response.status, 500);
+  assert.equal(
+    responseText,
+    JSON.stringify({
+      error: "Setup could not complete the request. Review the setup terminal for details and try again."
+    })
+  );
+  assert.doesNotMatch(responseText, /EEXIST|private-repository-do-not-expose|\.devbot|repositoryPath/);
+
+  const stderr = await waitForStderr(server, /Setup request failed \(POST \/api\/finish, HTTP 500\)/);
+  assert.match(stderr, /EEXIST/);
+  assert.match(stderr, /\[local path\]/);
+  assert.doesNotMatch(stderr, /private-repository-do-not-expose|\.devbot/);
 });
