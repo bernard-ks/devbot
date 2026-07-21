@@ -47,7 +47,12 @@ test("complete Discord command surface is unique, bounded, and intentionally cou
 });
 
 test("every deployed command and subcommand has an interaction dispatch branch", async () => {
-  const source = await readFile(path.resolve("src/index.ts"), "utf8");
+  const source = (
+    await Promise.all([
+      readFile(path.resolve("src/index.ts"), "utf8"),
+      readFile(path.resolve("src/interaction-router.ts"), "utf8")
+    ])
+  ).join("\n");
   const intentionalFallthrough = new Set(["setup room"]);
   for (const command of commandDefinitions) {
     if (command.type === ApplicationCommandType.Message) {

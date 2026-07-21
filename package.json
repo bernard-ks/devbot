@@ -14,27 +14,29 @@
     "commands:deploy": "tsx src/deploy-commands.ts",
     "browsers:install": "playwright install chromium",
     "setup": "tsx src/setup-app.ts",
+    "state:backup": "npm run build && node dist/state-backup.js create",
+    "state:verify": "npm run build && node dist/state-backup.js verify",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "test": "npm run build && node scripts/run-tests.mjs",
-    "coverage": "npm run build && node scripts/run-tests.mjs --experimental-test-coverage",
-    "check": "npm run lint && npm test"
+    "test": "node scripts/run-suite.mjs",
+    "coverage": "node scripts/run-suite.mjs --coverage",
+    "check": "npm run lint && npm run coverage"
   },
   "dependencies": {
-    "discord.js": "^14.16.3",
-    "dotenv": "^16.4.7",
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.6.1",
     "playwright": "^1.61.1",
-    "sharp": "^0.35.2"
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
-    "@types/node": "^22.10.2",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "@types/node": "^22.20.1",
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.3"
   },
   "overrides": {
     "undici": "6.27.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

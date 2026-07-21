@@ -12,7 +12,7 @@ npm run setup
 
 On a fresh Linux host, use `npx playwright install --with-deps chromium` so screenshot capture and its E2E check have the required system packages.
 
-The local browser tool requires Node.js 20+ and a signed-in Codex CLI, validates Discord, opens the bot install flow, discovers the selected server, registers a repository, creates the private room, posts the workspace launcher, writes protected local state, deploys commands, and requests a Devbot start. The setup session remains available for 30 minutes. You must explicitly confirm that Discord's owner of the selected server should become the immutable bootstrap owner; the person opening the local page is not assumed to be that owner. Setup also records whether screenshots for the first repository are allowed, approval-gated, or blocked.
+The local browser tool requires Node.js 22+ and a signed-in Codex CLI, validates Discord, opens the bot install flow, discovers the selected server, registers a repository, creates the private room, posts the workspace launcher, writes protected local state, deploys commands, and requests a Devbot start. The setup session remains available for 30 minutes. You must explicitly confirm that Discord's owner of the selected server should become the immutable bootstrap owner; the person opening the local page is not assumed to be that owner. Setup also records whether screenshots for the first repository are allowed, approval-gated, or blocked.
 
 The final page says **Setup saved** and reports the actual next state: starting, already running and requiring a restart, manual start required, or automatic start failed. It also displays provisioning warnings such as a workspace launcher that Discord refused to post. Treat the bot as ready only after the terminal confirms that it logged in to Discord.
 
@@ -235,6 +235,17 @@ During the transition from checkout-local state, a running Devbot also holds `.d
 Use absolute paths if you want state stored outside this repo.
 
 These files are intentionally not committed.
+
+### Backup and recovery
+
+Stop Devbot before creating or restoring a runtime-state snapshot. A running process can update several ledgers as one operation, so a live filesystem copy is not guaranteed to be internally consistent.
+
+```bash
+npm run state:backup -- /absolute/path/to/new-backup
+npm run state:verify -- /absolute/path/to/backup
+```
+
+The backup command loads `.env`, honors `DEVBOT_STATE_DIR` and `DEVBOT_RUNTIME_LOCK`, and requires a new absolute destination outside the live state tree. It fails closed if any individual `DEVBOT_*_STORE` override is configured because one state-root copy would be incomplete; consolidate those stores under `DEVBOT_STATE_DIR` or back them up separately. It refuses symlinks and special files, preserves owner-only permissions, and writes a SHA-256 manifest for every copied file. Verification rejects missing, additional, modified, symlinked, or malformed entries. There is deliberately no automatic restore command: verify the snapshot, keep Devbot stopped, preserve the current state directory, then copy the verified data files (excluding `manifest.json`) into the configured `DEVBOT_STATE_DIR` as an explicit recovery operation.
 
 ## Request Routing
 

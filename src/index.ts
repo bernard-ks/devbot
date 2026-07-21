@@ -32,7 +32,6 @@ import {
   inboxEntityId,
   inboxProjectKey,
   needsMeInbox,
-  parseAmbientCustomId,
   parseInboxEntityId,
   parseAmbientRoleSelection,
   parseProposalEntityId,
@@ -83,6 +82,8 @@ import { runtimeLockPath } from "./runtime-lock.js";
 import { executeMemoryCommand, type MemoryCommandRequest } from "./memory-commands.js";
 import { formatMemoryRecallBlock } from "./memory-recall.js";
 import { checkMemoryStoreHealth, MemoryStore, type MemoryAccessContext, type MemoryKind } from "./memory-store.js";
+import { createInteractionRouter } from "./interaction-router.js";
+import { logError, logEvent } from "./logger.js";
 import { parseFallbackStatusRequest, parseMentionRequest, parseOptionalProjectReference, parseStatusRequest, stripBotMention } from "./mention.js";
 import { splitDiscordMessage } from "./messages.js";
 import { buildAgentPrompt, classifyNaturalIntent, type AgentRole } from "./natural-intent.js";
@@ -140,9 +141,7 @@ import {
   type TaskWorktree
 } from "./task-worktree.js";
 import {
-  parsePreviewControl,
   interruptedTaskNoticeRow,
-  parseTaskControl,
   previewControlRow,
   taskActionMatchesState,
   taskActionRows,
@@ -164,7 +163,6 @@ import {
 import {
   continuationPrompt,
   formatInterruptedTaskNotice,
-  parseTaskModal,
   taskProgressPresentation,
   taskRequestModal,
   type TaskModalAction,
@@ -179,7 +177,6 @@ import {
   filterImageAttachments,
   formatNoErrorFoundReply,
   formatScreenshotAnalysisReply,
-  parseScreenshotFixControl,
   screenshotFixControlRow,
   withTempImageDir,
   type ImageAttachmentInput,
@@ -188,7 +185,6 @@ import {
 } from "./screenshot-fix.js";
 import { ScreenshotFixStore } from "./screenshot-fix-store.js";
 import {
-  parseScreenshotApprovalControl,
   persistScreenshotPolicy,
   ScreenshotApprovalStore,
   screenshotApprovalRow,
@@ -210,16 +206,13 @@ import { acquireRuntimeStateLease } from "./runtime-state.js";
 import { SetupStore, type SetupState, type SetupUserPermission } from "./setup-store.js";
 import { buildStudioSnapshot, isStudioTaskVisible, type StudioSnapshot } from "./studio-data.js";
 import {
-  parseStudioControl,
   studioDashboardCard,
   studioEnabled,
   type StudioAction
 } from "./studio-ui.js";
-import { parseSetupWizardAction, setupRepositoryModal, setupWizardView, type SetupWizardAction } from "./setup-wizard.js";
+import { setupRepositoryModal, setupWizardView, type SetupWizardAction } from "./setup-wizard.js";
 import type { AppConfig, PackedProjectContext, ProjectEntry } from "./types.js";
 import {
-  parseWorkspaceControl,
-  parseWorkspaceModal,
   workspaceLauncherView,
   workspacePanelView,
   workspaceRequestModal,
@@ -430,279 +423,42 @@ function runTrackedMergeGates(project: ProjectEntry, commandNames?: string[]) {
   return runTrackedCommand((signal) => evaluateMergeGates(project, commandNames, signal));
 }
 
-client.on("interactionCreate", async (interaction) => {
-  try {
-    if (interaction.isAutocomplete()) {
-      if (!(await isConfiguredRoomId(interaction.channelId))) {
-        await interaction.respond([]);
-        return;
-      }
-      if (!isAllowed(interaction, config)) {
-        await interaction.respond([]);
-        return;
-      }
-      await handleAutocomplete(interaction, config);
-      return;
-    }
-
-    if (interaction.isButton()) {
-      const screenshotApproval = parseScreenshotApprovalControl(interaction.customId);
-      if (screenshotApproval) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) return;
-        await handleScreenshotApprovalButton(interaction, config, screenshotApproval.action, screenshotApproval.id);
-        return;
-      }
-      const ambientControl = parseAmbientCustomId(interaction.customId);
-      if (ambientControl && ambientControl.action !== "team-select") {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) return;
-        await handleAmbientButton(interaction, config, ambientControl.action, ambientControl.entityId);
-        return;
-      }
-      const studioControl = parseStudioControl(interaction.customId);
-      if (studioControl) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) return;
-        if (!isControllerUser(interaction.user.id, config)) {
-          await interaction.reply({ content: "Only the owner or an approved controller can use Devbot Studio.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        await handleStudioButton(interaction, config, studioControl.action, studioControl.scope);
-        return;
-      }
-      const workspaceControl = parseWorkspaceControl(interaction.customId);
-      if (workspaceControl) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) {
-          return;
-        }
-        await handleWorkspaceButton(interaction, config, workspaceControl.action, workspaceControl.projectName);
-        return;
-      }
-      const setupAction = parseSetupWizardAction(interaction.customId);
-      if (setupAction) {
-        if (!isOwner(interaction.user.id, config)) {
-          await interaction.reply({ content: "Only the configured Devbot owner can use setup controls.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        await handleSetupWizardButton(interaction, config, setupAction);
-        return;
-      }
-      const previewControl = parsePreviewControl(interaction.customId);
-      if (previewControl) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) {
-          return;
-        }
-        await handlePreviewControlButton(interaction, config, previewControl.action, previewControl.previewId);
-        return;
-      }
-      const taskControl = parseTaskControl(interaction.customId);
-      if (taskControl) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) {
-          return;
-        }
-        await handleTaskControl(interaction, config, taskControl.action, taskControl.taskId);
-        return;
-      }
-      const screenshotFixControl = parseScreenshotFixControl(interaction.customId);
-      if (screenshotFixControl) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) {
-          return;
-        }
-        await handleScreenshotFixControl(interaction, config, screenshotFixControl.action, screenshotFixControl.id);
-        return;
-      }
-      if (!parseWorkroomButton(interaction.customId)) {
-        return;
-      }
-      if (!isAllowed(interaction, config)) {
-        await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (!(await ensureConfiguredRoom(interaction))) {
-        return;
-      }
-      await handleWorkroomButton(interaction, config);
-      return;
-    }
-
-    if (interaction.isUserSelectMenu() || interaction.isStringSelectMenu()) {
-      const ambientControl = parseAmbientCustomId(interaction.customId);
-      if (ambientControl?.action === "team-select" && interaction.isStringSelectMenu()) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) return;
-        await handleAmbientTeamSelect(interaction, config, ambientControl.entityId);
-        return;
-      }
-      const studioControl = parseStudioControl(interaction.customId);
-      if (studioControl && interaction.isStringSelectMenu()) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) return;
-        if (!isControllerUser(interaction.user.id, config)) {
-          await interaction.reply({ content: "Only the owner or an approved controller can use Devbot Studio.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        await handleStudioSelect(interaction, config, studioControl.action, studioControl.scope);
-        return;
-      }
-      const workspaceControl = parseWorkspaceControl(interaction.customId);
-      if (workspaceControl?.action === "project" && interaction.isStringSelectMenu()) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) {
-          return;
-        }
-        await handleWorkspaceProjectSelect(interaction, config);
-        return;
-      }
-      const setupAction = parseSetupWizardAction(interaction.customId);
-      if (!setupAction) {
-        return;
-      }
-      if (!isOwner(interaction.user.id, config)) {
-        await interaction.reply({ content: "Only the configured Devbot owner can use setup controls.", flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (interaction.isUserSelectMenu()) {
-        await handleSetupUserSelect(interaction, config, setupAction);
-      } else {
-        await handleSetupProjectSelect(interaction, config, setupAction);
-      }
-      return;
-    }
-
-    if (interaction.isModalSubmit()) {
-      const ambientControl = parseAmbientCustomId(interaction.customId);
-      if (ambientControl?.action === "proposal-edit") {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) return;
-        await handleAmbientProposalEdit(interaction, config, ambientControl.entityId);
-        return;
-      }
-      const workspaceModal = parseWorkspaceModal(interaction.customId);
-      if (workspaceModal) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) {
-          return;
-        }
-        await handleWorkspaceModal(interaction, config, workspaceModal.action, workspaceModal.projectName);
-        return;
-      }
-      const taskModal = parseTaskModal(interaction.customId);
-      if (taskModal) {
-        if (!isAllowed(interaction, config)) {
-          await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!(await ensureConfiguredRoom(interaction))) {
-          return;
-        }
-        await handleTaskModal(interaction, config, taskModal.action, taskModal.taskId);
-        return;
-      }
-      const setupAction = parseSetupWizardAction(interaction.customId);
-      if (!setupAction) {
-        return;
-      }
-      if (!isOwner(interaction.user.id, config)) {
-        await interaction.reply({ content: "Only the configured Devbot owner can use setup controls.", flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await handleSetupRepoModal(interaction, config, setupAction);
-      return;
-    }
-
-    if (interaction.isMessageContextMenuCommand()) {
-      if (interaction.commandName !== "Start Devbot workroom") return;
-      if (!isAllowed(interaction, config)) {
-        await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (!(await ensureConfiguredRoom(interaction))) return;
-      await handleAmbientContextMenu(interaction, config);
-      return;
-    }
-
-    if (!interaction.isChatInputCommand()) {
-      return;
-    }
-
-    if (interaction.commandName === "setup") {
-      if (!config.ownerUserId) {
-        await interaction.reply({
-          content: "Devbot has no configured owner. Set `DEVBOT_OWNER_USER_ID` locally, restart, then run `/setup wizard`.",
-          flags: MessageFlags.Ephemeral
-        });
-        return;
-      }
-      if (!isOwner(interaction.user.id, config)) {
-        await interaction.reply({ content: "Only the configured Devbot owner can run `/setup`.", flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await handleSetupCommand(interaction, config);
-      return;
-    }
-
-    if (!isAllowed(interaction, config)) {
-      await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (!(await ensureConfiguredRoom(interaction))) {
-      return;
-    }
-
-    await handleCommand(interaction, config);
-  } catch (error) {
-    console.error(publicErrorMessage(error));
-    try {
-      await replyWithError(interaction, error);
-    } catch (replyError) {
-      console.warn(`Unable to send the interaction error response: ${publicErrorMessage(replyError)}`);
-    }
-  }
-});
+client.on("interactionCreate", createInteractionRouter(config, {
+  isConfiguredRoomId,
+  isAllowed,
+  ensureConfiguredRoom,
+  isOwner,
+  isControllerUser,
+  handleAutocomplete,
+  handleScreenshotApprovalButton,
+  handleAmbientButton,
+  handleStudioButton,
+  handleWorkspaceButton,
+  handleSetupWizardButton,
+  handlePreviewControlButton,
+  handleTaskControl,
+  handleScreenshotFixControl,
+  handleWorkroomButton,
+  handleAmbientTeamSelect,
+  handleStudioSelect,
+  handleWorkspaceProjectSelect,
+  handleSetupUserSelect,
+  handleSetupProjectSelect,
+  handleAmbientProposalEdit,
+  handleWorkspaceModal,
+  handleTaskModal,
+  handleSetupRepoModal,
+  handleAmbientContextMenu,
+  handleSetupCommand,
+  handleCommand,
+  replyWithError,
+  logEvent,
+  logError,
+  warn: (message) => console.warn(message)
+}));
 
 client.on("error", (error) => {
-  console.error(`Discord client error: ${publicErrorMessage(error)}`);
+  logError("discord.client.error", error);
 });
 
 client.on("messageCreate", async (message) => {
@@ -872,7 +628,10 @@ client.on("messageCreate", async (message) => {
       recallMemory: true
     });
   } catch (error) {
-    console.error(publicErrorMessage(error));
+    logError("discord.message.failed", error, {
+      requestId: message.id,
+      channelId: message.channelId
+    });
     await message.reply(`Error: ${publicErrorMessage(error)}`).catch((replyError) => {
       console.warn(`Unable to send the message error response: ${publicErrorMessage(replyError)}`);
     });

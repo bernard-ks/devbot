@@ -26,7 +26,7 @@ Devbot picks a backend in this order: the `DEVBOT_AGENT_BACKEND` environment var
 
 ## One-Command Setup
 
-Prerequisites: Node.js 20 or newer, a signed-in Codex CLI or app, and a Discord account that can add apps to the target server.
+Prerequisites: Node.js 22 or newer, a signed-in Codex CLI or app, and a Discord account that can add apps to the target server.
 
 1. Install dependencies and launch the local setup tool:
 
@@ -52,7 +52,7 @@ Prerequisites: Node.js 20 or newer, a signed-in Codex CLI or app, and a Discord 
    - writes the ignored local `.env` and protected runtime setup state with owner-only file permissions
    - requests a Devbot start in the same terminal, or reports that an existing process must be restarted
 
-The setup page binds only to `127.0.0.1`, validates its loopback host, protects its API with a per-run 30-minute browser claim, clears the pasted token field after validation, and never returns the token in an API response. Completion stays locked until Node.js 20+ and a signed-in Codex CLI pass the system check. The result reports launcher/start warnings and does not claim Devbot is ready before the terminal confirms its Discord login.
+The setup page binds only to `127.0.0.1`, validates its loopback host, protects its API with a per-run 30-minute browser claim, clears the pasted token field after validation, and never returns the token in an API response. Completion stays locked until Node.js 22+ and a signed-in Codex CLI pass the system check. The result reports launcher/start warnings and does not claim Devbot is ready before the terminal confirms its Discord login.
 
 The Discord application itself cannot be created by Devbot: Discord's [application API](https://docs.discord.com/developers/resources/application) exposes read and edit operations for the current app, while creation and bot-token retrieval remain in the Developer Portal. Everything after that token is automated.
 
@@ -194,6 +194,8 @@ Status-style mentions such as `@devbot wip`, `@devbot current dev work`, or `@de
 The optional `include` field accepts comma-separated path patterns. `*` is supported as a wildcard, so examples like `src/*`, `README.md`, or `*.json` work.
 
 Task history, in-flight executions, managed previews, preferences, peers, collaboration workrooms, setup, screenshots, and project memory default to owner-only files under `~/.devbot/state`. Set `DEVBOT_STATE_DIR` to move that protected root, or use `DEVBOT_TASK_STORE`, `DEVBOT_EXECUTION_STORE`, `DEVBOT_PREVIEW_STORE`, `DEVBOT_PREFERENCES_STORE`, `DEVBOT_PEER_STORE`, `DEVBOT_COLLAB_STORE`, `DEVBOT_SETUP_STORE`, `DEVBOT_SNAPFIX_STORE`, or `DEVBOT_MEMORY_STORE` for an individual override; relative override paths resolve from the Devbot process working directory. On first use, Devbot migrates recognized legacy runtime files from this repository's `.devbot/` directory without moving project metadata such as `.devbot/project.json`.
+
+For a consistent offline backup, stop Devbot and run `npm run state:backup -- /absolute/path/to/new-backup`. The command loads `.env`, honors `DEVBOT_STATE_DIR` and `DEVBOT_RUNTIME_LOCK`, and fails closed if any individual `DEVBOT_*_STORE` override is configured because one directory would not be a complete snapshot. Consolidate those stores under `DEVBOT_STATE_DIR` or back them up separately. The destination must not already exist and cannot contain, or be contained by, the live state root. Devbot refuses symlinks and special files, writes owner-only copies plus a SHA-256 manifest, and can recheck the snapshot with `npm run state:verify -- /absolute/path/to/backup`. Restore remains an explicit operator action: verify the backup first, keep the bot stopped, preserve the current state root, and copy the verified data files—not `manifest.json`—into the configured state root.
 
 ## Restart Recovery
 

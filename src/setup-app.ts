@@ -35,10 +35,93 @@ const session: { token?: string; identity?: DiscordBotIdentity; botProcess?: Chi
 let baseUrl = "";
 let pageClaim: string | undefined;
 
+const setupErrorResponses = {
+  "bot-not-installed": {
+    status: 409,
+    error: "Devbot is not installed in that Discord server yet. Add it, then refresh the server list."
+  },
+  "discord-session-required": {
+    status: 409,
+    error: "Connect and validate the Discord application first."
+  },
+  "discord-token-rejected": {
+    status: 400,
+    error: "Discord rejected that bot token. Check the token in the Discord Developer Portal and try again."
+  },
+  "discord-token-required": {
+    status: 400,
+    error: "Paste the bot token from the Discord Developer Portal."
+  },
+  "discord-unavailable": {
+    status: 502,
+    error: "Discord could not be reached to complete setup. Check your connection and try again."
+  },
+  "discord-user-credential": {
+    status: 400,
+    error: "That credential belongs to a Discord user, not a bot application."
+  },
+  "folder-selection-unavailable": {
+    status: 400,
+    error: "Folder selection was canceled or is unavailable. You can paste the path instead."
+  },
+  "guild-owner-confirmation-required": {
+    status: 400,
+    error: "Confirm that the selected Discord server owner should become Devbot's bootstrap owner."
+  },
+  "invalid-json": {
+    status: 400,
+    error: "Setup request is not valid JSON."
+  },
+  "invalid-repository-name": {
+    status: 400,
+    error: "Give the repository a short name containing letters, numbers, underscores, or hyphens."
+  },
+  "invalid-repository-path": {
+    status: 400,
+    error: "The repository path does not exist or is not a directory on this machine."
+  },
+  "invalid-screenshot-policy": {
+    status: 400,
+    error: "Screenshot policy must be allow, approval, or deny."
+  },
+  "missing-setup-value": {
+    status: 400,
+    error: "Complete all required setup fields before continuing."
+  },
+  "prerequisites-incomplete": {
+    status: 409,
+    error: "Finish the System check before completing setup. Devbot requires Node.js 22+ and a signed-in Codex CLI."
+  },
+  "request-too-large": {
+    status: 413,
+    error: "Setup request is too large."
+  }
+} as const;
+
+type SetupRequestErrorCode = keyof typeof setupErrorResponses;
+
+class SetupRequestError extends Error {
+  constructor(readonly code: SetupRequestErrorCode, cause?: unknown) {
+    super(setupErrorResponses[code].error, cause === undefined ? undefined : { cause });
+    this.name = "SetupRequestError";
+  }
+}
+
+const internalSetupErrorResponse = {
+  status: 500,
+  error: "Setup could not complete the request. Review the setup terminal for details and try again."
+} as const;
+
 const server = createServer((request, response) => {
   void handleRequest(request, response).catch((error) => {
-    console.error(`Setup request failed: ${publicErrorMessage(error)}`);
-    sendJson(response, 500, { error: friendlyError(error) });
+    const clientResponse = error instanceof SetupRequestError
+      ? setupErrorResponses[error.code]
+      : internalSetupErrorResponse;
+    const diagnostic = error instanceof SetupRequestError && error.cause !== undefined ? error.cause : error;
+    console.error(
+      `Setup request failed (${requestLabel(request)}, HTTP ${clientResponse.status}): ${publicErrorMessage(diagnostic, 2_000)}`
+    );
+    sendJson(response, clientResponse.status, { error: clientResponse.error });
   });
 });
 const sessionExpiryTimer = setTimeout(() => {
@@ -133,18 +216,31 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
 
   if (request.method === "POST" && url.pathname === "/api/connect") {
     const body = await readJsonBody(request);
-    const token = typeof body.token === "string" ? body.token : "";
-    const identity = await validateDiscordBotToken(token);
-    session.token = token.trim().replace(/^Bot\s+/i, "");
+    const token = typeof body.token === "string" ? body.token.trim().replace(/^Bot\s+/i, "") : "";
+    if (!token) throw new SetupRequestError("discord-token-required");
+    let identity: DiscordBotIdentity;
+    let guilds: Awaited<ReturnType<typeof listDiscordBotGuilds>>;
+    try {
+      identity = await validateDiscordBotToken(token);
+      guilds = await listDiscordBotGuilds(token);
+    } catch (error) {
+      throw classifyDiscordError(error);
+    }
+    session.token = token;
     session.identity = identity;
-    const guilds = await listDiscordBotGuilds(session.token);
     sendJson(response, 200, { identity, guilds, installUrl: buildDiscordInstallUrl(identity.applicationId) });
     return;
   }
 
   if (request.method === "GET" && url.pathname === "/api/guilds") {
     requireDiscordSession();
-    sendJson(response, 200, { guilds: await listDiscordBotGuilds(session.token!) });
+    let guilds: Awaited<ReturnType<typeof listDiscordBotGuilds>>;
+    try {
+      guilds = await listDiscordBotGuilds(session.token!);
+    } catch (error) {
+      throw classifyDiscordError(error);
+    }
+    sendJson(response, 200, { guilds });
     return;
   }
 
@@ -162,22 +258,27 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     const body = await readJsonBody(request);
     const { node, codex } = await checkPrerequisites();
     if (!node.ready || !codex.ready) {
-      throw new Error("Finish the System check before completing setup. Devbot requires Node.js 20+ and a signed-in Codex CLI.");
+      throw new SetupRequestError("prerequisites-incomplete");
     }
     if (body.confirmGuildOwner !== true) {
-      throw new Error("Confirm that the selected Discord server owner should become Devbot's bootstrap owner.");
+      throw new SetupRequestError("guild-owner-confirmation-required");
     }
-    const result = await finishInitialSetup({
-      token: session.token!,
-      guildId: stringField(body, "guildId"),
-      repositoryName: stringField(body, "repositoryName"),
-      repositoryPath: stringField(body, "repositoryPath"),
-      enableStudio: body.enableStudio === true,
-      screenshotPolicy: screenshotPolicyField(body),
-      envFile: path.join(cwd, ".env"),
-      envTemplateFile: path.join(cwd, ".env.example"),
-      setupFile
-    });
+    let result: Awaited<ReturnType<typeof finishInitialSetup>>;
+    try {
+      result = await finishInitialSetup({
+        token: session.token!,
+        guildId: stringField(body, "guildId"),
+        repositoryName: stringField(body, "repositoryName"),
+        repositoryPath: stringField(body, "repositoryPath"),
+        enableStudio: body.enableStudio === true,
+        screenshotPolicy: screenshotPolicyField(body),
+        envFile: path.join(cwd, ".env"),
+        envTemplateFile: path.join(cwd, ".env.example"),
+        setupFile
+      });
+    } catch (error) {
+      throw classifyFinishError(error);
+    }
     process.env.DISCORD_TOKEN = session.token!;
     process.env.DISCORD_CLIENT_ID = result.applicationId;
     process.env.DISCORD_GUILD_ID = result.guildId;
@@ -218,13 +319,13 @@ async function hydrateExistingIdentity(): Promise<void> {
 
 function requireDiscordSession(): void {
   if (!session.token || !session.identity) {
-    throw new Error("Connect and validate the Discord application first.");
+    throw new SetupRequestError("discord-session-required");
   }
 }
 
 async function checkNode(): Promise<{ ready: boolean; version: string }> {
   const major = Number(process.versions.node.split(".")[0] ?? 0);
-  return { ready: major >= 20, version: `${process.version}${major >= 20 ? " ready" : " requires Node 20+"}` };
+  return { ready: major >= 22, version: `${process.version}${major >= 22 ? " ready" : " requires Node 22+"}` };
 }
 
 async function checkCodex(): Promise<{ ready: boolean; label: string }> {
@@ -325,7 +426,7 @@ async function chooseRepositoryFolder(): Promise<string> {
     execFile(command, args, { env: setupUtilityEnvironment(), timeout: 120_000 }, (error, stdout) => {
       const selected = stdout.trim().replace(/[\\/]+$/, "");
       if (error || !selected) {
-        reject(new Error("Folder selection was canceled or is unavailable. You can paste the path instead."));
+        reject(new SetupRequestError("folder-selection-unavailable", error));
         return;
       }
       resolve(path.resolve(selected));
@@ -349,7 +450,7 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
     if (size > 64_000) {
-      throw new Error("Setup request is too large.");
+      throw new SetupRequestError("request-too-large");
     }
     chunks.push(buffer);
   }
@@ -358,14 +459,14 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
     return parsed as Record<string, unknown>;
   } catch {
-    throw new Error("Setup request is not valid JSON.");
+    throw new SetupRequestError("invalid-json");
   }
 }
 
 function stringField(body: Record<string, unknown>, name: string): string {
   const value = body[name];
   if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`Missing setup value: ${name}.`);
+    throw new SetupRequestError("missing-setup-value");
   }
   return value.trim();
 }
@@ -374,7 +475,7 @@ function screenshotPolicyField(body: Record<string, unknown>): SetupScreenshotPo
   const value = body.screenshotPolicy;
   if (value === undefined) return "approval";
   if (value !== "allow" && value !== "approval" && value !== "deny") {
-    throw new Error("Screenshot policy must be allow, approval, or deny.");
+    throw new SetupRequestError("invalid-screenshot-policy");
   }
   return value;
 }
@@ -408,8 +509,49 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
   response.end(JSON.stringify(value));
 }
 
-function friendlyError(error: unknown): string {
-  return publicErrorMessage(error);
+function classifyDiscordError(error: unknown): SetupRequestError {
+  const message = error instanceof Error ? error.message : "";
+  if (message === "That credential belongs to a Discord user, not a bot application.") {
+    return new SetupRequestError("discord-user-credential", error);
+  }
+  if (/^Discord rejected the setup request \((?:401|403)\)/.test(message)) {
+    return new SetupRequestError("discord-token-rejected", error);
+  }
+  return new SetupRequestError("discord-unavailable", error);
+}
+
+function classifyFinishError(error: unknown): unknown {
+  if (error instanceof SetupRequestError) return error;
+  const message = error instanceof Error ? error.message : "";
+  if (message === "The repository path does not exist or is not a directory on this machine.") {
+    return new SetupRequestError("invalid-repository-path", error);
+  }
+  if (message === "Give the repository a short name containing letters, numbers, underscores, or hyphens.") {
+    return new SetupRequestError("invalid-repository-name", error);
+  }
+  if (message === "Devbot is not installed in that Discord server yet. Add it, then refresh the server list.") {
+    return new SetupRequestError("bot-not-installed", error);
+  }
+  if (
+    message === "That credential belongs to a Discord user, not a bot application."
+    || /^Discord rejected the setup request \((?:401|403)\)/.test(message)
+    || message.startsWith("Unable to reach Discord:")
+    || message.startsWith("Discord did not respond in time.")
+    || message.startsWith("Discord setup did not complete after several attempts.")
+  ) {
+    return classifyDiscordError(error);
+  }
+  return error;
+}
+
+function requestLabel(request: IncomingMessage): string {
+  const method = request.method ?? "UNKNOWN";
+  try {
+    const pathname = new URL(request.url ?? "/", `http://${host}`).pathname;
+    return publicErrorMessage(`${method} ${pathname}`, 240);
+  } catch {
+    return method;
+  }
 }
 
 function shutdown(): void {
