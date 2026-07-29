@@ -47,6 +47,29 @@ export function taskSyncRefusal(task: TaskRecord, context: TaskAccessContext & {
   return undefined;
 }
 
+export type TaskPublishRefusal =
+  | "access"
+  | "needs-controller"
+  | "safe-mode"
+  | "not-succeeded-action"
+  | "no-isolated-branch"
+  | "not-committed"
+  | "already-merged";
+
+export function taskPublishRefusal(
+  task: TaskRecord,
+  context: TaskAccessContext & { safeMode: boolean }
+): TaskPublishRefusal | undefined {
+  if (!canAccessTaskRecord(task, context)) return "access";
+  if (!context.controller) return "needs-controller";
+  if (context.safeMode) return "safe-mode";
+  if (task.mode !== "action" || task.status !== "succeeded") return "not-succeeded-action";
+  if (!task.workspaceIsolated || !task.workspacePath || !task.branchName || !task.baseBranch) return "no-isolated-branch";
+  if (!task.commitSha) return "not-committed";
+  if (task.branchMerged) return "already-merged";
+  return undefined;
+}
+
 export interface TaskRetryContext {
   interrupted: boolean;
   writeCapable: boolean;

@@ -16,6 +16,31 @@ export type TaskStatus = "awaiting-approval" | "running" | "succeeded" | "failed
 export type TaskAttention = "approval" | "blocked" | "review";
 export type TaskApprovalStatus = "pending" | "approved" | "read-only" | "denied";
 export type TaskAccessScope = "project" | "workroom";
+export type TaskReviewStatus = "draft" | "open" | "merged" | "closed";
+
+export interface TaskReviewChecks {
+  total: number;
+  pending: number;
+  passed: number;
+  failed: number;
+}
+
+export interface TaskReviewState {
+  provider: "github";
+  repository: string;
+  number: number;
+  url: string;
+  branch: string;
+  baseBranch: string;
+  commitSha: string;
+  status: TaskReviewStatus;
+  draft: boolean;
+  checks: TaskReviewChecks;
+  unresolvedThreads: number;
+  mergeable?: string;
+  reviewDecision?: string;
+  lastSyncedAt: string;
+}
 
 const TASK_ID_PATTERN = /^task-[a-z0-9-]{1,52}$/i;
 
@@ -51,6 +76,7 @@ export interface TaskRecord {
   diffStat?: string;
   commitSha?: string;
   verification?: string[];
+  review?: TaskReviewState;
   memoryIds?: string[];
   contextFileCount?: number;
   model?: string;
@@ -261,6 +287,19 @@ export class TaskStore {
       if (input.commitSha !== undefined) task.commitSha = redactSensitiveText(input.commitSha);
       if (input.verification) task.verification = normalizedStrings(input.verification).map((value) => redactSensitiveText(value));
       if (input.memoryIds) task.memoryIds = normalizedStrings(input.memoryIds);
+      updated = cloneTask(task);
+    });
+    return updated;
+  }
+
+  async setReview(id: string, input: TaskReviewState): Promise<TaskRecord | undefined> {
+    const review = normalizeReviewState(input);
+    if (!review) {
+      throw new Error("Task review state is invalid.");
+    }
+    let updated: TaskRecord | undefined;
+    await this.update(id, (task) => {
+      task.review = review;
       updated = cloneTask(task);
     });
     return updated;
@@ -603,6 +642,17 @@ export function formatTaskDetail(task: TaskRecord): string {
     task.changedFiles?.length ? `Changed files: ${task.changedFiles.map((file) => `\`${sanitizeDiscordOutput(file)}\``).join(", ")}` : undefined,
     task.diffStat ? `Diff: ${sanitizeDiscordOutput(task.diffStat)}` : undefined,
     task.verification?.length ? ["", "Verification:", ...task.verification.map((item) => `- ${sanitizeDiscordOutput(item)}`)].join("\n") : undefined,
+    task.review ? [
+      "",
+      `Review: ${task.review.provider} ${task.review.repository}#${task.review.number} (${task.review.status})`,
+      `Review URL: ${task.review.url}`,
+      `Published commit: \`${task.review.commitSha}\``,
+      `Checks: ${task.review.checks.passed} passed, ${task.review.checks.failed} failed, ${task.review.checks.pending} pending`,
+      task.review.unresolvedThreads > 0 ? `Unresolved review threads: ${task.review.unresolvedThreads}` : undefined,
+      task.review.reviewDecision ? `Review decision: ${sanitizeDiscordOutput(task.review.reviewDecision)}` : undefined,
+      task.review.mergeable ? `Mergeability: ${sanitizeDiscordOutput(task.review.mergeable)}` : undefined,
+      `Review synced: ${formatTime(task.review.lastSyncedAt)}`
+    ].filter((line) => line !== undefined).join("\n") : undefined,
     task.captureNote ? `Visual proof: ${sanitizeDiscordOutput(task.captureNote)}` : undefined,
     task.memoryIds?.length ? `Memory cited: ${task.memoryIds.map((id) => `\`${id}\``).join(", ")}` : undefined,
     "",
@@ -641,13 +691,14 @@ function createTaskRecord(input: StartTaskInput, status: TaskStatus, now: string
 }
 
 function cloneTask(task: TaskRecord): TaskRecord {
-  const { agentRoles, changedFiles, verification, memoryIds, ...base } = task;
+  const { agentRoles, changedFiles, verification, review, memoryIds, ...base } = task;
   return {
     ...base,
     includePatterns: [...task.includePatterns],
     ...(agentRoles ? { agentRoles: [...agentRoles] } : {}),
     ...(changedFiles ? { changedFiles: [...changedFiles] } : {}),
     ...(verification ? { verification: [...verification] } : {}),
+    ...(review ? { review: { ...review, checks: { ...review.checks } } } : {}),
     ...(memoryIds ? { memoryIds: [...memoryIds] } : {})
   };
 }
@@ -678,6 +729,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
   const normalizedChangedFiles = Array.isArray(task.changedFiles) ? normalizedStrings(task.changedFiles) : [];
   const normalizedVerification = Array.isArray(task.verification) ? normalizedStrings(task.verification) : [];
   const normalizedMemoryIds = Array.isArray(task.memoryIds) ? normalizedStrings(task.memoryIds) : [];
+  const review = normalizeReviewState(task.review);
   const attention = oneOf(task.attention, ["approval", "blocked", "review"] as const);
   const approvalStatus = oneOf(task.approvalStatus, ["pending", "approved", "read-only", "denied"] as const);
   const proposalRevision = positiveInteger(task.proposalRevision) ?? (status === "awaiting-approval" ? 1 : undefined);
@@ -715,6 +767,7 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
     ...(stringValue(task.diffStat) ? { diffStat: stringValue(task.diffStat)! } : {}),
     ...(stringValue(task.commitSha) ? { commitSha: stringValue(task.commitSha)! } : {}),
     ...(normalizedVerification.length > 0 ? { verification: normalizedVerification } : {}),
+    ...(review ? { review } : {}),
     ...(normalizedMemoryIds.length > 0 ? { memoryIds: normalizedMemoryIds } : {}),
     ...(typeof task.contextFileCount === "number" && Number.isInteger(task.contextFileCount) && task.contextFileCount >= 0
       ? { contextFileCount: task.contextFileCount }
@@ -734,6 +787,80 @@ function normalizeLoadedTask(value: unknown): TaskRecord | undefined {
   };
 }
 
+function normalizeReviewState(value: unknown): TaskReviewState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const review = value as Partial<TaskReviewState>;
+  const checks = review.checks as Partial<TaskReviewChecks> | undefined;
+  const statuses: TaskReviewStatus[] = ["draft", "open", "merged", "closed"];
+  if (
+    review.provider !== "github"
+    || !validRepository(review.repository)
+    || !positiveInteger(review.number)
+    || !validReviewUrl(review.url, review.repository, review.number)
+    || !stringValue(review.branch)
+    || !stringValue(review.baseBranch)
+    || !validCommitSha(review.commitSha)
+    || !statuses.includes(review.status as TaskReviewStatus)
+    || typeof review.draft !== "boolean"
+    || !checks
+    || !nonNegativeInteger(checks.total)
+    || !nonNegativeInteger(checks.pending)
+    || !nonNegativeInteger(checks.passed)
+    || !nonNegativeInteger(checks.failed)
+    || checks.pending + checks.passed + checks.failed !== checks.total
+    || !nonNegativeInteger(review.unresolvedThreads)
+    || !validTimestamp(review.lastSyncedAt)
+  ) {
+    return undefined;
+  }
+  return {
+    provider: "github",
+    repository: review.repository!,
+    number: review.number!,
+    url: review.url!,
+    branch: redactSensitiveText(review.branch!.trim()),
+    baseBranch: redactSensitiveText(review.baseBranch!.trim()),
+    commitSha: review.commitSha!.toLowerCase(),
+    status: review.status as TaskReviewStatus,
+    draft: review.draft,
+    checks: {
+      total: checks.total!,
+      pending: checks.pending!,
+      passed: checks.passed!,
+      failed: checks.failed!
+    },
+    unresolvedThreads: review.unresolvedThreads!,
+    ...(stringValue(review.mergeable) ? { mergeable: redactSensitiveText(review.mergeable!.trim()) } : {}),
+    ...(stringValue(review.reviewDecision) ? { reviewDecision: redactSensitiveText(review.reviewDecision!.trim()) } : {}),
+    lastSyncedAt: review.lastSyncedAt!
+  };
+}
+
+function validRepository(value: unknown): value is string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) return false;
+  return value.split("/").every((segment) => segment !== "." && segment !== "..");
+}
+
+function validCommitSha(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{40}$/i.test(value);
+}
+
+function validReviewUrl(value: unknown, repository: unknown, number: unknown): value is string {
+  if (typeof value !== "string" || typeof repository !== "string" || typeof number !== "number") return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && url.hostname === "github.com"
+      && url.username === ""
+      && url.password === ""
+      && url.pathname === `/${repository}/pull/${number}`
+      && !url.search
+      && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
@@ -744,6 +871,10 @@ function validTimestamp(value: unknown): string | undefined {
 
 function positiveInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function oneOf<const T extends readonly string[]>(value: unknown, values: T): T[number] | undefined {

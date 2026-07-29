@@ -53,7 +53,8 @@ const snapshot: StudioSnapshot = {
         diffStat: "1 file changed",
         verification: ["npm test passed at https://example.com/proof"],
         captureNote: null
-      }
+      },
+      review: null
     },
     {
       id: "task-running",
@@ -68,7 +69,8 @@ const snapshot: StudioSnapshot = {
       roles: ["builder"],
       approval: { attention: null, status: "approved", actor: "owner" },
       branch: { name: "codex/api", base: "main", isolated: true, merged: false },
-      evidence: { changedFiles: [], diffStat: null, verification: [], captureNote: null }
+      evidence: { changedFiles: [], diffStat: null, verification: [], captureNote: null },
+      review: null
     },
     {
       id: "task-done",
@@ -88,6 +90,17 @@ const snapshot: StudioSnapshot = {
         diffStat: "1 file changed",
         verification: ["npm test passed"],
         captureNote: "Visual proof complete"
+      },
+      review: {
+        provider: "github",
+        repository: "example/devbot",
+        number: 42,
+        status: "draft",
+        draft: true,
+        checks: { pending: 1, passed: 2, failed: 0 },
+        unresolvedThreads: 1,
+        reviewDecision: null,
+        mergeable: "MERGEABLE"
       }
     }
   ],
@@ -114,7 +127,7 @@ test("Studio is opt-in only", () => {
 });
 
 test("Discord-native Studio renders a bounded Components V2 workroom", () => {
-  const payload = studioDashboardCard(snapshot, { selectedProject: "pullprice", selectedTaskId: "task-needs-me" });
+  const payload = studioDashboardCard(snapshot, { selectedProject: "pullprice", selectedTaskId: "task-done" });
   const json = JSON.stringify({
     flags: payload.flags,
     components: payload.components.map((component) => component.toJSON()),
@@ -126,6 +139,7 @@ test("Discord-native Studio renders a bounded Components V2 workroom", () => {
   assert.match(json, /Agent map/);
   assert.match(json, /Branch state/);
   assert.match(json, /Open full task/);
+  assert.match(json, /example\\\/devbot#42|example\/devbot#42/);
   assert.doesNotMatch(json, /https:\/\/example\.com/);
   assert.doesNotMatch(json, /@everyone/);
   assert.ok(json.length < 30_000);

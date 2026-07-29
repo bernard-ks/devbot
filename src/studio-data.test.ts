@@ -75,6 +75,20 @@ test("Studio snapshot maps task lanes, branch state, and proof without local pat
         verification: ["npm test in /Users/bernard/devbot: passed"],
         diffStat: "2 files changed",
         captureNote: "Screenshot captured at /private/worktree/never-expose/proof.png.",
+        review: {
+          provider: "github",
+          repository: "example/devbot",
+          number: 42,
+          url: "https://github.com/example/devbot/pull/42",
+          branch: "devbot/task/studio",
+          baseBranch: "main",
+          commitSha: "a".repeat(40),
+          status: "draft",
+          draft: true,
+          checks: { total: 2, pending: 1, passed: 1, failed: 0 },
+          unresolvedThreads: 0,
+          lastSyncedAt: "2026-07-10T10:01:30.000Z"
+        },
         resultPreview: "Updated /Users/bernard/devbot/src/index.ts while process pid 1234 was active."
       }),
       task({
@@ -102,6 +116,7 @@ test("Studio snapshot maps task lanes, branch state, and proof without local pat
   assert.equal(snapshot.tasks.some((item) => item.id === "task-status-detail"), false);
   assert.equal(snapshot.projects[0]?.dirty, true);
   assert.equal(snapshot.agents.find((agent) => agent.id === "builder")?.status, "active");
+  assert.equal(snapshot.tasks[0]?.review?.number, 42);
   assert.doesNotMatch(JSON.stringify(snapshot), /private\/worktree|private\/local|\/Users\/|pid 1234/);
   assert.match(snapshot.tasks[0]?.result ?? "", /\[local path\]|process \[redacted\]/);
 });

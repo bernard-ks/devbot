@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canAccessTaskRecord, isTaskListVisible, taskRetryRefusal, taskSyncRefusal } from "./task-access.js";
+import { canAccessTaskRecord, isTaskListVisible, taskPublishRefusal, taskRetryRefusal, taskSyncRefusal } from "./task-access.js";
 import type { TaskRecord } from "./task-store.js";
 
 test("workroom tasks are limited to their requester and project-authorized controllers", () => {
@@ -54,6 +54,30 @@ test("safe mode, missing branch evidence, and open tasks refuse branch sync", ()
   );
   assert.equal(taskSyncRefusal({ ...task, status: "running" }, context), "task-active");
   assert.equal(taskSyncRefusal({ ...task, status: "awaiting-approval" }, context), "task-active");
+});
+
+test("publishing is controller-only and requires a committed isolated change task", () => {
+  const task = record({
+    mode: "action",
+    workspaceIsolated: true,
+    workspacePath: "/tmp/worktree",
+    branchName: "devbot/task/task-access",
+    baseBranch: "a".repeat(40),
+    commitSha: "b".repeat(40)
+  });
+  const controller = { userId: "controller", projectAllowed: true, controller: true, safeMode: false };
+
+  assert.equal(taskPublishRefusal(task, controller), undefined);
+  assert.equal(taskPublishRefusal(task, { ...controller, controller: false }), "needs-controller");
+  assert.equal(taskPublishRefusal(task, { ...controller, projectAllowed: false }), "access");
+  assert.equal(taskPublishRefusal(task, { ...controller, safeMode: true }), "safe-mode");
+  assert.equal(taskPublishRefusal({ ...task, mode: "answer" }, controller), "not-succeeded-action");
+  assert.equal(taskPublishRefusal({ ...task, status: "failed" }, controller), "not-succeeded-action");
+  assert.equal(taskPublishRefusal({ ...task, workspaceIsolated: false }, controller), "no-isolated-branch");
+  const uncommitted = { ...task };
+  delete uncommitted.commitSha;
+  assert.equal(taskPublishRefusal(uncommitted, controller), "not-committed");
+  assert.equal(taskPublishRefusal({ ...task, branchMerged: true }, controller), "already-merged");
 });
 
 test("a write-task requester whose controller access was revoked cannot retry it", () => {

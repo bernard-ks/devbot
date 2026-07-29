@@ -91,7 +91,8 @@ export interface InteractionRouterDependencies {
     interaction: ButtonInteraction,
     appConfig: AppConfig,
     action: TaskControlAction,
-    taskId: string
+    taskId: string,
+    expectedCommitPrefix?: string
   ): Promise<void>;
   handleScreenshotFixControl(
     interaction: ButtonInteraction,
@@ -267,7 +268,13 @@ export function createInteractionRouter(
           if (!(await dependencies.ensureConfiguredRoom(interaction))) {
             return;
           }
-          await dependencies.handleTaskControl(interaction, appConfig, taskControl.action, taskControl.taskId);
+          await dependencies.handleTaskControl(
+            interaction,
+            appConfig,
+            taskControl.action,
+            taskControl.taskId,
+            taskControl.expectedCommitPrefix
+          );
           return;
         }
         const screenshotFixControl = parseScreenshotFixControl(interaction.customId);

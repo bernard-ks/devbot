@@ -230,6 +230,15 @@ const commandBuilders = [
     )
     .addSubcommand((subcommand) =>
       subcommand
+        .setName("publish")
+        .setDescription("Validate and publish a committed task branch as a draft pull request.")
+        .addStringOption((option) => option.setName("task").setDescription("Task ID.").setRequired(true).setAutocomplete(true))
+        .addBooleanOption((option) =>
+          option.setName("confirm").setDescription("Confirm validation, branch push, and draft pull request creation.").setRequired(false)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
         .setName("preview")
         .setDescription("Start, stop, or inspect a loopback-only dev server for a task's isolated workspace.")
         .addStringOption((option) => option.setName("task").setDescription("Task ID.").setRequired(true).setAutocomplete(true))

@@ -67,6 +67,77 @@ test("loading rejects non-boolean branch merged values", async () => {
   assert.equal(persisted.tasks[0]?.branchMerged, true);
 });
 
+test("review publication state is durable, bounded, and rendered in task details", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-review-"));
+  const stateFile = path.join(root, ".devbot", "tasks.json");
+  const store = new TaskStore(stateFile);
+  const task = await store.start({
+    source: "test",
+    mode: "action",
+    projectName: "demo",
+    requester: "tester",
+    text: "Publish the parser fix"
+  });
+  const review = await store.setReview(task.id, {
+    provider: "github",
+    repository: "example/devbot",
+    number: 42,
+    url: "https://github.com/example/devbot/pull/42",
+    branch: "devbot/task/parser",
+    baseBranch: "main",
+    commitSha: "a".repeat(40),
+    status: "draft",
+    draft: true,
+    checks: { total: 3, pending: 1, passed: 2, failed: 0 },
+    unresolvedThreads: 1,
+    mergeable: "BLOCKED",
+    lastSyncedAt: "2026-07-29T12:00:00.000Z"
+  });
+  assert.equal(review?.review?.number, 42);
+
+  const reloaded = await new TaskStore(stateFile).get(task.id);
+  assert.deepEqual(reloaded?.review?.checks, { total: 3, pending: 1, passed: 2, failed: 0 });
+  const detail = formatTaskDetail(reloaded!);
+  assert.match(detail, /example\/devbot#42 \(draft\)/);
+  assert.match(detail, /Checks: 2 passed, 0 failed, 1 pending/);
+  assert.match(detail, /Unresolved review threads: 1/);
+
+  review!.review!.checks.passed = 99;
+  assert.equal((await store.get(task.id))?.review?.checks.passed, 2);
+});
+
+test("loading drops malformed review publication state without dropping the task", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "devbot-task-review-load-"));
+  const stateFile = path.join(root, ".devbot", "tasks.json");
+  await mkdir(path.dirname(stateFile), { recursive: true });
+  await writeFile(stateFile, JSON.stringify({
+    version: 1,
+    tasks: [{
+      id: "task-review-invalid",
+      status: "succeeded",
+      source: "test",
+      mode: "action",
+      projectName: "demo",
+      requester: "tester",
+      text: "Publish safely",
+      includePatterns: [],
+      review: {
+        provider: "github",
+        repository: "example/devbot",
+        number: 42,
+        url: "https://evil.example/pull/42",
+        checks: { total: 1, pending: 0, passed: 9, failed: 0 }
+      },
+      startedAt: "2026-07-29T12:00:00.000Z",
+      updatedAt: "2026-07-29T12:00:00.000Z"
+    }]
+  }, null, 2));
+
+  const task = await new TaskStore(stateFile).get("task-review-invalid");
+  assert.ok(task);
+  assert.equal(task.review, undefined);
+});
+
 function hostileTask(): TaskRecord {
   const now = new Date().toISOString();
   return {

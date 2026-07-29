@@ -111,6 +111,7 @@ import {
   validationCommandNames,
   type ReviewPacket
 } from "./review.js";
+import { GitHubReviewProvider } from "./review-provider.js";
 import { contextLimitForRoute, routeRequest, type RequestRoute } from "./request-router.js";
 import { publicErrorMessage, redactSensitiveText, sanitizeDiscordOutput } from "./security.js";
 import {
@@ -123,7 +124,15 @@ import {
   screenshotRequiresApproval
 } from "./safety.js";
 import { formatTaskDetail, formatTaskList, formatTaskLogs, TaskStore, type TaskRecord, type TaskStatus } from "./task-store.js";
-import { canAccessTaskRecord, taskRetryRefusal, taskSyncRefusal, type TaskRetryRefusal, type TaskSyncRefusal } from "./task-access.js";
+import {
+  canAccessTaskRecord,
+  taskPublishRefusal,
+  taskRetryRefusal,
+  taskSyncRefusal,
+  type TaskPublishRefusal,
+  type TaskRetryRefusal,
+  type TaskSyncRefusal
+} from "./task-access.js";
 import {
   describeBranchFreshness,
   inspectBranchFreshness,
@@ -146,6 +155,7 @@ import {
   taskActionMatchesState,
   taskActionRows,
   taskControlRow,
+  taskPublishConfirmationRow,
   type PreviewButtonAction,
   type TaskControlAction
 } from "./task-controls.js";
@@ -253,6 +263,7 @@ setActiveBackendId(process.env.DEVBOT_AGENT_BACKEND?.trim() || setupStore.snapsh
 const contextService = new ProjectContextService(config.scanner);
 const workTracker = new WorkTracker();
 const taskStore = new TaskStore(process.env.DEVBOT_TASK_STORE?.trim() || undefined);
+const reviewProvider = new GitHubReviewProvider();
 const previewLedgerFile = process.env.DEVBOT_PREVIEW_STORE?.trim();
 const previewManager = new TaskPreviewManager(previewLedgerFile ? { ledgerFile: previewLedgerFile } : {});
 const memoryStore = new MemoryStore(
@@ -1021,10 +1032,15 @@ async function studioSnapshotForInteraction(
       lastCommit: "unavailable"
     }))))
   ]);
-  const tasks = [...attention, ...recent]
+  const visibleTasks = [...attention, ...recent]
     .filter((task, index, values) => values.findIndex((candidate) => candidate.id === task.id) === index)
     .filter((task) => projectNames.has(task.projectName) && isStudioTaskVisible(task) && canAccessTask(interaction, task, appConfig))
     .slice(0, 25);
+  const tasks = await Promise.all(visibleTasks.map((task) => (
+    task.review
+      ? refreshTaskReviewState(task, projects.find((project) => project.name === task.projectName))
+      : task
+  )));
   return buildStudioSnapshot({
     bot: {
       name: appConfig.botIdentity.displayName,
@@ -3445,7 +3461,9 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
       await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
       return;
     }
-    const { task, freshness } = await refreshTaskBranchState(saved, findProject(appConfig.projects, saved.projectName));
+    const project = findProject(appConfig.projects, saved.projectName);
+    const { task: branchTask, freshness } = await refreshTaskBranchState(saved, project);
+    const task = await refreshTaskReviewState(branchTask, project);
     await replyChunked(
       interaction,
       freshness
@@ -3591,6 +3609,44 @@ async function handleTaskCommand(interaction: ChatInputCommandInteraction, appCo
     } finally {
       activeTaskActions.delete(actionKey);
     }
+    return;
+  }
+
+  if (subcommand === "publish") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const id = interaction.options.getString("task", true);
+    const task = await taskStore.get(id);
+    if (!task || !allowedProjectNames.has(task.projectName)) {
+      await interaction.editReply(`No accessible saved task found for \`${id}\`.`);
+      return;
+    }
+    const refusal = taskPublishRefusal(task, {
+      userId: interaction.user.id,
+      projectAllowed: allowedProjectNames.has(task.projectName),
+      controller: isControllerUser(interaction.user.id, appConfig),
+      safeMode: appConfig.safeMode
+    });
+    if (refusal) {
+      await interaction.editReply(taskPublishRefusalMessage(refusal));
+      return;
+    }
+    const project = mustFindProject(appConfig.projects, task.projectName);
+    if (interaction.options.getBoolean("confirm") !== true) {
+      await interaction.editReply([
+        formatApprovalCard({
+          action: "Publish task for review",
+          actor: interaction.user.tag,
+          projectName: project.name,
+          risk: "high",
+          reason: "This action runs configured merge gates, pushes the exact isolated branch, and creates a draft pull request.",
+          scope: `Task ${task.id} at commit ${shortSha(task.commitSha!)} on branch ${task.branchName}.`,
+          sideEffects: "Writes the task branch to origin and creates or reuses a GitHub draft pull request. It never merges."
+        }),
+        `Run \`/task publish task:${task.id} confirm:true\` to approve these exact side effects.`
+      ].join("\n\n"));
+      return;
+    }
+    await runTaskPublish(interaction, project, task);
     return;
   }
 
@@ -3810,6 +3866,119 @@ async function appendTaskSyncEvidence(taskId: string, lines: string[]): Promise<
   await taskStore.setEvidence(taskId, { verification: [...(current?.verification ?? []), ...lines].slice(-12) });
 }
 
+async function runTaskPublish(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  project: ProjectEntry,
+  task: TaskRecord
+): Promise<void> {
+  const actionKey = `${task.id}:publish`;
+  if (activeTaskActions.has(actionKey)) {
+    await interaction.editReply("That task is already being published or refreshed.");
+    return;
+  }
+  activeTaskActions.add(actionKey);
+  try {
+    const reviewProject = await projectForTaskWorkspace(project, task);
+    const gates = await runTrackedMergeGates(reviewProject);
+    await appendTaskSyncEvidence(task.id, [
+      `Pre-publish merge gates ${gates.ok ? "passed" : "failed"}: working tree ${gates.cleanWorkingTree ? "clean" : "dirty"}; ${gates.validation.filter((item) => item.ok).length}/${gates.validation.length} checks passed.`
+    ]);
+    if (!gates.ok) {
+      await interaction.editReply(reviewEvidenceCard({
+        title: "Publish blocked by merge gates",
+        project: project.name,
+        passed: false,
+        summary: [
+          `Task ${task.id} was not pushed.`,
+          `Working tree: ${gates.cleanWorkingTree ? "clean" : "has uncommitted changes"}.`,
+          `Validation: ${gates.validation.every((item) => item.ok) ? "passed" : "failed"}.`
+        ],
+        checks: reviewEvidenceChecks(gates.validation)
+      }));
+      return;
+    }
+
+    const current = (await taskStore.get(task.id)) ?? task;
+    const review = await reviewProvider.publish({
+      project,
+      task: current,
+      worktree: {
+        sourcePath: project.root,
+        path: current.workspacePath!,
+        branch: current.branchName!,
+        baseRevision: current.baseBranch!
+      }
+    });
+    const updated = await taskStore.setReview(task.id, review);
+    if (review.status === "merged") {
+      await taskStore.setBranchSync(task.id, { merged: true });
+    }
+    const notice = await publishReviewNotice(updated ?? current, review.url);
+    await interaction.editReply([
+      `Published \`${review.repository}#${review.number}\` as ${review.status === "draft" ? "a draft pull request" : `an existing ${review.status} pull request`}.`,
+      review.url,
+      `Exact commit: \`${shortSha(review.commitSha)}\``,
+      `Checks: ${review.checks.passed} passed, ${review.checks.failed} failed, ${review.checks.pending} pending.`,
+      review.unresolvedThreads > 0 ? `Unresolved review threads: ${review.unresolvedThreads}.` : "Unresolved review threads: none.",
+      "Merge remains a separate human decision.",
+      notice
+    ].filter((line) => line !== undefined).join("\n"));
+  } catch (error) {
+    await interaction.editReply(`Publish blocked: ${publicErrorMessage(error)}`);
+  } finally {
+    activeTaskActions.delete(actionKey);
+  }
+}
+
+async function publishReviewNotice(task: TaskRecord, url: string): Promise<string | undefined> {
+  const channelId = task.threadId;
+  if (!channelId) return "No private task workroom is recorded, so the review link remains in this private reply.";
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (channel?.type !== ChannelType.PrivateThread) {
+      return "The recorded task workroom is not a private thread, so the review link remains in this private reply.";
+    }
+    await sendToTextChannel(channel, {
+      content: [
+        `**${task.projectName} review published**`,
+        `Task \`${task.id}\` is ready for review.`,
+        url,
+        "CI and review state will refresh in task details and Studio. Merge still requires a separate human decision."
+      ].join("\n"),
+      allowedMentions: { parse: [] }
+    });
+    return `Review details were also posted to <#${channelId}>.`;
+  } catch (error) {
+    return `The pull request exists, but its workroom notice could not be posted: ${publicErrorMessage(error)}`;
+  }
+}
+
+async function refreshTaskReviewState(task: TaskRecord, project: ProjectEntry | undefined): Promise<TaskRecord> {
+  if (!project || !task.review) return task;
+  try {
+    const review = await reviewProvider.sync({ project, review: task.review });
+    const updated = await taskStore.setReview(task.id, review);
+    if (review.status === "merged" && !task.branchMerged) {
+      await taskStore.setBranchSync(task.id, { merged: true });
+      return (await taskStore.get(task.id)) ?? updated ?? task;
+    }
+    return updated ?? task;
+  } catch (error) {
+    console.warn(`Unable to refresh review state for ${task.id}: ${publicErrorMessage(error)}`);
+    return task;
+  }
+}
+
+function taskPublishRefusalMessage(refusal: TaskPublishRefusal): string {
+  if (refusal === "access") return "No accessible saved task was found.";
+  if (refusal === "needs-controller") return "Only the owner or an approved controller can publish a task branch.";
+  if (refusal === "safe-mode") return safeModeActionMessage("/task publish");
+  if (refusal === "not-succeeded-action") return "Only a succeeded change task can be published for review.";
+  if (refusal === "no-isolated-branch") return "This task has no trusted isolated branch and worktree to publish.";
+  if (refusal === "not-committed") return "Commit the reviewed task changes with `/task commit` before publishing.";
+  return "This task branch is already merged.";
+}
+
 function shortSha(value: string): string {
   return value.slice(0, 10);
 }
@@ -3969,7 +4138,8 @@ async function handleTaskControl(
   interaction: ButtonInteraction,
   appConfig: AppConfig,
   action: TaskControlAction,
-  taskId: string
+  taskId: string,
+  expectedCommitPrefix?: string
 ): Promise<void> {
   const task = await taskStore.get(taskId);
   if (!task) {
@@ -4061,6 +4231,47 @@ async function handleTaskControl(
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const packet = await createReviewPacket(await projectForTaskWorkspace(project, task), task);
     await editButtonReplyWithChunks(interaction, formatReviewPacket(packet));
+    return;
+  }
+
+  if (action === "publish" || action === "publish-confirm") {
+    if (
+      action === "publish-confirm"
+      && (!expectedCommitPrefix || !task.commitSha?.toLowerCase().startsWith(expectedCommitPrefix))
+    ) {
+      await interaction.reply({
+        content: "The task commit changed after this confirmation was shown. Open the publish action again and review the new commit.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    const refusal = taskPublishRefusal(task, {
+      userId: interaction.user.id,
+      projectAllowed: isAllowedForProject(interaction, project),
+      controller: canControl,
+      safeMode: appConfig.safeMode
+    });
+    if (refusal) {
+      await interaction.reply({ content: taskPublishRefusalMessage(refusal), flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (action === "publish") {
+      await interaction.reply({
+        content: [
+          "**Publish this task for review?**",
+          `Task: \`${task.id}\``,
+          `Branch: \`${task.branchName}\``,
+          `Recorded commit: \`${shortSha(task.commitSha!)}\``,
+          "",
+          "Confirming will run configured merge gates, push only this exact isolated branch without force, and create or reuse a draft GitHub pull request. It will not merge."
+        ].join("\n"),
+        components: [taskPublishConfirmationRow(task.id, task.commitSha!)],
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await runTaskPublish(interaction, project, task);
     return;
   }
 
