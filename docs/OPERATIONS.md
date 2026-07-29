@@ -373,6 +373,9 @@ Recommended flow:
 4. Have an owner/controller create the reviewed task commit with `/task commit task:<id>`.
 5. Run `/review validate project:<name> task:<id>` against that exact isolated checkout.
 6. Run `/review gates project:<name> task:<id>` against the same branch.
-7. Push and merge outside Devbot unless you have added a separate controlled provider integration.
+7. Run `/task publish task:<id>`. Inspect the exact branch and commit in the confirmation card, then use its button or rerun with `confirm:true`.
+8. Review CI and review-thread state in `/task show` or Studio. Merge remains a separate human decision outside this flow.
 
-`/review gates` checks that the selected checkout is clean and its configured validation commands pass. Supplying `task:<id>` is what binds the evidence to the task worktree and branch; omitting it intentionally checks the source checkout. Devbot does not merge.
+`/review gates` checks that the selected checkout is clean and its configured validation commands pass. Supplying `task:<id>` is what binds the evidence to the task worktree and branch; omitting it intentionally checks the source checkout.
+
+`/task publish` currently supports GitHub through an authenticated local `gh` session. It runs configured merge gates again, verifies the isolated checkout is clean and still at the task's recorded commit, refreshes `origin/<default-branch>`, refuses a stale branch, and pushes an exact non-force refspec before creating a draft. Repeat publication reuses an existing pull request only when its head commit matches. The provider URL, commit, CI totals, unresolved review threads, decision, mergeability, and merged/closed state are persisted and refreshed when task details or Studio are opened. Devbot does not merge.

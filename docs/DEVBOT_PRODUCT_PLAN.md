@@ -1,24 +1,24 @@
 # Devbot Product Plan
 
-Updated: 2026-07-20
+Updated: 2026-07-29
 
 ## Purpose
 
-Devbot is a local Discord interface for Codex-backed development work. It answers project questions, runs focused local Codex tasks, reports active work, and attaches live UI screenshots without requiring an OpenAI API key.
+Devbot is a local Discord interface for coding-agent-backed development work. It answers project questions, runs focused local tasks through a capability-checked agent backend, reports active work, and attaches live UI screenshots without requiring a Devbot-hosted backend.
 
 The small-team foundation now exists: owner-managed private setup, durable local tasks, peer discovery, sealed councils, approval records, and review handoffs. The next product step is to make those capabilities feel as natural as ordinary Discord conversation while deepening evidence-backed multi-agent work.
 
-## Current Hardening Priorities
+## Current Product Priorities
 
-The active backlog is deliberately narrower than the historical idea inventory below:
+The next product cycle is defined in [Devbot Next Product Bets](NEXT_PRODUCT_BETS.md). The product niche is a Discord-native control plane for coding agents running on real developer machines: work stays tied to an owned local environment, writes are human-gated, and the handoff includes observed proof.
 
-1. Keep setup/browser errors behind a fixed public-error boundary while retaining sanitized local diagnostics.
-2. Support maintained Node.js LTS releases, require pinned CI actions, and protect `main` with pull-request and check rules.
-3. Split the Discord gateway into testable interaction routers; `src/index.ts` remains the largest unisolated orchestration surface.
-4. Enforce a coverage floor and keep build-backed test suites safe when invoked concurrently.
-5. Extend request/task-correlated structured logs across background work and keep runtime-state backups integrity-verifiable.
+The recommended release order is:
 
-Items marked **Implemented** below describe shipped foundations, not pending work. SQLite, richer provider integration, and multiplayer automation remain conditional investments rather than prerequisites for the current single-host product.
+1. **Review Bridge completion:** the provider-neutral publish state, GitHub draft-PR adapter, and on-view review synchronization baseline are implemented; finish event-driven refresh and wider Needs Me/workroom visibility.
+2. **Proof You Can Replay:** one correlated, sanitized, integrity-verifiable task timeline.
+3. **See It Work:** allow-listed visual QA journeys against the exact isolated task preview.
+
+Versioned rituals and safe schedules, a durable task queue, capability passports, and an experiment arena follow those three foundations. Items marked **Implemented** below describe shipped foundations, not pending work.
 
 ## Ambient Workrooms And Studio: Ideas 1-9
 
@@ -26,7 +26,7 @@ The ambient workroom slice is now implemented:
 
 1. Natural `@devbot` requests are classified as answer requests or proposed actions. Action-shaped mentions receive a confirmation preview with **Approve and start**, **Edit**, **Answer only**, and **Decline**; no write begins from the mention alone.
 2. Each proposal is persisted as an approval-gated task and gets a private Discord task thread when the room supports private thread creation and membership management.
-3. Approved write tasks run in a separate `devbot/task/<task-name>` Git branch and worktree outside the source checkout. Completion records the branch, changed files, and bounded diff-status evidence. An owner/controller can commit exactly those reviewed paths with `/task commit`; Devbot does not merge or push.
+3. Approved write tasks run in a separate `devbot/task/<task-name>` Git branch and worktree outside the source checkout. Completion records the branch, changed files, and bounded diff-status evidence. An owner/controller can commit exactly those reviewed paths with `/task commit` and explicitly publish the exact recorded commit as a draft GitHub pull request with `/task publish`; Devbot does not merge.
 4. `/inbox` and dashboard **Needs Me** show pending decisions for the current user, with private task detail, pagination, and refresh controls.
 5. Completion cards put recorded proof before the result and provide an **Open proof** action for the saved task record.
 6. Owner-only `/setup project-room action:bind project:<name> channel:<channel>` binds a private channel or private thread to one project; `action:remove` removes the binding.
@@ -128,7 +128,7 @@ The safety contract is explicit: only the requester or an approved controller ca
 ## Current Constraints
 
 - Active process tracking is in memory, while task, setup, peer, and collaboration history use local JSON stores rather than a shared database.
-- Review packets and approval records are durable. Local branch merge state and freshness are now synchronized on demand: `/task freshness` and `/task show` detect merged and stale task branches, mark merged state durably, and `/task sync` rebases a task branch onto the local default branch inside its isolated worktree with a backup ref and conflict-abort safety. Provider (pull request) merge state remains unsynchronized; Devbot stays local-git only.
+- Review packets and approval records are durable. Local branch merge state and freshness are synchronized on demand: `/task freshness` and `/task show` detect merged and stale task branches, mark merged state durably, and `/task sync` rebases a task branch onto the local default branch inside its isolated worktree with a backup ref and conflict-abort safety. `/task publish` now runs merge gates, verifies the exact clean commit and remote-base ancestry, pushes a non-force branch, creates or reuses a draft GitHub pull request, and persists CI/review/merge state. Provider refresh is currently view-driven, GitHub-only, and dependent on the local `gh` session rather than webhook- or schedule-driven.
 - The context scanner is text-only and does not understand repository structure beyond path/content ranking.
 - Screenshot targeting can click one visible matching UI control, but it does not yet plan multi-step flows, log in, seed test data, or navigate complex dynamic states.
 - Local Codex process detection is heuristic and depends on command-line shape.
@@ -334,17 +334,18 @@ MVP multi-bot flow:
 
 ## Near-Term Backlog
 
-- Update README for live UI screenshot behavior. Done.
-- Add `docs/OPERATIONS.md` for setup, restart, and troubleshooting. Done.
-- Add `.devbot/project.example.json`. Done.
-- Add `/snip` as a dedicated command instead of overloading `/status image:true`. Done.
-- Add `/task` command group. Baseline done.
-- Add `/review` command group. Done.
-- Add `BOT_OWNER`, `BOT_DISPLAY_NAME`, and `PEER_BOT_IDS` config. Done.
-- Add a coordination channel ID config. Done with `COORDINATION_CHANNEL_ID`.
-- Add structured result envelopes for bot-to-bot messages. Done.
-- Add collaboration event persistence. Done with `~/.devbot/state/collab.json` by default.
-- Add tests for peer message parsing and permission enforcement. Peer parsing tests added; permission enforcement is handled by `PEER_BOT_IDS` and should get deeper integration tests when Discord handlers are split out.
+The completed historical checklist has been replaced by the ranked, evidence-backed backlog in [Devbot Next Product Bets](NEXT_PRODUCT_BETS.md):
+
+1. Provider-neutral publish and review-state sync.
+2. Replayable proof timeline.
+3. Managed visual QA journeys.
+4. Versioned rituals and safe schedules.
+5. Durable queue and capacity planner.
+6. Capability passports and evidence-backed trust.
+7. Experiment arena.
+8. Symbol-aware context and repo skills.
+9. One Discord app with many owned workers.
+10. Usage and reliability scorecards.
 
 ## Open Questions
 

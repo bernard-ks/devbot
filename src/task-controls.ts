@@ -13,7 +13,9 @@ export type TaskControlAction =
   | "promote"
   | "validate"
   | "adjust"
-  | "ship";
+  | "ship"
+  | "publish"
+  | "publish-confirm";
 
 interface PublicTaskControlOptions {
   status?: TaskStatus;
@@ -62,10 +64,13 @@ export function taskActionRows(
     }
     if (mode === "action") {
       buttons.push(button("review", task.id, "Review changes", ButtonStyle.Secondary));
-      if (options.canControl) {
+      if (options.canControl && task.commitSha && !task.review && options.hasChecks && !options.safeMode) {
+        buttons.push(button("publish", task.id, "Publish for review", ButtonStyle.Success));
+      }
+      if (options.canControl && buttons.length < 5) {
         buttons.push(button("ship", task.id, "Ship it", ButtonStyle.Success));
       }
-      if (options.canControl && options.hasChecks && !options.safeMode) {
+      if (options.canControl && options.hasChecks && !options.safeMode && buttons.length < 5) {
         buttons.push(button("validate", task.id, "Run checks", ButtonStyle.Success));
       }
     }
@@ -130,15 +135,41 @@ export function taskActionMatchesState(action: TaskControlAction, task: TaskReco
   if (action === "promote") {
     return task.status === "succeeded" && mode === "answer";
   }
+  if (action === "publish" || action === "publish-confirm") {
+    return task.status === "succeeded" && mode === "action";
+  }
   return task.status === "succeeded" && mode === "action";
 }
 
-export function parseTaskControl(customId: string): { action: TaskControlAction; taskId: string } | undefined {
-  const match = /^devbot:task-control:(details|actions|followup|review|retry|cancel|dismiss|promote|validate|adjust|ship):(.+)$/i.exec(customId);
+export function parseTaskControl(
+  customId: string
+): { action: TaskControlAction; taskId: string; expectedCommitPrefix?: string } | undefined {
+  const confirmation = /^devbot:task-publish:([^:]+):([a-f0-9]{16})$/i.exec(customId);
+  if (confirmation?.[1] && confirmation[2] && isTaskId(confirmation[1])) {
+    return {
+      action: "publish-confirm",
+      taskId: confirmation[1],
+      expectedCommitPrefix: confirmation[2].toLowerCase()
+    };
+  }
+  const match = /^devbot:task-control:(details|actions|followup|review|retry|cancel|dismiss|promote|validate|adjust|ship|publish):(.+)$/i.exec(customId);
   if (!match?.[1] || !match[2] || !isTaskId(match[2])) {
     return undefined;
   }
   return { action: match[1] as TaskControlAction, taskId: match[2] };
+}
+
+export function taskPublishConfirmationRow(taskId: string, commitSha: string): ActionRowBuilder<ButtonBuilder> {
+  if (!isTaskId(taskId) || !/^[a-f0-9]{40}$/i.test(commitSha)) {
+    throw new Error("Task and commit IDs cannot be encoded in a publish confirmation.");
+  }
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`devbot:task-publish:${taskId}:${commitSha.slice(0, 16).toLowerCase()}`)
+      .setLabel("Confirm draft PR")
+      .setStyle(ButtonStyle.Success),
+    button("details", taskId, "Review task details", ButtonStyle.Secondary)
+  );
 }
 
 export type PreviewButtonAction = "stop" | "status";

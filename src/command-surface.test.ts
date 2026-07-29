@@ -36,7 +36,7 @@ test("complete Discord command surface is unique, bounded, and intentionally cou
   const slashPaths = commandDefinitions
     .filter((command) => command.type === ApplicationCommandType.ChatInput)
     .flatMap((command) => invocationPaths(command));
-  assert.equal(slashPaths.length, 62);
+  assert.equal(slashPaths.length, 63);
   assert.equal(commandDefinitions.filter((command) => command.type === ApplicationCommandType.Message).length, 1);
 
   for (const command of commandDefinitions) {
@@ -86,6 +86,17 @@ test("configured command approval is exposed on run and not unrelated dashboard 
   const dashboardOptions = dashboard && "options" in dashboard ? dashboard.options ?? [] : [];
   assert.ok(runOptions.some((option) => option.name === "confirm" && option.type === ApplicationCommandOptionType.Boolean));
   assert.equal(dashboardOptions.some((option) => option.name === "confirm"), false);
+});
+
+test("task publishing exposes an explicit non-required confirmation field", () => {
+  const task = commandDefinitions.find((command) => command.name === "task");
+  const publish = task && "options" in task
+    ? task.options?.find((option) => option.type === ApplicationCommandOptionType.Subcommand && option.name === "publish")
+    : undefined;
+  const confirm = publish && "options" in publish ? publish.options?.find((option) => option.name === "confirm") : undefined;
+  assert.equal(confirm?.type, ApplicationCommandOptionType.Boolean);
+  assert.equal(confirm?.required, false);
+  assert.match(confirm?.description ?? "", /confirm.*draft pull request/i);
 });
 
 test("configured command surfaces share shutdown-aware cancellation tracking", async () => {

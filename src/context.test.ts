@@ -43,7 +43,13 @@ import {
 } from "./lab.js";
 import { renderStatusImage } from "./status-image.js";
 import { formatTaskDetail, TaskStore } from "./task-store.js";
-import { parseTaskControl, taskActionMatchesState, taskActionRows, taskControlRow } from "./task-controls.js";
+import {
+  parseTaskControl,
+  taskActionMatchesState,
+  taskActionRows,
+  taskControlRow,
+  taskPublishConfirmationRow
+} from "./task-controls.js";
 import type { ProjectEntry } from "./types.js";
 import { filterWorkForProjects, formatWorkStatus, parseExternalCodexWork, scopeStatusToProject, WorkTracker } from "./work-status.js";
 import { parseWorkroomButton, workroomActionRows } from "./workroom-controls.js";
@@ -1083,6 +1089,53 @@ test("ship control is offered to controllers on completed action tasks but never
     (row) => row.toJSON().components.map((component) => ("label" in component ? component.label : undefined))
   );
   assert.ok(!answerLabels.includes("Ship it"));
+});
+
+test("publish control requires a committed checked change and uses a separate confirmation action", () => {
+  const task = {
+    id: "task-publish",
+    status: "succeeded" as const,
+    source: "test",
+    mode: "action",
+    projectName: "webapp",
+    requester: "tester",
+    text: "Fix the review flow",
+    includePatterns: [],
+    startedAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z",
+    commitSha: "a".repeat(40)
+  };
+  const labels = (overrides: Parameters<typeof taskActionRows>[1]) =>
+    taskActionRows(task, overrides).flatMap((row) =>
+      row.toJSON().components.map((component) => ("label" in component ? component.label : undefined))
+    );
+
+  assert.ok(labels({ canControl: true, safeMode: false, hasChecks: true }).includes("Publish for review"));
+  assert.ok(!labels({ canControl: false, safeMode: false, hasChecks: true }).includes("Publish for review"));
+  assert.ok(!labels({ canControl: true, safeMode: true, hasChecks: true }).includes("Publish for review"));
+  assert.ok(!labels({ canControl: true, safeMode: false, hasChecks: false }).includes("Publish for review"));
+  const { commitSha: _commitSha, ...uncommitted } = task;
+  assert.ok(!taskActionRows(uncommitted, { canControl: true, safeMode: false, hasChecks: true })
+    .flatMap((row) => row.toJSON().components)
+    .some((component) => "label" in component && component.label === "Publish for review"));
+
+  assert.deepEqual(parseTaskControl("devbot:task-control:publish:task-publish"), {
+    action: "publish",
+    taskId: "task-publish"
+  });
+  assert.deepEqual(parseTaskControl(`devbot:task-publish:task-publish:${"a".repeat(16)}`), {
+    action: "publish-confirm",
+    taskId: "task-publish",
+    expectedCommitPrefix: "a".repeat(16)
+  });
+  assert.equal(parseTaskControl("devbot:task-control:publish-confirm:task-publish"), undefined);
+  assert.equal(taskActionMatchesState("publish", task), true);
+  assert.deepEqual(
+    taskPublishConfirmationRow(task.id, task.commitSha).toJSON().components.map((component) => "label" in component ? component.label : undefined),
+    ["Confirm draft PR", "Review task details"]
+  );
+  const confirmationButton = taskPublishConfirmationRow(task.id, task.commitSha).toJSON().components[0];
+  assert.ok(confirmationButton && "custom_id" in confirmationButton && confirmationButton.custom_id.length <= 100);
 });
 
 interface CommandJson {

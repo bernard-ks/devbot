@@ -179,11 +179,15 @@ function formatSelectedTask(task: StudioTask): string {
     ? task.evidence.changedFiles.slice(0, 5).map((file) => `\`${inlineCode(file, 120)}\``).join(", ")
     : "None recorded";
   const outcome = task.error ?? task.result;
+  const review = task.review
+    ? `**Review:** ${inline(task.review.repository, 120)}#${task.review.number} · ${inline(task.review.status, 30)} · checks ${task.review.checks.passed} passed / ${task.review.checks.failed} failed / ${task.review.checks.pending} pending${task.review.unresolvedThreads ? ` · ${task.review.unresolvedThreads} unresolved threads` : ""}`
+    : undefined;
   return [
     `### Selected · ${inline(task.title, 180)}`,
     `**Project:** ${inline(task.project, 70)} | **Status:** ${inline(task.status, 40)} | **Decision:** ${approval}`,
     `**Branch:** ${branch}`,
     `**Changed:** ${changed}`,
+    review,
     `**Proof**\n${proof}`,
     outcome ? `**Outcome**\n${block(outcome, 520)}` : undefined
   ].filter((value): value is string => Boolean(value)).join("\n\n");

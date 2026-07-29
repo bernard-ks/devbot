@@ -1,6 +1,6 @@
 import type { ReviewPacket } from "./review.js";
 import { redactSensitiveText } from "./security.js";
-import type { TaskRecord } from "./task-store.js";
+import type { TaskRecord, TaskReviewStatus } from "./task-store.js";
 
 export type StudioLane = "needs-me" | "in-flight" | "recent";
 export type StudioAgentStatus = "active" | "waiting" | "ready";
@@ -33,6 +33,21 @@ export interface StudioTask {
     verification: string[];
     captureNote: string | null;
   };
+  review: {
+    provider: "github";
+    repository: string;
+    number: number;
+    status: TaskReviewStatus;
+    draft: boolean;
+    checks: {
+      pending: number;
+      passed: number;
+      failed: number;
+    };
+    unresolvedThreads: number;
+    reviewDecision: string | null;
+    mergeable: string | null;
+  } | null;
 }
 
 export interface StudioProject {
@@ -147,7 +162,22 @@ function studioTask(task: TaskRecord, privatePaths: readonly string[]): StudioTa
       diffStat: task.diffStat ? compact(task.diffStat, 900, privatePaths) : null,
       verification: (task.verification ?? []).slice(0, MAX_VERIFICATION_ITEMS).map((item) => compact(item, 360, privatePaths)),
       captureNote: task.captureNote ? compact(task.captureNote, 700, privatePaths) : null
-    }
+    },
+    review: task.review ? {
+      provider: task.review.provider,
+      repository: compact(task.review.repository, 180, privatePaths),
+      number: task.review.number,
+      status: task.review.status,
+      draft: task.review.draft,
+      checks: {
+        pending: task.review.checks.pending,
+        passed: task.review.checks.passed,
+        failed: task.review.checks.failed
+      },
+      unresolvedThreads: task.review.unresolvedThreads,
+      reviewDecision: task.review.reviewDecision ? compact(task.review.reviewDecision, 80, privatePaths) : null,
+      mergeable: task.review.mergeable ? compact(task.review.mergeable, 80, privatePaths) : null
+    } : null
   };
 }
 
